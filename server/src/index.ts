@@ -306,6 +306,22 @@ const computerGateway = computerClient
   : undefined;
 
 /**
+ * Whether a Bot's tools run here or in the browser.
+ *
+ * Off by default, and deliberately so while both halves of the move exist. The surface still
+ * registers these tools with `useFrontendTool`, and a deployment running both would offer the model
+ * two tools under each name. Worse, switching this on before remote AG-UI Bots can be served from
+ * here would take the tools away from every Bot that is an endpoint rather than a built-in one,
+ * which is most of them, including the one that ships in the box.
+ *
+ * So the machinery lands first and is proven by its tests, and this turns on in the change that
+ * removes the browser's copy. Same shape as `dry-run` in the action policy: the mechanism arrives
+ * before it starts deciding anything.
+ */
+const serverSideComputerTools =
+  process.env.OPENBOT_SERVER_SIDE_TOOLS?.trim() === "true";
+
+/**
  * The computer tools, bound to the person a run belongs to.
  *
  * Built here rather than inside the runtime because the two things a tool needs — the gateway that
@@ -313,39 +329,42 @@ const computerGateway = computerClient
  * respectively. Absent when no computer is configured, which leaves every Bot able to talk and
  * nothing else: the honest degraded state, rather than tools that fail on first use.
  */
-const computerToolsForActor = computerGateway
-  ? (actor: AgentActor): ToolsForAgent =>
-      (agentId: string) =>
-        toRuntimeTools(
-          createComputerToolSpecs({
-            gateway: computerGateway,
-            // The Bot IS the computer: the gateway addresses a container by the Bot's id, the same
-            // way the HTTP routes do.
-            botId: agentId,
-            actor: {
-              id: actor.id,
-              // Only a real users row may go in the audit table's foreign key column. Matched on the
-              // id rather than the address, which is the fact this file already holds.
-              ...(actor.id === DEV_ACTOR.id ? {} : { userId: actor.id }),
-            },
-            recordRefusal: async ({ reason, request }) => {
-              await recordAuditEvent(bootAuditStore, {
-                eventType: "bot.declined",
-                targetType: "agent",
-                targetId: agentId,
-                ...(actor.id === DEV_ACTOR.id ? {} : { actorUserId: actor.id }),
-                payload: {
-                  bot: agentId,
-                  actor: actor.id,
-                  reason: reason.slice(0, 500),
-                  ...(request ? { request: request.slice(0, 500) } : {}),
-                  reportedBy: "the Bot itself",
-                },
-              });
-            },
-          }),
-        )
-  : undefined;
+const computerToolsForActor =
+  computerGateway && serverSideComputerTools
+    ? (actor: AgentActor): ToolsForAgent =>
+        (agentId: string) =>
+          toRuntimeTools(
+            createComputerToolSpecs({
+              gateway: computerGateway,
+              // The Bot IS the computer: the gateway addresses a container by the Bot's id, the same
+              // way the HTTP routes do.
+              botId: agentId,
+              actor: {
+                id: actor.id,
+                // Only a real users row may go in the audit table's foreign key column. Matched on the
+                // id rather than the address, which is the fact this file already holds.
+                ...(actor.id === DEV_ACTOR.id ? {} : { userId: actor.id }),
+              },
+              recordRefusal: async ({ reason, request }) => {
+                await recordAuditEvent(bootAuditStore, {
+                  eventType: "bot.declined",
+                  targetType: "agent",
+                  targetId: agentId,
+                  ...(actor.id === DEV_ACTOR.id
+                    ? {}
+                    : { actorUserId: actor.id }),
+                  payload: {
+                    bot: agentId,
+                    actor: actor.id,
+                    reason: reason.slice(0, 500),
+                    ...(request ? { request: request.slice(0, 500) } : {}),
+                    reportedBy: "the Bot itself",
+                  },
+                });
+              },
+            }),
+          )
+    : undefined;
 
 const app = createApp(
   config,
