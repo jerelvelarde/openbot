@@ -245,6 +245,14 @@ export type ControlState = {
   reason?: string;
   /** The Bot has asked and nobody has taken over yet. */
   requested: boolean;
+  /**
+   * What the Bot is waiting for a person to type, in the Bot's own words.
+   *
+   * The label only, never the value: this is the same string the person is shown above the masked
+   * box, and it clearing is how anything waiting on the secret learns it was supplied. The computer
+   * has always returned it; the type said nothing about it while only the browser read it.
+   */
+  secretWanted?: string;
 };
 
 /**
