@@ -1,5 +1,8 @@
 import { AbstractAgent, HttpAgent } from "@ag-ui/client";
-import type { BuiltInAgentConfiguration } from "@copilotkit/runtime/v2";
+import type {
+  BuiltInAgentConfiguration,
+  ToolDefinition,
+} from "@copilotkit/runtime/v2";
 import {
   BuiltInAgent,
   CopilotKitIntelligence,
@@ -159,10 +162,29 @@ function isHttpUrl(value: string) {
   }
 }
 
+/**
+ * How many times a Bot may act before it has to say something.
+ *
+ * The runtime's default is 1, which was right while the tools ran in the browser: the Bot emitted one
+ * call, the tab carried it out, and the surface started a new run with the result. With the tools on
+ * this side that arrangement would stop a Bot after its first snapshot, so the loop it used to get
+ * from the browser has to be granted here instead.
+ *
+ * Bounded rather than open, because every step is another model call, and a Bot that cannot make
+ * progress will spend the deployment's money discovering that. Twelve is enough for the ordinary
+ * shape of this work — snapshot, act, read, act again — and short enough that a spinning Bot stops.
+ *
+ * NOTE for the `ask` outcome: an interrupt tool requires `maxSteps: 1`, so parking an action for a
+ * human cannot be expressed as an interrupt tool while this is set. That is a reason to park in the
+ * gateway rather than in the model loop, which is what the plan already calls for.
+ */
+const MAX_TOOL_STEPS = 12;
+
 export function builtInAgentConfiguration(
   agent: RegisteredBuiltInAgent,
   model: RuntimeModel,
   apiKey: string | null,
+  tools: ToolDefinition[] = [],
 ): BuiltInAgentConfiguration {
   if (!apiKey) {
     return {
@@ -180,8 +202,17 @@ export function builtInAgentConfiguration(
     model: `${model.provider}/${model.defaultModel}`,
     prompt: agent.systemPrompt,
     apiKey,
+    ...(tools.length ? { tools, maxSteps: MAX_TOOL_STEPS } : {}),
   };
 }
+
+/**
+ * The tools one Bot may act with, resolved per Bot because a computer belongs to a Bot.
+ *
+ * A factory rather than a fixed list: the tools close over which Bot's computer they address and
+ * which person is asking, and both are known only once a run is being set up.
+ */
+export type ToolsForAgent = (agentId: string) => ToolDefinition[];
 
 /**
  * Build the built-in and remote AG-UI agent map the runtime serves.
@@ -189,13 +220,18 @@ export function builtInAgentConfiguration(
  * Keyed by the registry id, which is what the browser sends as the agent name, so the two cannot
  * drift apart without the lookup failing loudly rather than silently running the wrong Bot.
  */
+
 export function buildAgents(
   agents: RegisteredAgent[],
   model: RuntimeModel,
   apiKey: string | null,
+  toolsFor?: ToolsForAgent,
 ): Record<string, AbstractAgent> {
   return Object.fromEntries(
-    agents.map((agent) => [agent.id, buildAgent(agent, model, apiKey)]),
+    agents.map((agent) => [
+      agent.id,
+      buildAgent(agent, model, apiKey, toolsFor),
+    ]),
   );
 }
 
@@ -203,9 +239,12 @@ function buildAgent(
   agent: RegisteredAgent,
   model: RuntimeModel,
   apiKey: string | null,
+  toolsFor?: ToolsForAgent,
 ): AbstractAgent {
   if (agent.type === "built_in") {
-    return new BuiltInAgent(builtInAgentConfiguration(agent, model, apiKey));
+    return new BuiltInAgent(
+      builtInAgentConfiguration(agent, model, apiKey, toolsFor?.(agent.id)),
+    );
   }
   if (agent.type === "unavailable") {
     return new UnavailableAgent(agent);
@@ -262,6 +301,7 @@ export async function resolveRuntimeAgents(
   loadAgents: () => Promise<RegisteredAgent[]>,
   model: RuntimeModel,
   resolveModelApiKey: () => Promise<string | null>,
+  toolsFor?: ToolsForAgent,
 ): Promise<Record<string, AbstractAgent>> {
   const registered = await loadAgents();
   if (registered.length === 0) {
@@ -273,7 +313,7 @@ export async function resolveRuntimeAgents(
   const apiKey = registered.some((agent) => agent.type === "built_in")
     ? await resolveModelApiKey()
     : null;
-  return buildAgents(registered, model, apiKey);
+  return buildAgents(registered, model, apiKey, toolsFor);
 }
 
 /** Who is asking. Agent visibility is decided per person, so a run has to know this first. */
@@ -296,6 +336,14 @@ export function createRequestAgents(
   loadAgents: LoadAgentsForActor,
   model: RuntimeModel,
   resolveModelApiKey: () => Promise<string | null>,
+  /**
+   * The computer tools, bound to the person this request is for.
+   *
+   * Per request for the same reason the agent map is: the actor goes on every audit row a tool
+   * writes, so a factory captured at boot would attribute one person's actions to whoever happened
+   * to start the server.
+   */
+  toolsForActor?: (actor: AgentActor) => ToolsForAgent,
 ) {
   return async ({ request }: { request: Request }) => {
     const actor = await identifyActor(request);
@@ -303,6 +351,7 @@ export function createRequestAgents(
       () => loadAgents(actor),
       model,
       resolveModelApiKey,
+      toolsForActor?.(actor),
     );
   };
 }
@@ -321,6 +370,14 @@ export function mountCopilotRuntime(
   resolveModelApiKey: () => Promise<string | null>,
   identifyUser: IdentifyUser,
   identifyActor: IdentifyActor,
+  /**
+   * The computer tools a Bot may act with.
+   *
+   * Absent leaves every Bot able to talk and nothing else, which is the correct degraded behaviour
+   * for a deployment with no computer configured: a Bot that cannot reach a browser must say so
+   * rather than be offered tools that will fail.
+   */
+  toolsForActor?: (actor: AgentActor) => ToolsForAgent,
   basePath = "/api/copilotkit",
 ) {
   const { intelligence } = config.runtime;
@@ -345,6 +402,7 @@ export function mountCopilotRuntime(
       loadAgents,
       model,
       resolveModelApiKey,
+      toolsForActor,
     ) as never,
   });
 

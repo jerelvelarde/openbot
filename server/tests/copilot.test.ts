@@ -103,6 +103,52 @@ describe("registered Copilot agents", () => {
     });
   });
 
+  test("gives a built-in agent its tools, and the steps to use more than one", () => {
+    const tool = {
+      name: "computer_snapshot",
+      description: "List what is on the page.",
+      parameters: {},
+    } as never;
+
+    const configured = builtInAgentConfiguration(
+      {
+        id: "general-assistant",
+        name: "General Assistant",
+        type: "built_in",
+        systemPrompt: "Be helpful.",
+      },
+      { provider: "openai", defaultModel: "gpt-4.1" },
+      "openai-secret",
+      [tool],
+    );
+
+    // The runtime defaults to one step, which was right while the browser ran the loop: the Bot
+    // emitted a call, the tab carried it out and started a new run. With the tools on this side, one
+    // step stops a Bot dead after its first snapshot.
+    expect(configured).toMatchObject({ tools: [tool] });
+    expect((configured as { maxSteps?: number }).maxSteps ?? 1).toBeGreaterThan(
+      1,
+    );
+  });
+
+  test("leaves a built-in agent alone when there are no tools to give it", () => {
+    const configured = builtInAgentConfiguration(
+      {
+        id: "general-assistant",
+        name: "General Assistant",
+        type: "built_in",
+        systemPrompt: "Be helpful.",
+      },
+      { provider: "openai", defaultModel: "gpt-4.1" },
+      "openai-secret",
+    );
+
+    // A deployment with no computer configured gets a Bot that talks, not one carrying tools that
+    // fail on first use, and not a step budget it has no use for.
+    expect(configured).not.toHaveProperty("tools");
+    expect(configured).not.toHaveProperty("maxSteps");
+  });
+
   test("fails an unavailable built-in agent through the AG-UI lifecycle", async () => {
     const agents = buildAgents(
       [

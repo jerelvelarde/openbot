@@ -1,5 +1,6 @@
 import { serve } from "bun";
 import { createAgentProfileStore } from "./agents/profile-store";
+import type { AgentActor } from "./agents/profile-types";
 import { createRuntimeAgentLoader } from "./agents/runtime-agents";
 import { createApp } from "./app";
 import { createAuditReader, createAuditStore, recordAuditEvent } from "./audit";
@@ -18,6 +19,8 @@ import { createSandboxedStore } from "./components/sandboxed";
 import { createComponentStore } from "./components/store";
 import { createComputerClient } from "./computer/client";
 import { createComputerGateway } from "./computer/gateway";
+import { toRuntimeTools } from "./computer/runtime-tools";
+import { createComputerToolSpecs } from "./computer/tools";
 import {
   createPolicyStore,
   DEFAULT_ACTION_POLICY,
@@ -29,6 +32,7 @@ import {
   type IdentifyActor,
   type IdentifyUser,
   mountCopilotRuntime,
+  type ToolsForAgent,
 } from "./copilot";
 import {
   createCredentialAdminService,
@@ -281,6 +285,68 @@ process.on("unhandledRejection", (reason) => {
   );
 });
 
+/**
+ * The only path to an acting call, built once and shared.
+ *
+ * Hoisted out of the `createApp` argument list because there are now two consumers rather than one:
+ * the HTTP routes a person's browser calls, and the computer tools the runtime hands to a Bot. Both
+ * must be the same instance — the gateway holds the snapshot each ref is resolved against, so a
+ * second one would resolve refs against a page it never took a snapshot of.
+ */
+const computerGateway = computerClient
+  ? createComputerGateway({
+      client: computerClient,
+      auditStore: bootAuditStore,
+      // Read on every decision rather than captured once, so a rule an administrator adds while the
+      // server is running applies to the very next action instead of after a restart.
+      policy: () => policyStore.get(),
+      // Stop, reset and the listing act on containers when there are containers to act on.
+      ...(supervisor ? { supervisor } : {}),
+    })
+  : undefined;
+
+/**
+ * The computer tools, bound to the person a run belongs to.
+ *
+ * Built here rather than inside the runtime because the two things a tool needs — the gateway that
+ * governs it and the person it is attributable to — are owned by this file and by the request
+ * respectively. Absent when no computer is configured, which leaves every Bot able to talk and
+ * nothing else: the honest degraded state, rather than tools that fail on first use.
+ */
+const computerToolsForActor = computerGateway
+  ? (actor: AgentActor): ToolsForAgent =>
+      (agentId: string) =>
+        toRuntimeTools(
+          createComputerToolSpecs({
+            gateway: computerGateway,
+            // The Bot IS the computer: the gateway addresses a container by the Bot's id, the same
+            // way the HTTP routes do.
+            botId: agentId,
+            actor: {
+              id: actor.id,
+              // Only a real users row may go in the audit table's foreign key column. Matched on the
+              // id rather than the address, which is the fact this file already holds.
+              ...(actor.id === DEV_ACTOR.id ? {} : { userId: actor.id }),
+            },
+            recordRefusal: async ({ reason, request }) => {
+              await recordAuditEvent(bootAuditStore, {
+                eventType: "bot.declined",
+                targetType: "agent",
+                targetId: agentId,
+                ...(actor.id === DEV_ACTOR.id ? {} : { actorUserId: actor.id }),
+                payload: {
+                  bot: agentId,
+                  actor: actor.id,
+                  reason: reason.slice(0, 500),
+                  ...(request ? { request: request.slice(0, 500) } : {}),
+                  reportedBy: "the Bot itself",
+                },
+              });
+            },
+          }),
+        )
+  : undefined;
+
 const app = createApp(
   config,
   auth,
@@ -317,20 +383,10 @@ const app = createApp(
       }),
     identifyUser,
     identifyActor,
+    computerToolsForActor,
   ),
   computerClient,
-  // The only path to an acting call.
-  computerClient
-    ? createComputerGateway({
-        client: computerClient,
-        auditStore: bootAuditStore,
-        // Read on every decision rather than captured once, so a rule an administrator adds while the
-        // server is running applies to the very next action instead of after a restart.
-        policy: () => policyStore.get(),
-        // Stop, reset and the listing act on containers when there are containers to act on.
-        ...(supervisor ? { supervisor } : {}),
-      })
-    : undefined,
+  computerGateway,
   policyStore,
   // Bots as durable objects, and the channels they run in.
   agentProfileStore,
