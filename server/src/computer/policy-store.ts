@@ -19,7 +19,15 @@ import type { Database } from "../db/client";
 import { actionPolicy } from "../db/schema";
 import type { ActionPolicy } from "./policy";
 
-/** There is one boundary per deployment, so there is one row. */
+/**
+ * There is one boundary per deployment, so there is one row.
+ *
+ * The id is a parameter rather than a constant because "one row" is a property of a deployment, not
+ * of this module, and something that shares a database with a running deployment must be able to
+ * have its own. A test that reaches for `current` deletes the boundary the deployment on this machine
+ * is enforcing, and the next restart comes up permissive with nothing in the trail saying the rule
+ * stopped applying — which is the exact failure this file exists to prevent.
+ */
 const CURRENT = "current";
 
 /**
@@ -61,6 +69,8 @@ export function createPolicyStore(
   initial: ActionPolicy,
   /** Absent keeps everything in memory, which is what a test without a database wants. */
   database?: Database,
+  /** Which row. See {@link CURRENT}: only something sharing a deployment's database needs its own. */
+  id: string = CURRENT,
 ): PolicyStore {
   const configured = clone(initial);
   let current = clone(initial);
@@ -77,7 +87,7 @@ export function createPolicyStore(
         await database
           .insert(actionPolicy)
           .values({
-            id: CURRENT,
+            id,
             mode: next.mode,
             deny: next.deny,
             ask: next.ask ?? [],
@@ -107,7 +117,7 @@ export function createPolicyStore(
       // this deployment has no boundary of its own again, and changing what configuration says then
       // changes what it enforces, which is what an operator expects of a reset.
       if (database) {
-        await database.delete(actionPolicy).where(eq(actionPolicy.id, CURRENT));
+        await database.delete(actionPolicy).where(eq(actionPolicy.id, id));
       }
       current = clone(configured);
     },
@@ -117,7 +127,7 @@ export function createPolicyStore(
       const [row] = await database
         .select()
         .from(actionPolicy)
-        .where(eq(actionPolicy.id, CURRENT))
+        .where(eq(actionPolicy.id, id))
         .limit(1);
       if (!row) return "configuration";
 

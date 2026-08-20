@@ -283,11 +283,16 @@ export function ChannelScreen({
             <TextInput
               onChangeText={setDraft}
               onSubmitEditing={send}
-              placeholder={
-                channel?.busy
-                  ? "It is working — this will be queued"
-                  : `Ask ${channel?.botName ?? "this Bot"}`
-              }
+              /**
+               * Always the same invitation.
+               *
+               * It used to say "this will be queued" while a Bot was busy, which only the local
+               * source actually does — against a real deployment a message sent now starts another
+               * turn. A message that reports itself as queued when it was not is the one thing a
+               * composer must never say, so the promise is made by the message afterwards, where it
+               * can be true.
+               */
+              placeholder={`Ask ${channel?.botName ?? "this Bot"}`}
               placeholderTextColor={colors.muted}
               style={{
                 flex: 1,
