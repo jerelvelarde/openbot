@@ -14,11 +14,14 @@
  * and that resolved value is what the audit row carries; a phone showing the model's own label for
  * what it is about to click would be showing the one thing the policy exists not to trust.
  */
-export type ApprovalSubject =
-  | { kind: "element"; label: string; host: string }
-  | { kind: "page"; host: string; url: string }
-  | { kind: "file"; path: string }
-  | { kind: "mcp"; server: string; tool: string; effect: "read" | "write" };
+export type ApprovalSubject = {
+  /** How to phrase it: an element on a page, a file, a page itself, or a tool on an MCP server. */
+  kind: "element" | "file" | "page" | "mcp";
+  /** The element label, file path or tool name, exactly as the server resolved it. */
+  label: string;
+  /** Where it lands, when there is a where. */
+  host?: string;
+};
 
 export type ApprovalState = "pending" | "allowed" | "denied" | "expired";
 
@@ -39,6 +42,7 @@ export type Approval = {
   askedAt: string;
   state: ApprovalState;
   answeredBy?: string;
+  answeredAt?: string | null;
   /** Set when the answer wrote a scoped allow rule rather than a one-off permission. */
   scopedRule?: string;
 };
@@ -103,7 +107,7 @@ export type AuditRow = {
 export type Notification = {
   id: string;
   /** The tight rule: approval, question, done-if-asked, routine-failed. Nothing else buzzes. */
-  kind: "approval" | "question" | "done" | "routine-failed";
+  kind: "approval" | "question" | "done" | "refused" | "routine-failed";
   botName: string;
   /**
    * The line a person reads on a lock screen.

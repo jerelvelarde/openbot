@@ -22,6 +22,8 @@ import type { ComponentStore } from "./components/store";
 import type { ComputerClient } from "./computer/client";
 import type { ComputerGateway } from "./computer/gateway";
 import type { PolicyStore } from "./computer/policy-store";
+import type { ApprovalStore } from "./computer/approvals";
+import { createApprovalRoutes } from "./computer/approval-routes";
 import { createComputerRoutes } from "./computer/routes";
 import type { DeploymentConfig } from "./config";
 import type { ConnectorAdminService } from "./connectors";
@@ -95,6 +97,14 @@ export function createApp(
    * says nothing about which deployment the conversation belongs to.
    */
   threadIdentity?: ThreadIdentity,
+  /**
+   * Actions parked for a person to answer.
+   *
+   * Absent leaves `/api/approvals` unmounted, and an `ask` rule then refuses rather than parking:
+   * a deployment that cannot record approvals must not carry an action out on the grounds that
+   * nobody could be asked.
+   */
+  approvalStore?: ApprovalStore,
 ) {
   const app = new Hono<{ Variables: AppVariables }>();
 
@@ -151,6 +161,48 @@ export function createApp(
     return context.json(
       await auditReader.list(auditQueryFromUrl(new URL(context.req.url))),
     );
+  });
+  /**
+   * The trail, for the person whose Bots it is about.
+   *
+   * Separate from `/api/admin/audit-events`, which is an administrator reading the whole deployment.
+   * This answers "what did my Bots just do", which is a thing an ordinary user needs and a phone shows,
+   * and it is scoped to the Bots that person can see rather than to their role.
+   *
+   * Read-only, and it adds no new facts: the same rows, filtered. A refusal still carries the rule
+   * that caused it, because that is the one detail that turns "blocked" into something actionable.
+   */
+  app.get("/api/audit", requireUser, async (context) => {
+    if (!auditReader || !agentProfileStore) {
+      return context.json({ error: "Audit logging is not configured." }, 503);
+    }
+    const actor = context.var.actor;
+    const visible = new Set(
+      (await agentProfileStore.list({ id: actor.id, role: actor.role })).map(
+        (profile) => profile.id,
+      ),
+    );
+
+    const { events, nextCursor } = await auditReader.list(
+      auditQueryFromUrl(new URL(context.req.url)),
+    );
+
+    /**
+     * Filtered on the Bot named in the payload.
+     *
+     * An event with no Bot in it is deployment-level - a policy load, a credential rotation - and is
+     * not this person's business here; the admin trail is where those are read. So an unattributable
+     * row is dropped rather than shown to everybody, which is the fail-closed direction.
+     */
+    const mine = events.filter((event) => {
+      const bot = (event.payload as { bot?: unknown } | null)?.bot;
+      return typeof bot === "string" && visible.has(bot);
+    });
+
+    return context.json({
+      events: mine,
+      ...(nextCursor ? { nextCursor } : {}),
+    });
   });
   app.get("/api/admin/credentials", requireUser, async (context) => {
     const denied = requireAdmin(context);
@@ -304,6 +356,20 @@ export function createApp(
       createComputerRoutes(
         computerClient,
         computerGateway,
+        computerPolicy,
+        requireUser,
+      ),
+    );
+  }
+
+  // Scoped by agent visibility rather than merely by being signed in, so one person cannot answer
+  // another's private Bot. See createApprovalRoutes.
+  if (approvalStore && agentProfileStore && computerPolicy) {
+    app.route(
+      "/api/approvals",
+      createApprovalRoutes(
+        approvalStore,
+        agentProfileStore,
         computerPolicy,
         requireUser,
       ),

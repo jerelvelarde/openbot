@@ -26,16 +26,17 @@ import {
 import { Screen, TopBar } from "./chrome";
 
 function describe(approval: Approval): { what: string; where: string } {
-  const subject = approval.subject;
-  if (subject.kind === "element") {
-    return { what: `“${subject.label}”`, where: subject.host };
+  const { kind, label, host } = approval.subject;
+  if (kind === "file") return { what: label, where: "its workspace" };
+  if (kind === "mcp") {
+    return { what: label, where: host ? `${host} (MCP)` : "an MCP server" };
   }
-  if (subject.kind === "page")
-    return { what: subject.url, where: subject.host };
-  if (subject.kind === "file") {
-    return { what: subject.path, where: "its workspace" };
-  }
-  return { what: subject.tool, where: `${subject.server} (${subject.effect})` };
+  // An element is quoted because it is a label a person will go looking for on a page. A page, or a
+  // bare action the server could not name, is not.
+  return {
+    what: kind === "element" ? `“${label}”` : label,
+    where: host ?? "its computer",
+  };
 }
 
 export function ApprovalScreen({

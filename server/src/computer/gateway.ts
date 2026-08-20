@@ -18,6 +18,7 @@
  * The refs are opaque to the caller precisely so that the server holds the mapping.
  */
 import { type AuditStore, recordAuditEvent } from "../audit";
+import type { ApprovalStore, ApprovalSubject } from "./approvals";
 import type { ComputerClient } from "./client";
 import {
   type ActionPolicy,
@@ -76,6 +77,21 @@ export type ComputerGatewayOptions = {
   auditStore: AuditStore;
   /** Absent denies everything. See evaluateActionPolicy. */
   policy: () => ActionPolicy | undefined;
+  /**
+   * Where a parked action waits for a person.
+   *
+   * Absent turns an `ask` rule into a refusal rather than into a question, which is the only safe
+   * degradation: a deployment whose approval table is unreachable must not carry the action out
+   * because nobody could be asked.
+   */
+  approvals?: ApprovalStore;
+  /**
+   * Grant a scoped permission, for an "always allow" answer.
+   *
+   * Injected rather than reached for, because the policy store is the gateway's read-only input
+   * everywhere else and this is the one path that writes to it.
+   */
+  grant?: (rule: string, by: string) => Promise<void>;
 };
 
 /**
@@ -154,6 +170,13 @@ export function createComputerGateway(options: ComputerGatewayOptions) {
       filePath?: string;
       targetUrl?: string;
       key?: string;
+      /**
+       * Which conversation this action belongs to.
+       *
+       * Carried so a parked approval can be shown beside the thread it came out of. Absent is fine:
+       * an approval with no thread is still answerable, it just has less context around it.
+       */
+      threadId?: string;
       /** The person's Stop, on its way to the browser. See the acting methods below. */
       signal?: AbortSignal;
     },
@@ -203,7 +226,112 @@ export function createComputerGateway(options: ComputerGatewayOptions) {
       decision,
     });
 
-    if (!decision.forward) {
+    /**
+     * The policy asked rather than deciding. Park, and wait for a person.
+     *
+     * The audit row above is already written, and that ordering is deliberate: an action that was not
+     * recorded did not happen, and that invariant has to hold for a parked action too or the trail
+     * cannot show that a Bot ever asked. What follows adds the answer to the trail, not the question.
+     */
+    if (decision.parked) {
+      if (!options.approvals) {
+        throw new ActionRefusedError(
+          "That needs a person to approve it, and this deployment cannot record approvals right now.",
+          decision.matched,
+        );
+      }
+
+      const approval = await options.approvals.create({
+        agentId: botId,
+        ...(subject.threadId ? { threadId: subject.threadId } : {}),
+        ...(actor.userId ? { actorUserId: actor.userId } : {}),
+        toolName,
+        ...(intent ? { intent } : {}),
+        subject: approvalSubjectOf(context, element),
+        rule: decision.matched ?? "an ask rule",
+        reason: decision.reason,
+      });
+
+      // The question is already in the trail: the row written above is `computer.action_asked`,
+      // because the decision was parked. What is missing is the answer, and then the action.
+      const outcome = await options.approvals.wait(approval.id, subject.signal);
+
+      if (!outcome.answered) {
+        await writeAsk(auditStore, {
+          eventType: "computer.action_answered",
+          approvalId: approval.id,
+          botId,
+          actor,
+          computerId,
+          decision,
+          subjectLabel: approval.subject.label,
+          pageUrl,
+          answer: outcome.reason === "cancelled" ? "cancelled" : "expired",
+        });
+        throw new ActionRefusedError(
+          outcome.reason === "cancelled"
+            ? "That was stopped before anybody answered."
+            : "Nobody approved that in time, so it did not happen.",
+          decision.matched,
+        );
+      }
+
+      await writeAsk(auditStore, {
+        eventType: "computer.action_answered",
+        approvalId: approval.id,
+        botId,
+        actor,
+        computerId,
+        decision,
+        subjectLabel: approval.subject.label,
+        pageUrl,
+        answer: outcome.allowed ? "allowed" : "denied",
+        answeredByUserId: outcome.answeredByUserId,
+      });
+
+      if (!outcome.allowed) {
+        await write(auditStore, {
+          toolName,
+          botId,
+          actor,
+          computerId,
+          element,
+          ref,
+          ...(subject.key ? { key: subject.key } : {}),
+          filePath,
+          pageUrl,
+          // Refused, and by a person rather than by a rule. Written for the same reason the allowed
+          // row is: without it, the refusals a human actually made are the only ones the trail has no
+          // refusal row for.
+          decision: { ...decision, allowed: false, parked: false },
+        });
+        throw new ActionRefusedError(
+          "A person refused that.",
+          decision.matched,
+        );
+      }
+
+      /**
+       * Answered yes, so record the action itself before carrying it out.
+       *
+       * Three rows, each saying something the others do not: it was asked, somebody answered, and it
+       * then happened. Leaving this one out would mean a trail where the most consequential actions in
+       * the deployment — the ones a human had to approve — are the only ones with no "permitted" row,
+       * which is exactly backwards.
+       */
+      await write(auditStore, {
+        toolName,
+        botId,
+        actor,
+        computerId,
+        element,
+        ref,
+        ...(subject.key ? { key: subject.key } : {}),
+        filePath,
+        pageUrl,
+        decision: { ...decision, allowed: true, parked: false },
+      });
+    } else if (!decision.forward) {
       throw new ActionRefusedError(decision.reason, decision.matched);
     }
 
@@ -680,11 +808,17 @@ async function write(
   await recordAuditEvent(auditStore, {
     // A failure is its own kind of event, not a variant of "allowed": the whole point of the extra row
     // is that a reader can tell an action that happened from one that was permitted and then did not.
+    //
+    // A parked action is its own kind too, and getting this wrong is worse than it sounds: recorded as
+    // a refusal, the trail says a Bot was blocked from doing something it was in fact asked about and
+    // then allowed to do, and anybody auditing the deployment reads the opposite of what happened.
     eventType: entry.failure
       ? "computer.action_failed"
-      : entry.decision.allowed
-        ? "computer.action_allowed"
-        : "computer.action_refused",
+      : entry.decision.parked
+        ? "computer.action_asked"
+        : entry.decision.allowed
+          ? "computer.action_allowed"
+          : "computer.action_refused",
     targetType: "computer",
     targetId: entry.computerId,
     // Only ever a real users row. The audit table has a foreign key to it, so writing the local
@@ -749,6 +883,79 @@ async function write(
  * a policy allowed something it never saw is exactly the kind of comfortable fiction this trail exists
  * to avoid.
  */
+/**
+ * Describe what an approval is about, from what the SERVER resolved.
+ *
+ * Never from the caller's arguments. The gateway holds the snapshot precisely so that "do not click
+ * Submit" cannot be evaded by calling it something else in the request, and an approval screen that
+ * quoted the caller's own label would hand that trust straight back to the model.
+ */
+function approvalSubjectOf(
+  context: PolicyContext,
+  element: SnapshotElement | undefined,
+): ApprovalSubject {
+  if (context.file) {
+    return { kind: "file", label: context.file.path };
+  }
+  if (context.mcp) {
+    return { kind: "mcp", label: context.mcp.tool, host: context.mcp.server };
+  }
+  if (element?.name) {
+    return {
+      kind: "element",
+      label: element.name,
+      ...(context.page.host ? { host: context.page.host } : {}),
+    };
+  }
+  // No element the server can name: describe the action itself rather than inventing a label.
+  return {
+    kind: "page",
+    label: context.tool.name.replace("computer_", ""),
+    ...(context.page.host ? { host: context.page.host } : {}),
+  };
+}
+
+/**
+ * Record that a Bot asked, and separately that somebody answered.
+ *
+ * Two rows rather than one. The gap between them is how long a Bot sat waiting on a person, and that
+ * is the number which decides whether an `ask` rule is workable or is quietly stopping people from
+ * getting their work done.
+ */
+async function writeAsk(
+  auditStore: AuditStore,
+  entry: {
+    eventType: "computer.action_asked" | "computer.action_answered";
+    approvalId: string;
+    botId: string;
+    actor: ActionActor;
+    computerId: string;
+    decision: PolicyDecision;
+    subjectLabel: string;
+    pageUrl: string;
+    answer?: "allowed" | "denied" | "expired" | "cancelled";
+    answeredByUserId?: string | null;
+  },
+) {
+  await recordAuditEvent(auditStore, {
+    eventType: entry.eventType,
+    targetType: "computer",
+    targetId: entry.computerId,
+    ...(entry.actor.userId ? { actorUserId: entry.actor.userId } : {}),
+    payload: {
+      approval: entry.approvalId,
+      bot: entry.botId,
+      actor: entry.actor.id,
+      page: entry.pageUrl,
+      subject: entry.subjectLabel,
+      rule: entry.decision.matched,
+      ...(entry.answer ? { answer: entry.answer } : {}),
+      // Who allowed it. An approval nobody can be attributed to is the same as no approval at all.
+      ...(entry.answeredByUserId ? { answeredBy: entry.answeredByUserId } : {}),
+    },
+  });
+}
+
 async function writeControlEvent(
   auditStore: AuditStore,
   eventType:

@@ -9,7 +9,11 @@
 import { useMemo, useState } from "react";
 import { Platform, Pressable, Text, useColorScheme, View } from "react-native";
 import { StatusBar } from "expo-status-bar";
-import { createLocalSource } from "./src/data/local";
+import {
+  type Connection,
+  createSource,
+  resolveConnection,
+} from "./src/data/config";
 import { ActivityScreen } from "./src/screens/activity";
 import { ApprovalScreen } from "./src/screens/approval";
 import { ChannelScreen } from "./src/screens/channel";
@@ -107,7 +111,44 @@ function TabBar({
   );
 }
 
-function Shell() {
+/**
+ * Which deployment is on screen.
+ *
+ * Shown, not hidden, and shown in every build. "Is this real?" is the first question anybody asks of
+ * a screenshot of an approval, and a companion that cannot answer it is one nobody should trust.
+ */
+function ConnectionBar({ connection }: { connection: Connection }) {
+  const colors = useColors();
+  const live = connection.kind === "live";
+  return (
+    <View
+      style={{
+        flexDirection: "row",
+        alignItems: "center",
+        gap: 6,
+        paddingHorizontal: space.lg,
+        paddingVertical: 6,
+        backgroundColor: colors.cardMuted,
+        borderBottomColor: colors.border,
+        borderBottomWidth: 1,
+      }}
+    >
+      <View
+        style={{
+          width: 7,
+          height: 7,
+          borderRadius: 4,
+          backgroundColor: live ? colors.allow : colors.muted,
+        }}
+      />
+      <Text style={{ ...type_.small, color: colors.muted }}>
+        {live ? `Live · ${connection.label}` : "Local · nothing behind it"}
+      </Text>
+    </View>
+  );
+}
+
+function Shell({ connection }: { connection: Connection }) {
   const colors = useColors();
   const [route, setRoute] = useState<Route>({ name: "inbox" });
   const [tab, setTab] = useState<Route["name"]>("inbox");
@@ -155,6 +196,7 @@ function Shell() {
 
   return (
     <View style={{ flex: 1, backgroundColor: colors.background }}>
+      <ConnectionBar connection={connection} />
       <View style={{ flex: 1 }}>{screen}</View>
       <TabBar active={tab} onSelect={onTab} waiting={waiting} />
     </View>
@@ -163,8 +205,14 @@ function Shell() {
 
 export default function App() {
   const scheme = useColorScheme() === "dark" ? "dark" : "light";
-  // One source for the life of the app. Rebuilding it would restart the deployment it represents.
-  const source = useMemo(() => createLocalSource(), []);
+  /**
+   * One source for the life of the app.
+   *
+   * Rebuilding it would restart the deployment it represents, and against a live server it would
+   * throw away the poll subscription mid-flight.
+   */
+  const connection = useMemo(() => resolveConnection(), []);
+  const source = useMemo(() => createSource(connection), [connection]);
 
   const colors = palettes[scheme];
 
@@ -185,7 +233,7 @@ export default function App() {
       }}
     >
       <View style={{ height: framed ? 0 : 52 }} />
-      <Shell />
+      <Shell connection={connection} />
     </View>
   );
 

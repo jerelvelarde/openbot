@@ -7,7 +7,7 @@
  */
 import { ScrollView, View } from "react-native";
 import type { Approval, Notification } from "../data/types";
-import { useLive, useSource } from "../store";
+import { useLiveResult, useSource } from "../store";
 import { space } from "../theme";
 import {
   Badge,
@@ -22,12 +22,10 @@ import {
 import { Screen, Title } from "./chrome";
 
 function subjectLine(approval: Approval): string {
-  const subject = approval.subject;
-  if (subject.kind === "element")
-    return `“${subject.label}” on ${subject.host}`;
-  if (subject.kind === "page") return `open ${subject.host}`;
-  if (subject.kind === "file") return subject.path;
-  return `${subject.tool} on ${subject.server}`;
+  const { kind, label, host } = approval.subject;
+  if (kind === "file") return label;
+  const named = kind === "element" ? `“${label}”` : label;
+  return host ? `${named} on ${host}` : named;
 }
 
 export function InboxScreen({
@@ -38,8 +36,12 @@ export function InboxScreen({
   onOpenChannel: (id: string) => void;
 }) {
   const colors = useColors();
-  const approvals = useLive((source) => source.approvals());
-  const notifications = useLive((source) => source.notifications());
+  const { value: approvals, error } = useLiveResult((source) =>
+    source.approvals(),
+  );
+  const { value: notifications } = useLiveResult((source) =>
+    source.notifications(),
+  );
   const source = useSource();
 
   const waiting = (approvals ?? []).filter((one) => one.state === "pending");
@@ -54,11 +56,28 @@ export function InboxScreen({
         <Title
           text="Inbox"
           detail={
-            waiting.length === 0
-              ? "Nothing is waiting on you."
-              : `${waiting.length} thing${waiting.length === 1 ? "" : "s"} waiting on you.`
+            // "Nothing is waiting" is a claim about the deployment, so it is only made when the
+            // deployment actually answered. Otherwise the state is unknown, and it says so.
+            error
+              ? "Could not reach this deployment."
+              : approvals === undefined
+                ? "Checking…"
+                : waiting.length === 0
+                  ? "Nothing is waiting on you."
+                  : `${waiting.length} thing${waiting.length === 1 ? "" : "s"} waiting on you.`
           }
         />
+
+        {error ? (
+          <Card muted>
+            <Label>Offline</Label>
+            <Body muted>{error}</Body>
+            <Body muted>
+              What you can see below is the last thing this app was told, which
+              may be out of date.
+            </Body>
+          </Card>
+        ) : null}
 
         {waiting.map((approval) => (
           <Card key={approval.id} onPress={() => onOpenApproval(approval.id)}>
@@ -95,7 +114,11 @@ export function InboxScreen({
                 <View style={{ flexDirection: "row", gap: space.md }}>
                   <OutcomeDot
                     outcome={
-                      note.kind === "routine-failed" ? "failed" : "allowed"
+                      note.kind === "refused"
+                        ? "refused"
+                        : note.kind === "routine-failed"
+                          ? "failed"
+                          : "allowed"
                     }
                   />
                   <View style={{ flex: 1, gap: 2 }}>

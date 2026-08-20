@@ -36,6 +36,13 @@ const CURRENT = "current";
 export const DEFAULT_ACTION_POLICY: ActionPolicy = {
   mode: "enforce",
   deny: [],
+  // Nothing is asked about by default. An `ask` rule is a deliberate decision to put a person in the
+  // path of a class of action, and inventing one on a deployment's behalf would be putting somebody
+  // on call for a boundary they never wrote.
+  ask: [],
+  // Nothing is exempt by default. A standing permission is something a person granted, and there is
+  // nobody to attribute one to on a deployment that has just started.
+  exempt: [],
   allow: ["true"],
 };
 
@@ -73,6 +80,8 @@ export function createPolicyStore(
             id: CURRENT,
             mode: next.mode,
             deny: next.deny,
+            ask: next.ask ?? [],
+            exempt: next.exempt ?? [],
             allow: next.allow,
             updatedBy: by ?? null,
             updatedAt: new Date(),
@@ -82,6 +91,8 @@ export function createPolicyStore(
             set: {
               mode: next.mode,
               deny: next.deny,
+              ask: next.ask ?? [],
+              exempt: next.exempt ?? [],
               allow: next.allow,
               updatedBy: by ?? null,
               updatedAt: new Date(),
@@ -113,6 +124,9 @@ export function createPolicyStore(
       current = {
         mode: row.mode as ActionPolicy["mode"],
         deny: [...row.deny],
+        // A row written before the column existed reads as null, and that means no rules of that kind.
+        ask: [...(row.ask ?? [])],
+        exempt: [...(row.exempt ?? [])],
         allow: [...row.allow],
       };
       return "the database";
@@ -124,6 +138,8 @@ function clone(policy: ActionPolicy): ActionPolicy {
   return {
     mode: policy.mode,
     deny: [...policy.deny],
+    ask: [...(policy.ask ?? [])],
+    exempt: [...(policy.exempt ?? [])],
     allow: [...policy.allow],
   };
 }
@@ -155,8 +171,13 @@ export function parseActionPolicy(
     };
   }
 
-  const lists: Record<"deny" | "allow", string[]> = { deny: [], allow: [] };
-  for (const key of ["deny", "allow"] as const) {
+  const lists: Record<"deny" | "ask" | "exempt" | "allow", string[]> = {
+    deny: [],
+    ask: [],
+    exempt: [],
+    allow: [],
+  };
+  for (const key of ["deny", "ask", "exempt", "allow"] as const) {
     const value = candidate[key] ?? [];
     if (!Array.isArray(value) || value.some((v) => typeof v !== "string")) {
       return { ok: false, error: `${key} must be a list of expressions.` };
@@ -164,5 +185,14 @@ export function parseActionPolicy(
     lists[key] = value as string[];
   }
 
-  return { ok: true, policy: { mode, deny: lists.deny, allow: lists.allow } };
+  return {
+    ok: true,
+    policy: {
+      mode,
+      deny: lists.deny,
+      ask: lists.ask,
+      exempt: lists.exempt,
+      allow: lists.allow,
+    },
+  };
 }

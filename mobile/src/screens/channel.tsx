@@ -109,6 +109,8 @@ export function ChannelScreen({
   const messages = useLive((s) => s.messages(channelId));
   const approvals = useLive((s) => s.approvals());
   const [draft, setDraft] = useState("");
+  /** What went wrong sending, in the words the source used. Cleared on the next attempt. */
+  const [sendError, setSendError] = useState<string | null>(null);
   const scroller = useRef<ScrollView>(null);
 
   // Follow the conversation as it grows, and when the Bot settles: a transcript that has to be
@@ -133,7 +135,16 @@ export function ChannelScreen({
     const text = draft.trim();
     if (!text) return;
     setDraft("");
-    void source.send(channelId, text);
+    setSendError(null);
+    // A message that could not be sent is said out loud. Against a live deployment starting a turn is
+    // an AG-UI run rather than a REST call, and a person believing they sent something they did not
+    // is the worst outcome available here.
+    void source.send(channelId, text).catch((error: unknown) => {
+      setDraft(text);
+      setSendError(
+        error instanceof Error ? error.message : "That could not be sent.",
+      );
+    });
   };
 
   return (
@@ -167,7 +178,7 @@ export function ChannelScreen({
                 {waiting.botName} needs approval to {waiting.intent}{" "}
                 {waiting.subject.kind === "element"
                   ? `“${waiting.subject.label}”`
-                  : waiting.toolName}
+                  : waiting.subject.label}
                 .
               </Body>
               <Button
@@ -200,6 +211,19 @@ export function ChannelScreen({
           ))}
         </ScrollView>
 
+        {sendError ? (
+          <View
+            style={{
+              paddingHorizontal: space.lg,
+              paddingTop: space.sm,
+              backgroundColor: colors.card,
+            }}
+          >
+            <Text style={{ ...type_.small, color: colors.fail }}>
+              {sendError}
+            </Text>
+          </View>
+        ) : null}
         <View
           style={{
             flexDirection: "row",

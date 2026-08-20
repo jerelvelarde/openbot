@@ -18,6 +18,7 @@ import { websocket as channelSocket } from "./channels/socket";
 import { createSandboxedStore } from "./components/sandboxed";
 import { createComponentStore } from "./components/store";
 import { createComputerClient } from "./computer/client";
+import { createApprovalStore } from "./computer/approvals";
 import { createComputerGateway } from "./computer/gateway";
 import { toRuntimeTools } from "./computer/runtime-tools";
 import { createComputerToolSpecs } from "./computer/tools";
@@ -293,6 +294,14 @@ process.on("unhandledRejection", (reason) => {
  * must be the same instance — the gateway holds the snapshot each ref is resolved against, so a
  * second one would resolve refs against a page it never took a snapshot of.
  */
+/**
+ * Where an `ask` rule parks an action while it waits for a person.
+ *
+ * A table, so the answer can come from a device other than the one that started the turn. That is the
+ * whole point: a phone, another laptop, or somebody who was not at their desk when the Bot asked.
+ */
+const approvalStore = createApprovalStore(database);
+
 const computerGateway = computerClient
   ? createComputerGateway({
       client: computerClient,
@@ -300,6 +309,18 @@ const computerGateway = computerClient
       // Read on every decision rather than captured once, so a rule an administrator adds while the
       // server is running applies to the very next action instead of after a restart.
       policy: () => policyStore.get(),
+      approvals: approvalStore,
+      // The one path that writes to the policy store, for an "always allow" answer. Everywhere else
+      // the gateway only reads it.
+      grant: async (rule, by) => {
+        const current = policyStore.get();
+        if ((current.exempt ?? []).includes(rule)) return;
+        // `exempt`, because a standing permission has to outrank `ask` to stop the asking.
+        await policyStore.set(
+          { ...current, exempt: [...(current.exempt ?? []), rule] },
+          by,
+        );
+      },
       // Stop, reset and the listing act on containers when there are containers to act on.
       ...(supervisor ? { supervisor } : {}),
     })
@@ -422,6 +443,8 @@ const app = createApp(
   sandboxedStore,
   // How a thread that has no channel is named, so the direct Bot chat is in the same namespace.
   threadIdentity,
+  // What is waiting on a person, and the surface that answers it.
+  approvalStore,
 );
 
 /**

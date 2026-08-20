@@ -8,6 +8,20 @@
       "when": 1786891733850,
       "tag": "0000_schema",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1787228625309,
+      "tag": "0001_soft_mikhail_rasputin",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1787230436576,
+      "tag": "0002_slimy_boomerang",
+      "breakpoints": true
     }
   ]
 }

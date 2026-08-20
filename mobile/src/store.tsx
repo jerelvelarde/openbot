@@ -39,8 +39,23 @@ export function useSource(): DataSource {
 export function useLive<T>(
   read: (source: DataSource) => Promise<T>,
 ): T | undefined {
+  return useLiveResult(read).value;
+}
+
+/**
+ * The same read, with the failure kept.
+ *
+ * A read that failed and a read that came back empty look identical once the error is thrown away,
+ * and only one of them means there is nothing waiting on you. Anything that would otherwise render
+ * "nothing" from an absent value should use this and say which it is.
+ */
+export function useLiveResult<T>(read: (source: DataSource) => Promise<T>): {
+  value: T | undefined;
+  error: string | undefined;
+} {
   const source = useSource();
   const [value, setValue] = useState<T | undefined>(undefined);
+  const [error, setError] = useState<string | undefined>(undefined);
 
   /**
    * The reader, held rather than depended on.
@@ -55,9 +70,23 @@ export function useLive<T>(
   useEffect(() => {
     let current = true;
     const refresh = () => {
-      void readRef.current(source).then((next) => {
-        if (current) setValue(next);
-      });
+      void readRef.current(source).then(
+        (next) => {
+          if (!current) return;
+          setValue(next);
+          setError(undefined);
+        },
+        (cause: unknown) => {
+          if (!current) return;
+          // The last good value is kept on screen rather than blanked. A companion that empties itself
+          // on one failed poll is one that shows you an empty approval queue every time the wifi dips.
+          setError(
+            cause instanceof Error
+              ? cause.message
+              : "This deployment could not be reached.",
+          );
+        },
+      );
     };
     refresh();
     const stop = source.subscribe(refresh);
@@ -67,5 +96,5 @@ export function useLive<T>(
     };
   }, [source]);
 
-  return value;
+  return { value, error };
 }

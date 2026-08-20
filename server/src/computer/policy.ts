@@ -29,6 +29,33 @@ export type ActionPolicy = {
   mode: PolicyMode;
   /** Evaluated first. Any expression true means refused, whatever `allow` says. */
   deny: string[];
+  /**
+   * Permitted, and never asked about. Evaluated after `deny` and before `ask`.
+   *
+   * This is what "always allow" means, and it has to outrank `ask` to mean anything: a permission
+   * written into `allow` is evaluated *after* `ask`, so it can never stop the asking, and a person who
+   * pressed "always allow" would be asked again the very next time. That is not a subtle bug — it is
+   * the button not working.
+   *
+   * Still below `deny`, so exempting something from being asked about can never exempt it from being
+   * forbidden.
+   */
+  exempt?: string[];
+  /**
+   * Evaluated after `deny` and `exempt`, and before `allow`. Any expression true means ask a person.
+   *
+   * The third answer, and the one that makes unattended work safe to permit at all. Without it a
+   * deployment has to choose in advance between refusing a whole class of action and allowing it
+   * unwatched; with it, the boundary can say "not without a human", which is what an operator
+   * actually means about anything that spends money or sends something.
+   *
+   * Below `deny` on purpose. A thing an operator has forbidden must not become a question: offering
+   * somebody a button that overrides a deny rule is how a boundary stops meaning anything.
+   *
+   * Optional, because a deployment that has written no ask rules is an ordinary state rather than a
+   * misconfiguration, and the evaluator reads absence as empty.
+   */
+  ask?: string[];
   /** Any expression true means permitted. Empty means nothing is permitted. */
   allow: string[];
 };
@@ -139,9 +166,17 @@ export type PolicyDecision = {
   /** Which expression decided it, so the audit row can say why and an operator can find the rule. */
   matched: string | null;
   /** Which list that expression came from. `default` means nothing matched and the floor applied. */
-  source: "deny" | "allow" | "default";
+  source: "deny" | "exempt" | "allow" | "ask" | "default";
   /** True when the action should actually be carried out. False for a refusal in `enforce`. */
   forward: boolean;
+  /**
+   * True when the action is neither permitted nor refused yet: it is waiting on a person.
+   *
+   * Distinct from `allowed: false`, and the distinction matters to everything downstream. A refusal is
+   * final and the Bot should stop asking; a parked action is a question that has not been answered,
+   * and the same call becomes permitted or refused once somebody says.
+   */
+  parked: boolean;
   /** Why, in words that go in front of a person. */
   reason: string;
 };
@@ -219,6 +254,8 @@ export function evaluateActionPolicy(
 ): PolicyDecision {
   const mode: PolicyMode = policy?.mode ?? "enforce";
   const deny = policy?.deny ?? [];
+  const exempt = policy?.exempt ?? [];
+  const ask = policy?.ask ?? [];
   const allow = policy?.allow ?? [];
 
   // Deny first, and a broken deny expression still denies. One typo in a rule therefore blocks the
@@ -234,7 +271,53 @@ export function evaluateActionPolicy(
         // dry-run records the refusal and lets the work continue, which is what makes it safe to
         // switch on against live traffic.
         forward: mode === "dry-run",
+        parked: false,
         reason: describeRefusal(context, expression),
+      };
+    }
+  }
+
+  /**
+   * Then the standing permissions somebody has already granted.
+   *
+   * Above `ask` so that "always allow" actually stops the asking, and a broken expression here does
+   * NOT exempt: an unreadable permission is no permission, and the action falls through to being
+   * asked about, which is the safe direction.
+   */
+  for (const expression of exempt) {
+    if (matches(expression, context, false)) {
+      return {
+        allowed: true,
+        mode,
+        matched: expression,
+        source: "exempt",
+        forward: true,
+        parked: false,
+        reason: "Permitted by a standing permission.",
+      };
+    }
+  }
+
+  /**
+   * Then ask, and a broken ask expression asks.
+   *
+   * Fail-closed here means "involve a person", which is the safe reading of a rule nobody can
+   * evaluate: the alternative is a typo quietly turning a supervised action into an unsupervised one.
+   *
+   * Nothing is carried out yet. `forward` is false and `parked` is true, and it is the gateway that
+   * turns that into a question somebody can answer. In `dry-run` an ask forwards like everything else,
+   * because dry-run's whole promise is that it changes no outcomes.
+   */
+  for (const expression of ask) {
+    if (matches(expression, context, true)) {
+      return {
+        allowed: false,
+        mode,
+        matched: expression,
+        source: "ask",
+        forward: mode === "dry-run",
+        parked: mode === "enforce",
+        reason: describeAsk(context, expression),
       };
     }
   }
@@ -247,6 +330,7 @@ export function evaluateActionPolicy(
         matched: expression,
         source: "allow",
         forward: true,
+        parked: false,
         reason: "Permitted by policy.",
       };
     }
@@ -258,10 +342,34 @@ export function evaluateActionPolicy(
     matched: null,
     source: "default",
     forward: mode === "dry-run",
+    parked: false,
     reason:
       "No rule in this deployment's policy permits that action, so it was refused. " +
       "An administrator can add one.",
   };
+}
+
+/**
+ * A question a person can answer: what is about to happen, and on what.
+ *
+ * Phrased as a pending action rather than as a refusal, because the two are read differently and
+ * acted on differently. Somebody told "blocked" goes to look for the rule to change; somebody told
+ * "waiting for you" answers it.
+ */
+function describeAsk(context: PolicyContext, expression: string): string {
+  if (context.file) {
+    return (
+      `This deployment's policy asks before that: the file ${context.file.path} ` +
+      `is covered by the rule \`${expression}\`.`
+    );
+  }
+  const what = context.element?.name
+    ? `\u201c${context.element.name}\u201d`
+    : `a ${context.tool.name.replace("computer_", "")} action`;
+  return (
+    `This deployment's policy asks before that: ${what} on ${context.page.host} ` +
+    `needs a person to say yes, under the rule \`${expression}\`.`
+  );
 }
 
 /** A refusal a person can act on: what was refused, and on what. */
