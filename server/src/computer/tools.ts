@@ -19,6 +19,8 @@
  * wire in `RunAgentInput.tools`, so one declaration serves both paths: converted to Zod for a
  * `BuiltInAgent`, and sent verbatim to a remote AG-UI Bot.
  */
+
+import type { ToolOutcome, ToolSpec } from "../tools/spec";
 import {
   ComputerUnavailableError,
   ElementNotFoundError,
@@ -32,40 +34,6 @@ import {
   ActionRefusedError,
   type ComputerGateway,
 } from "./gateway";
-
-/** A JSON Schema subset, matching what the runtime's converter and AG-UI both accept. */
-export type ToolParameterSchema = {
-  type: "string" | "number" | "integer" | "boolean";
-  description?: string;
-};
-
-export type ToolParameters = {
-  type: "object";
-  properties: Record<string, ToolParameterSchema>;
-  required?: string[];
-};
-
-/**
- * One tool, independent of how it is eventually handed to a model.
- *
- * `execute` returns the object the model sees. It never throws: a refusal is an outcome the model
- * has to be able to read and act on, not an error that ends the run.
- */
-export type ComputerToolSpec = {
-  name: string;
-  description: string;
-  parameters: ToolParameters;
-  execute: (args: Record<string, unknown>) => Promise<ToolOutcome>;
-};
-
-/**
- * What every computer call returns: the result, or a reason it did not happen.
- *
- * The keys are the ones the browser handlers used to produce, because the transcript renderers in
- * `app/src/lib/copilot/computer-tools.tsx` parse them. Changing them here would blank the transcript
- * without changing anything a test asserts.
- */
-export type ToolOutcome = Record<string, unknown> & { ok: boolean };
 
 export type ComputerToolsContext = {
   gateway: ComputerGateway;
@@ -179,7 +147,7 @@ function optionalNumber(
  */
 export function createComputerToolSpecs(
   context: ComputerToolsContext,
-): ComputerToolSpec[] {
+): ToolSpec[] {
   const { gateway, botId, actor } = context;
   const timeoutMs = context.waitFor?.timeoutMs ?? WAIT_FOR_PERSON_MS;
   const pollMs = context.waitFor?.pollMs ?? WAIT_POLL_MS;

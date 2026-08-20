@@ -11,7 +11,7 @@ import {
   defineTool,
   type ToolDefinition,
 } from "@copilotkit/runtime/v2";
-import type { ComputerToolSpec } from "./tools";
+import type { ToolSpec } from "../tools/spec";
 
 /**
  * The tools as a `BuiltInAgent` takes them.
@@ -20,7 +20,7 @@ import type { ComputerToolSpec } from "./tools";
  * AG-UI Bot receives on the wire and the schema a built-in Bot is given cannot drift into describing
  * different tools under the same names.
  */
-export function toRuntimeTools(specs: ComputerToolSpec[]): ToolDefinition[] {
+export function toRuntimeTools(specs: ToolSpec[]): ToolDefinition[] {
   return specs.map((spec) =>
     defineTool({
       name: spec.name,
@@ -31,20 +31,4 @@ export function toRuntimeTools(specs: ComputerToolSpec[]): ToolDefinition[] {
       execute: (args) => spec.execute((args ?? {}) as Record<string, unknown>),
     }),
   );
-}
-
-/**
- * The tools as AG-UI puts them on the wire, for a remote Bot.
- *
- * Exactly the shape `RunAgentInput.tools` carries, which is what the browser used to send after
- * registering the same tools locally. A remote Bot therefore sees no change at all: it still
- * receives a list of callable tools and still ends its run when it calls one. What changed is who
- * carries the call out on the other side.
- */
-export function toAgUiTools(specs: ComputerToolSpec[]) {
-  return specs.map((spec) => ({
-    name: spec.name,
-    description: spec.description,
-    parameters: spec.parameters,
-  }));
 }

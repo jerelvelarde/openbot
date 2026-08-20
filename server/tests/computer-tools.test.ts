@@ -8,10 +8,8 @@ import {
   ActionRefusedError,
   type ComputerGateway,
 } from "../src/computer/gateway";
-import {
-  type ComputerToolSpec,
-  createComputerToolSpecs,
-} from "../src/computer/tools";
+import { createComputerToolSpecs } from "../src/computer/tools";
+import type { ToolSpec } from "../src/tools/spec";
 
 /**
  * What the server-side tools must guarantee.
@@ -78,7 +76,7 @@ function specsFor(
   });
 }
 
-function toolNamed(specs: ComputerToolSpec[], name: string): ComputerToolSpec {
+function toolNamed(specs: ToolSpec[], name: string): ToolSpec {
   const spec = specs.find((candidate) => candidate.name === name);
   if (!spec) throw new Error(`No tool called ${name}`);
   return spec;

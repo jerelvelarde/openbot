@@ -150,7 +150,7 @@ describe("registered Copilot agents", () => {
   });
 
   test("fails an unavailable built-in agent through the AG-UI lifecycle", async () => {
-    const agents = buildAgents(
+    const agents = await buildAgents(
       [
         {
           id: "general-assistant",
@@ -185,8 +185,8 @@ describe("registered Copilot agents", () => {
     );
   });
 
-  test("constructs built-in and remote agents together", () => {
-    const agents = buildAgents(
+  test("constructs built-in and remote agents together", async () => {
+    const agents = await buildAgents(
       [
         {
           id: "general-assistant",
@@ -298,7 +298,7 @@ describe("standing agent roles", () => {
 
   test("sends one standing role message ahead of the conversation", async () => {
     await using endpoint = fakeAgUiEndpoint();
-    const agents = buildAgents(
+    const agents = await buildAgents(
       [remoteAgent(endpoint.url)],
       { provider: "openai", defaultModel: "gpt-4.1" },
       null,
@@ -322,7 +322,7 @@ describe("standing agent roles", () => {
 
   test("keeps the standing role out of forwarded props and agent state", async () => {
     await using endpoint = fakeAgUiEndpoint();
-    const agents = buildAgents(
+    const agents = await buildAgents(
       [remoteAgent(endpoint.url)],
       { provider: "openai", defaultModel: "gpt-4.1" },
       null,
@@ -341,7 +341,7 @@ describe("standing agent roles", () => {
 
   test("resolves a deleted coworker as a tombstone that never reaches its endpoint", async () => {
     await using endpoint = fakeAgUiEndpoint();
-    const agents = buildAgents(
+    const agents = await buildAgents(
       [
         {
           id: "agent_expense",

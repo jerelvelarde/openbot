@@ -10,7 +10,10 @@ import {
 } from "@copilotkit/runtime/v2";
 import { createCopilotHonoHandler } from "@copilotkit/runtime/v2/hono";
 import type { AgentActor } from "./agents/profile-types";
+import { ComputerToolLoop } from "./computer/agui-tool-loop";
+import { toRuntimeTools } from "./computer/runtime-tools";
 import type { DeploymentConfig } from "./config";
+import type { ToolSpec } from "./tools/spec";
 
 /**
  * The CopilotKit runtime, always in Intelligence mode.
@@ -211,8 +214,16 @@ export function builtInAgentConfiguration(
  *
  * A factory rather than a fixed list: the tools close over which Bot's computer they address and
  * which person is asking, and both are known only once a run is being set up.
+ *
+ * Asynchronous because part of the answer is a question about the database: which MCP servers this
+ * Bot has been granted. Resolving that per run is what makes a grant taken away a moment ago gone
+ * from the very next run rather than after a restart.
+ *
+ * It yields the specs rather than finished runtime tools because the two kinds of Bot need the same
+ * tools in different forms — converted to Zod for a built-in Bot, put on the wire for a remote one —
+ * and one declaration converted twice cannot drift the way two declarations can.
  */
-export type ToolsForAgent = (agentId: string) => ToolDefinition[];
+export type ToolsForAgent = (agentId: string) => Promise<ToolSpec[]>;
 
 /**
  * Build the built-in and remote AG-UI agent map the runtime serves.
@@ -221,35 +232,44 @@ export type ToolsForAgent = (agentId: string) => ToolDefinition[];
  * drift apart without the lookup failing loudly rather than silently running the wrong Bot.
  */
 
-export function buildAgents(
+export async function buildAgents(
   agents: RegisteredAgent[],
   model: RuntimeModel,
   apiKey: string | null,
   toolsFor?: ToolsForAgent,
-): Record<string, AbstractAgent> {
+): Promise<Record<string, AbstractAgent>> {
   return Object.fromEntries(
-    agents.map((agent) => [
-      agent.id,
-      buildAgent(agent, model, apiKey, toolsFor),
-    ]),
+    await Promise.all(
+      agents.map(async (agent) => [
+        agent.id,
+        await buildAgent(agent, model, apiKey, toolsFor),
+      ]),
+    ),
   );
 }
 
-function buildAgent(
+async function buildAgent(
   agent: RegisteredAgent,
   model: RuntimeModel,
   apiKey: string | null,
   toolsFor?: ToolsForAgent,
-): AbstractAgent {
+): Promise<AbstractAgent> {
+  const specs = (await toolsFor?.(agent.id)) ?? [];
+
   if (agent.type === "built_in") {
     return new BuiltInAgent(
-      builtInAgentConfiguration(agent, model, apiKey, toolsFor?.(agent.id)),
+      builtInAgentConfiguration(
+        agent,
+        model,
+        apiKey,
+        specs.length ? toRuntimeTools(specs) : [],
+      ),
     );
   }
   if (agent.type === "unavailable") {
     return new UnavailableAgent(agent);
   }
-  return remoteAgentWithStandingRole(agent);
+  return remoteAgentWithStandingRole(agent, specs);
 }
 
 /**
@@ -259,8 +279,15 @@ function buildAgent(
  * so the same coworker works against any endpoint that speaks the protocol. Any copy of the standing
  * message already in the conversation is dropped: the endpoint must receive exactly one, first,
  * however many times the thread has been replayed.
+ *
+ * The computer tools arrive as a second piece of middleware rather than as configuration, because a
+ * remote Bot cannot run its own tool loop: the protocol has it emit a call and end the run. See
+ * `computer/agui-tool-loop.ts` for who carries the call out.
  */
-function remoteAgentWithStandingRole(agent: RegisteredRemoteAgent) {
+function remoteAgentWithStandingRole(
+  agent: RegisteredRemoteAgent,
+  specs: ToolSpec[] = [],
+) {
   const remote = new HttpAgent({
     url: agent.endpoint,
     agentId: agent.id,
@@ -279,6 +306,9 @@ function remoteAgentWithStandingRole(agent: RegisteredRemoteAgent) {
       ],
     }),
   );
+  // Ordering matters: the standing role is prepended once per pass, so it has to sit inside the loop
+  // rather than outside it, or the endpoint would see it on the first pass and never again.
+  if (specs.length) remote.use(new ComputerToolLoop(specs));
   return remote;
 }
 

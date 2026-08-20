@@ -13,20 +13,19 @@ import {
   startChannelActivityListener,
 } from "./channels/events";
 import { createChannelStore } from "./channels/routes";
-import { createThreadIdentity } from "./channels/thread-identity";
 import { websocket as channelSocket } from "./channels/socket";
+import { createThreadIdentity } from "./channels/thread-identity";
 import { createSandboxedStore } from "./components/sandboxed";
 import { createComponentStore } from "./components/store";
-import { createComputerClient } from "./computer/client";
 import { createApprovalStore } from "./computer/approvals";
+import { createComputerClient } from "./computer/client";
 import { createComputerGateway } from "./computer/gateway";
-import { toRuntimeTools } from "./computer/runtime-tools";
-import { createComputerToolSpecs } from "./computer/tools";
 import {
   createPolicyStore,
   DEFAULT_ACTION_POLICY,
 } from "./computer/policy-store";
 import { createSupervisorClient } from "./computer/supervisor";
+import { createComputerToolSpecs } from "./computer/tools";
 import { loadConfig } from "./config";
 import { createConnectorAdminService } from "./connectors";
 import {
@@ -42,6 +41,7 @@ import {
 } from "./credentials";
 import { createDatabase } from "./db/client";
 import { createPluginStore } from "./plugins/store";
+import { createPluginToolSpecs } from "./plugins/tools";
 import {
   createPackageStatusReader,
   loadTenantPackage,
@@ -329,63 +329,90 @@ const computerGateway = computerClient
 /**
  * Whether a Bot's tools run here or in the browser.
  *
- * Off by default, and deliberately so while both halves of the move exist. The surface still
- * registers these tools with `useFrontendTool`, and a deployment running both would offer the model
- * two tools under each name. Worse, switching this on before remote AG-UI Bots can be served from
- * here would take the tools away from every Bot that is an endpoint rather than a built-in one,
- * which is most of them, including the one that ships in the box.
+ * On now, and there is no longer a browser copy to conflict with: the surface registers renderers
+ * only, and both kinds of Bot are served from here — a built-in one is handed executable tools, and a
+ * remote AG-UI one gets the loop it cannot run itself from `computer/agui-tool-loop.ts`.
  *
- * So the machinery lands first and is proven by its tests, and this turns on in the change that
- * removes the browser's copy. Same shape as `dry-run` in the action policy: the mechanism arrives
- * before it starts deciding anything.
+ * It stays a switch, off with `OPENBOT_SERVER_SIDE_TOOLS=false`, for one reason: turning it off is
+ * how a deployment reduces a Bot to talking. That is the honest fallback if the tools themselves are
+ * the problem, and it is better than a half-configured deployment where a Bot is offered tools that
+ * cannot work.
  */
 const serverSideComputerTools =
-  process.env.OPENBOT_SERVER_SIDE_TOOLS?.trim() === "true";
+  process.env.OPENBOT_SERVER_SIDE_TOOLS?.trim() !== "false";
 
 /**
- * The computer tools, bound to the person a run belongs to.
+ * Every tool a Bot may act with, bound to the person a run belongs to.
  *
- * Built here rather than inside the runtime because the two things a tool needs — the gateway that
- * governs it and the person it is attributable to — are owned by this file and by the request
- * respectively. Absent when no computer is configured, which leaves every Bot able to talk and
- * nothing else: the honest degraded state, rather than tools that fail on first use.
+ * Built here rather than inside the runtime because the things a tool needs — the gateway that
+ * governs a browser action, the store that governs an MCP call, and the person both are attributable
+ * to — are owned by this file and by the request respectively.
+ *
+ * Two sources, one list. The computer tools are declared in this repo and depend on a computer being
+ * configured; the MCP tools are whatever this Bot has been granted, which is a question about the
+ * database and is why this is asynchronous. A deployment with neither leaves every Bot able to talk
+ * and nothing else: the honest degraded state, rather than tools that fail on first use.
  */
-const computerToolsForActor =
-  computerGateway && serverSideComputerTools
-    ? (actor: AgentActor): ToolsForAgent =>
-        (agentId: string) =>
-          toRuntimeTools(
-            createComputerToolSpecs({
-              gateway: computerGateway,
-              // The Bot IS the computer: the gateway addresses a container by the Bot's id, the same
-              // way the HTTP routes do.
-              botId: agentId,
-              actor: {
-                id: actor.id,
-                // Only a real users row may go in the audit table's foreign key column. Matched on the
-                // id rather than the address, which is the fact this file already holds.
-                ...(actor.id === DEV_ACTOR.id ? {} : { userId: actor.id }),
-              },
-              recordRefusal: async ({ reason, request }) => {
-                await recordAuditEvent(bootAuditStore, {
-                  eventType: "bot.declined",
-                  targetType: "agent",
-                  targetId: agentId,
-                  ...(actor.id === DEV_ACTOR.id
-                    ? {}
-                    : { actorUserId: actor.id }),
-                  payload: {
-                    bot: agentId,
-                    actor: actor.id,
-                    reason: reason.slice(0, 500),
-                    ...(request ? { request: request.slice(0, 500) } : {}),
-                    reportedBy: "the Bot itself",
-                  },
-                });
-              },
-            }),
-          )
-    : undefined;
+const toolsForActor =
+  (actor: AgentActor): ToolsForAgent =>
+  async (agentId: string) => {
+    // Only a real users row may go in an audit table's foreign key column. Matched on the id rather
+    // than the address, which is the fact this file already holds.
+    const isDevActor = actor.id === DEV_ACTOR.id;
+
+    const computer =
+      computerGateway && serverSideComputerTools
+        ? createComputerToolSpecs({
+            gateway: computerGateway,
+            // The Bot IS the computer: the gateway addresses a container by the Bot's id, the same
+            // way the HTTP routes do.
+            botId: agentId,
+            actor: {
+              id: actor.id,
+              ...(isDevActor ? {} : { userId: actor.id }),
+            },
+            recordRefusal: async ({ reason, request }) => {
+              await recordAuditEvent(bootAuditStore, {
+                eventType: "bot.declined",
+                targetType: "agent",
+                targetId: agentId,
+                ...(isDevActor ? {} : { actorUserId: actor.id }),
+                payload: {
+                  bot: agentId,
+                  actor: actor.id,
+                  reason: reason.slice(0, 500),
+                  ...(request ? { request: request.slice(0, 500) } : {}),
+                  reportedBy: "the Bot itself",
+                },
+              });
+            },
+          })
+        : [];
+
+    /**
+     * The MCP tools this Bot holds.
+     *
+     * Behind the same switch as the computer tools, because the browser still registers its copy of
+     * these too and a model shown two tools under one name picks one at random.
+     */
+    const plugins = serverSideComputerTools
+      ? await createPluginToolSpecs({
+          store: pluginStore,
+          botId: agentId,
+          actorId: actor.id,
+        }).catch((error: unknown) => {
+          // Said out loud rather than swallowed. A Bot that quietly lost its MCP tools will tell the
+          // person it cannot do something and nobody will know why, which is the worst of both.
+          console.error(
+            `Could not read the MCP tools granted to ${agentId}; it will run without them.`,
+            error,
+          );
+          return [];
+        })
+      : [];
+
+    return [...computer, ...plugins];
+  };
 
 const app = createApp(
   config,
@@ -423,7 +450,7 @@ const app = createApp(
       }),
     identifyUser,
     identifyActor,
-    computerToolsForActor,
+    toolsForActor,
   ),
   computerClient,
   computerGateway,
