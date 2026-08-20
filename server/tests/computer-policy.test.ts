@@ -350,3 +350,74 @@ describe("a rule that names an identifier only some actions carry", () => {
     expect(decision.allowed).toBe(false);
   });
 });
+
+describe("how a decision is phrased", () => {
+  /**
+   * The gateway fills every field, using a neutral value where an action has none. Anything reading
+   * the context has to test for a VALUE and not for presence, or a click gets described as a file.
+   */
+  const CLICK_CONTEXT = {
+    tool: { name: "computer_click" },
+    bot: { id: "risk-analyst" },
+    actor: { id: "user_1" },
+    page: { url: "https://portal.example/pay", host: "portal.example" },
+    intent: "activate",
+    key: "",
+    element: { ref: "e9", role: "button", name: "Submit payment run" },
+    file: { path: "", name: "", extension: "" },
+  };
+
+  test("an ask about a button names the button, not an empty file", () => {
+    const decision = evaluateActionPolicy(
+      {
+        mode: "enforce",
+        deny: [],
+        ask: ['contains(element.name, "Submit payment run")'],
+        allow: ["true"],
+      },
+      CLICK_CONTEXT,
+    );
+
+    expect(decision.parked).toBe(true);
+    expect(decision.reason).toContain("“Submit payment run”");
+    expect(decision.reason).toContain("portal.example");
+    expect(decision.reason).not.toContain("the file");
+  });
+
+  test("a refusal about a button names the button too", () => {
+    const decision = evaluateActionPolicy(
+      {
+        mode: "enforce",
+        deny: ['contains(element.name, "Submit payment run")'],
+        ask: [],
+        allow: ["true"],
+      },
+      CLICK_CONTEXT,
+    );
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reason).toContain("“Submit payment run”");
+    expect(decision.reason).not.toContain("the file");
+  });
+
+  test("a file still gets described as a file", () => {
+    const decision = evaluateActionPolicy(
+      {
+        mode: "enforce",
+        deny: ['file.name == ".env"'],
+        ask: [],
+        allow: ["true"],
+      },
+      {
+        ...CLICK_CONTEXT,
+        tool: { name: "computer_read_file" },
+        element: { ref: "", role: "", name: "" },
+        file: { path: "secrets/.env", name: ".env", extension: "" },
+      },
+    );
+
+    // And not "on portal.example": the workspace has nothing to do with whatever page is open.
+    expect(decision.reason).toContain("secrets/.env");
+    expect(decision.reason).not.toContain("portal.example");
+  });
+});

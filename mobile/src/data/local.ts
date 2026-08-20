@@ -10,6 +10,8 @@
  * `server/src/computer/policy.ts` phrases one, and the audit event names are the ones in
  * `server/src/audit.ts`.
  */
+
+import type { AnswerScope, DataSource } from "./source";
 import type {
   Approval,
   AuditRow,
@@ -17,7 +19,6 @@ import type {
   Message,
   Notification,
 } from "./types";
-import type { AnswerScope, DataSource } from "./source";
 
 const BOT = { id: "risk-analyst", name: "Risk Analyst" };
 const HOST = "portal.northwind.example";
@@ -154,6 +155,7 @@ export function createLocalSource(): DataSource {
     {
       id: id("note"),
       kind: "approval",
+      botId: BOT.id,
       botName: BOT.name,
       // Resolved subject only. No amount, no invoice count, no page contents: everything a lock
       // screen does not need is everything a lock screen must not have.
@@ -344,6 +346,7 @@ export function createLocalSource(): DataSource {
         notifications.unshift({
           id: id("note"),
           kind: "done",
+          botId: approval.botId,
           botName: approval.botName,
           body: "finished the August payment run",
           at: stamp(),

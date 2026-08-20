@@ -26,18 +26,22 @@ Nothing else is required: no Docker, no Postgres, no model key. See the data sou
   approval really does resume the parked turn, a refusal really does write the rule that caused it
   into the trail, and a message sent to a busy Bot really is held and drained into one follow-up
   turn. That behaviour is what the screens are built against.
-- **`src/data/http.ts`** — the same data from a real deployment, written against the endpoints the
-  plan's Phase 1 and Phase 2 add (`GET`/`POST /api/approvals`, notifications) plus the channel routes
-  that already exist. **Not reachable yet** — those routes do not exist on the server.
+- **`src/data/http.ts`** — the same data from a real deployment: `/api/approvals`, `/api/channels`,
+  `/api/agents`, `/api/audit`, and the runtime's own thread history and run endpoint under
+  `/api/copilotkit`. All of those exist. Sending a message starts a real AG-UI run.
 
-The seam is the point: the screens were finished once, against the interface, and the transport
-swaps underneath when the server catches up.
+The seam is still the point: the screens were finished once against the interface, and either
+transport can be swapped underneath without touching them.
 
-Two things `http.ts` deliberately does not do. It never falls back to local data when a request
-fails — a companion that quietly shows an invented approval queue is worse than one that says it is
-offline. And it authenticates with a bearer token, never a cookie: a native client needs a token
-flow, and the server must refuse to issue one while `OPENBOT_DEV_NO_AUTH` is set, because that flag
-admits every caller as one administrator.
+One thing `http.ts` deliberately does not do: it never falls back to local data when a request
+fails. A companion that quietly shows an invented approval queue is worse than one that says it is
+offline, so it says `Could not reach this deployment` and keeps the last thing it was told.
+
+How it authenticates depends on how it was started. Same-origin — the web build behind
+`scripts/dev-proxy.ts` — is authenticated by the browser's own session cookie, which is why a
+recording needs no token. A build pointed at a deployment over the network signs in through the
+system browser and holds a session token in the platform's secure store. See
+[docs/mobile.md](../docs/mobile.md).
 
 ## Screens
 
@@ -48,6 +52,7 @@ admits every caller as one administrator.
 | Channels | The Bots you are working with, and which are mid-turn. |
 | Channel | The transcript, and the composer that queues while a Bot is busy. |
 | Activity | Audit rows: permitted, refused, failed — every refusal with its rule. |
+| Sign in | One button, which opens the system browser. This app has no password field. |
 
 ## Rules this app holds itself to
 
@@ -63,6 +68,13 @@ admits every caller as one administrator.
   more: no argument values, no file contents, no message bodies. A push payload is a less trusted
   surface than the audit trail, not a more trusted one.
 
+## Notifications
+
+Four things buzz: an approval, a question, work you asked to be told about, and something unattended
+that stopped. Nothing else. The server decides all of it — what is worth a notification and what a
+notification may say — because a phone is not where that judgement belongs. `src/data/push.ts` only
+gets the platform's token and hands it over.
+
 ## Notes
 
 - Navigation is hand-rolled rather than expo-router: three tabs and two pushed screens is less than a
@@ -70,5 +82,9 @@ admits every caller as one administrator.
   on a device and in a browser.
 - `mobile/` is **not** in the root `workspaces` array. Metro and Bun workspace hoisting fight each
   other, and this app has no dependency on the server's package graph.
-- On web the app renders inside a device-sized frame. A companion stretched across a desktop window
-  stops being an honest picture of itself.
+- On web the app renders inside a device-sized frame at 393 x 852 points, scaled to the window. A
+  companion stretched across a desktop window stops being an honest picture of itself, and the frame
+  is also what makes a recording of it legible.
+- A Bot's face is drawn from its `avatarSeed` with the same hash, palette and composition the web app
+  gets from `boring-avatars`, ported to React Native views. Same seed, same avatar — drawn crisply
+  rather than blurred, because the blur needs a native module.

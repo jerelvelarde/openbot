@@ -149,10 +149,10 @@ describe("sending through Expo", () => {
       }) as unknown as typeof fetch,
     });
 
-    await delivery.send(
-      { title: "T", body: "B", data: { kind: "approval" } },
-      [DEVICE, { ...DEVICE, id: "d2", token: "ExponentPushToken[zzzz]" }],
-    );
+    await delivery.send({ title: "T", body: "B", data: { kind: "approval" } }, [
+      DEVICE,
+      { ...DEVICE, id: "d2", token: "ExponentPushToken[zzzz]" },
+    ]);
 
     expect(body).toEqual([
       {

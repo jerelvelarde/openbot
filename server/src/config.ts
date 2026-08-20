@@ -222,7 +222,9 @@ function authConfig(
     secret,
     google,
     trustedOrigins: [
-      ...(configuredOrigins.length ? configuredOrigins : ["http://localhost:3000"]),
+      ...(configuredOrigins.length
+        ? configuredOrigins
+        : ["http://localhost:3000"]),
       // The companion's own scheme, added rather than expected in TRUSTED_ORIGINS, so turning the
       // mobile app on is one variable and not two that have to agree.
       ...(appScheme ? [`${appScheme}://`] : []),

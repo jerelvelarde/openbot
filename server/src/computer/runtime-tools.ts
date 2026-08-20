@@ -11,7 +11,7 @@ import {
   defineTool,
   type ToolDefinition,
 } from "@copilotkit/runtime/v2";
-import type { ToolSpec } from "../tools/spec";
+import { runTool, type ToolSpec } from "../tools/spec";
 
 /**
  * The tools as a `BuiltInAgent` takes them.
@@ -28,7 +28,7 @@ export function toRuntimeTools(specs: ToolSpec[]): ToolDefinition[] {
       // `true` says the parameter object itself is required; optionality of each property is read
       // from the schema's own `required` list by the converter.
       parameters: convertJsonSchemaToZodSchema(spec.parameters, true),
-      execute: (args) => spec.execute((args ?? {}) as Record<string, unknown>),
+      execute: (args) => runTool(spec, (args ?? {}) as Record<string, unknown>),
     }),
   );
 }

@@ -7,14 +7,17 @@
  * person hunting through Boundaries for something they cannot name.
  */
 import { useEffect, useRef, useState } from "react";
+import type { TextStyle } from "react-native";
 import {
   KeyboardAvoidingView,
   Platform,
+  Pressable,
   ScrollView,
   Text,
   TextInput,
   View,
 } from "react-native";
+import { BotAvatar } from "../avatar";
 import type { Message, ToolLine } from "../data/types";
 import { useLive, useSource } from "../store";
 import { radius, space, type as type_ } from "../theme";
@@ -25,22 +28,25 @@ import {
   Label,
   OutcomeDot,
   Rule,
+  richText,
   useColors,
-  when,
 } from "../ui";
 import { Screen, TopBar } from "./chrome";
 
 function ToolLineView({ line }: { line: ToolLine }) {
+  const colors = useColors();
   return (
-    <View style={{ gap: space.xs }}>
+    <View style={{ gap: space.xs, paddingLeft: space.xs }}>
       <View style={{ flexDirection: "row", gap: space.sm }}>
         <OutcomeDot outcome={line.outcome} />
         <View style={{ flex: 1 }}>
-          <Body muted>
-            {line.label}
+          <Text style={{ ...type_.small, fontSize: 13, color: colors.muted }}>
+            <Text style={{ fontWeight: "600", color: colors.foreground }}>
+              {line.label}
+            </Text>
             {line.detail ? ` · ${line.detail}` : ""}
             {line.outcome === "running" ? " …" : ""}
-          </Body>
+          </Text>
         </View>
       </View>
       {/* The rule travels with the refusal, so the boundary can be found and edited. */}
@@ -59,14 +65,16 @@ function Bubble({ message }: { message: Message }) {
   return (
     <View
       style={{
-        maxWidth: "90%",
+        maxWidth: "86%",
         alignSelf: mine ? "flex-end" : "flex-start",
-        backgroundColor: mine ? colors.primary : colors.card,
-        borderColor: mine ? colors.primary : colors.border,
-        borderWidth: 1,
-        borderRadius: radius,
-        paddingVertical: space.md,
-        paddingHorizontal: space.lg,
+        backgroundColor: mine ? colors.primary : colors.cardMuted,
+        borderRadius: radius.lg,
+        // The corner nearest its own side is tightened, which is what makes a row of bubbles read as
+        // a conversation rather than a stack of cards.
+        borderBottomRightRadius: mine ? 6 : radius.lg,
+        borderBottomLeftRadius: mine ? radius.lg : 6,
+        paddingVertical: 11,
+        paddingHorizontal: 15,
         gap: space.xs,
       }}
     >
@@ -77,7 +85,7 @@ function Bubble({ message }: { message: Message }) {
           color: mine ? colors.primaryForeground : colors.foreground,
         }}
       >
-        {message.text}
+        {richText(message.text ?? "")}
       </Text>
       {message.queued ? (
         <Text
@@ -90,6 +98,36 @@ function Bubble({ message }: { message: Message }) {
           Queued · it will pick this up when it settles
         </Text>
       ) : null}
+    </View>
+  );
+}
+
+/**
+ * The focus ring a browser draws around a text input, removed.
+ *
+ * No phone has one, and it makes the composer look like a web form in a recording. `outlineStyle` is
+ * a react-native-web property that React Native's own style types do not carry, so it is asserted
+ * here in one place rather than cast at the point of use.
+ */
+const NO_FOCUS_RING = (
+  Platform.OS === "web" ? { outlineStyle: "none" } : {}
+) as TextStyle;
+
+/** The plus and the microphone. Marks rather than glyphs, so no icon font is needed. */
+function Plus({ color }: { color: string }) {
+  return (
+    <View style={{ width: 16, height: 16, justifyContent: "center" }}>
+      <View style={{ height: 2, borderRadius: 1, backgroundColor: color }} />
+      <View
+        style={{
+          position: "absolute",
+          left: 7,
+          width: 2,
+          height: 16,
+          borderRadius: 1,
+          backgroundColor: color,
+        }}
+      />
     </View>
   );
 }
@@ -136,9 +174,8 @@ export function ChannelScreen({
     if (!text) return;
     setDraft("");
     setSendError(null);
-    // A message that could not be sent is said out loud. Against a live deployment starting a turn is
-    // an AG-UI run rather than a REST call, and a person believing they sent something they did not
-    // is the worst outcome available here.
+    // A message that could not be sent is said out loud. A person believing they sent something they
+    // did not is the worst outcome available here.
     void source.send(channelId, text).catch((error: unknown) => {
       setDraft(text);
       setSendError(
@@ -150,17 +187,18 @@ export function ChannelScreen({
   return (
     <Screen>
       <TopBar
-        title={channel?.name ?? "Channel"}
+        leading={<BotAvatar seed={channel?.botId ?? channelId} size={28} />}
         onBack={onBack}
         right={channel?.busy ? <Badge tone="quiet">Working</Badge> : undefined}
+        title={channel?.name ?? "Channel"}
       />
       <KeyboardAvoidingView
-        style={{ flex: 1 }}
         behavior={Platform.OS === "ios" ? "padding" : undefined}
+        style={{ flex: 1 }}
       >
         <ScrollView
+          contentContainerStyle={{ padding: space.lg, gap: space.md }}
           ref={scroller}
-          contentContainerStyle={{ padding: space.lg, gap: space.lg }}
         >
           {waiting ? (
             <View
@@ -168,7 +206,7 @@ export function ChannelScreen({
                 backgroundColor: colors.card,
                 borderColor: colors.pending,
                 borderWidth: 1,
-                borderRadius: radius,
+                borderRadius: radius.md,
                 padding: space.lg,
                 gap: space.md,
               }}
@@ -182,8 +220,8 @@ export function ChannelScreen({
                 .
               </Body>
               <Button
-                title="Review it"
                 onPress={() => onOpenApproval(waiting.id)}
+                title="Review it"
               />
             </View>
           ) : null}
@@ -197,16 +235,6 @@ export function ChannelScreen({
                   line={line}
                 />
               ))}
-              <Text
-                style={{
-                  ...type_.small,
-                  color: colors.muted,
-                  alignSelf:
-                    message.role === "user" ? "flex-end" : "flex-start",
-                }}
-              >
-                {when(message.at)}
-              </Text>
             </View>
           ))}
         </ScrollView>
@@ -224,40 +252,81 @@ export function ChannelScreen({
             </Text>
           </View>
         ) : null}
+
         <View
           style={{
             flexDirection: "row",
             gap: space.sm,
-            padding: space.md,
+            paddingHorizontal: space.md,
+            paddingVertical: space.sm,
             borderTopColor: colors.border,
             borderTopWidth: 1,
             backgroundColor: colors.card,
             alignItems: "center",
           }}
         >
-          <TextInput
-            value={draft}
-            onChangeText={setDraft}
-            onSubmitEditing={send}
-            placeholder={
-              channel?.busy
-                ? "It is working — this will be queued"
-                : "Say something"
-            }
-            placeholderTextColor={colors.muted}
+          <View
             style={{
               flex: 1,
-              ...type_.body,
-              color: colors.foreground,
+              flexDirection: "row",
+              alignItems: "center",
+              gap: space.sm,
               backgroundColor: colors.cardMuted,
               borderColor: colors.border,
               borderWidth: 1,
-              borderRadius: 10,
-              paddingVertical: 11,
-              paddingHorizontal: space.md,
+              borderRadius: radius.pill,
+              paddingLeft: 14,
+              paddingRight: 6,
             }}
-          />
-          <Button title="Send" onPress={send} disabled={!draft.trim()} />
+          >
+            <Plus color={colors.muted} />
+            <TextInput
+              onChangeText={setDraft}
+              onSubmitEditing={send}
+              placeholder={
+                channel?.busy
+                  ? "It is working — this will be queued"
+                  : `Ask ${channel?.botName ?? "this Bot"}`
+              }
+              placeholderTextColor={colors.muted}
+              style={{
+                flex: 1,
+                ...type_.body,
+                color: colors.foreground,
+                paddingVertical: 11,
+                ...NO_FOCUS_RING,
+              }}
+              value={draft}
+            />
+            <Pressable
+              accessibilityLabel="Send"
+              accessibilityRole="button"
+              disabled={!draft.trim()}
+              onPress={send}
+              style={({ pressed }) => ({
+                width: 34,
+                height: 34,
+                borderRadius: 17,
+                alignItems: "center",
+                justifyContent: "center",
+                backgroundColor: colors.primary,
+                opacity: draft.trim() ? (pressed ? 0.8 : 1) : 0.25,
+              })}
+            >
+              {/* An upward chevron: the arrow every composer has. */}
+              <View
+                style={{
+                  width: 9,
+                  height: 9,
+                  borderTopWidth: 2,
+                  borderRightWidth: 2,
+                  borderColor: colors.primaryForeground,
+                  transform: [{ rotate: "-45deg" }],
+                  marginBottom: 2,
+                }}
+              />
+            </Pressable>
+          </View>
         </View>
       </KeyboardAvoidingView>
     </Screen>

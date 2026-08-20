@@ -59,3 +59,23 @@ export type ToolSpec = {
   parameters: ToolParameters;
   execute: (args: Record<string, unknown>) => Promise<ToolOutcome>;
 };
+
+/**
+ * Run a tool and stamp which one produced the outcome.
+ *
+ * Used by both places a spec is executed, so a result always says what made it.
+ *
+ * It exists because of what the durable thread keeps. Intelligence stores the tool RESULT messages
+ * but not the assistant message carrying the calls, so a thread read back later has the outcomes and
+ * no names for them — and a transcript that says "allowed · Submit payment run" with no verb is a
+ * transcript nobody can audit. The name in the result is the one copy that survives a reload.
+ *
+ * Stamped first so a tool that returns its own `tool` key wins, which keeps this from overwriting
+ * something a tool deliberately said about itself.
+ */
+export async function runTool(
+  spec: ToolSpec,
+  args: Record<string, unknown>,
+): Promise<ToolOutcome> {
+  return { tool: spec.name, ...(await spec.execute(args)) };
+}

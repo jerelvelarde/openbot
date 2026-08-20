@@ -1,8 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import {
-  createMobileAuthRoutes,
-  NO_SCHEME,
-} from "../src/mobile-auth-routes";
+import { createMobileAuthRoutes, NO_SCHEME } from "../src/mobile-auth-routes";
 
 /**
  * What signing in from a phone must guarantee.
@@ -80,7 +77,9 @@ describe("signing in from the companion", () => {
     const response = await routes.request("/handoff");
 
     expect(response.status).toBe(302);
-    expect(response.headers.get("location")).toBe("openbot://auth?token=ott_abc");
+    expect(response.headers.get("location")).toBe(
+      "openbot://auth?token=ott_abc",
+    );
   });
 
   test("arriving without a session says so, so the app can explain it", async () => {

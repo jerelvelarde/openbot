@@ -59,7 +59,19 @@ const dark: Palette = {
 
 export const palettes: Record<Scheme, Palette> = { light, dark };
 
-export const radius = 12;
+/**
+ * Corner radii, as a scale rather than one number.
+ *
+ * Three sizes because three things need corners and they are not the same thing: a control, a card,
+ * and a bubble. One value made bubbles look like buttons.
+ */
+export const radius = {
+  sm: 10,
+  md: 16,
+  lg: 20,
+  /** A composer, a chip, a badge: anything whose height is its radius. */
+  pill: 999,
+};
 
 export const space = {
   xs: 4,
@@ -70,8 +82,8 @@ export const space = {
 };
 
 export const type = {
-  title: { fontSize: 26, fontWeight: "700" as const, letterSpacing: -0.4 },
-  heading: { fontSize: 17, fontWeight: "600" as const },
+  title: { fontSize: 30, fontWeight: "700" as const, letterSpacing: -0.7 },
+  heading: { fontSize: 16.5, fontWeight: "600" as const, letterSpacing: -0.2 },
   body: { fontSize: 15, fontWeight: "400" as const },
   label: { fontSize: 13, fontWeight: "500" as const },
   small: { fontSize: 12, fontWeight: "400" as const },

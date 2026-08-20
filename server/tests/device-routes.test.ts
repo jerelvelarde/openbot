@@ -75,7 +75,10 @@ function routes(authDisabled: boolean) {
 const registration = {
   method: "POST",
   headers: { "content-type": "application/json" },
-  body: JSON.stringify({ platform: "expo", token: "ExponentPushToken[abc123]" }),
+  body: JSON.stringify({
+    platform: "expo",
+    token: "ExponentPushToken[abc123]",
+  }),
 };
 
 describe("registering a device", () => {
@@ -137,7 +140,7 @@ describe("listing and revoking", () => {
   test("listing works even without sign-in, because it reveals nothing new", async () => {
     // Under OPENBOT_DEV_NO_AUTH there is one person, so their own list is their own. Refusing here
     // would make the screen unusable locally for no gain.
-    expect((await (await routes(true).app.request("/")).status)).toBe(200);
+    expect(await (await routes(true).app.request("/")).status).toBe(200);
   });
 
   test("revoking somebody else's device is a 404, not a 403", async () => {

@@ -6,44 +6,143 @@
  * screens use RN primitives only — so the same code runs on a device and in a browser, which is what
  * makes it possible to record the flows without a simulator.
  */
-import { useMemo, useState } from "react";
-import { Platform, Pressable, Text, useColorScheme, View } from "react-native";
-import { StatusBar } from "expo-status-bar";
+
+import * as Notifications from "expo-notifications";
+import { StatusBar as ExpoStatusBar } from "expo-status-bar";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Platform, Pressable, Text, View } from "react-native";
 import {
   type Connection,
   createSource,
   resolveConnection,
 } from "./src/data/config";
+import { targetOf } from "./src/data/push";
+import { SessionProvider, useSession } from "./src/data/session";
+import {
+  DeviceFrame,
+  HomeIndicator,
+  SCREEN_HEIGHT,
+  StatusBar,
+} from "./src/device";
 import { ActivityScreen } from "./src/screens/activity";
 import { ApprovalScreen } from "./src/screens/approval";
 import { ChannelScreen } from "./src/screens/channel";
 import { ChannelsScreen } from "./src/screens/channels";
 import { InboxScreen } from "./src/screens/inbox";
+import { SignInScreen } from "./src/screens/sign-in";
 import { SourceProvider, useLive } from "./src/store";
 import { palettes, space, type as type_ } from "./src/theme";
 import { SchemeProvider, useColors } from "./src/ui";
 
+/** The three tabs. A route is one of these, or one of the two screens pushed over them. */
+type TabName = "inbox" | "channels" | "activity";
+
 type Route =
-  | { name: "inbox" }
-  | { name: "channels" }
-  | { name: "activity" }
+  | { name: TabName }
   | { name: "approval"; approvalId: string }
   | { name: "channel"; channelId: string };
 
-const TABS = [
-  { name: "inbox" as const, label: "Inbox" },
-  { name: "channels" as const, label: "Channels" },
-  { name: "activity" as const, label: "Activity" },
+/**
+ * The tab icons, drawn from Views.
+ *
+ * No icon font and no SVG dependency: three shapes are cheaper than either, and a font that fails to
+ * load leaves a row of empty boxes where the navigation used to be.
+ */
+function TabIcon({ name, color }: { name: TabName; color: string }) {
+  if (name === "inbox") {
+    // A tray: a line with two shoulders.
+    return (
+      <View style={{ width: 20, height: 20, justifyContent: "center" }}>
+        <View
+          style={{
+            height: 9,
+            borderLeftWidth: 2,
+            borderRightWidth: 2,
+            borderBottomWidth: 2,
+            borderColor: color,
+            borderBottomLeftRadius: 4,
+            borderBottomRightRadius: 4,
+          }}
+        />
+        <View
+          style={{
+            position: "absolute",
+            top: 3,
+            left: 5,
+            width: 10,
+            height: 2,
+            backgroundColor: color,
+            borderRadius: 1,
+          }}
+        />
+      </View>
+    );
+  }
+  if (name === "channels") {
+    // Two overlapping bubbles.
+    return (
+      <View style={{ width: 20, height: 20 }}>
+        <View
+          style={{
+            position: "absolute",
+            top: 2,
+            left: 0,
+            width: 13,
+            height: 11,
+            borderWidth: 2,
+            borderColor: color,
+            borderRadius: 4,
+          }}
+        />
+        <View
+          style={{
+            position: "absolute",
+            bottom: 1,
+            right: 0,
+            width: 13,
+            height: 11,
+            borderWidth: 2,
+            borderColor: color,
+            borderRadius: 4,
+          }}
+        />
+      </View>
+    );
+  }
+  // Three stacked lines of decreasing length: a list of what happened.
+  return (
+    <View style={{ width: 20, height: 20, justifyContent: "center", gap: 3 }}>
+      {[16, 12, 8].map((width) => (
+        <View
+          key={width}
+          style={{
+            width,
+            height: 2,
+            borderRadius: 1,
+            backgroundColor: color,
+          }}
+        />
+      ))}
+    </View>
+  );
+}
+
+const TABS: { name: TabName; label: string }[] = [
+  { name: "inbox", label: "Inbox" },
+  { name: "channels", label: "Channels" },
+  { name: "activity", label: "Activity" },
 ];
 
 function TabBar({
   active,
   onSelect,
   waiting,
+  framed,
 }: {
-  active: Route["name"];
-  onSelect: (name: Route["name"]) => void;
+  active: TabName;
+  onSelect: (name: TabName) => void;
   waiting: number;
+  framed: boolean;
 }) {
   const colors = useColors();
   return (
@@ -53,44 +152,39 @@ function TabBar({
         borderTopColor: colors.border,
         borderTopWidth: 1,
         backgroundColor: colors.card,
-        paddingBottom: Platform.OS === "web" ? space.sm : space.xl,
         paddingTop: space.sm,
+        // In the frame the home indicator supplies the bottom inset; on a device the safe area does.
+        paddingBottom: framed ? space.xs : space.xl,
       }}
     >
       {TABS.map((tab) => {
         const selected = active === tab.name;
+        const tint = selected ? colors.foreground : colors.muted;
         return (
           <Pressable
-            key={tab.name}
             accessibilityRole="tab"
+            key={tab.name}
             onPress={() => onSelect(tab.name)}
             style={{
               flex: 1,
               alignItems: "center",
-              paddingVertical: space.sm,
-              gap: 3,
+              paddingVertical: 6,
+              gap: 4,
             }}
           >
-            <View
-              style={{ flexDirection: "row", alignItems: "center", gap: 6 }}
-            >
-              <Text
-                style={{
-                  ...type_.label,
-                  color: selected ? colors.foreground : colors.muted,
-                  fontWeight: selected ? "700" : "500",
-                }}
-              >
-                {tab.label}
-              </Text>
+            <View>
+              <TabIcon color={tint} name={tab.name} />
               {/* The one count worth interrupting somebody for. */}
               {tab.name === "inbox" && waiting > 0 ? (
                 <View
                   style={{
-                    minWidth: 18,
-                    height: 18,
+                    position: "absolute",
+                    top: -5,
+                    right: -8,
+                    minWidth: 17,
+                    height: 17,
                     borderRadius: 9,
-                    paddingHorizontal: 5,
+                    paddingHorizontal: 4.5,
                     alignItems: "center",
                     justifyContent: "center",
                     backgroundColor: colors.pending,
@@ -104,6 +198,16 @@ function TabBar({
                 </View>
               ) : null}
             </View>
+            <Text
+              style={{
+                ...type_.small,
+                fontSize: 11,
+                color: tint,
+                fontWeight: selected ? "700" : "500",
+              }}
+            >
+              {tab.label}
+            </Text>
           </Pressable>
         );
       })}
@@ -127,7 +231,7 @@ function ConnectionBar({ connection }: { connection: Connection }) {
         alignItems: "center",
         gap: 6,
         paddingHorizontal: space.lg,
-        paddingVertical: 6,
+        paddingVertical: 5,
         backgroundColor: colors.cardMuted,
         borderBottomColor: colors.border,
         borderBottomWidth: 1,
@@ -135,33 +239,67 @@ function ConnectionBar({ connection }: { connection: Connection }) {
     >
       <View
         style={{
-          width: 7,
-          height: 7,
-          borderRadius: 4,
+          width: 6,
+          height: 6,
+          borderRadius: 3,
           backgroundColor: live ? colors.allow : colors.muted,
         }}
       />
-      <Text style={{ ...type_.small, color: colors.muted }}>
+      <Text style={{ ...type_.small, fontSize: 11, color: colors.muted }}>
         {live ? `Live · ${connection.label}` : "Local · nothing behind it"}
       </Text>
     </View>
   );
 }
 
-function Shell({ connection }: { connection: Connection }) {
+function Shell({
+  connection,
+  framed,
+}: {
+  connection: Connection;
+  framed: boolean;
+}) {
   const colors = useColors();
   const [route, setRoute] = useState<Route>({ name: "inbox" });
-  const [tab, setTab] = useState<Route["name"]>("inbox");
+  const [tab, setTab] = useState<TabName>("inbox");
   const approvals = useLive((source) => source.approvals());
   const waiting = (approvals ?? []).filter(
     (one) => one.state === "pending",
   ).length;
 
-  const back = () => setRoute({ name: tab } as Route);
-  const openApproval = (approvalId: string) =>
-    setRoute({ name: "approval", approvalId });
-  const openChannel = (channelId: string) =>
-    setRoute({ name: "channel", channelId });
+  const back = () => setRoute({ name: tab });
+  const openApproval = useCallback(
+    (approvalId: string) => setRoute({ name: "approval", approvalId }),
+    [],
+  );
+  const openChannel = useCallback(
+    (channelId: string) => setRoute({ name: "channel", channelId }),
+    [],
+  );
+
+  /**
+   * Opening the app from a notification lands on the thing it was about.
+   *
+   * A push that drops somebody on a list they then have to search is a push that wasted the
+   * interruption it cost.
+   */
+  useEffect(() => {
+    if (Platform.OS === "web") return;
+    const subscription = Notifications.addNotificationResponseReceivedListener(
+      (response) => {
+        const target = targetOf(
+          response.notification.request.content.data as unknown,
+        );
+        if (target.screen === "approval") openApproval(target.approvalId);
+        else if (target.screen === "channel") openChannel(target.channelId);
+        else {
+          setTab("inbox");
+          setRoute({ name: "inbox" });
+        }
+      },
+    );
+    return () => subscription.remove();
+  }, [openApproval, openChannel]);
 
   const screen = (() => {
     switch (route.name) {
@@ -189,22 +327,57 @@ function Shell({ connection }: { connection: Connection }) {
     }
   })();
 
-  const onTab = (name: Route["name"]) => {
+  const onTab = (name: TabName) => {
     setTab(name);
-    setRoute({ name } as Route);
+    setRoute({ name });
   };
 
   return (
     <View style={{ flex: 1, backgroundColor: colors.background }}>
       <ConnectionBar connection={connection} />
       <View style={{ flex: 1 }}>{screen}</View>
-      <TabBar active={tab} onSelect={onTab} waiting={waiting} />
+      <TabBar active={tab} framed={framed} onSelect={onTab} waiting={waiting} />
     </View>
   );
 }
 
+/**
+ * Signed in, or the screen that asks.
+ *
+ * Inside the provider rather than around it, because whether a sign-in is even needed is a property of
+ * the connection: same-origin in a browser already has a cookie, and a local build has no deployment
+ * to sign in to.
+ */
+function Gate({
+  connection,
+  framed,
+}: {
+  connection: Connection;
+  framed: boolean;
+}) {
+  const { state } = useSession();
+
+  if (state.status === "unknown") {
+    // Blank rather than a spinner: this resolves in a few milliseconds from the secure store, and a
+    // spinner that flashes is worse than nothing.
+    return <View style={{ flex: 1 }} />;
+  }
+  if (state.status === "signed-in") {
+    return <Shell connection={connection} framed={framed} />;
+  }
+  return (
+    <SignInScreen
+      label={
+        connection.kind === "live"
+          ? connection.label
+          : "No deployment configured."
+      }
+    />
+  );
+}
+
 export default function App() {
-  const scheme = useColorScheme() === "dark" ? "dark" : "light";
+  const scheme = "light";
   /**
    * One source for the life of the app.
    *
@@ -213,63 +386,42 @@ export default function App() {
    */
   const connection = useMemo(() => resolveConnection(), []);
   const source = useMemo(() => createSource(connection), [connection]);
-
   const colors = palettes[scheme];
 
   /**
-   * On a phone the app is the screen. In a browser it is not, and a companion stretched across a
-   * desktop window stops being an honest picture of itself — the line lengths, the reach, and the
-   * balance between the transcript and the composer are all properties of a narrow screen. So the web
-   * build renders inside a device-sized frame, which is also what makes a recording of it legible.
+   * On a phone the app is the screen. In a browser it is not, so the web build draws a phone around
+   * itself at a real phone's proportions. See `src/device.tsx`.
    */
   const framed = Platform.OS === "web";
 
   const body = (
-    <View
-      style={{
-        flex: 1,
-        backgroundColor: colors.background,
-        overflow: "hidden",
-      }}
-    >
-      <View style={{ height: framed ? 0 : 52 }} />
-      <Shell connection={connection} />
+    <View style={{ flex: 1, backgroundColor: colors.background }}>
+      {framed ? (
+        <StatusBar background={colors.card} color={colors.foreground} />
+      ) : (
+        <View style={{ height: 52, backgroundColor: colors.card }} />
+      )}
+      <Gate connection={connection} framed={framed} />
+      {framed ? <HomeIndicator color={colors.foreground} /> : null}
     </View>
   );
 
   return (
     <SchemeProvider value={scheme}>
-      <SourceProvider source={source}>
-        {framed ? (
-          <View
-            style={{
-              flex: 1,
-              alignItems: "center",
-              justifyContent: "center",
-              backgroundColor: scheme === "dark" ? "#000000" : "#e4e4e7",
-              padding: space.lg,
-            }}
-          >
-            <View
-              style={{
-                width: 390,
-                height: 800,
-                maxHeight: "100%",
-                borderRadius: 28,
-                borderWidth: 1,
-                borderColor: colors.border,
-                overflow: "hidden",
-                backgroundColor: colors.background,
-              }}
-            >
-              {body}
-            </View>
-          </View>
-        ) : (
-          body
-        )}
-        <StatusBar style={scheme === "dark" ? "light" : "dark"} />
-      </SourceProvider>
+      <SessionProvider
+        baseUrl={connection.kind === "live" ? connection.baseUrl : ""}
+      >
+        <SourceProvider source={source}>
+          {framed ? (
+            <DeviceFrame backdrop="#e7e7ea">
+              <View style={{ height: SCREEN_HEIGHT }}>{body}</View>
+            </DeviceFrame>
+          ) : (
+            body
+          )}
+          <ExpoStatusBar style="dark" />
+        </SourceProvider>
+      </SessionProvider>
     </SchemeProvider>
   );
 }

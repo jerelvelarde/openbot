@@ -108,6 +108,8 @@ export type Notification = {
   id: string;
   /** The tight rule: approval, question, done-if-asked, routine-failed. Nothing else buzzes. */
   kind: "approval" | "question" | "done" | "refused" | "routine-failed";
+  /** The Bot's id, which is also its avatar seed. Its face is how a list is scanned. */
+  botId: string;
   botName: string;
   /**
    * The line a person reads on a lock screen.

@@ -54,6 +54,19 @@ function fakeClient() {
           reached.push("click");
           return { action: "click", url: SNAPSHOT.url, elapsedMs: 1 } as never;
         },
+        // The actions with no element of their own, which is what the rules below are about.
+        navigate: async () => {
+          reached.push("navigate");
+          return { url: SNAPSHOT.url, title: "Orders", text: "" } as never;
+        },
+        scroll: async () => {
+          reached.push("scroll");
+          return { action: "scroll", url: SNAPSHOT.url } as never;
+        },
+        readFile: async () => {
+          reached.push("readFile");
+          return { path: "notes.md", contents: "" } as never;
+        },
       }),
     } as unknown as ComputerClient,
   };
@@ -329,9 +342,9 @@ describe("the ask outcome", () => {
     );
     // Recorded, not silent. A trail that shows the question and never the outcome cannot answer
     // whether an `ask` rule is workable.
-    expect((answered?.payload as Record<string, unknown>).answer).toBe(
-      "expired",
-    );
+    expect(
+      answered?.payload as Record<string, unknown> | undefined,
+    ).toMatchObject({ answer: "expired" });
   });
 
   test("an ask with nowhere to record it refuses rather than acting", async () => {
@@ -523,5 +536,106 @@ describe("telling somebody it is waiting", () => {
 
     // A product that notifies on everything is a product whose notifications are switched off.
     expect(announced).toEqual([]);
+  });
+});
+
+describe("a rule about a button is not a rule about everything", () => {
+  /**
+   * The shape of rule every deployment writes, and the trap under it.
+   *
+   * The policy engine treats an expression it cannot evaluate as a MATCH, which is right for an
+   * element the server could not resolve. Applied to an action with no element at all it is a
+   * disaster: this rule is unevaluable for a navigation, so it would match, so asking about one
+   * button would ask about every page the Bot opens.
+   */
+  const ASK_ABOUT_A_BUTTON: ActionPolicy = {
+    mode: "enforce",
+    deny: [],
+    ask: ['contains(element.name, "Submit payment run")'],
+    allow: ["true"],
+  };
+
+  test("opening a page is not parked by a rule about a button", async () => {
+    const announced: Announcement[] = [];
+    const approvals = fakeApprovals({
+      answered: true,
+      allowed: true,
+      answeredByUserId: "user_1",
+    });
+    const { gateway, reached } = gatewayWith(
+      ASK_ABOUT_A_BUTTON,
+      approvals.store,
+      (announcement) => announced.push(announcement),
+    );
+
+    await gateway.navigate(
+      "risk-analyst",
+      "risk-analyst",
+      ACTOR,
+      "https://portal.example/orders",
+    );
+
+    // A navigation did not click anything, so a rule about a click is false for it.
+    expect(announced).toEqual([]);
+    expect(approvals.created).toEqual([]);
+    expect(reached).toContain("navigate");
+  });
+
+  test("scrolling and reading a file are not parked by it either", async () => {
+    const approvals = fakeApprovals({
+      answered: true,
+      allowed: true,
+      answeredByUserId: "user_1",
+    });
+    const { gateway } = gatewayWith(ASK_ABOUT_A_BUTTON, approvals.store);
+
+    await gateway.scroll("risk-analyst", "risk-analyst", ACTOR, {
+      deltaY: 600,
+    });
+    await gateway.readFile("risk-analyst", "risk-analyst", ACTOR, {
+      path: "notes.md",
+    });
+
+    expect(approvals.created).toEqual([]);
+  });
+
+  test("but the button itself still asks", async () => {
+    const approvals = fakeApprovals({
+      answered: true,
+      allowed: true,
+      answeredByUserId: "user_1",
+    });
+    const { gateway } = gatewayWith(ASK_ABOUT_A_BUTTON, approvals.store);
+    await gateway.snapshot("risk-analyst");
+
+    await gateway.click("risk-analyst", "risk-analyst", ACTOR, {
+      ref: "e9",
+      snapshotId: 1,
+    });
+
+    expect(approvals.created).toHaveLength(1);
+  });
+
+  test("and an element the server could not resolve still fails closed", async () => {
+    const approvals = fakeApprovals({
+      answered: false,
+      reason: "expired",
+    });
+    const { gateway, reached } = gatewayWith(
+      ASK_ABOUT_A_BUTTON,
+      approvals.store,
+    );
+    // No snapshot taken, so there is nothing to resolve the ref against.
+
+    await expect(
+      gateway.click("risk-analyst", "risk-analyst", ACTOR, {
+        ref: "e9",
+        snapshotId: 1,
+      }),
+    ).rejects.toThrow();
+
+    // The neutral values are for actions that HAVE no element. A click whose element could not be
+    // found must still be treated as possibly the one the rule is about.
+    expect(reached).not.toContain("click");
   });
 });

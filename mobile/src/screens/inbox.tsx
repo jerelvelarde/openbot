@@ -5,20 +5,12 @@
  * the companion is for the half of OpenBot that happens while nobody is watching: a parked approval,
  * a Bot with a question, a routine that failed.
  */
-import { ScrollView, View } from "react-native";
+import { ScrollView, Text, View } from "react-native";
+import { BotAvatar, BotAvatarWithDot } from "../avatar";
 import type { Approval, Notification } from "../data/types";
 import { useLiveResult, useSource } from "../store";
-import { space } from "../theme";
-import {
-  Badge,
-  Body,
-  Card,
-  Heading,
-  Label,
-  OutcomeDot,
-  useColors,
-  when,
-} from "../ui";
+import { radius, space, type as type_ } from "../theme";
+import { Body, Card, Divider, Label, Row, useColors, when } from "../ui";
 import { Screen, Title } from "./chrome";
 
 function subjectLine(approval: Approval): string {
@@ -52,7 +44,14 @@ export function InboxScreen({
 
   return (
     <Screen>
-      <ScrollView contentContainerStyle={{ padding: space.lg, gap: space.lg }}>
+      <ScrollView
+        contentContainerStyle={{
+          paddingHorizontal: space.lg,
+          paddingTop: space.sm,
+          paddingBottom: space.xl,
+          gap: space.lg,
+        }}
+      >
         <Title
           text="Inbox"
           detail={
@@ -79,74 +78,134 @@ export function InboxScreen({
           </Card>
         ) : null}
 
-        {waiting.map((approval) => (
-          <Card key={approval.id} onPress={() => onOpenApproval(approval.id)}>
-            <View
-              style={{
-                flexDirection: "row",
-                gap: space.sm,
-                alignItems: "center",
-              }}
-            >
-              <Badge tone="pending">Needs you</Badge>
-              <Body muted>{when(approval.askedAt)}</Body>
-            </View>
-            <Heading>{approval.botName}</Heading>
-            <Body>
-              wants to {approval.intent} {subjectLine(approval)}
-            </Body>
-          </Card>
-        ))}
-
-        {news.length > 0 ? (
-          <View style={{ gap: space.sm }}>
-            <Label>Earlier</Label>
-            {news.map((note: Notification) => (
+        {waiting.length > 0 ? (
+          <View style={{ gap: space.md }}>
+            {waiting.map((approval) => (
               <Card
-                key={note.id}
-                muted
-                onPress={() => {
-                  void source.markRead(note.id);
-                  if (note.approvalId) onOpenApproval(note.approvalId);
-                  else if (note.channelId) onOpenChannel(note.channelId);
-                }}
+                accent
+                key={approval.id}
+                onPress={() => onOpenApproval(approval.id)}
               >
-                <View style={{ flexDirection: "row", gap: space.md }}>
-                  <OutcomeDot
-                    outcome={
-                      note.kind === "refused"
-                        ? "refused"
-                        : note.kind === "routine-failed"
-                          ? "failed"
-                          : "allowed"
-                    }
+                <View
+                  style={{
+                    flexDirection: "row",
+                    alignItems: "center",
+                    gap: space.md,
+                  }}
+                >
+                  <BotAvatarWithDot
+                    dot={colors.pending}
+                    seed={approval.botId}
+                    size={40}
                   />
-                  <View style={{ flex: 1, gap: 2 }}>
-                    <Body>
-                      {note.botName} {note.body}
-                    </Body>
-                    <Body muted>{when(note.at)}</Body>
+                  <View style={{ flex: 1, gap: 1 }}>
+                    <Text
+                      style={{ ...type_.heading, color: colors.foreground }}
+                    >
+                      {approval.botName}
+                    </Text>
+                    <Text style={{ ...type_.small, color: colors.pending }}>
+                      Needs you · {when(approval.askedAt)}
+                    </Text>
                   </View>
+                </View>
+                <Body>
+                  wants to {approval.intent} {subjectLine(approval)}
+                </Body>
+                {/* The one call to action on the screen, drawn as a bar rather than a button so the
+                    whole card stays the tap target. */}
+                <View
+                  style={{
+                    marginTop: space.xs,
+                    borderRadius: radius.pill,
+                    backgroundColor: colors.primary,
+                    paddingVertical: 11,
+                    alignItems: "center",
+                  }}
+                >
+                  <Text
+                    style={{
+                      ...type_.body,
+                      fontWeight: "600",
+                      color: colors.primaryForeground,
+                    }}
+                  >
+                    Review it
+                  </Text>
                 </View>
               </Card>
             ))}
           </View>
         ) : null}
 
+        {news.length > 0 ? (
+          <View style={{ gap: space.sm }}>
+            <Label>Earlier</Label>
+            <View
+              style={{
+                backgroundColor: colors.card,
+                borderColor: colors.border,
+                borderWidth: 1,
+                borderRadius: radius.md,
+                paddingHorizontal: space.lg,
+              }}
+            >
+              {news.map((note: Notification, index) => (
+                <View key={note.id}>
+                  {index > 0 ? <Divider inset={44} /> : null}
+                  <Row
+                    detail={note.body}
+                    leading={
+                      <BotAvatarWithDot
+                        dot={
+                          note.kind === "refused"
+                            ? colors.refuse
+                            : note.kind === "routine-failed"
+                              ? colors.fail
+                              : colors.allow
+                        }
+                        seed={note.botId}
+                        size={32}
+                      />
+                    }
+                    lines={2}
+                    meta={when(note.at)}
+                    onPress={() => {
+                      void source.markRead(note.id);
+                      if (note.approvalId) onOpenApproval(note.approvalId);
+                      else if (note.channelId) onOpenChannel(note.channelId);
+                    }}
+                    title={note.botName}
+                  />
+                </View>
+              ))}
+            </View>
+          </View>
+        ) : null}
+
         {waiting.length === 0 &&
         news.length === 0 &&
         approvals !== undefined ? (
-          <Card muted>
-            <Body muted>
-              Nothing has needed you today. Bots carry on working, and this is
-              where they come when they cannot.
-            </Body>
-          </Card>
+          <View style={{ alignItems: "center", gap: space.md, paddingTop: 64 }}>
+            <View style={{ opacity: 0.35 }}>
+              <BotAvatar seed="openbot" size={56} />
+            </View>
+            <Body muted>Nothing has needed you today.</Body>
+            <View style={{ paddingHorizontal: space.xl }}>
+              <Text
+                style={{
+                  ...type_.body,
+                  color: colors.muted,
+                  textAlign: "center",
+                  lineHeight: 21,
+                }}
+              >
+                Bots carry on working, and this is where they come when they
+                cannot.
+              </Text>
+            </View>
+          </View>
         ) : null}
-
-        <View
-          style={{ height: space.xl, backgroundColor: colors.background }}
-        />
       </ScrollView>
     </Screen>
   );

@@ -22,6 +22,7 @@
       "favicon": "./assets/favicon.png",
       "bundler": "metro"
     },
-    "scheme": "openbot"
+    "scheme": "openbot",
+    "plugins": ["expo-secure-store", "expo-web-browser"]
   }
 }

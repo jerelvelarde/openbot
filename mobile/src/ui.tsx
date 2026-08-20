@@ -5,10 +5,10 @@
  * harder to read than this. They take colours from the active scheme rather than closing over one,
  * so the whole app follows the phone's appearance setting.
  */
-import type { ReactNode } from "react";
+import type { ReactElement, ReactNode } from "react";
 import { createContext, useContext } from "react";
 import { Pressable, Text, View } from "react-native";
-import { type Scheme, palettes, radius, space, type as type_ } from "./theme";
+import { palettes, radius, type Scheme, space, type as type_ } from "./theme";
 
 const SchemeContext = createContext<Scheme>("light");
 export const SchemeProvider = SchemeContext.Provider;
@@ -43,19 +43,22 @@ export function Card({
   children,
   onPress,
   muted,
+  accent,
 }: {
   children: ReactNode;
   onPress?: () => void;
   muted?: boolean;
+  /** A card that is the reason the screen exists. Used once per screen at most. */
+  accent?: boolean;
 }) {
   const colors = useColors();
   const body = (
     <View
       style={{
         backgroundColor: muted ? colors.cardMuted : colors.card,
-        borderColor: colors.border,
+        borderColor: accent ? colors.pending : colors.border,
         borderWidth: 1,
-        borderRadius: radius,
+        borderRadius: radius.md,
         padding: space.lg,
         gap: space.sm,
       }}
@@ -67,10 +70,114 @@ export function Card({
   return (
     <Pressable
       onPress={onPress}
-      style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}
+      style={({ pressed }) => ({
+        opacity: pressed ? 0.72 : 1,
+        transform: [{ scale: pressed ? 0.994 : 1 }],
+      })}
     >
       {body}
     </Pressable>
+  );
+}
+
+/** A row in a list: a picture, then words, then when. The shape of every list in the app. */
+export function Row({
+  leading,
+  title,
+  detail,
+  meta,
+  onPress,
+  trailing,
+  lines = 1,
+}: {
+  leading?: ReactNode;
+  title: ReactNode;
+  detail?: ReactNode;
+  /** When it happened. Sits with the name, so the detail gets the full width. */
+  meta?: string;
+  onPress?: () => void;
+  trailing?: ReactNode;
+  /** How much of the detail to show. Two where the detail IS the news, one where it is context. */
+  lines?: number;
+}) {
+  const colors = useColors();
+  const body = (
+    <View
+      style={{
+        flexDirection: "row",
+        alignItems: "center",
+        gap: space.md,
+        paddingVertical: 11,
+      }}
+    >
+      {leading}
+      <View style={{ flex: 1, gap: 2 }}>
+        <View
+          style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}
+        >
+          <Text
+            numberOfLines={1}
+            style={{
+              ...type_.heading,
+              color: colors.foreground,
+              flexShrink: 1,
+            }}
+          >
+            {title}
+          </Text>
+          {trailing}
+          {/* The time sits with the name rather than in its own column, so the sentence underneath
+              gets the full width. A truncated "was allowed to activate “Submi…" says nothing. */}
+          {meta ? (
+            <Text
+              style={{
+                ...type_.small,
+                color: colors.muted,
+                marginLeft: "auto",
+              }}
+            >
+              {meta}
+            </Text>
+          ) : null}
+        </View>
+        {detail !== undefined ? (
+          <Text
+            numberOfLines={lines}
+            style={{
+              ...type_.body,
+              fontSize: 14,
+              lineHeight: 19,
+              color: colors.muted,
+            }}
+          >
+            {detail}
+          </Text>
+        ) : null}
+      </View>
+    </View>
+  );
+  if (!onPress) return body;
+  return (
+    <Pressable
+      onPress={onPress}
+      style={({ pressed }) => ({ opacity: pressed ? 0.6 : 1 })}
+    >
+      {body}
+    </Pressable>
+  );
+}
+
+/** A hairline between rows, inset past the picture so the column reads as one list. */
+export function Divider({ inset = 0 }: { inset?: number }) {
+  const colors = useColors();
+  return (
+    <View
+      style={{
+        height: 1,
+        marginLeft: inset,
+        backgroundColor: colors.border,
+      }}
+    />
   );
 }
 
@@ -135,7 +242,7 @@ export function Rule({ children }: { children: ReactNode }) {
         backgroundColor: colors.cardMuted,
         borderColor: colors.border,
         borderWidth: 1,
-        borderRadius: 8,
+        borderRadius: radius.sm,
         paddingVertical: space.sm,
         paddingHorizontal: space.md,
       }}
@@ -182,9 +289,9 @@ export function Button({
         backgroundColor: background,
         borderColor: tone === "quiet" ? colors.border : background,
         borderWidth: 1,
-        borderRadius: 10,
+        borderRadius: radius.pill,
         paddingVertical: 13,
-        paddingHorizontal: space.lg,
+        paddingHorizontal: space.xl,
         alignItems: "center",
         opacity: disabled ? 0.4 : pressed ? 0.85 : 1,
       })}
@@ -231,4 +338,47 @@ export function Badge({
 export function when(iso: string): string {
   const date = new Date(iso);
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+/**
+ * A Bot's prose, with the little bit of markdown it actually writes.
+ *
+ * Bots write `**bold**` and `` `code` `` constantly, and rendering those literally puts asterisks and
+ * backticks in front of a person — which reads as a bug in the app rather than a habit of the model.
+ * A full markdown renderer is a dependency and a layout engine; this is two inline spans, which is
+ * what the messages in this app contain.
+ *
+ * Deliberately not headings, lists, links or tables. Those belong in the web transcript, which has
+ * `Streamdown` and the width for them.
+ */
+export function richText(text: string): (string | ReactElement)[] {
+  const parts: (string | ReactElement)[] = [];
+  // Bold or code, whichever comes first, and never across a line break: an unclosed marker is far
+  // more likely to be a stray asterisk than the start of a span that ends three paragraphs later.
+  const pattern = /\*\*([^*\n]+)\*\*|`([^`\n]+)`/g;
+  let index = 0;
+  let match = pattern.exec(text);
+  let key = 0;
+
+  while (match) {
+    if (match.index > index) parts.push(text.slice(index, match.index));
+    const bold = match[1];
+    const code = match[2];
+    key += 1;
+    parts.push(
+      bold !== undefined ? (
+        <Text key={`b${key}`} style={{ fontWeight: "700" }}>
+          {bold}
+        </Text>
+      ) : (
+        <Text key={`c${key}`} style={type_.mono}>
+          {code}
+        </Text>
+      ),
+    );
+    index = match.index + match[0].length;
+    match = pattern.exec(text);
+  }
+  if (index < text.length) parts.push(text.slice(index));
+  return parts;
 }

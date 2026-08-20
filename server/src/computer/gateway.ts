@@ -210,13 +210,32 @@ export function createComputerGateway(options: ComputerGatewayOptions) {
 
     const intent = intentOf(toolName, subject.key);
 
+    /**
+     * Every field is present, including the ones this action has no use for.
+     *
+     * Load bearing, not tidy. The engine treats an expression it cannot evaluate as a MATCH, which is
+     * right for an element the server could not resolve — a rule about a submit button must not be
+     * skipped because the ref went stale. Applied to an action that has no element at all it is a
+     * disaster: `contains(element.name, "Submit payment run")` is unevaluable for a navigation, so it
+     * matches, so a rule about one button asks a person about every page the Bot opens.
+     *
+     * Neutral values instead, for the fields an action genuinely does not have. An empty string
+     * matches no substring, no key and no extension, so a rule written about a button is FALSE for a
+     * navigation — which is the honest answer, because a navigation did not click anything. The
+     * unresolved-element case still fails closed, because a tool that acts on an element and could
+     * not resolve one keeps an absent `element`.
+     *
+     * Same reasoning, and the same fix, as `plugins/store.ts` applies to an MCP call.
+     */
+    const actsOnElement = ELEMENT_TOOLS.has(toolName);
+
     const context: PolicyContext = {
       tool: { name: toolName },
       bot: { id: botId },
       actor: { id: actor.id },
       page: { url: pageUrl, host: hostOf(pageUrl) },
       ...(intent ? { intent } : {}),
-      ...(subject.key ? { key: subject.key } : {}),
+      key: subject.key ?? "",
       ...(element
         ? {
             element: {
@@ -226,8 +245,12 @@ export function createComputerGateway(options: ComputerGatewayOptions) {
               ...(element.type ? { type: element.type } : {}),
             },
           }
-        : {}),
-      ...(filePath ? { file: describeFile(filePath) } : {}),
+        : actsOnElement
+          ? {}
+          : { element: { ref: "", role: "", name: "" } }),
+      ...(filePath
+        ? { file: describeFile(filePath) }
+        : { file: { path: "", name: "", extension: "" } }),
     };
 
     const decision = evaluateActionPolicy(options.policy(), context);
@@ -613,13 +636,14 @@ export function createComputerGateway(options: ComputerGatewayOptions) {
       botId: string,
       actor: ActionActor,
       url: string,
+      options: ActionOptions = {},
     ) {
       return govern(
         computerId,
         "computer_navigate",
         botId,
         actor,
-        { targetUrl: url },
+        { targetUrl: url, ...of(options) },
         () => as(botId).navigate(url),
       );
     },
@@ -629,15 +653,15 @@ export function createComputerGateway(options: ComputerGatewayOptions) {
       botId: string,
       actor: ActionActor,
       input: ClickInput,
-      signal?: AbortSignal,
+      options: ActionOptions = {},
     ) {
       return govern(
         computerId,
         "computer_click",
         botId,
         actor,
-        { ref: input.ref, ...(signal ? { signal } : {}) },
-        () => as(botId).click(input, signal),
+        { ref: input.ref, ...of(options) },
+        () => as(botId).click(input, options.signal),
       );
     },
 
@@ -646,15 +670,15 @@ export function createComputerGateway(options: ComputerGatewayOptions) {
       botId: string,
       actor: ActionActor,
       input: TypeInput,
-      signal?: AbortSignal,
+      options: ActionOptions = {},
     ) {
       return govern(
         computerId,
         "computer_type",
         botId,
         actor,
-        { ref: input.ref, ...(signal ? { signal } : {}) },
-        () => as(botId).type(input, signal),
+        { ref: input.ref, ...of(options) },
+        () => as(botId).type(input, options.signal),
       );
     },
 
@@ -663,7 +687,7 @@ export function createComputerGateway(options: ComputerGatewayOptions) {
       botId: string,
       actor: ActionActor,
       input: KeyInput,
-      signal?: AbortSignal,
+      options: ActionOptions = {},
     ) {
       return govern(
         computerId,
@@ -672,8 +696,8 @@ export function createComputerGateway(options: ComputerGatewayOptions) {
         actor,
         // The key is part of the subject, so a rule can tell Enter from a letter. Form submission can
         // happen through a keypress as well as a click, so the policy context carries the key.
-        { ref: input.ref, key: input.key, ...(signal ? { signal } : {}) },
-        () => as(botId).key(input, signal),
+        { ref: input.ref, key: input.key, ...of(options) },
+        () => as(botId).key(input, options.signal),
       );
     },
 
@@ -682,9 +706,15 @@ export function createComputerGateway(options: ComputerGatewayOptions) {
       botId: string,
       actor: ActionActor,
       input: ScrollInput,
+      options: ActionOptions = {},
     ) {
-      return govern(computerId, "computer_scroll", botId, actor, {}, () =>
-        as(botId).scroll(input),
+      return govern(
+        computerId,
+        "computer_scroll",
+        botId,
+        actor,
+        of(options),
+        () => as(botId).scroll(input),
       );
     },
 
@@ -700,13 +730,14 @@ export function createComputerGateway(options: ComputerGatewayOptions) {
       botId: string,
       actor: ActionActor,
       input: ReadFileInput,
+      options: ActionOptions = {},
     ) {
       return govern(
         computerId,
         "computer_read_file",
         botId,
         actor,
-        { filePath: input.path },
+        { filePath: input.path, ...of(options) },
         () => as(botId).readFile(input),
       );
     },
@@ -721,13 +752,14 @@ export function createComputerGateway(options: ComputerGatewayOptions) {
       botId: string,
       actor: ActionActor,
       input: ListFilesInput,
+      options: ActionOptions = {},
     ) {
       return govern(
         computerId,
         "computer_list_files",
         botId,
         actor,
-        { filePath: input.path ?? "." },
+        { filePath: input.path ?? ".", ...of(options) },
         () => as(botId).listFiles(input),
       );
     },
@@ -737,18 +769,42 @@ export function createComputerGateway(options: ComputerGatewayOptions) {
       botId: string,
       actor: ActionActor,
       input: WriteFileInput,
+      options: ActionOptions = {},
     ) {
       return govern(
         computerId,
         "computer_write_file",
         botId,
         actor,
-        { filePath: input.path },
+        { filePath: input.path, ...of(options) },
         () => as(botId).writeFile(input),
       );
     },
   };
 }
+
+/** Only the fields that are set, so an absent thread stays absent rather than becoming undefined. */
+function of(options: ActionOptions) {
+  return {
+    ...(options.signal ? { signal: options.signal } : {}),
+    ...(options.threadId ? { threadId: options.threadId } : {}),
+  };
+}
+
+/**
+ * The tools that act on something the snapshot named.
+ *
+ * For these, and only these, an unresolved element leaves `element` absent so the policy fails closed:
+ * a rule about a submit button must not be skipped because a ref went stale. Everything else — a
+ * navigation, a scroll, a file, a read — never has an element, and gets neutral values so a rule about
+ * a button is simply false for it.
+ */
+const ELEMENT_TOOLS = new Set([
+  "computer_click",
+  "computer_type",
+  "computer_key",
+  "computer_request_secret",
+]);
 
 /**
  * Split a path into the parts a rule wants to match on.
@@ -771,6 +827,18 @@ function describeFile(path: string): {
     extension: dot > 0 ? name.slice(dot + 1).toLowerCase() : "",
   };
 }
+
+/**
+ * What every governed action can be told about the run it belongs to.
+ *
+ * One object rather than a growing tail of positional optionals. Both fields are about the run and not
+ * about the browser: the signal is the person's Stop, and the thread is the conversation the action
+ * came out of, which is what lets a parked approval be shown beside it.
+ */
+export type ActionOptions = {
+  signal?: AbortSignal;
+  threadId?: string;
+};
 
 export type ComputerGateway = ReturnType<typeof createComputerGateway>;
 
@@ -931,10 +999,12 @@ function approvalSubjectOf(
   context: PolicyContext,
   element: SnapshotElement | undefined,
 ): ApprovalSubject {
-  if (context.file) {
+  // Non-empty, not merely present: every field is in the context now, filled with a neutral value
+  // where the action has none. See the context built in `govern`.
+  if (context.file?.path) {
     return { kind: "file", label: context.file.path };
   }
-  if (context.mcp) {
+  if (context.mcp?.tool) {
     return { kind: "mcp", label: context.mcp.tool, host: context.mcp.server };
   }
   if (element?.name) {

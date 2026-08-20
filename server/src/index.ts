@@ -28,12 +28,6 @@ import { createSupervisorClient } from "./computer/supervisor";
 import { createComputerToolSpecs } from "./computer/tools";
 import { loadConfig } from "./config";
 import { createConnectorAdminService } from "./connectors";
-import { createDeviceStore } from "./devices";
-import {
-  createExpoDelivery,
-  createLoggingDelivery,
-  createNotifier,
-} from "./notify";
 import {
   type IdentifyActor,
   type IdentifyUser,
@@ -46,6 +40,12 @@ import {
   resolveModelApiKey,
 } from "./credentials";
 import { createDatabase } from "./db/client";
+import { createDeviceStore } from "./devices";
+import {
+  createExpoDelivery,
+  createLoggingDelivery,
+  createNotifier,
+} from "./notify";
 import { createPluginStore } from "./plugins/store";
 import { createPluginToolSpecs } from "./plugins/tools";
 import {
@@ -406,9 +406,19 @@ const toolsForActor =
     // than the address, which is the fact this file already holds.
     const isDevActor = actor.id === DEV_ACTOR.id;
 
+    /**
+     * Which conversation the tools are acting inside.
+     *
+     * One holder per request, filled in by whoever drives the run — the AG-UI middleware does, for a
+     * remote Bot. It exists so a parked approval can name the thread it came out of and be shown
+     * beside it rather than only in a list.
+     */
+    const thread: { current?: string } = {};
+
     const computer =
       computerGateway && serverSideComputerTools
         ? createComputerToolSpecs({
+            thread,
             gateway: computerGateway,
             // The Bot IS the computer: the gateway addresses a container by the Bot's id, the same
             // way the HTTP routes do.
@@ -460,7 +470,7 @@ const toolsForActor =
         })
       : [];
 
-    return [...computer, ...plugins];
+    return { specs: [...computer, ...plugins], thread };
   };
 
 const app = createApp(

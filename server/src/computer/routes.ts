@@ -113,7 +113,9 @@ export function createComputerRoutes(
     act(context, (botId, actor, body, signal) => {
       const ref = asRef(body);
       if (!ref) return badRef;
-      return gateway.click(botId, botId, actor, ref, signal);
+      // A person driving from a surface has no thread to attribute the action to — the surface is not
+      // in a conversation. Only the Stop travels.
+      return gateway.click(botId, botId, actor, ref, { signal });
     }),
   );
 
@@ -133,7 +135,7 @@ export function createComputerRoutes(
           text: body.text,
           submit: body?.submit === true,
         },
-        signal,
+        { signal },
       );
     }),
   );
@@ -152,7 +154,7 @@ export function createComputerRoutes(
           key: body.key,
           ...(ref ?? {}),
         },
-        signal,
+        { signal },
       );
     }),
   );

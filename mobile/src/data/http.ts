@@ -5,14 +5,14 @@
  * `/api/agents`, `/api/audit`, and the runtime's own thread history under `/api/copilotkit`. Nothing
  * here invents a route.
  *
- * Three things this deliberately does NOT do:
+ * Two things this deliberately does NOT do:
  *  - it does not fall back to local data when a request fails. A companion that quietly shows a made
  *    up approval queue when it cannot reach the server is worse than one that says it is offline.
- *  - it does not pretend it can start a turn. Running a Bot is an AG-UI run over the CopilotKit
- *    runtime, not a REST call, so `send` refuses in plain words rather than dropping the message.
  *  - it does not invent a notification feed. What is waiting on a person IS the approval queue, and a
  *    second list derived from it would be a second source of truth for the same fact.
  */
+
+import type { AnswerScope, DataSource } from "./source";
 import type {
   Approval,
   ApprovalSubject,
@@ -23,7 +23,6 @@ import type {
   Notification,
   ToolLine,
 } from "./types";
-import type { AnswerScope, DataSource } from "./source";
 
 export type HttpSourceConfig = {
   /**
@@ -34,13 +33,17 @@ export type HttpSourceConfig = {
    */
   baseUrl?: string;
   /**
-   * The device token.
+   * The session token, read at call time.
    *
-   * Absent is only correct against a deployment running `OPENBOT_DEV_NO_AUTH` on loopback, which
-   * admits every caller as one administrator. Anything reachable from a phone needs a real token, and
-   * the server must refuse to issue one while that flag is set.
+   * A function rather than a value, because this source is built once for the life of the app and a
+   * captured token would be the one that existed before somebody signed in. It also keeps the token
+   * out of any object a screen can reach.
+   *
+   * Absent is only correct same-origin, where the browser's own cookie is how it is known, or against
+   * a deployment running `OPENBOT_DEV_NO_AUTH` on loopback. Anything reachable from a phone needs a
+   * real one, and the server refuses to register a device while that flag is set.
    */
-  token?: string;
+  token?: () => Promise<string | undefined>;
   /** How often to re-read while nothing is pushing. */
   pollMs?: number;
 };
@@ -54,12 +57,15 @@ export class ApiError extends Error {
   }
 }
 
-/** A message this app cannot deliver, said plainly rather than swallowed. */
-export class NotOverRestError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "NotOverRestError";
-  }
+/**
+ * A run id, and a message id.
+ *
+ * `crypto.randomUUID` is not on every React Native runtime, so this does not depend on it. The value
+ * only has to be unique within a thread, and the platform's own ids are what identify anything that
+ * matters.
+ */
+function randomId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 type ServerChannel = {
@@ -103,7 +109,7 @@ type ServerMessage = {
   role: string;
   content?: string | null;
   toolCallId?: string;
-  toolCalls?: { id: string; function: { name: string; arguments: string } }[];
+  createdAt?: string;
 };
 
 /**
@@ -113,47 +119,58 @@ type ServerMessage = {
  * distinguishable from a refusal. Arguments are never rendered: the label and the resolved element
  * are enough, and a transcript is not a place for whatever was typed into a password field.
  */
-function toolLineOf(name: string, result: string | undefined): ToolLine {
-  const label = name.replace(/^computer_/, "").replace(/_/g, " ");
-  let outcome: ToolLine["outcome"] = "running";
-  let detail: string | undefined;
-  let rule: string | undefined;
-
-  if (result !== undefined) {
-    try {
-      const parsed = JSON.parse(result) as {
-        ok?: boolean;
-        refused?: boolean;
-        reason?: string;
-        rule?: string;
-        element?: { name?: string };
-      };
-      if (parsed.refused) {
-        outcome = "refused";
-        rule = typeof parsed.rule === "string" ? parsed.rule : undefined;
-        detail = parsed.element?.name ?? parsed.reason;
-      } else if (parsed.ok === false) {
-        outcome = "failed";
-        detail = parsed.reason;
-      } else {
-        outcome = "allowed";
-        detail = parsed.element?.name;
-      }
-    } catch {
-      // Not JSON: the runtime stringifies a thrown handler. Treat it as a plain failure rather than
-      // guessing, and show what it said.
-      outcome = result.startsWith("Error:") ? "failed" : "allowed";
-      detail = result.startsWith("Error:")
-        ? result.slice("Error:".length).trim()
-        : undefined;
-    }
+function toolLineOf(result: string): ToolLine | undefined {
+  let parsed: {
+    tool?: string;
+    action?: string;
+    ok?: boolean;
+    refused?: boolean;
+    reason?: string;
+    rule?: string;
+    element?: { name?: string };
+    text?: string;
+  };
+  try {
+    parsed = JSON.parse(result) as typeof parsed;
+  } catch {
+    // Not JSON: the runtime stringifies a thrown handler this way. Shown as a failure rather than
+    // guessed at, because the alternative is a line that claims something worked.
+    return {
+      label: "tool",
+      outcome: "failed",
+      detail: result.slice(0, 120),
+    };
   }
 
+  const name = parsed.tool ?? parsed.action;
+  // Without a name there is nothing to say. Drawing an anonymous outcome would be a line a person
+  // cannot audit, which is worse than no line.
+  if (!name) return undefined;
+
+  const label = name.replace(/^computer_/, "").replace(/_/g, " ");
+
+  if (parsed.refused) {
+    return {
+      label,
+      outcome: "refused",
+      ...(parsed.element?.name || parsed.reason
+        ? { detail: parsed.element?.name ?? parsed.reason }
+        : {}),
+      ...(typeof parsed.rule === "string" ? { rule: parsed.rule } : {}),
+    };
+  }
+  if (parsed.ok === false) {
+    return {
+      label,
+      outcome: "failed",
+      ...(parsed.reason ? { detail: parsed.reason } : {}),
+    };
+  }
   return {
     label,
-    outcome,
-    ...(detail ? { detail } : {}),
-    ...(rule ? { rule } : {}),
+    outcome: "allowed",
+    // The element as the SERVER resolved it, never the ref the model sent.
+    ...(parsed.element?.name ? { detail: parsed.element.name } : {}),
   };
 }
 
@@ -175,11 +192,12 @@ export function createHttpSource(config: HttpSourceConfig = {}): DataSource {
   };
 
   async function call<T>(path: string, init?: RequestInit): Promise<T> {
+    const token = await config.token?.();
     const response = await fetch(`${base}${path}`, {
       ...init,
       headers: {
         "content-type": "application/json",
-        ...(config.token ? { authorization: `Bearer ${config.token}` } : {}),
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
         ...(init?.headers ?? {}),
       },
       // Same-origin behind the dev proxy, where the session cookie is how the browser is known.
@@ -195,6 +213,21 @@ export function createHttpSource(config: HttpSourceConfig = {}): DataSource {
       );
     }
     return (await response.json()) as T;
+  }
+
+  /**
+   * Whether the runtime has ever seen this thread.
+   *
+   * Asked because a thread the runtime does not know about cannot be read: `…/messages` answers 500,
+   * not an empty list. That is indistinguishable from a real failure unless something checks, and the
+   * difference matters — an unread history sent as empty would silently drop a conversation's context
+   * on the next message.
+   */
+  async function threadExists(threadId: string, botId: string) {
+    const { threads } = await call<{ threads: { id: string }[] }>(
+      `/api/copilotkit/api/threads?agentId=${encodeURIComponent(botId)}`,
+    );
+    return threads.some((thread) => thread.id === threadId);
   }
 
   /** Bot names, for putting a name rather than an id in front of a person. */
@@ -227,12 +260,12 @@ export function createHttpSource(config: HttpSourceConfig = {}): DataSource {
 
   const source: DataSource = {
     async channels() {
-      const [rows, waiting, named] = await Promise.all([
-        call<ServerChannel[]>("/api/channels"),
+      const [{ channels }, waiting, named] = await Promise.all([
+        call<{ channels: ServerChannel[] }>("/api/channels"),
         approvals(),
         botNames(),
       ]);
-      return rows.map((row) => {
+      return channels.map((row) => {
         const botId = row.agentIds[0] ?? "";
         const pending = waiting.filter(
           (one) => one.state === "pending" && one.channelId === row.threadId,
@@ -262,49 +295,117 @@ export function createHttpSource(config: HttpSourceConfig = {}): DataSource {
     },
 
     async messages(channelId) {
-      const rows = await call<{ messages: ServerMessage[] }>(
-        `/api/copilotkit/threads/${encodeURIComponent(channelId)}/messages`,
-      ).then((body) => body.messages ?? []);
+      /**
+       * The thread, from the runtime.
+       *
+       * The agent is a required query parameter: a thread belongs to one Bot, and the runtime will not
+       * hand over somebody's conversation without being told whose it is.
+       */
+      const channel = await source.channel(channelId);
+      const botId = channel?.botId ?? "";
 
-      // Tool results arrive as their own messages, keyed by call id. Collected first so each call can
-      // be rendered with its outcome rather than as a permanently running line.
-      const results = new Map<string, string>();
-      for (const row of rows) {
-        if (row.role === "tool" && row.toolCallId) {
-          results.set(row.toolCallId, String(row.content ?? ""));
-        }
-      }
+      // A channel nobody has spoken in yet has no thread to read. Empty, rather than an error a
+      // person would read as "this is broken".
+      if (!(await threadExists(channelId, botId))) return [];
+
+      const rows = await call<{ messages: ServerMessage[] }>(
+        `/api/copilotkit/api/threads/${encodeURIComponent(channelId)}/messages` +
+          `?agentId=${encodeURIComponent(botId)}`,
+      ).then((body) => body.messages ?? []);
 
       const messages: Message[] = [];
       for (const row of rows) {
-        if (row.role === "tool" || row.role === "system") continue;
-        const toolLines = (row.toolCalls ?? []).map((call_) =>
-          toolLineOf(call_.function.name, results.get(call_.id)),
-        );
+        /**
+         * A tool result is its own line.
+         *
+         * Not attached to the assistant message that made the call, because that message is not in the
+         * thread: Intelligence keeps the results and not the calls. So the name comes from the result
+         * itself, which is why the server stamps it there — see `tools/spec.ts`.
+         */
+        if (row.role === "tool") {
+          const line = toolLineOf(String(row.content ?? ""));
+          if (line) {
+            messages.push({
+              id: row.id,
+              role: "assistant",
+              toolLines: [line],
+              at: row.createdAt ?? "",
+            });
+          }
+          continue;
+        }
+        if (row.role === "system" || row.role === "developer") continue;
+
         const text = typeof row.content === "string" ? row.content : "";
-        if (!text && toolLines.length === 0) continue;
+        if (!text) continue;
         messages.push({
           id: row.id,
           role: row.role === "user" ? "user" : "assistant",
-          ...(text ? { text } : {}),
-          ...(toolLines.length ? { toolLines } : {}),
-          at: new Date().toISOString(),
+          text,
+          at: row.createdAt ?? "",
         });
       }
       return messages;
     },
 
-    async send() {
+    async send(channelId, text) {
+      const channel = await source.channel(channelId);
+      if (!channel?.botId) {
+        throw new ApiError(404, "That channel has no Bot to talk to.");
+      }
+
       /**
-       * Starting a turn is an AG-UI run, not a REST call.
+       * Starting a turn is an AG-UI run, and a run carries the conversation.
        *
-       * Said out loud rather than accepted and dropped. The honest version of this needs the
-       * CopilotKit client in the app, which is its own piece of work; until then a person is told
-       * their message did not go, which is far better than believing it did.
+       * The runtime does not merge the stored thread into what a caller sends — proven by asking a
+       * follow-up question with only the new message and watching the Bot go looking for the answer in
+       * its own workspace. So the history goes back up with it, which is what every AG-UI client does.
        */
-      throw new NotOverRestError(
-        "Sending needs the CopilotKit runtime, which this build does not carry yet. Approvals, activity and reading a thread all work against the live deployment.",
+      const history = await source.messages(channelId);
+
+      const runId = randomId();
+      await call(
+        `/api/copilotkit/agent/${encodeURIComponent(channel.botId)}/run`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            threadId: channelId,
+            runId,
+            messages: [
+              ...history
+                /**
+                 * Text only, on purpose.
+                 *
+                 * The thread keeps tool RESULTS without the assistant message that made the calls, so
+                 * sending them back would hand a provider a tool result answering a call it has never
+                 * seen — which every provider rejects, and which would break every follow-up message.
+                 * What those tools found is already in the Bot's own answer.
+                 */
+                .filter((message) => Boolean(message.text))
+                .map((message) => ({
+                  id: message.id,
+                  role: message.role,
+                  content: message.text,
+                })),
+              { id: `msg_${runId}`, role: "user", content: text },
+            ],
+            tools: [],
+            context: [],
+            state: {},
+            forwardedProps: {},
+          }),
+        },
       );
+
+      announce();
+      /**
+       * Never "queued".
+       *
+       * The local source models a Bot mid-turn holding a message until it settles. Against a real
+       * deployment this app cannot know that a turn is in flight — a run belongs to whichever client
+       * started it — so claiming a message was queued would be inventing a state.
+       */
+      return { queued: false };
     },
 
     approvals,
@@ -396,6 +497,7 @@ export function createHttpSource(config: HttpSourceConfig = {}): DataSource {
               : one.state === "expired"
                 ? "routine-failed"
                 : "done",
+          botId: one.botId,
           botName: one.botName,
           body:
             one.state === "allowed"

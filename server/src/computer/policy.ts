@@ -357,7 +357,10 @@ export function evaluateActionPolicy(
  * "waiting for you" answers it.
  */
 function describeAsk(context: PolicyContext, expression: string): string {
-  if (context.file) {
+  // Non-empty, not merely present. The gateway now fills every field, using a neutral value where the
+  // action has none, so `context.file` exists for a click and its path is "". Testing presence here
+  // produced "the file  is covered by the rule" for a button.
+  if (context.file?.path) {
     return (
       `This deployment's policy asks before that: the file ${context.file.path} ` +
       `is covered by the rule \`${expression}\`.`
@@ -376,7 +379,8 @@ function describeAsk(context: PolicyContext, expression: string): string {
 function describeRefusal(context: PolicyContext, expression: string): string {
   // A file refusal must not be phrased as happening "on <host>": the workspace has nothing to do with
   // whatever page the browser happens to be showing, and saying so sends somebody to the wrong place.
-  if (context.file) {
+  // Non-empty rather than present, for the same reason as `describeAsk` above.
+  if (context.file?.path) {
     return (
       `This deployment's policy does not allow that: the file ${context.file.path} ` +
       `is blocked by the rule \`${expression}\`.`

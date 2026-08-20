@@ -146,10 +146,17 @@ describe("the tool loop for a remote AG-UI Bot", () => {
         },
       ],
     });
+    // The tool's own name is stamped on the outcome. Intelligence keeps the result messages and not
+    // the assistant message carrying the calls, so this is the one copy of the name that survives a
+    // thread being read back later.
     expect(second?.messages.at(-1)).toMatchObject({
       role: "tool",
       toolCallId: "c1",
-      content: JSON.stringify({ ok: true, element: { name: "Submit" } }),
+      content: JSON.stringify({
+        tool: "computer_click",
+        ok: true,
+        element: { name: "Submit" },
+      }),
     });
 
     // The result is emitted downstream too, or the transcript and the durable thread would never
@@ -337,5 +344,45 @@ describe("the tool loop for a remote AG-UI Bot", () => {
     // The tool reports what it needed, which the model can read and correct. An exception here would
     // end the run with a stack trace instead.
     expect(click.calls).toEqual([{}]);
+  });
+});
+
+describe("which conversation the tools are acting inside", () => {
+  test("the thread is recorded before any tool runs", async () => {
+    const seen: (string | undefined)[] = [];
+    const thread: { current?: string } = {};
+    const spec: ToolSpec = {
+      name: "computer_click",
+      description: "Click.",
+      parameters: { type: "object", properties: {} },
+      // Read at call time, the way the real tools read it.
+      execute: async () => {
+        seen.push(thread.current);
+        return { ok: true };
+      },
+    };
+    const endpoint = new ScriptedAgent([
+      [started, ...toolCall("c1", "computer_click", "{}"), finished],
+      [started, ...text("m2", "Done."), finished],
+    ]);
+
+    await drive(new ComputerToolLoop([spec], { thread }), endpoint);
+
+    // Without this a parked approval has no thread on it, and can only be found in a list rather than
+    // shown beside the conversation that caused it.
+    expect(seen).toEqual(["t"]);
+  });
+
+  test("no holder is fine, and nothing breaks", async () => {
+    const endpoint = new ScriptedAgent([
+      [started, ...toolCall("c1", "computer_click", "{}"), finished],
+      [started, ...text("m2", "Done."), finished],
+    ]);
+    const click = spy("computer_click");
+
+    await drive(new ComputerToolLoop([click]), endpoint);
+
+    // A built-in Bot has nowhere to write one. The approval is still answerable.
+    expect(click.calls).toHaveLength(1);
   });
 });

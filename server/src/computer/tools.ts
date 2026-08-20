@@ -69,6 +69,18 @@ export type ComputerToolsContext = {
    * without reading the request. It must not be able to fail the tool.
    */
   announceQuestion?: (question: { asked: string }) => void;
+  /**
+   * Which conversation this Bot is currently in.
+   *
+   * A holder rather than a value, because the tools are built when a request arrives and the thread is
+   * only known once a run starts inside it. Whoever drives the run sets it; `computer/agui-tool-loop.ts`
+   * does for a remote Bot.
+   *
+   * It is worth threading through because an approval carrying its thread can be shown beside the
+   * conversation it came out of, and one without it can only be found in a list. Absent is fine — the
+   * approval is still answerable, it just has less context around it.
+   */
+  thread?: { current?: string };
 };
 
 /** Hold a tool call open until a person has answered, or the window closes. */
@@ -162,6 +174,9 @@ export function createComputerToolSpecs(
 ): ToolSpec[] {
   const { gateway, botId, actor } = context;
   const announce = context.announceQuestion;
+  /** Read at call time, never captured: one build of these tools serves every run in the request. */
+  const threadId = () =>
+    context.thread?.current ? { threadId: context.thread.current } : {};
   const timeoutMs = context.waitFor?.timeoutMs ?? WAIT_FOR_PERSON_MS;
   const pollMs = context.waitFor?.pollMs ?? WAIT_POLL_MS;
   const sleep =
@@ -206,7 +221,13 @@ export function createComputerToolSpecs(
       },
       execute: (args) =>
         outcomeOf(() =>
-          gateway.navigate(botId, botId, actor, requireString(args, "url")),
+          gateway.navigate(
+            botId,
+            botId,
+            actor,
+            requireString(args, "url"),
+            threadId(),
+          ),
         ),
     },
     {
@@ -255,12 +276,18 @@ export function createComputerToolSpecs(
       },
       execute: (args) =>
         outcomeOf(() =>
-          gateway.type(botId, botId, actor, {
-            ref: requireString(args, "ref"),
-            snapshotId: optionalNumber(args, "snapshotId") ?? 0,
-            text: requireString(args, "text"),
-            ...(args.submit === true ? { submit: true } : {}),
-          }),
+          gateway.type(
+            botId,
+            botId,
+            actor,
+            {
+              ref: requireString(args, "ref"),
+              snapshotId: optionalNumber(args, "snapshotId") ?? 0,
+              text: requireString(args, "text"),
+              ...(args.submit === true ? { submit: true } : {}),
+            },
+            threadId(),
+          ),
         ),
     },
     {
@@ -285,10 +312,16 @@ export function createComputerToolSpecs(
       },
       execute: (args) =>
         outcomeOf(() =>
-          gateway.click(botId, botId, actor, {
-            ref: requireString(args, "ref"),
-            snapshotId: optionalNumber(args, "snapshotId") ?? 0,
-          }),
+          gateway.click(
+            botId,
+            botId,
+            actor,
+            {
+              ref: requireString(args, "ref"),
+              snapshotId: optionalNumber(args, "snapshotId") ?? 0,
+            },
+            threadId(),
+          ),
         ),
     },
     {
@@ -319,10 +352,16 @@ export function createComputerToolSpecs(
         const ref = requireString(args, "ref");
         const snapshotId = optionalNumber(args, "snapshotId");
         return outcomeOf(() =>
-          gateway.key(botId, botId, actor, {
-            key: requireString(args, "key"),
-            ...(ref && snapshotId !== undefined ? { ref, snapshotId } : {}),
-          }),
+          gateway.key(
+            botId,
+            botId,
+            actor,
+            {
+              key: requireString(args, "key"),
+              ...(ref && snapshotId !== undefined ? { ref, snapshotId } : {}),
+            },
+            threadId(),
+          ),
         );
       },
     },
@@ -347,6 +386,7 @@ export function createComputerToolSpecs(
             botId,
             actor,
             deltaY === undefined ? {} : { deltaY },
+            threadId(),
           ),
         );
       },
@@ -370,7 +410,13 @@ export function createComputerToolSpecs(
       execute: (args) => {
         const path = requireString(args, "path");
         return outcomeOf(() =>
-          gateway.listFiles(botId, botId, actor, path ? { path } : {}),
+          gateway.listFiles(
+            botId,
+            botId,
+            actor,
+            path ? { path } : {},
+            threadId(),
+          ),
         );
       },
     },
@@ -392,9 +438,13 @@ export function createComputerToolSpecs(
       },
       execute: (args) =>
         outcomeOf(() =>
-          gateway.readFile(botId, botId, actor, {
-            path: requireString(args, "path"),
-          }),
+          gateway.readFile(
+            botId,
+            botId,
+            actor,
+            { path: requireString(args, "path") },
+            threadId(),
+          ),
         ),
     },
     {
@@ -421,11 +471,17 @@ export function createComputerToolSpecs(
       },
       execute: (args) =>
         outcomeOf(() =>
-          gateway.writeFile(botId, botId, actor, {
-            path: requireString(args, "path"),
-            contents: requireString(args, "contents"),
-            ...(args.append === true ? { append: true } : {}),
-          }),
+          gateway.writeFile(
+            botId,
+            botId,
+            actor,
+            {
+              path: requireString(args, "path"),
+              contents: requireString(args, "contents"),
+              ...(args.append === true ? { append: true } : {}),
+            },
+            threadId(),
+          ),
         ),
     },
     {

@@ -33,7 +33,7 @@
 import type { BaseEvent, Message, RunAgentInput } from "@ag-ui/client";
 import { type AbstractAgent, EventType, Middleware } from "@ag-ui/client";
 import { Observable, type Subscription } from "rxjs";
-import type { ToolSpec } from "../tools/spec";
+import { runTool, type ToolSpec } from "../tools/spec";
 import { toAgUiTools } from "../tools/wire";
 
 /**
@@ -64,18 +64,32 @@ type ToolCallArgs = BaseEvent & { toolCallId: string; delta: string };
 
 export type ComputerToolLoopOptions = {
   maxSteps?: number;
+  /**
+   * Where to record which conversation a run belongs to.
+   *
+   * The tools are built when the request arrives, before any run has started, so the thread cannot be
+   * captured then. This is the hook that fills it in: the same holder the tools read from, written
+   * here at the start of each pass.
+   *
+   * Only a remote Bot gets this. A `BuiltInAgent` runs its own loop and there is no equivalent place
+   * to stand, so an approval a built-in Bot parks has no thread on it — answerable, but findable only
+   * in the list rather than beside the conversation.
+   */
+  thread?: { current?: string };
 };
 
 export class ComputerToolLoop extends Middleware {
   private readonly specs: Map<string, ToolSpec>;
   private readonly offered: ReturnType<typeof toAgUiTools>;
   private readonly maxSteps: number;
+  private readonly thread: { current?: string } | undefined;
 
   constructor(specs: ToolSpec[], options: ComputerToolLoopOptions = {}) {
     super();
     this.specs = new Map(specs.map((spec) => [spec.name, spec]));
     this.offered = toAgUiTools(specs);
     this.maxSteps = options.maxSteps ?? MAX_TOOL_STEPS;
+    this.thread = options.thread;
   }
 
   run(input: RunAgentInput, next: AbstractAgent): Observable<BaseEvent> {
@@ -91,6 +105,8 @@ export class ComputerToolLoop extends Middleware {
 
       const pass = (messages: Message[], step: number) => {
         if (stopped) return;
+        // Which conversation the tools are acting inside, for as long as this run lasts.
+        if (this.thread) this.thread.current = input.threadId;
 
         const openText = new Map<string, { content: string }>();
         const finishedText: Message[] = [];
@@ -267,7 +283,7 @@ export class ComputerToolLoop extends Middleware {
       if (stopped()) return results;
       const spec = this.specs.get(call.name);
       if (!spec) continue;
-      const outcome = await spec.execute(parseArguments(call.args));
+      const outcome = await runTool(spec, parseArguments(call.args));
       const content = JSON.stringify(outcome);
       results.push({
         id: `tool_${call.id}`,

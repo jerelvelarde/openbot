@@ -9,6 +9,7 @@
  */
 import { useState } from "react";
 import { ScrollView, View } from "react-native";
+import { BotAvatar } from "../avatar";
 import type { Approval } from "../data/types";
 import { useLive, useSource } from "../store";
 import { space } from "../theme";
@@ -54,7 +55,7 @@ export function ApprovalScreen({
   if (!approval) {
     return (
       <Screen>
-        <TopBar title="Approval" onBack={onBack} />
+        <TopBar onBack={onBack} title="Approval" />
         <View style={{ padding: space.lg }}>
           <Body muted>That approval is no longer waiting.</Body>
         </View>
@@ -74,9 +75,13 @@ export function ApprovalScreen({
 
   return (
     <Screen>
-      <TopBar title={approval.botName} onBack={onBack} />
+      <TopBar
+        leading={<BotAvatar seed={approval.botId} size={28} />}
+        onBack={onBack}
+        title={approval.botName}
+      />
       <ScrollView contentContainerStyle={{ padding: space.lg, gap: space.lg }}>
-        <Card>
+        <Card accent={!settled}>
           <Badge tone={settled ? "quiet" : "pending"}>
             {approval.state === "pending"
               ? "Waiting for you"

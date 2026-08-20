@@ -42,7 +42,9 @@ async function withTwoPeople(
   try {
     await body(a, b);
   } finally {
-    await database.delete(pushDevices).where(inArray(pushDevices.userId, [a, b]));
+    await database
+      .delete(pushDevices)
+      .where(inArray(pushDevices.userId, [a, b]));
     await database.delete(users).where(inArray(users.id, [a, b]));
   }
 }
@@ -139,8 +141,12 @@ describe("reading a registration request", () => {
   test("refuses what cannot be delivered to", () => {
     // A stored value that is not a push token leaves a row that looks like a working registration
     // and never rings, which is worse than a refusal at the door.
-    expect(readRegistration({ platform: "carrier-pigeon", token: "xxxxxxxx" }).ok).toBe(false);
-    expect(readRegistration({ platform: "expo", token: "short" }).ok).toBe(false);
+    expect(
+      readRegistration({ platform: "carrier-pigeon", token: "xxxxxxxx" }).ok,
+    ).toBe(false);
+    expect(readRegistration({ platform: "expo", token: "short" }).ok).toBe(
+      false,
+    );
     expect(readRegistration({ platform: "expo" }).ok).toBe(false);
     expect(readRegistration(null).ok).toBe(false);
     expect(readRegistration("expo").ok).toBe(false);

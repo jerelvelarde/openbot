@@ -223,7 +223,18 @@ export function builtInAgentConfiguration(
  * tools in different forms — converted to Zod for a built-in Bot, put on the wire for a remote one —
  * and one declaration converted twice cannot drift the way two declarations can.
  */
-export type ToolsForAgent = (agentId: string) => Promise<ToolSpec[]>;
+export type AgentTools = {
+  specs: ToolSpec[];
+  /**
+   * Where the run records which conversation it belongs to.
+   *
+   * Shared with the specs, and written by whoever drives the run. Only the remote path has somewhere
+   * to write it from; see `computer/agui-tool-loop.ts`.
+   */
+  thread?: { current?: string };
+};
+
+export type ToolsForAgent = (agentId: string) => Promise<AgentTools>;
 
 /**
  * Build the built-in and remote AG-UI agent map the runtime serves.
@@ -254,7 +265,8 @@ async function buildAgent(
   apiKey: string | null,
   toolsFor?: ToolsForAgent,
 ): Promise<AbstractAgent> {
-  const specs = (await toolsFor?.(agent.id)) ?? [];
+  const tools = await toolsFor?.(agent.id);
+  const specs = tools?.specs ?? [];
 
   if (agent.type === "built_in") {
     return new BuiltInAgent(
@@ -269,7 +281,7 @@ async function buildAgent(
   if (agent.type === "unavailable") {
     return new UnavailableAgent(agent);
   }
-  return remoteAgentWithStandingRole(agent, specs);
+  return remoteAgentWithStandingRole(agent, specs, tools?.thread);
 }
 
 /**
@@ -287,6 +299,7 @@ async function buildAgent(
 function remoteAgentWithStandingRole(
   agent: RegisteredRemoteAgent,
   specs: ToolSpec[] = [],
+  thread?: { current?: string },
 ) {
   const remote = new HttpAgent({
     url: agent.endpoint,
@@ -308,7 +321,9 @@ function remoteAgentWithStandingRole(
   );
   // Ordering matters: the standing role is prepended once per pass, so it has to sit inside the loop
   // rather than outside it, or the endpoint would see it on the first pass and never again.
-  if (specs.length) remote.use(new ComputerToolLoop(specs));
+  if (specs.length) {
+    remote.use(new ComputerToolLoop(specs, thread ? { thread } : {}));
+  }
   return remote;
 }
 
