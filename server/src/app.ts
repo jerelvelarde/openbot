@@ -24,6 +24,9 @@ import type { ComputerGateway } from "./computer/gateway";
 import type { PolicyStore } from "./computer/policy-store";
 import type { ApprovalStore } from "./computer/approvals";
 import { createApprovalRoutes } from "./computer/approval-routes";
+import { createDeviceRoutes } from "./device-routes";
+import type { DeviceStore } from "./devices";
+import { createMobileAuthRoutes } from "./mobile-auth-routes";
 import { createComputerRoutes } from "./computer/routes";
 import type { DeploymentConfig } from "./config";
 import type { ConnectorAdminService } from "./connectors";
@@ -105,6 +108,14 @@ export function createApp(
    * nobody could be asked.
    */
   approvalStore?: ApprovalStore,
+  /**
+   * The devices that have asked to be told.
+   *
+   * Absent leaves `/api/devices` unmounted, which is what a deployment with no notifications is.
+   * Present but with sign-in disabled leaves the routes mounted and registration refused, which is
+   * different and worth saying out loud: see `device-routes.ts`.
+   */
+  deviceStore?: DeviceStore,
 ) {
   const app = new Hono<{ Variables: AppVariables }>();
 
@@ -128,6 +139,24 @@ export function createApp(
 
     return auth.handler(context.req.raw);
   });
+
+  /**
+   * Sign-in for the companion app, when both an auth provider and a companion are configured.
+   *
+   * Mounted only when there is a real auth service, because the whole point of these routes is to
+   * turn a real cookie session into something a phone may hold. Under `OPENBOT_DEV_NO_AUTH` there is
+   * no session to convert and nothing here would be honest.
+   */
+  if (auth && config.auth) {
+    app.route(
+      "/api/mobile",
+      createMobileAuthRoutes({
+        auth: auth as never,
+        baseUrl: config.auth.baseUrl,
+        ...(config.auth.appScheme ? { appScheme: config.auth.appScheme } : {}),
+      }),
+    );
+  }
 
   const authenticationUnavailable: MiddlewareHandler<{
     Variables: AppVariables;
@@ -373,6 +402,19 @@ export function createApp(
         computerPolicy,
         requireUser,
       ),
+    );
+  }
+
+  if (deviceStore) {
+    app.route(
+      "/api/devices",
+      createDeviceRoutes({
+        devices: deviceStore,
+        // The same fact `index.ts` prints at boot, passed in rather than read here, so the refusal is
+        // a property of how the app was assembled and a test can drive both halves of it.
+        authDisabled: config.devNoAuth,
+        requireUser,
+      }),
     );
   }
 

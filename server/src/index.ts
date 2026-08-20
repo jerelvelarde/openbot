@@ -28,6 +28,12 @@ import { createSupervisorClient } from "./computer/supervisor";
 import { createComputerToolSpecs } from "./computer/tools";
 import { loadConfig } from "./config";
 import { createConnectorAdminService } from "./connectors";
+import { createDeviceStore } from "./devices";
+import {
+  createExpoDelivery,
+  createLoggingDelivery,
+  createNotifier,
+} from "./notify";
 import {
   type IdentifyActor,
   type IdentifyUser,
@@ -302,6 +308,32 @@ process.on("unhandledRejection", (reason) => {
  */
 const approvalStore = createApprovalStore(database);
 
+/**
+ * Who has asked to be told, and how they are told.
+ *
+ * Two decisions live here. The delivery is Expo when a project is configured and a logging adapter
+ * otherwise, because "notifications are not set up" and "notifications are broken" look identical
+ * from a phone and only one of them is worth investigating.
+ *
+ * The recipients are whoever may SEE the Bot, resolved per notification from the same profile store
+ * the approvals routes use. Not the person who started the turn: a Bot working unattended has nobody
+ * at the keyboard, and that is exactly the case this feature exists for.
+ */
+const deviceStore = createDeviceStore(database);
+
+const notifier = createNotifier({
+  recipients: async (botId) => {
+    const visible = await agentProfileStore.readers(botId);
+    return visible;
+  },
+  devicesFor: (userIds) => deviceStore.forUsers(userIds),
+  delivery: process.env.EXPO_ACCESS_TOKEN?.trim()
+    ? createExpoDelivery({ accessToken: process.env.EXPO_ACCESS_TOKEN.trim() })
+    : process.env.OPENBOT_PUSH === "expo"
+      ? createExpoDelivery()
+      : createLoggingDelivery(),
+});
+
 const computerGateway = computerClient
   ? createComputerGateway({
       client: computerClient,
@@ -320,6 +352,20 @@ const computerGateway = computerClient
           { ...current, exempt: [...(current.exempt ?? []), rule] },
           by,
         );
+      },
+      /**
+       * The push that makes the wait worth having.
+       *
+       * Fire-and-forget on purpose: the gateway has already recorded the question and is about to
+       * block on it, and a push service being down must not turn a parked action into a refusal.
+       */
+      announce: ({ botId, approvalId, subject }) => {
+        void notifier.notify({
+          kind: "approval",
+          botId,
+          subject,
+          target: { screen: "approval", approvalId },
+        });
       },
       // Stop, reset and the listing act on containers when there are containers to act on.
       ...(supervisor ? { supervisor } : {}),
@@ -370,6 +416,9 @@ const toolsForActor =
             actor: {
               id: actor.id,
               ...(isDevActor ? {} : { userId: actor.id }),
+            },
+            announceQuestion: ({ asked }) => {
+              void notifier.notify({ kind: "question", botId: agentId, asked });
             },
             recordRefusal: async ({ reason, request }) => {
               await recordAuditEvent(bootAuditStore, {
@@ -472,6 +521,8 @@ const app = createApp(
   threadIdentity,
   // What is waiting on a person, and the surface that answers it.
   approvalStore,
+  // The devices that have asked to be told about it.
+  deviceStore,
 );
 
 /**

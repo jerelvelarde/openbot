@@ -92,6 +92,24 @@ export type ComputerGatewayOptions = {
    * everywhere else and this is the one path that writes to it.
    */
   grant?: (rule: string, by: string) => Promise<void>;
+  /**
+   * Tell somebody an action is waiting on them.
+   *
+   * Called once, immediately after the question is recorded and before the wait begins, because the
+   * whole value of the wait is that somebody finds out about it during it. Absent leaves the
+   * approval answerable but silent, which is what a deployment with no registered devices is.
+   *
+   * It must not be able to fail the action: an approval that was recorded and could not be announced
+   * is still an approval, and turning that into a refusal would make a missing push service look
+   * like a policy decision.
+   */
+  announce?: (announcement: {
+    botId: string;
+    approvalId: string;
+    /** The subject as this server resolved it. Never the model's arguments. */
+    subject: string;
+    threadId?: string;
+  }) => void;
 };
 
 /**
@@ -252,8 +270,27 @@ export function createComputerGateway(options: ComputerGatewayOptions) {
         reason: decision.reason,
       });
 
-      // The question is already in the trail: the row written above is `computer.action_asked`,
-      // because the decision was parked. What is missing is the answer, and then the action.
+      // Recorded first, then announced, then waited on. In that order because the trail is the
+      // thing that must be true — a question that was announced but not recorded would be a question
+      // nobody could audit — and because announcing after the wait would announce it after it was
+      // already answered.
+      try {
+        options.announce?.({
+          botId,
+          approvalId: approval.id,
+          subject: approval.subject.label,
+          ...(subject.threadId ? { threadId: subject.threadId } : {}),
+        });
+      } catch (error) {
+        // Guarded here rather than trusted to the caller. An approval that was recorded and could
+        // not be announced is still an approval, and letting this throw would make a push service
+        // being down indistinguishable from a policy refusing the action.
+        console.error(
+          `Could not announce approval ${approval.id} for ${botId}.`,
+          error,
+        );
+      }
+
       const outcome = await options.approvals.wait(approval.id, subject.signal);
 
       if (!outcome.answered) {

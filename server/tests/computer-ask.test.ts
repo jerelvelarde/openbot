@@ -108,9 +108,17 @@ function fakeApprovals(
   };
 }
 
+type Announcement = {
+  botId: string;
+  approvalId: string;
+  subject: string;
+  threadId?: string;
+};
+
 function gatewayWith(
   policy: ActionPolicy,
   approvals?: ApprovalStore,
+  announce?: (announcement: Announcement) => void,
 ): {
   gateway: ReturnType<typeof createComputerGateway>;
   reached: string[];
@@ -123,6 +131,7 @@ function gatewayWith(
     auditStore: store,
     policy: () => policy,
     ...(approvals ? { approvals } : {}),
+    ...(announce ? { announce } : {}),
   });
   return { gateway, reached, rows };
 }
@@ -438,5 +447,81 @@ describe("the rule an always-allow writes", () => {
         label: 'Submit " || true || "',
       }),
     ).toBeUndefined();
+  });
+});
+
+describe("telling somebody it is waiting", () => {
+  const ASKS: ActionPolicy = {
+    mode: "enforce",
+    deny: [],
+    ask: ['contains(element.name, "submit")'],
+    allow: ["true"],
+  };
+
+  test("announces the parked action, with the subject the server resolved", async () => {
+    const announced: Announcement[] = [];
+    const approvals = fakeApprovals({
+      answered: true,
+      allowed: true,
+      answeredByUserId: "user_2",
+    });
+    const { gateway } = gatewayWith(ASKS, approvals.store, (announcement) =>
+      announced.push(announcement),
+    );
+    await gateway.snapshot("risk-analyst");
+
+    await gateway.click("risk-analyst", "risk-analyst", ACTOR, {
+      ref: "e9",
+      snapshotId: 1,
+    });
+
+    // The point of the wait is that somebody finds out about it during the wait. Announced with the
+    // label this server looked up, which is the same value the audit row carries.
+    expect(announced).toEqual([
+      {
+        botId: "risk-analyst",
+        approvalId: "approval_1",
+        subject: "Submit payment run",
+      },
+    ]);
+  });
+
+  test("a push that cannot be sent does not turn a parked action into a refusal", async () => {
+    const approvals = fakeApprovals({
+      answered: true,
+      allowed: true,
+      answeredByUserId: "user_2",
+    });
+    const { gateway, reached } = gatewayWith(ASKS, approvals.store, () => {
+      throw new Error("expo is down");
+    });
+    await gateway.snapshot("risk-analyst");
+
+    // An approval that was recorded and could not be announced is still an approval. Failing here
+    // would make a missing push service look like a policy decision.
+    await gateway.click("risk-analyst", "risk-analyst", ACTOR, {
+      ref: "e9",
+      snapshotId: 1,
+    });
+
+    expect(reached).toContain("click");
+  });
+
+  test("says nothing when the action was not parked", async () => {
+    const announced: Announcement[] = [];
+    const { gateway } = gatewayWith(
+      { mode: "enforce", deny: [], ask: [], allow: ["true"] },
+      undefined,
+      (announcement) => announced.push(announcement),
+    );
+    await gateway.snapshot("risk-analyst");
+
+    await gateway.click("risk-analyst", "risk-analyst", ACTOR, {
+      ref: "e9",
+      snapshotId: 1,
+    });
+
+    // A product that notifies on everything is a product whose notifications are switched off.
+    expect(announced).toEqual([]);
   });
 });

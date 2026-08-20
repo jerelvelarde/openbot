@@ -57,6 +57,18 @@ export type ComputerToolsContext = {
     pollMs?: number;
     sleep?: (ms: number) => Promise<void>;
   };
+  /**
+   * Tell somebody the Bot has stopped and needs a hand.
+   *
+   * The other half of the wait below. A Bot waiting ten minutes for a sign-in it cannot do itself is
+   * a Bot that has stopped, and the person who could unblock it in fifteen seconds has no way of
+   * knowing unless something tells them. Absent leaves the wait silent, which is a deployment with
+   * nowhere to send.
+   *
+   * It carries what the Bot said it needs, because a person cannot decide whether to get up and help
+   * without reading the request. It must not be able to fail the tool.
+   */
+  announceQuestion?: (question: { asked: string }) => void;
 };
 
 /** Hold a tool call open until a person has answered, or the window closes. */
@@ -149,6 +161,7 @@ export function createComputerToolSpecs(
   context: ComputerToolsContext,
 ): ToolSpec[] {
   const { gateway, botId, actor } = context;
+  const announce = context.announceQuestion;
   const timeoutMs = context.waitFor?.timeoutMs ?? WAIT_FOR_PERSON_MS;
   const pollMs = context.waitFor?.pollMs ?? WAIT_POLL_MS;
   const sleep =
@@ -455,6 +468,10 @@ export function createComputerToolSpecs(
         );
         if (!asked.ok) return asked;
 
+        // The label, not the value. There is no value on this side to leak: it goes from the
+        // person's keyboard into the page on a path this process is not on.
+        announce?.({ asked: `It needs ${label}.` });
+
         // Completion is `secretWanted` clearing. The value itself never comes back here: it goes from
         // the person's keyboard into the page, on a path this process is not on.
         const answered = await waitForPerson(
@@ -488,16 +505,15 @@ export function createComputerToolSpecs(
         required: ["reason"],
       },
       execute: async (args) => {
+        const reason =
+          requireString(args, "reason") ||
+          "The assistant needs a person to continue.";
         const asked = await outcomeOf(() =>
-          gateway.requestHelp(
-            botId,
-            botId,
-            actor,
-            requireString(args, "reason") ||
-              "The assistant needs a person to continue.",
-          ),
+          gateway.requestHelp(botId, botId, actor, reason),
         );
         if (!asked.ok) return asked;
+
+        announce?.({ asked: reason });
 
         // Resolved when the wheel is back with the Bot and no request is outstanding.
         const answered = await waitForPerson(

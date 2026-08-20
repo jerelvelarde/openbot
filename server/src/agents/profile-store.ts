@@ -6,6 +6,8 @@ import {
   agentProfiles,
   agents,
   deploymentPackages,
+  userRoles,
+  users,
 } from "../db/schema";
 import { authFromConfiguration, storeAgentAuth } from "./auth-header";
 import { canManageAgent } from "./profile-policy";
@@ -47,6 +49,18 @@ export type AgentProfileStore = {
   duplicate(actor: AgentActor, id: string): Promise<AgentProfile>;
   setHidden(actor: AgentActor, id: string, hidden: boolean): Promise<void>;
   softDelete(actor: AgentActor, id: string): Promise<void>;
+  /**
+   * Who may be told about this Bot.
+   *
+   * `accessFilter` answered from the other end: instead of "which Bots may this person see", it is
+   * "which people may see this Bot". A public Bot's work is everybody's business; a private Bot's is
+   * its owner's and any administrator's.
+   *
+   * It exists because a notification has to be addressed without a request to hang it on. A Bot that
+   * parks an action while running unattended has nobody at a keyboard, so there is no actor to ask —
+   * and answering "everybody" would put one person's private Bot on another person's lock screen.
+   */
+  readers(botId: string): Promise<string[]>;
 };
 
 export class AgentNotFoundError extends Error {
@@ -403,6 +417,41 @@ export function createAgentProfileStore(
         },
         { isolationLevel: "read committed" },
       );
+    },
+
+    async readers(botId) {
+      const [profile] = await database
+        .select({
+          visibility: agentProfiles.visibility,
+          ownerUserId: agentProfiles.ownerUserId,
+          deletedAt: agentProfiles.deletedAt,
+        })
+        .from(agentProfiles)
+        .where(eq(agentProfiles.agentId, botId))
+        .limit(1);
+
+      // A Bot that does not exist, or was deleted, has no readers. Not an error: a notification about
+      // it is simply not sent, which is better than failing whatever produced it.
+      if (!profile || profile.deletedAt) return [];
+
+      if (profile.visibility === "public") {
+        const rows = await database.select({ id: users.id }).from(users);
+        return rows.map((row) => row.id);
+      }
+
+      const admins = await database
+        .select({ id: userRoles.userId })
+        .from(userRoles)
+        .where(eq(userRoles.role, "admin"));
+
+      // Deduplicated, because the owner is very often an administrator too and one person should get
+      // one notification.
+      return [
+        ...new Set([
+          ...(profile.ownerUserId ? [profile.ownerUserId] : []),
+          ...admins.map((row) => row.id),
+        ]),
+      ];
     },
   };
 }

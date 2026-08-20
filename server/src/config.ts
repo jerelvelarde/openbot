@@ -43,6 +43,15 @@ export type DeploymentConfig = {
     google: { clientId: string; clientSecret: string };
     trustedOrigins: string[];
     initialAdminEmails: string[];
+    /**
+     * The URL scheme the companion app is reachable at, such as `openbot`.
+     *
+     * Sign-in on a phone ends in a redirect back into the app, and better-auth will not redirect to
+     * an origin it was not told to trust. Configured rather than assumed, because a deployment whose
+     * companion is a differently-named build has a different scheme and would otherwise get a
+     * refusal with nothing explaining it.
+     */
+    appScheme?: string;
   };
   /**
    * Local development only: admit everybody as a fixed administrator instead of requiring sign-in.
@@ -205,14 +214,21 @@ function authConfig(
     throw new Error("Google authentication requires BETTER_AUTH_URL");
   }
 
+  const appScheme = optional(environment, "OPENBOT_APP_SCHEME")?.trim();
+  const configuredOrigins = commaSeparated(environment, "TRUSTED_ORIGINS");
+
   return {
     baseUrl,
     secret,
     google,
-    trustedOrigins: commaSeparated(environment, "TRUSTED_ORIGINS").length
-      ? commaSeparated(environment, "TRUSTED_ORIGINS")
-      : ["http://localhost:3000"],
+    trustedOrigins: [
+      ...(configuredOrigins.length ? configuredOrigins : ["http://localhost:3000"]),
+      // The companion's own scheme, added rather than expected in TRUSTED_ORIGINS, so turning the
+      // mobile app on is one variable and not two that have to agree.
+      ...(appScheme ? [`${appScheme}://`] : []),
+    ],
     initialAdminEmails: commaSeparated(environment, "INITIAL_ADMIN_EMAILS"),
+    ...(appScheme ? { appScheme } : {}),
   };
 }
 
