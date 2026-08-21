@@ -39,6 +39,7 @@ import { ActivityScreen } from "./src/screens/activity";
 import { ApprovalScreen } from "./src/screens/approval";
 import { ChannelScreen } from "./src/screens/channel";
 import { ChannelsScreen } from "./src/screens/channels";
+import { ComposeScreen } from "./src/screens/compose";
 import { InboxScreen } from "./src/screens/inbox";
 import { SignInScreen } from "./src/screens/sign-in";
 import { SourceProvider, useLiveResult } from "./src/store";
@@ -67,7 +68,8 @@ type TabName = "inbox" | "channels" | "activity";
 type Route =
   | { name: TabName }
   | { name: "approval"; approvalId: string }
-  | { name: "channel"; channelId: string };
+  | { name: "channel"; channelId: string }
+  | { name: "compose" };
 
 /**
  * The tab icons, drawn from Views.
@@ -419,6 +421,22 @@ function Shell({
   const openChannel = useCallback((channelId: string) => {
     setStack((current) => [...current, { name: "channel", channelId }]);
   }, []);
+  const openCompose = useCallback(() => {
+    setStack((current) => [...current, { name: "compose" }]);
+  }, []);
+  /**
+   * Into the new conversation, not back onto the picker.
+   *
+   * Compose is a step on the way somewhere, so it is replaced rather than pushed past: back from a
+   * conversation you just started belongs on the channel list.
+   */
+  const openStarted = useCallback((channelId: string) => {
+    setStack((current) => [
+      ...current.slice(0, -1),
+      { name: "channel", channelId },
+    ]);
+  }, []);
+
   const onTab = useCallback((name: TabName) => {
     setTab(name);
     setStack([{ name }]);
@@ -469,8 +487,12 @@ function Shell({
             onOpenApproval={openApproval}
           />
         );
+      case "compose":
+        return <ComposeScreen onBack={pop} onOpenChannel={openStarted} />;
       case "channels":
-        return <ChannelsScreen onOpenChannel={openChannel} />;
+        return (
+          <ChannelsScreen onCompose={openCompose} onOpenChannel={openChannel} />
+        );
       case "activity":
         return <ActivityScreen />;
       default:

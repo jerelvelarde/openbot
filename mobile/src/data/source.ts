@@ -13,24 +13,55 @@
 import type {
   Approval,
   AuditRow,
+  Bot,
   Channel,
+  LiveTurn,
   Message,
   Notification,
+  Skill,
 } from "./types";
 
 export type AnswerScope = "once" | "always";
+
+export type SendOptions = {
+  /**
+   * Skills to put in front of the message.
+   *
+   * Each one becomes a system turn ahead of the person's own, which is how the web app does it too:
+   * pasting a skill's paragraph into somebody's message puts sentences in their mouth and makes the
+   * reply quote instructions back at them.
+   */
+  skills?: Skill[];
+  /** Called as the reply is written. See {@link DataSource.send}. */
+  onTurn?: (turn: LiveTurn) => void;
+  /**
+   * Leaving the screen, or the app.
+   *
+   * Aborts reading the stream. It does NOT stop the run: a turn belongs to the deployment once it has
+   * started, and pretending a phone can call it back would be the app claiming a power it has not
+   * got. Whatever happens next is in the thread and in the trail.
+   */
+  signal?: AbortSignal;
+};
 
 export type DataSource = {
   channels(): Promise<Channel[]>;
   channel(id: string): Promise<Channel | undefined>;
   messages(channelId: string): Promise<Message[]>;
   /**
-   * Say something to a Bot.
+   * Say something to a Bot, and watch it answer.
    *
    * Returns whether it was queued. A Bot mid-turn does not get interrupted: the message lands in the
    * thread immediately and drains into one follow-up turn when it settles.
+   *
+   * `onTurn` is called as the reply arrives, which is the difference between a chat and a form. It is
+   * optional: a caller that only wants the message sent can ignore it and read the thread afterwards.
    */
-  send(channelId: string, text: string): Promise<{ queued: boolean }>;
+  send(
+    channelId: string,
+    text: string,
+    options?: SendOptions,
+  ): Promise<{ queued: boolean }>;
   approvals(): Promise<Approval[]>;
   approval(id: string): Promise<Approval | undefined>;
   /**
@@ -47,6 +78,27 @@ export type DataSource = {
   audit(channelId?: string): Promise<AuditRow[]>;
   notifications(): Promise<Notification[]>;
   markRead(id: string): Promise<void>;
+  /**
+   * The Bots a conversation could be started with.
+   *
+   * Only the ones this person may see, and never the hidden ones: the deployment's own scoping, not
+   * a filter invented here.
+   */
+  bots(): Promise<Bot[]>;
+  /**
+   * Start a conversation with a Bot.
+   *
+   * The server mints the thread, so the app never invents one. Returns the channel to open.
+   */
+  createChannel(botId: string): Promise<Channel>;
+  /**
+   * The skills granted to a channel's Bot, offered as `/` commands in its composer.
+   *
+   * Keyed on the channel rather than the Bot, like every other read here. A read keyed on something
+   * that arrives from ANOTHER read runs once with nothing — `useLiveResult` re-subscribes on the
+   * source, not on a changed closure — and then waits for an unrelated announce to notice.
+   */
+  skills(channelId: string): Promise<Skill[]>;
   /** Fires when anything changes, so screens re-read rather than hold their own copy. */
   subscribe(listener: () => void): () => void;
   /**

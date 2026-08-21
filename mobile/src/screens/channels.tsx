@@ -25,8 +25,10 @@ import { Screen, Title } from "./chrome";
 
 export function ChannelsScreen({
   onOpenChannel,
+  onCompose,
 }: {
   onOpenChannel: (id: string) => void;
+  onCompose: () => void;
 }) {
   const colors = useColors();
   const source = useSource();
@@ -57,6 +59,50 @@ export function ChannelsScreen({
                 : channels === undefined
                   ? "Checking…"
                   : "The Bots you are working with."
+            }
+            right={
+              <Pressable
+                accessibilityLabel="Start a conversation"
+                accessibilityRole="button"
+                android_ripple={{ color: colors.border, borderless: true }}
+                hitSlop={10}
+                onPress={onCompose}
+                style={({ pressed }) => ({
+                  width: 34,
+                  height: 34,
+                  borderRadius: radius.pill,
+                  alignItems: "center",
+                  justifyContent: "center",
+                  backgroundColor: colors.cardMuted,
+                  borderColor: colors.border,
+                  borderWidth: 1,
+                  opacity: pressed ? 0.6 : 1,
+                })}
+              >
+                {/* A plus, drawn. This one is a button, unlike the mark that used to sit in the
+                    composer doing nothing. */}
+                <View
+                  style={{ width: 15, height: 15, justifyContent: "center" }}
+                >
+                  <View
+                    style={{
+                      height: 1.8,
+                      borderRadius: 1,
+                      backgroundColor: colors.foreground,
+                    }}
+                  />
+                  <View
+                    style={{
+                      position: "absolute",
+                      left: 6.6,
+                      width: 1.8,
+                      height: 15,
+                      borderRadius: 1,
+                      backgroundColor: colors.foreground,
+                    }}
+                  />
+                </View>
+              </Pressable>
             }
             text="Channels"
           />
@@ -176,12 +222,19 @@ export function ChannelsScreen({
               </View>
             ))}
             {rows.length === 0 ? (
-              <View style={{ paddingVertical: space.lg }}>
+              <View style={{ paddingVertical: space.lg, gap: space.md }}>
                 <Body muted>
                   {channels === undefined
                     ? "Checking…"
-                    : "No channels yet. One appears here when you or a Bot starts a conversation on this deployment."}
+                    : "No channels yet. Start one, or wait for a Bot to open one on this deployment."}
                 </Body>
+                {channels !== undefined && !error ? (
+                  <Button
+                    onPress={onCompose}
+                    title="Start a conversation"
+                    tone="quiet"
+                  />
+                ) : null}
               </View>
             ) : null}
           </View>

@@ -11,17 +11,55 @@
  * `server/src/audit.ts`.
  */
 
-import type { AnswerScope, DataSource } from "./source";
+import type { AnswerScope, DataSource, SendOptions } from "./source";
 import type {
   Approval,
   AuditRow,
+  Bot,
   Channel,
+  LiveTurn,
   Message,
   Notification,
+  Skill,
 } from "./types";
 
 const BOT = { id: "risk-analyst", name: "Risk Analyst" };
 const HOST = "portal.northwind.example";
+
+/**
+ * The roster, so starting a conversation has somebody to start it with.
+ *
+ * Three, because a picker with one entry teaches nobody anything about what the screen is for. The
+ * ids are the seeds the sign-in screen already shows faces for, so the same Bot has the same face
+ * everywhere in the app.
+ */
+const BOTS: Bot[] = [
+  { id: BOT.id, name: BOT.name, title: "Watches the payment runs" },
+  {
+    id: "general-assistant",
+    name: "General Assistant",
+    title: "Whatever nobody else owns",
+  },
+  { id: "knowledge", name: "Knowledge", title: "Reads the handbook" },
+];
+
+/** Granted skills, as the `/` menu offers them. */
+const SKILLS: Skill[] = [
+  {
+    slug: "reconcile",
+    title: "Reconcile a run",
+    summary: "Check a payment run against the control sheet before submitting",
+    instructions:
+      "Reconcile the run against the control sheet line by line. Report the totals and any difference before acting, and do not submit anything if they disagree.",
+  },
+  {
+    slug: "handover",
+    title: "Write a handover",
+    summary: "Summarise what happened for whoever picks this up next",
+    instructions:
+      "Write a short handover: what you did, what you found, what is still open, and what the next person has to decide. No preamble.",
+  },
+];
 
 /**
  * A fixed clock, on today's date.
@@ -185,6 +223,23 @@ export function createLocalSource(): DataSource {
     },
   ];
 
+  type Room = { channel: Channel; messages: Message[] };
+  /**
+   * Every conversation, seeded one plus whatever gets started.
+   *
+   * A list rather than the single channel this used to hold, because a companion that cannot start a
+   * conversation is read-only, and there was no way to demonstrate — or record — the screen that does.
+   */
+  const rooms: Room[] = [{ channel, messages }];
+
+  const roomOf = (channelId: string) =>
+    rooms.find((room) => room.channel.id === channelId);
+
+  const sleep = (ms: number) =>
+    new Promise<void>((resolve) => {
+      timers.push(setTimeout(resolve, ms));
+    });
+
   /** Messages typed at a busy Bot, drained into one follow-up turn when it settles. */
   let steerQueue: string[] = [];
   const timers: ReturnType<typeof setTimeout>[] = [];
@@ -228,26 +283,63 @@ export function createLocalSource(): DataSource {
 
   return {
     async channels() {
-      return [channel];
+      // Newest first, which is what the server's own roster query orders by.
+      return [...rooms]
+        .map((room) => room.channel)
+        .sort((left, right) =>
+          (right.lastMessageAt ?? "").localeCompare(left.lastMessageAt ?? ""),
+        );
     },
     async channel(channelId) {
-      return channelId === channel.id ? channel : undefined;
+      return roomOf(channelId)?.channel;
     },
-    async messages() {
-      return [...messages];
+    async messages(channelId) {
+      return [...(roomOf(channelId)?.messages ?? [])];
     },
 
-    async send(_channelId, text) {
-      const queued = channel.busy;
-      messages.push({
+    async bots() {
+      return [...BOTS];
+    },
+
+    async createChannel(botId) {
+      const bot = BOTS.find((candidate) => candidate.id === botId);
+      if (!bot) throw new Error("There is no Bot with that id.");
+      const room: Room = {
+        channel: {
+          id: id("channel"),
+          name: bot.name,
+          botId: bot.id,
+          botName: bot.name,
+          lastMessage: null,
+          lastMessageAt: null,
+          busy: false,
+          pendingApprovals: 0,
+        },
+        messages: [],
+      };
+      rooms.push(room);
+      announce();
+      return room.channel;
+    },
+
+    async skills() {
+      return [...SKILLS];
+    },
+
+    async send(channelId, text, options: SendOptions = {}) {
+      const room = roomOf(channelId);
+      if (!room) throw new Error("That channel is gone.");
+      const queued = room.channel.busy;
+
+      room.messages.push({
         id: id("msg"),
         role: "user",
         text,
         at: stamp(),
         ...(queued ? { queued: true } : {}),
       });
-      channel.lastMessage = text;
-      channel.lastMessageAt = stamp();
+      room.channel.lastMessage = text;
+      room.channel.lastMessageAt = stamp();
 
       if (queued) {
         // Held, not dropped and not interrupting. The words are in the thread either way; only the
@@ -257,17 +349,60 @@ export function createLocalSource(): DataSource {
         return { queued: true };
       }
 
-      channel.busy = true;
+      room.channel.busy = true;
       announce();
-      later(1200, () => {
-        messages.push({
-          id: id("msg"),
-          role: "assistant",
-          text: "Understood.",
-          at: stamp(),
-        });
-        settle();
+
+      /**
+       * The reply, written rather than delivered.
+       *
+       * Against a deployment this comes off the run's event stream a word at a time. The demo does
+       * the same thing on a timer, because "it arrives as it is written" is a property of the app
+       * worth being able to see and to record, and a source that jumped straight to the finished
+       * answer would be the one place the local build lied about how the product behaves.
+       */
+      const reply =
+        (options.skills ?? []).length > 0
+          ? `Working to the ${(options.skills ?? []).map((skill) => skill.title.toLowerCase()).join(" and ")} skill. I have read the run and nothing disagrees with the control sheet.`
+          : "Understood. I will pick that up now.";
+
+      const fold: LiveTurn = { text: "", toolLines: [], done: false };
+      const emit = () =>
+        options.onTurn?.({ ...fold, toolLines: [...fold.toolLines] });
+
+      await sleep(260);
+      fold.toolLines.push({ label: "read", outcome: "running" });
+      emit();
+      await sleep(520);
+      fold.toolLines[0] = {
+        label: "read",
+        detail: `${HOST}`,
+        outcome: "allowed",
+      };
+      emit();
+
+      for (const word of reply.split(" ")) {
+        await sleep(45);
+        fold.text = fold.text ? `${fold.text} ${word}` : word;
+        emit();
+      }
+
+      fold.done = true;
+      emit();
+
+      room.messages.push({
+        id: id("msg"),
+        role: "assistant",
+        text: reply,
+        at: stamp(),
+        toolLines: [{ label: "read", detail: HOST, outcome: "allowed" }],
       });
+      room.channel.lastMessage = reply;
+      room.channel.lastMessageAt = stamp();
+      if (room.channel === channel) settle();
+      else {
+        room.channel.busy = false;
+        announce();
+      }
       return { queued: false };
     },
 

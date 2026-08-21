@@ -77,6 +77,13 @@ gets the platform's token and hands it over.
 
 ## Notes
 
+- A reply is read off the run's event stream, so it appears as it is written. `src/data/run.ts` folds
+  AG-UI events into the turn on screen and is covered by `tests/`; it uses XHR because React Native's
+  `fetch` cannot stream a response body.
+- Tests live in `mobile/tests` and are run by the repository's own `bun test` from the root. They only
+  cover the parts with no React and no server in them — the event fold and the in-memory deployment —
+  which is where the behaviour worth pinning lives.
+
 - Navigation is hand-rolled rather than expo-router: three tabs and two pushed screens is less than a
   router's configuration would cost. Screens use React Native primitives only, so the same code runs
   on a device and in a browser.

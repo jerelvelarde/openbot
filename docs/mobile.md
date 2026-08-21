@@ -7,7 +7,8 @@ browser, take the wheel, approve a component, read a long transcript. The compan
 moments when a Bot needs *you* and you are not at a desk — an action parked waiting for an answer, a
 sign-in it cannot do itself, a routine that stopped overnight.
 
-Four screens: what is waiting on you, the channels you have, one conversation, and the audit trail.
+Five screens: what is waiting on you, the channels you have, one conversation, starting a new one,
+and the audit trail.
 
 ## Running it
 
@@ -106,6 +107,51 @@ Registration is **refused** while `OPENBOT_DEV_NO_AUTH` is on. That mode makes e
 administrator, so "register this token to me" would attach a handset to whoever the deployment
 pretends everybody is, and the next caller would start receiving that person's approvals. Reading
 approvals over loopback is a development convenience; putting them on a handset is not.
+
+## Chat
+
+A channel is a thread. Two channels with the same Bot keep separate durable threads, so the Channels
+list *is* the thread list, and the transcript is read from the runtime's own history at
+`/api/copilotkit/api/threads/{id}/messages`.
+
+**A reply arrives as it is written.** Starting a turn is an AG-UI run, and the run answers with an
+event stream. The app reads it and folds the events into the turn on screen: text grows by deltas, a
+tool call is drawn the moment it starts and resolves in place when its result lands. The durable
+thread takes over a moment later and nothing on screen shifts, because both paths derive the line
+through the same code — `src/data/run.ts`.
+
+That file is XHR rather than `fetch`, deliberately: React Native's `fetch` has no streaming body, so
+`response.body` is null and there is nothing to read incrementally. `XMLHttpRequest` exposes
+`responseText` as it arrives on a device and in a browser alike, which is how every SSE library for
+React Native works underneath. No dependency, one code path, both targets.
+
+**Starting a conversation.** Pick a Bot, and the server mints the thread — `POST /api/channels`, then
+open what comes back. The app never invents a thread id. Before this the app could only read the
+channels a deployment already had, so a deployment with none was permanently read-only from a phone.
+
+**`/` runs a skill.** The granted skills for a channel's Bot come from `/api/plugins/for/{botId}` and
+appear as a menu when the draft is a slash query. Choosing one leaves a **chip**, not a paragraph: the
+instruction goes to the Bot as a **system turn in front of** the message, never pasted into the
+person's own words — which is what the web app does, and what keeps the reply from quoting
+instructions back at somebody. The transcript skips system turns, so it never appears on either
+surface.
+
+**Sending reports the channel.** `POST /api/channels/{id}/activity` after the turn, which is what
+keeps the roster's preview current and what wakes the other members' sockets. It is never allowed to
+fail the send: the message went, and saying otherwise because a preview could not be updated is the
+worst thing a composer can claim.
+
+**Live updates.** The deployment pushes channel activity over `GET /api/channels/events`, and the app
+holds that socket open with reconnect and backoff while anything is subscribed. It is an optimisation
+and never a source of truth — an event only says "read again", so a dropped socket costs latency and
+nothing else, and the four-second poll stays as the floor. On a device the bearer token travels in the
+handshake headers, which is why that one constructor is asserted in `http.ts`: a token must never go
+in a URL.
+
+**What is deliberately not built: @mentions.** A channel has exactly one Bot (`MAX_RECIPIENTS = 1`),
+and the web app's own composer says the quiet part out loud — "`draft.agentId` carries the @mentioned
+coworker, but nothing routes on it yet: this channel is pinned to one `runtimeAgentId` for the life of
+its thread." A mention picker on a phone would be a menu with one entry that changes nothing.
 
 ## Things the app is careful about
 

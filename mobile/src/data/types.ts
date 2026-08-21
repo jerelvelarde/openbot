@@ -64,6 +64,14 @@ export type ToolLineOutcome = "allowed" | "refused" | "failed" | "running";
 
 /** One acting call, as the transcript draws it. Never the arguments: a trail is not a transcript. */
 export type ToolLine = {
+  /**
+   * The call this line is about, where the stream said so.
+   *
+   * Present on a line being drawn live, so a running line and the resolved line that replaces it are
+   * the same element to React rather than the same array position — which is what lets a list of
+   * calls resolve out of order without the rows swapping under somebody reading them.
+   */
+  id?: string;
   label: string;
   detail?: string;
   outcome: ToolLineOutcome;
@@ -84,6 +92,50 @@ export type Message = {
    * words are already in the thread either way; what is queued is only the intent to run.
    */
   queued?: boolean;
+};
+
+/**
+ * A Bot somebody could start a conversation with.
+ *
+ * The roster as `/api/agents` gives it, minus the fields only an administrator's screens need. It
+ * carries `title` because "Risk Analyst" and "reads the payment runs" answer different questions,
+ * and a person picking from a list of five Bots needs the second one.
+ */
+export type Bot = {
+  id: string;
+  name: string;
+  title: string | null;
+};
+
+/**
+ * A granted skill, as a `/` command.
+ *
+ * `instructions` travels with it because that is what actually goes to the Bot — as a system turn in
+ * front of the message, never pasted into the person's own words. See `send`.
+ */
+export type Skill = {
+  slug: string;
+  title: string;
+  summary: string | null;
+  instructions: string;
+};
+
+/**
+ * A turn as it arrives, before the deployment's own thread has it.
+ *
+ * The durable thread is authoritative and is what the transcript draws from a moment later; this is
+ * the same turn while it is still being written. Held by the screen that started the run rather than
+ * by the source, because it is ephemeral state about one in-flight request — and because announcing
+ * a re-read of the whole thread on every token would put a network call behind every character.
+ */
+export type LiveTurn = {
+  /** What the Bot has said so far. Grows by deltas. */
+  text: string;
+  /** What it has done so far, in order, resolving from running to an outcome. */
+  toolLines: ToolLine[];
+  /** Set when the run ended badly, in the words the deployment used. */
+  failure?: string;
+  done: boolean;
 };
 
 export type Channel = {

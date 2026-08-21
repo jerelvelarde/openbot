@@ -12,16 +12,18 @@
  *    second list derived from it would be a second source of truth for the same fact.
  */
 
-import type { AnswerScope, DataSource } from "./source";
+import { createTurnFold, streamRun, toolLineOf } from "./run";
+import type { AnswerScope, DataSource, SendOptions } from "./source";
 import type {
   Approval,
   ApprovalSubject,
   AuditOutcome,
   AuditRow,
+  Bot,
   Channel,
   Message,
   Notification,
-  ToolLine,
+  Skill,
 } from "./types";
 
 export type HttpSourceConfig = {
@@ -56,6 +58,20 @@ export type HttpSourceConfig = {
   onUnauthorized?: () => void;
 };
 
+/**
+ * React Native's WebSocket, which takes an options bag the browser's does not.
+ *
+ * The types resolve to the DOM constructor — `lib` is `["DOM", "ESNext"]` — so the third argument
+ * has to be asserted in one place rather than cast at the point of use. It matters because that bag
+ * is the only way to send a bearer token on a handshake: the alternative is the token in the query
+ * string, which is a credential in a URL, and URLs are logged.
+ */
+type WebSocketWithHeaders = new (
+  url: string,
+  protocols?: string[],
+  options?: { headers: Record<string, string> },
+) => WebSocket;
+
 export class ApiError extends Error {
   readonly status: number;
   constructor(status: number, message: string) {
@@ -85,7 +101,21 @@ type ServerChannel = {
   lastMessageAt: string | null;
 };
 
-type ServerAgent = { id: string; name: string };
+type ServerAgent = { id: string; name: string; title: string | null };
+
+type ServerChannelCreated = {
+  id: string;
+  name: string;
+  agentIds: string[];
+  threadId: string;
+};
+
+type ServerSkill = {
+  slug: string;
+  title: string;
+  summary: string | null;
+  instructions: string;
+};
 
 type ServerAuditEvent = {
   id: string;
@@ -120,68 +150,6 @@ type ServerMessage = {
   toolCallId?: string;
   createdAt?: string;
 };
-
-/**
- * Turn a tool call and its result into the one line a transcript shows.
- *
- * The outcome keys are the ones the gateway produces, so a refusal keeps its rule and a failure stays
- * distinguishable from a refusal. Arguments are never rendered: the label and the resolved element
- * are enough, and a transcript is not a place for whatever was typed into a password field.
- */
-function toolLineOf(result: string): ToolLine | undefined {
-  let parsed: {
-    tool?: string;
-    action?: string;
-    ok?: boolean;
-    refused?: boolean;
-    reason?: string;
-    rule?: string;
-    element?: { name?: string };
-    text?: string;
-  };
-  try {
-    parsed = JSON.parse(result) as typeof parsed;
-  } catch {
-    // Not JSON: the runtime stringifies a thrown handler this way. Shown as a failure rather than
-    // guessed at, because the alternative is a line that claims something worked.
-    return {
-      label: "tool",
-      outcome: "failed",
-      detail: result.slice(0, 120),
-    };
-  }
-
-  const name = parsed.tool ?? parsed.action;
-  // Without a name there is nothing to say. Drawing an anonymous outcome would be a line a person
-  // cannot audit, which is worse than no line.
-  if (!name) return undefined;
-
-  const label = name.replace(/^computer_/, "").replace(/_/g, " ");
-
-  if (parsed.refused) {
-    return {
-      label,
-      outcome: "refused",
-      ...(parsed.element?.name || parsed.reason
-        ? { detail: parsed.element?.name ?? parsed.reason }
-        : {}),
-      ...(typeof parsed.rule === "string" ? { rule: parsed.rule } : {}),
-    };
-  }
-  if (parsed.ok === false) {
-    return {
-      label,
-      outcome: "failed",
-      ...(parsed.reason ? { detail: parsed.reason } : {}),
-    };
-  }
-  return {
-    label,
-    outcome: "allowed",
-    // The element as the SERVER resolved it, never the ref the model sent.
-    ...(parsed.element?.name ? { detail: parsed.element.name } : {}),
-  };
-}
 
 /**
  * What a tool did, as a verb.
@@ -228,6 +196,80 @@ export function createHttpSource(config: HttpSourceConfig = {}): DataSource {
   const announce = () => {
     for (const listener of listeners) listener();
   };
+
+  /**
+   * Live channel activity, pushed rather than polled.
+   *
+   * The deployment tells every member of a channel when something was said in it, and the web app has
+   * consumed that since it existed. This app polled every four seconds instead, so anything said by
+   * another person — or by the same person at a desk — took up to four seconds to appear.
+   *
+   * It is an optimisation and never a source of truth. The server's own comment says so, and this
+   * follows it: an event does not carry state into the app, it only says "read again". So a dropped
+   * socket costs nothing but latency, the poll stays as the floor, and a reconnect re-reads
+   * everything rather than trying to work out what it missed.
+   */
+  let socket: WebSocket | undefined;
+  let reconnect: ReturnType<typeof setTimeout> | undefined;
+  let backoff = 500;
+
+  function socketUrl(): string | undefined {
+    const origin =
+      base || (typeof window === "undefined" ? "" : window.location.origin);
+    if (!origin) return undefined;
+    return `${origin.replace(/^http/, "ws")}/api/channels/events`;
+  }
+
+  async function connect() {
+    if (socket || listeners.size === 0) return;
+    const url = socketUrl();
+    if (!url) return;
+    const token = await config.token?.();
+    // Another subscriber may have connected, or the last one left, while the token was being read.
+    if (socket || listeners.size === 0) return;
+
+    try {
+      socket = token
+        ? new (WebSocket as unknown as WebSocketWithHeaders)(url, undefined, {
+            headers: { authorization: `Bearer ${token}` },
+          })
+        : new WebSocket(url);
+    } catch {
+      // A URL the platform will not open. The poll is still running, so this is latency, not failure.
+      return;
+    }
+
+    const dropped = () => {
+      socket = undefined;
+      // Nothing is listening any more, so there is nothing to keep a socket open for.
+      if (listeners.size === 0) return;
+      reconnect = setTimeout(() => {
+        backoff = Math.min(backoff * 2, 30_000);
+        void connect();
+      }, backoff);
+    };
+
+    socket.onopen = () => {
+      backoff = 500;
+      // Whatever happened while there was no socket is recovered by reading, not by replay.
+      announce();
+    };
+    // The payload says which channel changed and what was said. Nothing is taken from it: the roster
+    // read is authoritative, and trusting a socket frame over it would be two sources of one truth.
+    socket.onmessage = () => announce();
+    socket.onclose = dropped;
+    socket.onerror = () => {};
+  }
+
+  function disconnect() {
+    if (reconnect !== undefined) {
+      clearTimeout(reconnect);
+      reconnect = undefined;
+    }
+    const open = socket;
+    socket = undefined;
+    open?.close();
+  }
 
   /**
    * GETs in flight right now, so one announce is one request per path.
@@ -328,9 +370,16 @@ export function createHttpSource(config: HttpSourceConfig = {}): DataSource {
   let names: Map<string, string> | undefined;
   async function botNames(): Promise<Map<string, string>> {
     if (names) return names;
-    const { agents } = await call<{ agents: ServerAgent[] }>("/api/agents");
+    const agents = await roster();
     names = new Map(agents.map((agent) => [agent.id, agent.name]));
     return names;
+  }
+
+  async function roster(): Promise<ServerAgent[]> {
+    // Without `?hidden=true`, which is the deployment's own scoping: a hidden Bot is not one to
+    // start a conversation with, and that decision is not this app's to make.
+    const { agents } = await call<{ agents: ServerAgent[] }>("/api/agents");
+    return agents;
   }
 
   async function approvals(): Promise<Approval[]> {
@@ -445,7 +494,7 @@ export function createHttpSource(config: HttpSourceConfig = {}): DataSource {
       return messages;
     },
 
-    async send(channelId, text) {
+    async send(channelId, text, options: SendOptions = {}) {
       const channel = await source.channel(channelId);
       if (!channel?.botId) {
         throw new ApiError(404, "That channel has no Bot to talk to.");
@@ -461,9 +510,17 @@ export function createHttpSource(config: HttpSourceConfig = {}): DataSource {
       const history = await source.messages(channelId);
 
       const runId = randomId();
-      await post(
-        `/api/copilotkit/agent/${encodeURIComponent(channel.botId)}/run`,
-        {
+      const fold = createTurnFold();
+      const token = await config.token?.();
+
+      await streamRun({
+        url: `${base}/api/copilotkit/agent/${encodeURIComponent(channel.botId)}/run`,
+        headers: {
+          "content-type": "application/json",
+          accept: "text/event-stream",
+          ...(token ? { authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({
           threadId: channelId,
           runId,
           messages: [
@@ -482,14 +539,60 @@ export function createHttpSource(config: HttpSourceConfig = {}): DataSource {
                 role: message.role,
                 content: message.text,
               })),
+            /**
+             * A skill goes in FRONT of the message, as a system turn.
+             *
+             * Not pasted into what the person typed. The two are not the same kind of thing: the
+             * transcript shows what somebody said, and putting the skill's paragraph in their words
+             * puts sentences in their mouth and makes the reply quote instructions back at them.
+             * The web app does exactly this, and the thread reader skips system turns, so it never
+             * appears on screen on either surface.
+             */
+            ...(options.skills ?? []).map((skill, index) => ({
+              id: `sys_${runId}_${index}`,
+              role: "system" as const,
+              content: skill.instructions,
+            })),
             { id: `msg_${runId}`, role: "user", content: text },
           ],
           tools: [],
           context: [],
           state: {},
           forwardedProps: {},
+        }),
+        ...(options.signal ? { signal: options.signal } : {}),
+        onData: (data) => {
+          let event: unknown;
+          try {
+            event = JSON.parse(data);
+          } catch {
+            // A frame this app cannot parse is not a reason to fail a run that is going fine.
+            return;
+          }
+          options.onTurn?.(fold(event));
         },
-      );
+      });
+
+      /**
+       * Tell the channel something was said.
+       *
+       * This is what keeps the roster's preview current and what wakes the other members' sockets —
+       * the server's own comment is explicit that the person who ran it reports over HTTP and the
+       * socket is the other direction. Without it a message sent from a phone left the channel list
+       * showing whatever was said before it, on every surface.
+       *
+       * After the turn, and never allowed to fail the send: the message went, and saying it did not
+       * because a preview could not be updated would be the worst kind of lie a composer can tell.
+       */
+      try {
+        await post(`/api/channels/${encodeURIComponent(channelId)}/activity`, {
+          text,
+          agentId: null,
+          at: new Date().toISOString(),
+        });
+      } catch {
+        // Nothing to do about it here, and nothing worth interrupting anybody over.
+      }
 
       announce();
       /**
@@ -500,6 +603,53 @@ export function createHttpSource(config: HttpSourceConfig = {}): DataSource {
        * started it — so claiming a message was queued would be inventing a state.
        */
       return { queued: false };
+    },
+
+    async bots() {
+      const agents = await roster();
+      return agents.map<Bot>((agent) => ({
+        id: agent.id,
+        name: agent.name,
+        title: agent.title ?? null,
+      }));
+    },
+
+    async createChannel(botId) {
+      const { channel } = await call<{ channel: ServerChannelCreated }>(
+        "/api/channels",
+        { method: "POST", body: JSON.stringify({ agentIds: [botId] }) },
+      );
+      // The roster gained a channel, so anything showing the roster is now out of date.
+      names = undefined;
+      announce();
+      const named = await botNames();
+      return {
+        // The THREAD is the channel everywhere in this app: it is what the transcript is read by and
+        // what an approval names. Using the channel row's own id here would give the new channel an
+        // id nothing else can look anything up with.
+        id: channel.threadId,
+        name: channel.name,
+        botId,
+        botName: named.get(botId) ?? botId,
+        lastMessage: null,
+        lastMessageAt: null,
+        busy: false,
+        pendingApprovals: 0,
+      };
+    },
+
+    async skills(channelId) {
+      const channel = await source.channel(channelId);
+      if (!channel?.botId) return [];
+      const { skills } = await call<{ skills: ServerSkill[] }>(
+        `/api/plugins/for/${encodeURIComponent(channel.botId)}`,
+      );
+      return skills.map<Skill>((skill) => ({
+        slug: skill.slug,
+        title: skill.title,
+        summary: skill.summary,
+        instructions: skill.instructions,
+      }));
     },
 
     approvals,
@@ -653,6 +803,7 @@ export function createHttpSource(config: HttpSourceConfig = {}): DataSource {
 
     subscribe(listener) {
       listeners.add(listener);
+      connect();
       /**
        * One timer, not one per subscriber.
        *
@@ -665,10 +816,12 @@ export function createHttpSource(config: HttpSourceConfig = {}): DataSource {
       }
       return () => {
         listeners.delete(listener);
-        if (listeners.size === 0 && timer !== undefined) {
+        if (listeners.size > 0) return;
+        if (timer !== undefined) {
           clearInterval(timer);
           timer = undefined;
         }
+        disconnect();
       };
     },
 

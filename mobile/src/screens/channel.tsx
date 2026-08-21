@@ -19,7 +19,7 @@ import {
 } from "react-native";
 import { BotAvatar } from "../avatar";
 import { ApiError } from "../data/http";
-import type { Message, ToolLine } from "../data/types";
+import type { LiveTurn, Message, Skill, ToolLine } from "../data/types";
 import { useLiveResult, useSource } from "../store";
 import { radius, space, type as type_ } from "../theme";
 import {
@@ -30,6 +30,7 @@ import {
   Label,
   OUTCOME_WORDS,
   OutcomeDot,
+  Row,
   Rule,
   richText,
   subjectPhrase,
@@ -168,6 +169,18 @@ export function ChannelScreen({
   const [sendError, setSendError] = useState<string | null>(null);
   /** Said, and not yet in the thread the deployment returns. */
   const [sending, setSending] = useState<string | null>(null);
+  /**
+   * The reply as it is being written.
+   *
+   * Screen state rather than source state: it is one in-flight request that this screen started, and
+   * announcing a re-read of the whole thread on every token would put a network call behind every
+   * character. The durable thread takes over the moment it has the turn.
+   */
+  const [live, setLive] = useState<LiveTurn | null>(null);
+  /** `/` skills chosen for the next message. Chips, not text: see the composer. */
+  const [chips, setChips] = useState<Skill[]>([]);
+
+  const { value: skills } = useLiveResult((s) => s.skills(channelId));
   const scroller = useRef<ScrollView>(null);
   const nearBottom = useRef(true);
   const settled = useRef(false);
@@ -198,24 +211,62 @@ export function ChannelScreen({
     }
   }, [messages, sending]);
 
+  /**
+   * Hand the finished turn over to the thread.
+   *
+   * Held until the durable copy actually arrives rather than dropped when the run ends, because the
+   * gap between the two is a poll away and clearing early makes the reply vanish and come back.
+   */
+  useEffect(() => {
+    if (!live?.done || !live.text) return;
+    if (
+      (messages ?? []).some(
+        (m) => m.role === "assistant" && m.text === live.text,
+      )
+    ) {
+      setLive(null);
+    }
+  }, [live, messages]);
+
   const waiting = (approvals ?? []).find(
     (one) => one.state === "pending" && one.channelId === channelId,
   );
 
+  const streaming = Boolean(live && !live.done);
+
   const send = () => {
     const text = draft.trim();
-    if (!text || sending) return;
+    if (!text || sending || streaming) return;
+    const chosen = chips;
     setDraft("");
     setSendError(null);
     setSending(text);
-    void source.send(channelId, text).catch((cause: unknown) => {
-      setSending(null);
-      // Only if nothing has been typed since. Restoring unconditionally, seconds later, wrote over
-      // whatever was in the field by then.
-      setDraft((current) => current || text);
-      setSendError(describeSendFailure(cause));
-    });
+    setChips([]);
+    setLive({ text: "", toolLines: [], done: false });
+    void source
+      .send(channelId, text, { skills: chosen, onTurn: setLive })
+      .catch((cause: unknown) => {
+        setSending(null);
+        setLive(null);
+        setChips(chosen);
+        // Only if nothing has been typed since. Restoring unconditionally, seconds later, wrote over
+        // whatever was in the field by then.
+        setDraft((current) => current || text);
+        setSendError(describeSendFailure(cause));
+      });
   };
+
+  /** A draft that is only a slash query is the menu being opened, not a message being written. */
+  const query = /^\/(\S*)$/.exec(draft)?.[1]?.toLowerCase();
+  const offered =
+    query === undefined
+      ? []
+      : (skills ?? []).filter(
+          (skill) =>
+            !chips.some((chip) => chip.slug === skill.slug) &&
+            (skill.slug.includes(query) ||
+              skill.title.toLowerCase().includes(query)),
+        );
 
   const composerDisabled = Boolean(failed) || channel === null;
 
@@ -363,9 +414,41 @@ export function ChannelScreen({
               }}
             />
           ) : null}
-          {sending ? (
+          {/* The reply, arriving. Drawn exactly like a settled turn — same bubble, same tool lines
+              — so nothing shifts or restyles when the durable thread takes over. */}
+          {live && (live.text || live.toolLines.length > 0) ? (
+            <View style={{ gap: space.sm }}>
+              {live.text ? (
+                <Bubble
+                  botName={channel?.botName ?? "The Bot"}
+                  message={{
+                    id: "live",
+                    role: "assistant",
+                    text: live.text,
+                    at: new Date().toISOString(),
+                  }}
+                />
+              ) : null}
+              {live.toolLines.map((line) => (
+                <ToolLineView key={line.id ?? line.label} line={line} />
+              ))}
+            </View>
+          ) : null}
+
+          {live?.failure ? (
+            <Text style={{ ...type_.small, color: colors.refuse }}>
+              {live.failure}
+            </Text>
+          ) : null}
+
+          {sending && !live?.text && live?.toolLines.length === 0 ? (
             <Text style={{ ...type_.small, color: colors.muted }}>
               Sending…
+            </Text>
+          ) : null}
+          {streaming && (live?.text || live?.toolLines.length) ? (
+            <Text style={{ ...type_.small, color: colors.muted }}>
+              {channel?.botName ?? "The Bot"} is working…
             </Text>
           ) : null}
         </ScrollView>
@@ -403,6 +486,85 @@ export function ChannelScreen({
           </View>
         ) : null}
 
+        {offered.length > 0 ? (
+          <View
+            style={{
+              backgroundColor: colors.card,
+              borderTopColor: colors.border,
+              borderTopWidth: 1,
+              paddingHorizontal: space.lg,
+            }}
+          >
+            <Label>Skills</Label>
+            {offered.map((skill) => (
+              <Row
+                detail={skill.summary ?? skill.title}
+                key={skill.slug}
+                label={`${skill.title}. ${skill.summary ?? ""}`}
+                lines={2}
+                onPress={() => {
+                  setChips((current) => [...current, skill]);
+                  setDraft("");
+                }}
+                title={skill.title}
+              />
+            ))}
+          </View>
+        ) : null}
+
+        {chips.length > 0 ? (
+          <View
+            style={{
+              flexDirection: "row",
+              flexWrap: "wrap",
+              gap: space.sm,
+              paddingHorizontal: space.md,
+              paddingTop: space.sm,
+              backgroundColor: colors.card,
+            }}
+          >
+            {chips.map((skill) => (
+              /* A chip, not the skill's paragraph pasted into the box. What it stands for goes to
+                 the Bot as a system turn in front of the message; what stays on screen is one token
+                 saying which skill was used. */
+              <Pressable
+                accessibilityHint="Removes this skill"
+                accessibilityLabel={`${skill.title} skill`}
+                accessibilityRole="button"
+                key={skill.slug}
+                onPress={() =>
+                  setChips((current) =>
+                    current.filter((one) => one.slug !== skill.slug),
+                  )
+                }
+                style={({ pressed }) => ({
+                  flexDirection: "row",
+                  alignItems: "center",
+                  gap: 6,
+                  backgroundColor: colors.cardMuted,
+                  borderColor: colors.border,
+                  borderWidth: 1,
+                  borderRadius: radius.pill,
+                  paddingVertical: 5,
+                  paddingHorizontal: 11,
+                  opacity: pressed ? 0.6 : 1,
+                })}
+              >
+                <Text
+                  style={{
+                    ...type_.small,
+                    fontWeight: "600",
+                    color: colors.foreground,
+                  }}
+                >
+                  /{skill.slug}
+                </Text>
+                <Text style={{ ...type_.small, color: colors.muted }}>✕</Text>
+              </Pressable>
+            ))}
+          </View>
+        ) : null}
+
         <View
           style={{
             flexDirection: "row",
@@ -423,8 +585,9 @@ export function ChannelScreen({
               setDraft(text);
               if (sendError) setSendError(null);
             }}
+            hasSkills={(skills ?? []).length > 0}
             onSend={send}
-            sending={Boolean(sending)}
+            sending={Boolean(sending) || streaming}
           />
         </View>
       </KeyboardAvoidingView>
@@ -448,6 +611,7 @@ function Composer({
   onSend,
   sending,
   disabled,
+  hasSkills,
 }: {
   botName: string | undefined;
   draft: string;
@@ -455,6 +619,8 @@ function Composer({
   onSend: () => void;
   sending: boolean;
   disabled: boolean;
+  /** Whether to say the `/` menu exists. Promising it when the Bot has no skills would be a lie. */
+  hasSkills: boolean;
 }) {
   const colors = useColors();
   const [focused, setFocused] = useState(false);
@@ -518,7 +684,11 @@ function Composer({
          * never say, so the promise is made by the message afterwards, where it can be true.
          */
         placeholder={
-          disabled ? "Not connected" : `Ask ${botName ?? "this Bot"}`
+          disabled
+            ? "Not connected"
+            : hasSkills
+              ? `Ask ${botName ?? "this Bot"}, or / for a skill`
+              : `Ask ${botName ?? "this Bot"}`
         }
         placeholderTextColor={colors.muted}
         returnKeyType="send"
