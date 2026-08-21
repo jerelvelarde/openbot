@@ -49,4 +49,11 @@ export type DataSource = {
   markRead(id: string): Promise<void>;
   /** Fires when anything changes, so screens re-read rather than hold their own copy. */
   subscribe(listener: () => void): () => void;
+  /**
+   * Read everything again, now, because a person asked.
+   *
+   * A poll every few seconds is the right default and the wrong answer to "this says it could not
+   * reach the deployment". Relaunching the app was previously the only way to retry.
+   */
+  refresh(): void;
 };

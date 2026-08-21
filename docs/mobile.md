@@ -107,6 +107,32 @@ administrator, so "register this token to me" would attach a handset to whoever 
 pretends everybody is, and the next caller would start receiving that person's approvals. Reading
 approvals over loopback is a development convenience; putting them on a handset is not.
 
+## Things the app is careful about
+
+**It follows the phone's appearance setting.** `app.json` declares `automatic`, and on a device the
+app takes the system scheme — a dark-mode phone at 3am does not get a full-brightness white screen.
+The **web build stays pinned to light**, because it is a phone mockup for recordings and every
+published artefact should keep looking like the last one.
+
+**Insets are measured, not guessed.** `react-native-safe-area-context` supplies them, which is the
+one dependency here that RN core cannot replace: it exposes no Android navigation-bar inset at all,
+and a hardcoded 24pt is less than a three-button bar — so the tab labels get drawn underneath it and
+taps in that band go to the system. It reports zero insets on web, so the drawn frame is unaffected.
+
+**Timestamps say which day.** The approval queue keeps settled rows and the trail reaches back days,
+so a bare clock time makes a refusal from last Tuesday at 14:22 and one from today at 14:22 the same
+string. Same day is `14:22`, this week is `Tue 14:22`, older is `19 Aug 14:22`.
+
+**An approval shows its deadline.** The server parks an action for ten minutes and then answers the
+Bot itself. The phone renders the `expiresAt` it already sends, so nobody walks to a laptop to check
+a figure and comes back to a 409 — and once that time has passed the wording hedges, because the
+server is the authority on whether an approval is still open.
+
+**"Always allow this" says what it will grant, before the tap.** The rule the server writes carries
+the Bot and the element label and **no host term**, so "this button on this portal" is really "that
+Bot, anything labelled this, anywhere it can reach". That sentence is on the screen, and the button
+asks twice.
+
 ## What it deliberately does not do
 
 - **Take the wheel of a browser.** Driving somebody else's Chrome from a phone is worse than not

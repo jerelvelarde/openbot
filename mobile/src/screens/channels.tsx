@@ -5,11 +5,22 @@
  * by picture, not by the name of the last thing one of them said. The list underneath is the same set
  * ordered by what happened most recently.
  */
-import { ScrollView, Text, View } from "react-native";
+import { Pressable, ScrollView, Text, View } from "react-native";
 import { BotAvatar, BotAvatarWithDot } from "../avatar";
-import { useLive } from "../store";
+import { useLiveResult, useSource } from "../store";
 import { radius, space, type as type_ } from "../theme";
-import { Badge, Body, Divider, Row, useColors, when } from "../ui";
+import {
+  Badge,
+  Body,
+  Button,
+  Card,
+  Divider,
+  Label,
+  Row,
+  sentence,
+  useColors,
+  when,
+} from "../ui";
 import { Screen, Title } from "./chrome";
 
 export function ChannelsScreen({
@@ -18,7 +29,15 @@ export function ChannelsScreen({
   onOpenChannel: (id: string) => void;
 }) {
   const colors = useColors();
-  const channels = useLive((source) => source.channels());
+  const source = useSource();
+  /**
+   * A failed read is not an empty deployment.
+   *
+   * `channels()` fans out to three endpoints in one `Promise.all`, so any one of them failing used to
+   * empty the whole roster and say "No channels yet." — stranding every conversation behind a wrong
+   * explanation, under a subtitle still asserting these are the Bots you work with.
+   */
+  const { value: channels, error } = useLiveResult((s) => s.channels());
   const rows = channels ?? [];
 
   return (
@@ -31,41 +50,84 @@ export function ChannelsScreen({
         }}
       >
         <View style={{ paddingHorizontal: space.lg }}>
-          <Title text="Channels" detail="The Bots you are working with." />
+          <Title
+            detail={
+              error
+                ? "Could not reach this deployment."
+                : channels === undefined
+                  ? "Checking…"
+                  : "The Bots you are working with."
+            }
+            text="Channels"
+          />
         </View>
 
-        {rows.length > 0 ? (
+        {error ? (
+          <View style={{ paddingHorizontal: space.lg }}>
+            <Card muted>
+              <Label>Offline</Label>
+              <Body muted>{error}</Body>
+              <Button
+                onPress={() => source.refresh()}
+                title="Try again"
+                tone="quiet"
+              />
+            </Card>
+          </View>
+        ) : null}
+
+        {/* Below two Bots the rail is the row underneath it, drawn twice, sixty points apart. */}
+        {rows.length > 1 ? (
           <ScrollView
-            horizontal
             contentContainerStyle={{
               paddingHorizontal: space.lg,
               gap: space.lg,
             }}
+            horizontal
             showsHorizontalScrollIndicator={false}
           >
             {rows.map((channel) => (
-              <View
+              <Pressable
+                accessibilityLabel={
+                  channel.pendingApprovals > 0
+                    ? `${channel.botName}, ${channel.pendingApprovals} waiting on you`
+                    : channel.botName
+                }
+                // It carries a 56px face and the only pending indicator in the rail, above a list of
+                // identical faces that navigate. It looked exactly as tappable as they are.
+                accessibilityRole="button"
                 key={`rail_${channel.id}`}
-                style={{ alignItems: "center", gap: 7, width: 68 }}
+                onPress={() => onOpenChannel(channel.id)}
+                style={({ pressed }) => ({
+                  alignItems: "center",
+                  gap: 7,
+                  minWidth: 68,
+                  maxWidth: 84,
+                  opacity: pressed ? 0.6 : 1,
+                })}
               >
                 <BotAvatarWithDot
                   dot={
                     channel.pendingApprovals > 0 ? colors.pending : undefined
                   }
+                  // The rail sits on the page, not on a card, so a white ring was visible even in
+                  // the light theme.
+                  ring={colors.background}
                   seed={channel.botId}
                   size={56}
                 />
                 <Text
-                  numberOfLines={1}
+                  numberOfLines={2}
                   style={{
                     ...type_.small,
                     color: colors.foreground,
                     fontWeight: "500",
+                    textAlign: "center",
                   }}
                 >
                   {channel.botName}
                 </Text>
-              </View>
+              </Pressable>
             ))}
           </ScrollView>
         ) : null}
@@ -85,7 +147,15 @@ export function ChannelsScreen({
                 {index > 0 ? <Divider inset={52} /> : null}
                 <Row
                   detail={channel.lastMessage ?? "Nothing said yet."}
+                  label={sentence(
+                    channel.name,
+                    channel.lastMessage ?? "Nothing said yet.",
+                    channel.pendingApprovals > 0
+                      ? `${channel.pendingApprovals} waiting on you`
+                      : undefined,
+                  )}
                   leading={<BotAvatar seed={channel.botId} size={40} />}
+                  lines={2}
                   meta={
                     channel.lastMessageAt
                       ? when(channel.lastMessageAt)
@@ -107,7 +177,11 @@ export function ChannelsScreen({
             ))}
             {rows.length === 0 ? (
               <View style={{ paddingVertical: space.lg }}>
-                <Body muted>No channels yet.</Body>
+                <Body muted>
+                  {channels === undefined
+                    ? "Checking…"
+                    : "No channels yet. One appears here when you or a Bot starts a conversation on this deployment."}
+                </Body>
               </View>
             ) : null}
           </View>

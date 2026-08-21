@@ -25,6 +25,11 @@ export function SignInScreen({ label }: { label: string }) {
     <View
       style={{
         flex: 1,
+        width: "100%",
+        // This screen does not go through `Screen`, so it carries the same measure itself. Without
+        // it an iPad shows one button as wide as the window.
+        maxWidth: 560,
+        alignSelf: "center",
         backgroundColor: colors.background,
         padding: space.xl,
         justifyContent: "center",
@@ -48,6 +53,7 @@ export function SignInScreen({ label }: { label: string }) {
           ))}
         </View>
         <Text
+          accessibilityRole="header"
           style={{
             ...type_.title,
             color: colors.foreground,
@@ -61,7 +67,6 @@ export function SignInScreen({ label }: { label: string }) {
             ...type_.body,
             color: colors.muted,
             textAlign: "center",
-            lineHeight: 22,
             paddingHorizontal: space.md,
           }}
         >
@@ -71,7 +76,13 @@ export function SignInScreen({ label }: { label: string }) {
       </View>
 
       <View style={{ gap: space.md }}>
-        <Button onPress={() => void signIn()} title="Sign in" />
+        {/* Disabled while the browser is open, because `openAuthSessionAsync` throws on a second
+            call — into a discarded promise, which is nothing on screen at all. */}
+        <Button
+          disabled={state.status === "signing-in"}
+          onPress={() => void signIn()}
+          title={state.status === "signing-in" ? "Signing in…" : "Sign in"}
+        />
         <Text
           style={{
             ...type_.small,
@@ -79,7 +90,8 @@ export function SignInScreen({ label }: { label: string }) {
             textAlign: "center",
           }}
         >
-          Opens your browser. {label}
+          Opens your browser to sign in to {label}. This app never sees your
+          password.
         </Text>
       </View>
 

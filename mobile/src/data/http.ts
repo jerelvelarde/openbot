@@ -46,6 +46,14 @@ export type HttpSourceConfig = {
   token?: () => Promise<string | undefined>;
   /** How often to re-read while nothing is pushing. */
   pollMs?: number;
+  /**
+   * Called when the deployment says this session is no longer valid.
+   *
+   * Without it an expired token is terminal: every read throws 401, every screen shows "that did not
+   * work (401)", and nothing ever decides to stop being signed in — so there is no route back to the
+   * sign-in screen short of reinstalling the app.
+   */
+  onUnauthorized?: () => void;
 };
 
 export class ApiError extends Error {
@@ -100,6 +108,7 @@ type ServerApproval = {
   state: Approval["state"];
   askedAt: string;
   answeredAt: string | null;
+  expiresAt: string | null;
   scopedRule: string | null;
 };
 
@@ -174,6 +183,34 @@ function toolLineOf(result: string): ToolLine | undefined {
   };
 }
 
+/**
+ * What a tool did, as a verb.
+ *
+ * The trail's payload carries `action` — the tool name — and the thing acted on separately. Rendering
+ * only the second makes "typed into the password field" and "clicked the password field" the same
+ * row, which is the distinction the trail exists for.
+ */
+const VERBS: Record<string, string> = {
+  computer_click: "Clicked",
+  computer_type: "Typed into",
+  computer_key: "Pressed a key on",
+  computer_navigate: "Opened",
+  computer_read: "Read",
+  computer_snapshot: "Read the page",
+  computer_read_file: "Read the file",
+  computer_write_file: "Wrote to the file",
+  computer_list_files: "Listed the files in",
+  computer_request_secret: "Asked for a secret for",
+};
+
+function verbOf(action: unknown): string {
+  if (typeof action !== "string" || !action) return "Acted on";
+  const known = VERBS[action];
+  if (known) return known;
+  // An unmapped tool still names itself, which beats a bare noun. MCP tools land here.
+  return `Called ${action.replace(/^computer_/, "").replace(/_/g, " ")} on`;
+}
+
 /** Which audit rows a person reads as an outcome, and what to call it. */
 function auditOutcomeOf(eventType: string): AuditOutcome | undefined {
   if (eventType === "computer.action_allowed") return "allowed";
@@ -187,23 +224,80 @@ function auditOutcomeOf(eventType: string): AuditOutcome | undefined {
 export function createHttpSource(config: HttpSourceConfig = {}): DataSource {
   const base = config.baseUrl ?? "";
   const listeners = new Set<() => void>();
+  let timer: ReturnType<typeof setInterval> | undefined;
   const announce = () => {
     for (const listener of listeners) listener();
   };
 
+  /**
+   * GETs in flight right now, so one announce is one request per path.
+   *
+   * Several screens read overlapping things — the channel screen alone wants channels, messages and
+   * approvals, and `messages` asks for channels again to find the Bot — and every one of them fires
+   * on the same announce. Sharing the promise collapses that fan-out.
+   *
+   * Deliberately in-flight only, with no time-based cache: `answer` announces and then immediately
+   * re-reads, and a cached answer there would leave the screen saying an approval is still waiting
+   * after somebody answered it.
+   */
+  const inFlight = new Map<string, Promise<unknown>>();
+
   async function call<T>(path: string, init?: RequestInit): Promise<T> {
+    if (!init) {
+      const shared = inFlight.get(path);
+      if (shared) return shared as Promise<T>;
+      const started = request<T>(path).finally(() => inFlight.delete(path));
+      inFlight.set(path, started);
+      return started;
+    }
+    return request<T>(path, init);
+  }
+
+  async function request<T>(path: string, init?: RequestInit): Promise<T> {
+    const response = await send_(path, init);
+    return (await response.json()) as T;
+  }
+
+  /**
+   * A request whose body nobody reads.
+   *
+   * Starting a run answers `text/event-stream`, so parsing it as JSON waits for the whole turn and
+   * then rejects — which the composer showed as "that could not be sent" for a run that had in fact
+   * started, and restored the draft over whatever had been typed since.
+   */
+  async function post(path: string, body: unknown): Promise<void> {
+    await send_(path, { method: "POST", body: JSON.stringify(body) });
+  }
+
+  async function send_(path: string, init?: RequestInit): Promise<Response> {
     const token = await config.token?.();
-    const response = await fetch(`${base}${path}`, {
-      ...init,
-      headers: {
-        "content-type": "application/json",
-        ...(token ? { authorization: `Bearer ${token}` } : {}),
-        ...(init?.headers ?? {}),
-      },
-      // Same-origin behind the dev proxy, where the session cookie is how the browser is known.
-      credentials: "include",
-    });
+    let response: Response;
+    try {
+      response = await fetch(`${base}${path}`, {
+        ...init,
+        headers: {
+          "content-type": "application/json",
+          ...(token ? { authorization: `Bearer ${token}` } : {}),
+          ...(init?.headers ?? {}),
+        },
+        // Same-origin behind the dev proxy, where the session cookie is how the browser is known.
+        credentials: "include",
+      });
+    } catch {
+      /**
+       * A request that never arrived.
+       *
+       * The platform's own words for this are "Failed to fetch" in a browser and "Network request
+       * failed" on a device, and both of those end up on a card headed "Offline" in front of
+       * somebody who wanted to know whether their Bot is blocked. Status 0 because there was no
+       * response to have one.
+       */
+      throw new ApiError(0, "This deployment could not be reached.");
+    }
     if (!response.ok) {
+      // A dead session is not a failed read, and treating it as one strands the app on an error it
+      // can never clear. Told once, before the message is thrown for whoever asked.
+      if (response.status === 401) config.onUnauthorized?.();
       const body = (await response.json().catch(() => null)) as {
         error?: string;
       } | null;
@@ -212,7 +306,7 @@ export function createHttpSource(config: HttpSourceConfig = {}): DataSource {
         body?.error ?? `That did not work (${response.status}).`,
       );
     }
-    return (await response.json()) as T;
+    return response;
   }
 
   /**
@@ -253,7 +347,10 @@ export function createHttpSource(config: HttpSourceConfig = {}): DataSource {
       reason: row.reason,
       askedAt: row.askedAt,
       state: row.state,
-      ...(row.answeredAt ? { answeredBy: "a person" } : {}),
+      // The server deliberately does not say WHO answered, so nothing here may imply it did. This
+      // previously invented the string "a person" and rendered it as a fact.
+      ...(row.answeredAt ? { answeredAt: row.answeredAt } : {}),
+      ...(row.expiresAt ? { expiresAt: row.expiresAt } : {}),
       ...(row.scopedRule ? { scopedRule: row.scopedRule } : {}),
     }));
   }
@@ -364,36 +461,33 @@ export function createHttpSource(config: HttpSourceConfig = {}): DataSource {
       const history = await source.messages(channelId);
 
       const runId = randomId();
-      await call(
+      await post(
         `/api/copilotkit/agent/${encodeURIComponent(channel.botId)}/run`,
         {
-          method: "POST",
-          body: JSON.stringify({
-            threadId: channelId,
-            runId,
-            messages: [
-              ...history
-                /**
-                 * Text only, on purpose.
-                 *
-                 * The thread keeps tool RESULTS without the assistant message that made the calls, so
-                 * sending them back would hand a provider a tool result answering a call it has never
-                 * seen — which every provider rejects, and which would break every follow-up message.
-                 * What those tools found is already in the Bot's own answer.
-                 */
-                .filter((message) => Boolean(message.text))
-                .map((message) => ({
-                  id: message.id,
-                  role: message.role,
-                  content: message.text,
-                })),
-              { id: `msg_${runId}`, role: "user", content: text },
-            ],
-            tools: [],
-            context: [],
-            state: {},
-            forwardedProps: {},
-          }),
+          threadId: channelId,
+          runId,
+          messages: [
+            ...history
+              /**
+               * Text only, on purpose.
+               *
+               * The thread keeps tool RESULTS without the assistant message that made the calls, so
+               * sending them back would hand a provider a tool result answering a call it has never
+               * seen — which every provider rejects, and which would break every follow-up message.
+               * What those tools found is already in the Bot's own answer.
+               */
+              .filter((message) => Boolean(message.text))
+              .map((message) => ({
+                id: message.id,
+                role: message.role,
+                content: message.text,
+              })),
+            { id: `msg_${runId}`, role: "user", content: text },
+          ],
+          tools: [],
+          context: [],
+          state: {},
+          forwardedProps: {},
         },
       );
 
@@ -415,9 +509,9 @@ export function createHttpSource(config: HttpSourceConfig = {}): DataSource {
     },
 
     async answer(id, decision, scope: AnswerScope) {
-      await call(`/api/approvals/${encodeURIComponent(id)}`, {
-        method: "POST",
-        body: JSON.stringify({ decision, scope }),
+      await post(`/api/approvals/${encodeURIComponent(id)}`, {
+        decision,
+        scope,
       });
       announce();
       const answered = await source.approval(id);
@@ -436,39 +530,78 @@ export function createHttpSource(config: HttpSourceConfig = {}): DataSource {
         if (!outcome) continue;
         const payload = event.payload ?? {};
         /**
-         * "You answered" is not an outcome on its own.
+         * "Answered" is not an outcome on its own.
          *
-         * The row says a person answered; what they said is in the payload. Rendering a refusal in the
-         * same colour as an approval would make the one row somebody scrolling the trail most needs to
-         * spot look exactly like the rows either side of it.
+         * The row says an answer was given; what it was is in the payload — and one of the possible
+         * answers is that nobody gave one. A timeout recorded as "answered" tells a reader a person
+         * decided this, when the truth is the window closed and the server answered for them.
          */
-        if (outcome === "answered" && payload.answer === "denied") {
-          outcome = "refused";
+        if (outcome === "answered") {
+          if (payload.answer === "denied") outcome = "refused";
+          else if (
+            payload.answer === "expired" ||
+            payload.answer === "cancelled"
+          ) {
+            outcome = "expired";
+          }
         }
+
+        /**
+         * The decision, where the server puts it.
+         *
+         * `writeAsk` (the asked/answered rows) carries `rule` at the top level; `writeAction` (every
+         * allowed, refused and failed row) carries it under `decision`. Reading only the first meant
+         * no refusal in this list ever showed the rule that caused it — on the screen whose subtitle
+         * promises exactly that.
+         */
+        const decision = (
+          typeof payload.decision === "object" && payload.decision
+            ? payload.decision
+            : {}
+        ) as { rule?: unknown; mode?: unknown; carriedOut?: unknown };
+        const rule =
+          typeof payload.rule === "string"
+            ? payload.rule
+            : typeof decision.rule === "string"
+              ? decision.rule
+              : undefined;
+
         const botId = typeof payload.bot === "string" ? payload.bot : "";
-        const subject =
+        const element =
+          typeof payload.element === "object" &&
+          payload.element &&
+          "name" in payload.element
+            ? String((payload.element as { name?: unknown }).name ?? "")
+            : "";
+        // `subject` is the asked/answered rows' own phrasing and already reads as a sentence
+        // fragment; the acting rows are assembled from a verb and what it acted on.
+        const summary =
           typeof payload.subject === "string"
             ? payload.subject
-            : typeof payload.element === "object" &&
-                payload.element &&
-                "name" in payload.element
-              ? String((payload.element as { name?: unknown }).name ?? "")
-              : typeof payload.file === "string"
-                ? payload.file
-                : typeof payload.page === "string"
-                  ? payload.page
-                  : ((payload.action as string) ?? event.eventType);
+            : `${verbOf(payload.action)} ${
+                element ||
+                (typeof payload.file === "string" ? payload.file : "") ||
+                (typeof payload.page === "string" ? payload.page : "") ||
+                "something it could not name"
+              }`;
+
         rows.push({
           id: event.id,
           at: event.createdAt,
           eventType: event.eventType,
           botId,
           botName: named.get(botId) ?? botId,
-          summary: subject,
+          summary,
           outcome,
-          ...(typeof payload.rule === "string" ? { rule: payload.rule } : {}),
+          ...(rule ? { rule } : {}),
           ...(typeof payload.actor === "string"
             ? { actor: payload.actor }
+            : {}),
+          ...(decision.mode === "dry-run" || decision.mode === "enforce"
+            ? { mode: decision.mode }
+            : {}),
+          ...(typeof decision.carriedOut === "boolean"
+            ? { carriedOut: decision.carriedOut }
             : {}),
         });
       }
@@ -495,7 +628,9 @@ export function createHttpSource(config: HttpSourceConfig = {}): DataSource {
             one.state === "denied"
               ? "refused"
               : one.state === "expired"
-                ? "routine-failed"
+                ? // Not "routine-failed": that colour means permitted, attempted, did not work.
+                  // Nothing was permitted here and nothing was attempted.
+                  "expired"
                 : "done",
           botId: one.botId,
           botName: one.botName,
@@ -518,12 +653,26 @@ export function createHttpSource(config: HttpSourceConfig = {}): DataSource {
 
     subscribe(listener) {
       listeners.add(listener);
-      const timer = setInterval(announce, config.pollMs ?? 4_000);
+      /**
+       * One timer, not one per subscriber.
+       *
+       * Every `useLive` call used to start its own interval, and each tick announced to ALL of them:
+       * the channel screen's four hooks meant sixteen reads every four seconds, each several composed
+       * requests, which queues the response that matters behind seven that do not.
+       */
+      if (listeners.size === 1) {
+        timer = setInterval(announce, config.pollMs ?? 4_000);
+      }
       return () => {
         listeners.delete(listener);
-        clearInterval(timer);
+        if (listeners.size === 0 && timer !== undefined) {
+          clearInterval(timer);
+          timer = undefined;
+        }
       };
     },
+
+    refresh: announce,
   };
 
   return source;

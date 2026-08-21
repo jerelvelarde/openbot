@@ -2,15 +2,34 @@
  * The frame every screen sits in: background, title, and the bar above a pushed screen.
  */
 import type { ReactNode } from "react";
-import { Platform, Pressable, Text, View } from "react-native";
+import { Pressable, Text, View } from "react-native";
 import { space, type as type_ } from "../theme";
 import { Body, useColors } from "../ui";
+
+/**
+ * How wide a screen is allowed to get.
+ *
+ * The phone frame is web-only, so on an iPad — which `app.json` says this app supports — every screen
+ * otherwise runs the full ~880pt window: a 15pt transcript at newspaper measure, and three identical
+ * full-width decision pills that flatten the difference between Allow and Refuse the palette works to
+ * create. On a phone, and inside the 393pt frame, this never binds.
+ */
+const MAX_MEASURE = 560;
 
 export function Screen({ children }: { children: ReactNode }) {
   const colors = useColors();
   return (
     <View style={{ flex: 1, backgroundColor: colors.background }}>
-      {children}
+      <View
+        style={{
+          flex: 1,
+          width: "100%",
+          maxWidth: MAX_MEASURE,
+          alignSelf: "center",
+        }}
+      >
+        {children}
+      </View>
     </View>
   );
 }
@@ -34,7 +53,12 @@ export function Title({
           justifyContent: "space-between",
         }}
       >
-        <Text style={{ ...type_.title, color: colors.foreground }}>{text}</Text>
+        <Text
+          accessibilityRole="header"
+          style={{ ...type_.title, color: colors.foreground }}
+        >
+          {text}
+        </Text>
         {right}
       </View>
       {detail ? <Body muted>{detail}</Body> : null}
@@ -96,11 +120,15 @@ export function TopBar({
       <Pressable
         accessibilityLabel="Back"
         accessibilityRole="button"
-        hitSlop={14}
+        android_ripple={{ color: colors.border, borderless: true }}
+        // hitSlop is native-only — react-native-web's Pressable ignores it — so the size has to be
+        // real padding. Without it the only way off this screen is a 27x34 box in the corner a
+        // pointer coming from below hits worst, usually drawn below 1:1 by the frame's scale.
+        hitSlop={8}
         onPress={onBack}
         style={({ pressed }) => ({
-          paddingVertical: 8,
-          paddingHorizontal: 8,
+          paddingVertical: 13,
+          paddingHorizontal: 16,
           opacity: pressed ? 0.5 : 1,
         })}
       >
@@ -108,6 +136,7 @@ export function TopBar({
       </Pressable>
       {leading}
       <Text
+        accessibilityRole="header"
         numberOfLines={1}
         style={{ ...type_.heading, color: colors.foreground, flex: 1 }}
       >
@@ -117,5 +146,3 @@ export function TopBar({
     </View>
   );
 }
-
-export const isWeb = Platform.OS === "web";

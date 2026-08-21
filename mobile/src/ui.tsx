@@ -8,6 +8,7 @@
 import type { ReactElement, ReactNode } from "react";
 import { createContext, useContext } from "react";
 import { Pressable, Text, View } from "react-native";
+import type { ApprovalSubject } from "./data/types";
 import { palettes, radius, type Scheme, space, type as type_ } from "./theme";
 
 const SchemeContext = createContext<Scheme>("light");
@@ -15,25 +16,111 @@ export const SchemeProvider = SchemeContext.Provider;
 export const useScheme = () => useContext(SchemeContext);
 export const useColors = () => palettes[useContext(SchemeContext)];
 
-/** An outcome, in the one place colour is spent. */
+/**
+ * One sentence out of several fields, for the accessibility tree.
+ *
+ * Joins with a full stop unless the piece already ends in one, because a screen reader reads "run..
+ * one waiting" as a pause long enough to sound like a fault.
+ */
+export function sentence(...parts: (string | undefined)[]): string {
+  return parts
+    .filter((part): part is string => Boolean(part?.trim()))
+    .map((part) => part.trim())
+    .map((part) => (/[.!?]$/.test(part) ? part : `${part}.`))
+    .join(" ");
+}
+
+/**
+ * What a Bot wants to do, as a verb somebody reads rather than an enum.
+ *
+ * `intent` is the policy engine's own vocabulary, and five of its nine values are snake_case — so
+ * interpolating it raw produced "Risk Analyst wants to write_file controls/august.csv" in the middle
+ * of the sentence a person is being asked to approve.
+ */
+const INTENTS: Record<string, string> = {
+  activate: "activate",
+  type: "type into",
+  navigate: "open",
+  read: "read",
+  read_file: "read the file",
+  write_file: "write to the file",
+  list_files: "list the files in",
+  read_tool: "read from",
+  write_tool: "change something in",
+};
+
+export function intentPhrase(intent: string): string {
+  return INTENTS[intent] ?? intent.replace(/_/g, " ");
+}
+
+/**
+ * What is about to be acted on, as the SERVER named it.
+ *
+ * The `page` kind is not "a page": the gateway returns it when it could not match the action to
+ * anything in the snapshot it took, and puts the bare tool name in the label. That is the one case
+ * worth being loud about — a Bot about to click something nobody can identify — and it used to be
+ * signalled only by the absence of quotation marks, so "wants to activate click" read as a typo.
+ */
+export function subjectPhrase(subject: ApprovalSubject): string {
+  const where = subject.host ? ` on ${subject.host}` : "";
+  if (subject.kind === "page") {
+    return `something this deployment could not identify${where}`;
+  }
+  if (subject.kind === "file") return subject.label;
+  if (subject.kind === "mcp") return `${subject.label}${where}`;
+  return `“${subject.label}”${where}`;
+}
+
+/**
+ * What each outcome is called, in one place.
+ *
+ * One vocabulary because the same event is drawn on three surfaces — a tool line in a transcript, a
+ * row in the trail, a dot with no text at all — and a deployment that calls the same thing "Refused"
+ * here and "Blocked" there teaches nobody anything.
+ */
+export const OUTCOME_WORDS: Record<string, string> = {
+  allowed: "Permitted",
+  refused: "Refused",
+  failed: "Failed",
+  asked: "Asked for approval",
+  answered: "Answered",
+  expired: "Nobody answered",
+  running: "Waiting",
+};
+
+/**
+ * The colour an outcome is drawn in.
+ *
+ * Exported so the dot and the word beside it cannot disagree. They did: the trail coloured only
+ * refusals and failures, so every permitted row put a grey word next to a green dot.
+ */
+export function outcomeColor(
+  colors: ReturnType<typeof useColors>,
+  outcome: string,
+): string {
+  if (outcome === "refused" || outcome === "expired") return colors.refuse;
+  if (outcome === "failed") return colors.fail;
+  if (outcome === "asked" || outcome === "running") return colors.pending;
+  return colors.allow;
+}
+
+/**
+ * An outcome, in the one place colour is spent.
+ *
+ * It carries its own name. An 8px dot is the entire difference between a call that worked and one
+ * that did not on a bare tool line, and a dot is nothing at all to a screen reader.
+ */
 export function OutcomeDot({ outcome }: { outcome: string }) {
   const colors = useColors();
-  const color =
-    outcome === "refused"
-      ? colors.refuse
-      : outcome === "failed"
-        ? colors.fail
-        : outcome === "asked" || outcome === "running"
-          ? colors.pending
-          : colors.allow;
   return (
     <View
+      accessibilityLabel={OUTCOME_WORDS[outcome] ?? outcome}
+      accessibilityRole="image"
       style={{
         width: 8,
         height: 8,
         borderRadius: 4,
-        backgroundColor: color,
-        marginTop: 6,
+        backgroundColor: outcomeColor(colors, outcome),
       }}
     />
   );
@@ -44,12 +131,22 @@ export function Card({
   onPress,
   muted,
   accent,
+  label,
+  hint,
 }: {
   children: ReactNode;
   onPress?: () => void;
   muted?: boolean;
   /** A card that is the reason the screen exists. Used once per screen at most. */
   accent?: boolean;
+  /**
+   * What this card says, in one sentence, for somebody who cannot see it.
+   *
+   * A card built from four separate Texts is announced as four unrelated fragments, and the sentence
+   * a person actually needs — who wants to do what — is spread across them.
+   */
+  label?: string;
+  hint?: string;
 }) {
   const colors = useColors();
   const body = (
@@ -69,6 +166,13 @@ export function Card({
   if (!onPress) return body;
   return (
     <Pressable
+      // Without a role this is an inert div on web: not focusable, not announced, and Space does
+      // nothing. It is the tap target for every approval on the home screen.
+      accessibilityRole="button"
+      // What a tap looks like on Android, where an opacity dip is not the platform's language.
+      android_ripple={{ color: colors.border }}
+      {...(label ? { accessibilityLabel: label } : {})}
+      {...(hint ? { accessibilityHint: hint } : {})}
       onPress={onPress}
       style={({ pressed }) => ({
         opacity: pressed ? 0.72 : 1,
@@ -89,6 +193,7 @@ export function Row({
   onPress,
   trailing,
   lines = 1,
+  label,
 }: {
   leading?: ReactNode;
   title: ReactNode;
@@ -99,6 +204,8 @@ export function Row({
   trailing?: ReactNode;
   /** How much of the detail to show. Two where the detail IS the news, one where it is context. */
   lines?: number;
+  /** The whole row as one sentence, so it is not announced as five fragments. */
+  label?: string;
 }) {
   const colors = useColors();
   const body = (
@@ -121,11 +228,15 @@ export function Row({
               ...type_.heading,
               color: colors.foreground,
               flexShrink: 1,
+              // Without this a flex child refuses to shrink below its content, so at large text sizes
+              // the badge keeps its full width and the Bot's name is what disappears.
+              minWidth: 0,
             }}
           >
             {title}
           </Text>
-          {trailing}
+          {/* The badge yields before the name does: "1 waiting" is meaningless without whose. */}
+          {trailing ? <View style={{ flexShrink: 1 }}>{trailing}</View> : null}
           {/* The time sits with the name rather than in its own column, so the sentence underneath
               gets the full width. A truncated "was allowed to activate “Submi…" says nothing. */}
           {meta ? (
@@ -159,6 +270,9 @@ export function Row({
   if (!onPress) return body;
   return (
     <Pressable
+      accessibilityRole="button"
+      android_ripple={{ color: colors.border }}
+      {...(label ? { accessibilityLabel: label } : {})}
       onPress={onPress}
       style={({ pressed }) => ({ opacity: pressed ? 0.6 : 1 })}
     >
@@ -184,7 +298,10 @@ export function Divider({ inset = 0 }: { inset?: number }) {
 export function Heading({ children }: { children: ReactNode }) {
   const colors = useColors();
   return (
-    <Text style={{ ...type_.heading, color: colors.foreground }}>
+    <Text
+      accessibilityRole="header"
+      style={{ ...type_.heading, color: colors.foreground }}
+    >
       {children}
     </Text>
   );
@@ -202,7 +319,6 @@ export function Body({
     <Text
       style={{
         ...type_.body,
-        lineHeight: 21,
         color: muted ? colors.muted : colors.foreground,
       }}
     >
@@ -215,6 +331,9 @@ export function Label({ children }: { children: ReactNode }) {
   const colors = useColors();
   return (
     <Text
+      // A section label IS this screen's structure. Without the role the only way through an
+      // approval is swiping past every line in order.
+      accessibilityRole="header"
       style={{
         ...type_.label,
         color: colors.muted,
@@ -247,7 +366,11 @@ export function Rule({ children }: { children: ReactNode }) {
         paddingHorizontal: space.md,
       }}
     >
-      <Text style={{ ...type_.mono, color: colors.foreground }} selectable>
+      <Text
+        accessibilityLabel={`Rule: ${String(children)}`}
+        selectable
+        style={{ ...type_.mono, color: colors.foreground }}
+      >
         {children}
       </Text>
     </View>
@@ -279,10 +402,11 @@ export function Button({
       ? colors.foreground
       : tone === "default"
         ? colors.primaryForeground
-        : "#ffffff";
+        : colors.accentForeground;
   return (
     <Pressable
       accessibilityRole="button"
+      android_ripple={{ color: colors.border }}
       disabled={disabled}
       onPress={onPress}
       style={({ pressed }) => ({
@@ -316,16 +440,17 @@ export function Badge({
       style={{
         alignSelf: "flex-start",
         backgroundColor: tone === "pending" ? colors.pending : colors.cardMuted,
-        borderRadius: 999,
+        borderRadius: radius.pill,
         paddingVertical: 3,
         paddingHorizontal: 9,
       }}
     >
       <Text
+        numberOfLines={1}
         style={{
           ...type_.small,
           fontWeight: "600",
-          color: tone === "pending" ? "#ffffff" : colors.muted,
+          color: tone === "pending" ? colors.accentForeground : colors.muted,
         }}
       >
         {children}
@@ -334,10 +459,39 @@ export function Badge({
   );
 }
 
-/** Time as somebody glancing at a phone reads it. */
+/**
+ * Time as somebody glancing at a phone reads it.
+ *
+ * Day-aware, because this is an audit surface and the reads behind it go back days: `/api/audit`
+ * asks for the last sixty events and the approval queue keeps settled rows. A bare clock time makes
+ * a refusal from last Tuesday at 14:22 and one from today at 14:22 the same string, which is the one
+ * thing a trail must never do.
+ *
+ * An unparseable value says so rather than rendering "Invalid Date": the runtime's thread history can
+ * hand back an empty `createdAt`.
+ */
 export function when(iso: string): string {
   const date = new Date(iso);
-  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const at = date.getTime();
+  if (Number.isNaN(at)) return "an unknown time";
+
+  const clock = date.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  const now = new Date();
+  const sameDay =
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate();
+  if (sameDay) return clock;
+
+  // Inside the last week a weekday is how people actually refer to it; past that it needs a date.
+  const days = (now.getTime() - at) / 86_400_000;
+  if (days >= 0 && days < 6) {
+    return `${date.toLocaleDateString([], { weekday: "short" })} ${clock}`;
+  }
+  return `${date.toLocaleDateString([], { day: "numeric", month: "short" })} ${clock}`;
 }
 
 /**

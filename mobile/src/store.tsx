@@ -63,6 +63,11 @@ export function useLiveResult<T>(read: (source: DataSource) => Promise<T>): {
    * Callers write `useLive((s) => s.approvals())` inline, so the function is a new identity every
    * render. Depending on it would resubscribe on every render; the source is the identity that
    * actually matters, and the latest reader is always the one that runs.
+   *
+   * So a read must be keyed on the screen's own props, never on a value another read produced: the
+   * first run happens with whatever the closure held at mount, and nothing re-runs it until the
+   * source announces. Pass the id and let the source resolve the rest, which is why every method on
+   * `DataSource` takes an id.
    */
   const readRef = useRef(read);
   readRef.current = read;

@@ -24,13 +24,22 @@ const BOT = { id: "risk-analyst", name: "Risk Analyst" };
 const HOST = "portal.northwind.example";
 
 /**
- * A fixed clock.
+ * A fixed clock, on today's date.
  *
  * Timestamps are minted from a base rather than from `Date.now()` so a recording made today and one
- * made next week show the same thread, and a reviewer comparing them is looking at the change rather
+ * made next week show the same times, and a reviewer comparing them is looking at the change rather
  * than at the date.
+ *
+ * The base is a fixed time of day but the CURRENT day, which is the part that has to move: timestamps
+ * are rendered day-aware now (see `when()`), so a hardcoded date makes the whole demo read as
+ * "19 Aug 14:02" the day after it was pinned — a thread of stale history rather than this morning's
+ * work. The visible strings stay identical run to run; only the invisible date follows the calendar.
+ *
+ * 09:30 because the web build draws a status bar reading 9:41, as every phone mockup does. The events
+ * then run up to a few minutes short of it, so a recording does not show a conversation happening
+ * hours after the clock above it.
  */
-const BASE = new Date("2026-08-19T14:02:00Z").getTime();
+const BASE = new Date(new Date().setHours(9, 30, 0, 0)).getTime();
 let tick = 0;
 const stamp = () => new Date(BASE + tick++ * 41_000).toISOString();
 
@@ -113,6 +122,15 @@ export function createLocalSource(): DataSource {
       reason:
         "This deployment's policy asks before anything called submit is activated outside your own domain.",
       askedAt: stamp(),
+      /**
+       * Ten minutes from whenever this is being looked at.
+       *
+       * The server parks an action for ten minutes and the demo carries the same pressure, or the
+       * countdown on the approval screen is only ever exercised against a live deployment. Measured
+       * from now rather than from BASE, because BASE is a fixed hour: anchored to it, the demo says
+       * the deadline has passed for most of every day.
+       */
+      expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
       state: "pending",
     },
   ];
@@ -268,7 +286,7 @@ export function createLocalSource(): DataSource {
       if (approval.state !== "pending") return approval;
 
       approval.state = decision === "allow" ? "allowed" : "denied";
-      approval.answeredBy = "jerel@copilotkit.ai";
+      approval.answeredAt = stamp();
       const label =
         approval.subject.kind === "element"
           ? approval.subject.label
@@ -288,9 +306,12 @@ export function createLocalSource(): DataSource {
         botName: approval.botName,
         summary:
           decision === "allow"
-            ? `You allowed “${label}”${scope === "always" ? ", and from now on" : ""}`
-            : `You refused “${label}”`,
-        outcome: "answered",
+            ? `Allowed “${label}”${scope === "always" ? ", and from now on" : ""}`
+            : `Refused “${label}”`,
+        // A refusal drawn as "answered" is drawn in the allow colour, which makes the one row
+        // somebody scanning the trail most needs to spot look like the rows either side of it. The
+        // HTTP source already derives this from the answer; this is the demo matching it.
+        outcome: decision === "allow" ? "answered" : "refused",
         rule: approval.scopedRule ?? approval.rule,
         actor: "jerel@copilotkit.ai",
       });
@@ -299,8 +320,22 @@ export function createLocalSource(): DataSource {
         (candidate) => candidate.state === "pending",
       ).length;
 
+      /**
+       * The note becomes what happened.
+       *
+       * A notification body is written once, in the present tense, and then outlives the thing it
+       * described: "needs approval to activate …" sitting in the list under a green dot, minutes
+       * after it was refused, is the app reporting an outstanding request that is not outstanding.
+       */
       for (const note of notifications) {
-        if (note.approvalId === approvalId) note.read = true;
+        if (note.approvalId !== approvalId) continue;
+        note.read = true;
+        note.kind = decision === "allow" ? "done" : "refused";
+        note.body =
+          decision === "allow"
+            ? `was allowed to activate “${label}”`
+            : `was refused “${label}”`;
+        note.at = stamp();
       }
 
       // Replace the "waiting for you" line with what actually happened, then let the run continue.
@@ -394,6 +429,8 @@ export function createLocalSource(): DataSource {
       if (note) note.read = true;
       announce();
     },
+
+    refresh: announce,
 
     subscribe(listener) {
       listeners.add(listener);

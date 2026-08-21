@@ -82,9 +82,12 @@ gets the platform's token and hands it over.
   on a device and in a browser.
 - `mobile/` is **not** in the root `workspaces` array. Metro and Bun workspace hoisting fight each
   other, and this app has no dependency on the server's package graph.
-- On web the app renders inside a device-sized frame at 393 x 852 points, scaled to the window. A
-  companion stretched across a desktop window stops being an honest picture of itself, and the frame
-  is also what makes a recording of it legible.
+- On web the app renders inside a device-sized frame at 393 x 852 points, scaled to the window but
+  never below 1:1 — browser zoom otherwise shrank the phone by exactly as much as it enlarged the
+  page, and the frame pans instead of clipping. A companion stretched across a desktop window stops
+  being an honest picture of itself, and the frame is also what makes a recording of it legible.
+- The app follows the phone's appearance setting on a device. The web build stays light, so a
+  recording made today matches one made last month.
 - A Bot's face is drawn from its `avatarSeed` with the same hash, palette and composition the web app
   gets from `boring-avatars`, ported to React Native views. Same seed, same avatar — drawn crisply
   rather than blurred, because the blur needs a native module.

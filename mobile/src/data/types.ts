@@ -40,8 +40,21 @@ export type Approval = {
   /** Why, in words that go in front of a person. */
   reason: string;
   askedAt: string;
+  /**
+   * When the window closes.
+   *
+   * The server parks an action for ten minutes and then answers the Bot itself — "long enough that
+   * somebody can walk back to their desk", as it puts it. A screen that shows three live buttons and
+   * no deadline invites exactly that walk, and then a 409. Optional because the local fixtures and
+   * older rows may not carry one.
+   */
+  expiresAt?: string;
   state: ApprovalState;
-  answeredBy?: string;
+  /**
+   * When it was answered, if it was. Never BY WHOM: the server deliberately does not carry the
+   * answerer's identity, and a surface that filled that gap in would be inventing an attribution on
+   * a security decision.
+   */
   answeredAt?: string | null;
   /** Set when the answer wrote a scoped allow rule rather than a one-off permission. */
   scopedRule?: string;
@@ -90,7 +103,9 @@ export type AuditOutcome =
   | "refused"
   | "failed"
   | "asked"
-  | "answered";
+  | "answered"
+  /** The window closed with nobody answering. Not a refusal, and not a failure. */
+  | "expired";
 
 export type AuditRow = {
   id: string;
@@ -102,12 +117,28 @@ export type AuditRow = {
   outcome: AuditOutcome;
   rule?: string;
   actor?: string;
+  /**
+   * Whether the boundary was being enforced when this was decided.
+   *
+   * A dry-run deployment records a refusal and then lets the action through, so a row that says
+   * "Refused" about something that happened is the trail contradicting itself. `carriedOut` is the
+   * server's own word for "it went ahead anyway".
+   */
+  mode?: "enforce" | "dry-run";
+  carriedOut?: boolean;
 };
 
 export type Notification = {
   id: string;
   /** The tight rule: approval, question, done-if-asked, routine-failed. Nothing else buzzes. */
-  kind: "approval" | "question" | "done" | "refused" | "routine-failed";
+  kind:
+    | "approval"
+    | "question"
+    | "done"
+    | "refused"
+    /** Nobody answered in time. Not "failed": nothing was permitted and nothing was attempted. */
+    | "expired"
+    | "routine-failed";
   /** The Bot's id, which is also its avatar seed. Its face is how a list is scanned. */
   botId: string;
   botName: string;

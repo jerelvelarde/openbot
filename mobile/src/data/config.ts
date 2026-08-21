@@ -11,7 +11,7 @@
  */
 import { createHttpSource } from "./http";
 import { createLocalSource } from "./local";
-import { readToken } from "./session";
+import { forgetSession, readToken } from "./session";
 import type { DataSource } from "./source";
 
 export type Connection =
@@ -23,7 +23,19 @@ export function resolveConnection(): Connection {
   if (!api) return { kind: "local" };
   return {
     kind: "live",
-    label: api === "same-origin" ? "this deployment" : api,
+    /**
+     * Which deployment, in the words a person can check.
+     *
+     * "this deployment" distinguishes a laptop from production not at all, and the whole point of the
+     * bar it appears in is answering "is this real?" of a screenshot. Same-origin only ever happens
+     * in a browser, hence the guard: this module is imported on native too.
+     */
+    label:
+      api === "same-origin"
+        ? typeof window === "undefined"
+          ? "this deployment"
+          : window.location.host
+        : api,
     /**
      * Whether this build needs to sign in at all.
      *
@@ -41,5 +53,8 @@ export function createSource(connection: Connection): DataSource {
     baseUrl: connection.baseUrl,
     // Read per call, so a token acquired after the app started is used without rebuilding anything.
     token: readToken,
+    // A session the deployment no longer accepts ends, rather than becoming an error on every screen
+    // with no way back to the sign-in button.
+    onUnauthorized: forgetSession,
   });
 }

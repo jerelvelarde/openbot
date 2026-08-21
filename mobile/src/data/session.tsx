@@ -24,6 +24,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useRef,
   useState,
 } from "react";
 import { Platform } from "react-native";
@@ -34,6 +35,8 @@ const KEY = "openbot.session";
 export type SessionState =
   /** Reading the store. Rendering a sign-in screen before knowing would flash it at somebody who is signed in. */
   | { status: "unknown" }
+  /** The system browser is open, or the token it returned is being traded for a session. */
+  | { status: "signing-in" }
   /** Signed in, or not needing to be: see `cookies` below. */
   | { status: "signed-in"; cookies: boolean }
   | { status: "signed-out" }
@@ -56,6 +59,21 @@ export type Session = {
 export async function readToken(): Promise<string | undefined> {
   if (!supportsSecureStore()) return undefined;
   return (await SecureStore.getItemAsync(KEY)) ?? undefined;
+}
+
+/**
+ * Forget the session, from outside React.
+ *
+ * The data layer is built once for the life of the app and lives outside the tree, so when the
+ * deployment answers 401 it has no way to say so to the provider that holds the session. Without
+ * this an expired token is terminal: every screen shows "that did not work (401)" forever, and
+ * nothing ever decides to stop being signed in. Same escape hatch as `readToken`, for the same
+ * reason.
+ */
+let forget: (() => void) | undefined;
+
+export function forgetSession(): void {
+  forget?.();
 }
 
 /**
@@ -85,6 +103,8 @@ export function SessionProvider({
   children: ReactNode;
 }) {
   const sameOrigin = baseUrl === "";
+  /** One-time tokens already traded, so a redelivered redirect is ignored rather than failed. */
+  const spent = useRef<Set<string>>(new Set());
   const [state, setState] = useState<SessionState>(
     // Same-origin: the browser is already carrying whatever session it has, and there is nothing for
     // this app to hold or to ask for.
@@ -96,105 +116,193 @@ export function SessionProvider({
   useEffect(() => {
     if (sameOrigin || !supportsSecureStore()) return;
     let cancelled = false;
-    void readToken().then((token) => {
-      if (cancelled) return;
-      setState(
-        token
-          ? { status: "signed-in", cookies: false }
-          : { status: "signed-out" },
-      );
-    });
+    void readToken().then(
+      (token) => {
+        if (cancelled) return;
+        setState(
+          token
+            ? { status: "signed-in", cookies: false }
+            : { status: "signed-out" },
+        );
+      },
+      /**
+       * A keychain that will not answer.
+       *
+       * Corrupt entry, a device restored from a backup, a keystore the OS has decided to reject. With
+       * no rejection arm the state stayed `unknown` forever, which `Gate` renders as an empty view
+       * between a status bar and a tab bar: no message, no button, and force-quitting does not help.
+       */
+      () => {
+        if (cancelled) return;
+        setState({
+          status: "failed",
+          reason:
+            "This phone could not read its saved sign-in. Signing in again will fix it.",
+        });
+      },
+    );
     return () => {
       cancelled = true;
     };
   }, [sameOrigin]);
 
+  /**
+   * Turn a handoff redirect into a session.
+   *
+   * Split out because the redirect can arrive two ways. Normally it resolves the promise from
+   * `openAuthSessionAsync`; but if the system evicts this app while the sign-in tab is in front, the
+   * relaunch delivers it as a launch URL instead — and the one-time token, which is spent on first
+   * use, was being thrown away with no explanation and the sign-in screen shown again.
+   */
+  const consume = useCallback(
+    async (url: string) => {
+      const handoff = Linking.parse(url);
+      const oneTime = single(handoff.queryParams?.token);
+      /**
+       * Each token is used once, here.
+       *
+       * The same redirect can be delivered both as the auth session's result and as a `url` event.
+       * Trading it twice fails the second time — the server has already spent it — and would
+       * overwrite a good session with "that sign-in had expired".
+       */
+      if (oneTime) {
+        if (spent.current.has(oneTime)) return;
+        spent.current.add(oneTime);
+      }
+
+      const error = single(handoff.queryParams?.error);
+      if (error) {
+        setState({
+          status: "failed",
+          reason:
+            error === "not-signed-in"
+              ? "Sign-in did not complete. Try again."
+              : `That deployment refused the sign-in (${error}). Try again, or ask an administrator.`,
+        });
+        return;
+      }
+
+      if (!oneTime) {
+        setState({
+          status: "failed",
+          reason: "That deployment did not send a token back.",
+        });
+        return;
+      }
+
+      /**
+       * Trade the one-time token for a session.
+       *
+       * The one-time token travelled through the operating system to get here and may be in a log; it
+       * is spent on first use, so what is left in that log is worthless. The session it returns is
+       * what goes in the secure store.
+       */
+      try {
+        const response = await fetch(
+          `${baseUrl}/api/auth/one-time-token/verify`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ token: oneTime }),
+          },
+        );
+        if (!response.ok) {
+          setState({
+            status: "failed",
+            reason: "That sign-in had expired. Try again.",
+          });
+          return;
+        }
+        const body = (await response.json()) as {
+          session?: { token?: string };
+          token?: string;
+        };
+        const session = body.session?.token ?? body.token;
+        if (!session) {
+          setState({
+            status: "failed",
+            reason: "That deployment did not return a session.",
+          });
+          return;
+        }
+        await SecureStore.setItemAsync(KEY, session);
+        setState({ status: "signed-in", cookies: false });
+      } catch {
+        setState({
+          status: "failed",
+          reason: "Could not reach that deployment.",
+        });
+      }
+    },
+    [baseUrl],
+  );
+
   const signIn = useCallback(async () => {
     if (sameOrigin) return;
 
-    const returnTo = Linking.createURL("auth");
-    const result = await WebBrowser.openAuthSessionAsync(
-      `${baseUrl}/api/mobile/sign-in`,
-      returnTo,
-    );
-
-    if (result.type !== "success") {
-      // Dismissed, or the browser was closed. Not an error: somebody changed their mind.
-      setState({ status: "signed-out" });
-      return;
-    }
-
-    const handoff = Linking.parse(result.url);
-    const error = single(handoff.queryParams?.error);
-    if (error) {
-      setState({
-        status: "failed",
-        reason:
-          error === "not-signed-in"
-            ? "Sign-in did not complete. Try again."
-            : error,
-      });
-      return;
-    }
-
-    const oneTime = single(handoff.queryParams?.token);
-    if (!oneTime) {
-      setState({
-        status: "failed",
-        reason: "That deployment did not send a token back.",
-      });
-      return;
-    }
-
     /**
-     * Trade the one-time token for a session.
+     * In flight, and said so.
      *
-     * The one-time token travelled through the operating system to get here and may be in a log; it is
-     * spent on first use, so what is left in that log is worthless. The session it returns is what
-     * goes in the secure store.
+     * `openAuthSessionAsync` was awaited outside the try, so a second tap threw "WebBrowser is
+     * already open" straight into a discarded promise — nothing on screen, nothing in the state. And
+     * the token exchange after the browser closes takes a round trip during which the screen used to
+     * look untouched.
      */
+    setState({ status: "signing-in" });
     try {
-      const response = await fetch(
-        `${baseUrl}/api/auth/one-time-token/verify`,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ token: oneTime }),
-        },
+      const returnTo = Linking.createURL("auth");
+      const result = await WebBrowser.openAuthSessionAsync(
+        `${baseUrl}/api/mobile/sign-in`,
+        returnTo,
       );
-      if (!response.ok) {
-        setState({
-          status: "failed",
-          reason: "That sign-in had expired. Try again.",
-        });
+
+      if (result.type !== "success") {
+        // Dismissed, or the browser was closed. Not an error: somebody changed their mind.
+        setState({ status: "signed-out" });
         return;
       }
-      const body = (await response.json()) as {
-        session?: { token?: string };
-        token?: string;
-      };
-      const session = body.session?.token ?? body.token;
-      if (!session) {
-        setState({
-          status: "failed",
-          reason: "That deployment did not return a session.",
-        });
-        return;
-      }
-      await SecureStore.setItemAsync(KEY, session);
-      setState({ status: "signed-in", cookies: false });
+      await consume(result.url);
     } catch {
       setState({
         status: "failed",
-        reason: "Could not reach that deployment.",
+        reason: "Could not open the sign-in page. Try again.",
       });
     }
-  }, [baseUrl, sameOrigin]);
+  }, [baseUrl, consume, sameOrigin]);
+
+  /**
+   * The handoff that arrives without anybody waiting for it.
+   *
+   * A cold launch through the `openbot://` scheme, which is what happens when the system reclaimed
+   * this app while the sign-in tab was in front.
+   */
+  useEffect(() => {
+    if (sameOrigin || Platform.OS === "web") return;
+    const isHandoff = (url: string) => url.includes("auth");
+    void Linking.getInitialURL().then((url) => {
+      if (url && isHandoff(url)) void consume(url);
+    });
+    const subscription = Linking.addEventListener("url", ({ url }) => {
+      if (isHandoff(url)) void consume(url);
+    });
+    return () => subscription.remove();
+  }, [consume, sameOrigin]);
 
   const signOut = useCallback(async () => {
     if (supportsSecureStore()) await SecureStore.deleteItemAsync(KEY);
     setState({ status: "signed-out" });
   }, []);
+
+  // What `forgetSession` reaches, so a 401 from the data layer ends the session rather than becoming
+  // an error every screen repeats forever.
+  useEffect(() => {
+    forget = () => {
+      void signOut();
+    };
+    return () => {
+      forget = undefined;
+    };
+  }, [signOut]);
 
   return (
     <SessionContext.Provider value={{ state, signIn, signOut }}>

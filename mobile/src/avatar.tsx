@@ -125,10 +125,19 @@ export function BotAvatarWithDot({
   seed,
   size = 40,
   dot,
+  ring = "#ffffff",
 }: {
   seed: string;
   size?: number;
   dot?: string;
+  /**
+   * The colour the dot is cut out of, which is whatever surface the avatar sits on.
+   *
+   * It was a literal white. That is wrong on the roster rail, which sits on the page rather than on a
+   * card, and it becomes a white ring on a dark surface everywhere the moment the app follows a
+   * phone set to Dark.
+   */
+  ring?: string;
 }) {
   return (
     <View style={{ width: size, height: size }}>
@@ -144,7 +153,7 @@ export function BotAvatarWithDot({
             borderRadius: size / 6.8,
             backgroundColor: dot,
             borderWidth: 2,
-            borderColor: "#ffffff",
+            borderColor: ring,
           }}
         />
       ) : null}
