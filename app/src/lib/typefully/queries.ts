@@ -259,115 +259,65 @@ const ERROR_CODES = new Set<string>([
   "invalid_request",
 ]);
 
-const SYNC_STATUSES = new Set<DraftSyncStatus>([
-  "local",
-  "syncing",
-  "synced",
-  "connection_required",
-  "remote_error",
-  "grant_blocked",
-]);
-const PROPOSAL_STATUSES = new Set<ProposalStatus>([
-  "pending",
-  "in_flight",
-  "declined",
-  "expired",
-  "published",
-  "failed",
-  "unknown",
-]);
+const draftSummarySchema = z.strictObject({
+  id: stableIdSchema,
+  title: z.string().max(160),
+  destinations: uniqueDestinationsSchema,
+  socialSetLabel: z.string().max(160).nullable(),
+  mediaCount: z.number().int().min(0).max(20),
+  version: positiveSafeInteger,
+  syncStatus: z.enum([
+    "local",
+    "syncing",
+    "synced",
+    "connection_required",
+    "remote_error",
+    "grant_blocked",
+  ]),
+  proposalStatus: z
+    .enum([
+      "pending",
+      "in_flight",
+      "declined",
+      "expired",
+      "published",
+      "failed",
+      "unknown",
+    ])
+    .nullable(),
+});
+
+const remoteDraftStateSchema = z.strictObject({
+  state: draftSummarySchema.shape.syncStatus,
+  remoteDraftId: z.string().trim().min(1).max(240).nullable(),
+  confirmedVersion: positiveSafeInteger.nullable(),
+  confirmedHash: z.string().min(1).max(128).nullable(),
+});
+
+const mediaDescriptorSchema = z.strictObject({
+  id: stableIdSchema,
+  kind: z.enum(["image", "video"]),
+  order: z.number().int().min(0).max(19),
+  altText: z.string().max(10_000),
+  remoteId: z.string().trim().min(1).max(240).nullable(),
+});
 
 export function draftSummary(value: unknown): DraftSummary | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value))
-    return undefined;
-  const item = value as Record<string, unknown>;
-  if (
-    typeof item.id !== "string" ||
-    Array.from(item.id).length > 120 ||
-    typeof item.title !== "string" ||
-    Array.from(item.title).length > 160 ||
-    !Array.isArray(item.destinations) ||
-    !item.destinations.every(
-      (destination) => destination === "x" || destination === "linkedin",
-    ) ||
-    (item.socialSetLabel !== null &&
-      (typeof item.socialSetLabel !== "string" ||
-        Array.from(item.socialSetLabel).length > 160)) ||
-    !Number.isSafeInteger(item.mediaCount) ||
-    (item.mediaCount as number) < 0 ||
-    (item.mediaCount as number) > 20 ||
-    !Number.isSafeInteger(item.version) ||
-    (item.version as number) < 1 ||
-    !SYNC_STATUSES.has(item.syncStatus as DraftSyncStatus) ||
-    (item.proposalStatus !== null &&
-      !PROPOSAL_STATUSES.has(item.proposalStatus as ProposalStatus))
-  ) {
-    return undefined;
-  }
-  return {
-    id: item.id,
-    title: item.title,
-    destinations: item.destinations as TypefullyDestination[],
-    socialSetLabel: item.socialSetLabel as string | null,
-    mediaCount: item.mediaCount as number,
-    version: item.version as number,
-    syncStatus: item.syncStatus as DraftSyncStatus,
-    proposalStatus: item.proposalStatus as ProposalStatus | null,
-  };
+  const parsed = draftSummarySchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
 }
 
-function remoteDraftState(value: unknown): RemoteDraftState | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value))
-    return undefined;
-  const item = value as Record<string, unknown>;
-  if (!SYNC_STATUSES.has(item.state as DraftSyncStatus)) return undefined;
-  const remoteDraftId = boundedString(item.remoteDraftId, 240);
-  const confirmedHash = boundedString(item.confirmedHash, 128);
-  if (
-    (item.remoteDraftId !== null && remoteDraftId === undefined) ||
-    (item.confirmedHash !== null && confirmedHash === undefined) ||
-    (item.confirmedVersion !== null &&
-      !Number.isSafeInteger(item.confirmedVersion))
-  ) {
-    return undefined;
-  }
-  return {
-    state: item.state as DraftSyncStatus,
-    remoteDraftId: item.remoteDraftId === null ? null : (remoteDraftId ?? null),
-    confirmedVersion:
-      item.confirmedVersion === null ? null : (item.confirmedVersion as number),
-    confirmedHash: item.confirmedHash === null ? null : (confirmedHash ?? null),
-  };
+export function remoteDraftState(value: unknown): RemoteDraftState | undefined {
+  const parsed = remoteDraftStateSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
 }
 
-function mediaDescriptor(
+export function mediaDescriptor(
   value: unknown,
 ): CanonicalDraftDocument["media"][number] | null | undefined {
   if (value === null) return null;
-  if (!value || typeof value !== "object" || Array.isArray(value))
-    return undefined;
-  const item = value as Record<string, unknown>;
-  const id = boundedString(item.id, 120);
-  const altText = boundedString(item.altText, 10_000);
-  const remoteId = boundedString(item.remoteId, 240);
-  if (
-    id === undefined ||
-    (item.kind !== "image" && item.kind !== "video") ||
-    !Number.isSafeInteger(item.order) ||
-    (item.order as number) < 0 ||
-    (item.order as number) >= 20 ||
-    altText === undefined ||
-    (item.remoteId !== null && remoteId === undefined)
-  ) {
-    return undefined;
-  }
-  return {
-    id,
-    kind: item.kind,
-    order: item.order as number,
-    altText,
-    remoteId: item.remoteId === null ? null : (remoteId ?? null),
-  };
+  const parsed = mediaDescriptorSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
 }
 
 export class TypefullyClientError extends Error {

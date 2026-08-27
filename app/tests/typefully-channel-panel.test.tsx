@@ -1139,6 +1139,9 @@ for (const [label, uploadResult] of [
       ).toBe(false),
     );
     expect(view.queryByRole("button", { name: /Remove image/ })).toBeNull();
+    expect(view.getByRole("alert").textContent).toContain(
+      "Select the file again to retry",
+    );
     expect(view.getByTestId("publish-readiness").textContent).toContain(
       "Ready for approval",
     );
@@ -1149,8 +1152,77 @@ for (const [label, uploadResult] of [
         }) as HTMLButtonElement
       ).disabled,
     ).toBe(false);
+    await userEvent
+      .setup({ document })
+      .click(view.getByRole("button", { name: "Dismiss media upload error" }));
+    expect(view.queryByRole("alert")).toBeNull();
   });
 }
+
+test("a later successful selection clears the rollback media alert", async () => {
+  const { DraftCanvas } = await import(
+    "../src/components/typefully/draft-canvas"
+  );
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
+    },
+  });
+  queryClient.setQueryData(typefullyKeys.draft(draftId), {
+    draft: authoritativeDraft(),
+  });
+  let uploadCount = 0;
+  globalThis.fetch = (async (_input, init) => {
+    if ((init?.method ?? "GET") === "POST" && ++uploadCount === 1) {
+      throw new TypeError("offline");
+    }
+    if ((init?.method ?? "GET") === "POST") {
+      return new Response(
+        JSON.stringify({
+          draft: {
+            id: draftId,
+            title: "Production route draft",
+            destinations: ["x"],
+            socialSetLabel: "Route account",
+            mediaCount: 1,
+            version: 3,
+            syncStatus: "synced",
+            proposalStatus: null,
+          },
+          media: {
+            id: "successful-media-id",
+            kind: "image",
+            order: 0,
+            altText: "",
+            remoteId: "typefully-media-88",
+          },
+        }),
+        { status: 201, headers: { "content-type": "application/json" } },
+      );
+    }
+    return new Response(JSON.stringify({ draft: authoritativeDraft() }), {
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+  const view = render(
+    <QueryClientProvider client={queryClient}>
+      <DraftCanvas draftId={draftId} />
+    </QueryClientProvider>,
+  );
+  const user = userEvent.setup({ document });
+  const add = view.getByLabelText("Add media");
+  await user.upload(
+    add,
+    new File(["first"], "first.png", { type: "image/png" }),
+  );
+  await view.findByRole("alert");
+  await user.upload(
+    add,
+    new File(["second"], "second.png", { type: "image/png" }),
+  );
+  await waitFor(() => expect(view.queryByRole("alert")).toBeNull());
+  expect(view.getByRole("button", { name: /Remove image/ })).toBeTruthy();
+});
 
 test("production review control prepares a proposal without publishing", async () => {
   const { DraftCanvas } = await import(

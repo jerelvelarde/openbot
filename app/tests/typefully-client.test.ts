@@ -318,7 +318,16 @@ describe("Typefully mutation contracts", () => {
   });
 
   test("builds bounded multipart uploads and exact media deletes", async () => {
-    const calls = capture({});
+    const calls = capture({
+      draft: { ...draftSummary(3), id: "draft/1", mediaCount: 1 },
+      media: {
+        id: "retry-1",
+        kind: "image",
+        order: 0,
+        altText: "Product screenshot",
+        remoteId: "remote-1",
+      },
+    });
     const file = new File(["image"], "launch.png", { type: "image/png" });
     await mutate(uploadMediaMutationOptions(), {
       draftId: "draft/1",
@@ -795,6 +804,84 @@ describe("Typefully mutation contracts", () => {
       },
     });
   });
+
+  test.each([
+    {
+      name: "malformed truthy media fields",
+      inputMediaId: undefined,
+      response: {
+        draft: { ...draftSummary(2), mediaCount: 1 },
+        media: {
+          id: "media-malformed",
+          kind: "image",
+          order: 0,
+          altText: "Launch",
+          remoteId: true,
+        },
+      },
+    },
+    {
+      name: "a mismatched draft",
+      inputMediaId: undefined,
+      response: {
+        draft: { ...draftSummary(2), id: "other-draft", mediaCount: 1 },
+        media: {
+          id: "media-other-draft",
+          kind: "image",
+          order: 0,
+          altText: "Launch",
+          remoteId: "remote-1",
+        },
+      },
+    },
+    {
+      name: "a different retry media identity",
+      inputMediaId: "expected-media",
+      response: {
+        draft: { ...draftSummary(2), mediaCount: 1 },
+        media: {
+          id: "different-media",
+          kind: "image",
+          order: 0,
+          altText: "Launch",
+          remoteId: "remote-1",
+        },
+      },
+    },
+  ])(
+    "rejects $name before cache adoption",
+    async ({ inputMediaId, response }) => {
+      const queryClient = new QueryClient({
+        defaultOptions: {
+          mutations: { retry: false },
+          queries: { retry: false },
+        },
+      });
+      const original = authoritativeDraft(1);
+      queryClient.setQueryData(typefullyKeys.draft("draft-1"), {
+        draft: original,
+      });
+      globalThis.fetch = (async () => json(response)) as typeof fetch;
+      const observer = new MutationObserver(
+        queryClient,
+        uploadMediaMutationOptions(queryClient),
+      );
+
+      await expect(
+        observer.mutate({
+          draftId: "draft-1",
+          expectedVersion: 1,
+          kind: "image",
+          altText: "Launch",
+          file: new File(["x"], "x.png", { type: "image/png" }),
+          ...(inputMediaId ? { mediaId: inputMediaId } : {}),
+        }),
+      ).rejects.toMatchObject({ code: "remote_invalid_response" });
+      expect(queryClient.getQueryData(typefullyKeys.draft("draft-1"))).toEqual({
+        draft: original,
+      });
+    },
+  );
 
   test("replaces an in-cache upload placeholder when its version plus two descriptor arrives", async () => {
     const queryClient = new QueryClient({
@@ -1458,7 +1545,10 @@ describe("Typefully mutation contracts", () => {
       media,
     });
 
-    const calls = capture({});
+    const calls = capture({
+      draft: { ...draftSummary(3), mediaCount: 1 },
+      media: { ...media, remoteId: "remote-retry" },
+    });
     await mutate(uploadMediaMutationOptions(), {
       draftId: "draft-1",
       expectedVersion: failure?.draft?.version ?? 0,

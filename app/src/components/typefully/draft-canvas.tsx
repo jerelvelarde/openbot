@@ -141,6 +141,9 @@ function EditableDraftCanvas({
     {},
   );
   const [mediaBusy, setMediaBusy] = useState(false);
+  const [mediaOperationError, setMediaOperationError] = useState<string | null>(
+    null,
+  );
   const mediaBusyRef = useRef(false);
   const mediaOperation = useRef(0);
   const routedDraft = useRef<string | null>(null);
@@ -363,6 +366,7 @@ function EditableDraftCanvas({
               previewUrl: urls.current.get(settled.id),
             },
       }));
+      setMediaOperationError(null);
     } catch (error) {
       const clientError =
         error instanceof TypefullyClientError ? error : undefined;
@@ -379,6 +383,9 @@ function EditableDraftCanvas({
           delete next[mediaId];
           return next;
         });
+        setMediaOperationError(
+          "Media could not be uploaded. Select the file again to retry.",
+        );
         return;
       }
       const failed = clientError?.media ?? descriptor;
@@ -575,6 +582,7 @@ function EditableDraftCanvas({
       draft={draft}
       localMediaUrls={localMediaUrls}
       mediaBusy={mediaBusy}
+      mediaOperationError={mediaOperationError}
       mediaStates={mediaStates}
       onMediaReorder={(next) => {
         if (!mediaBusyRef.current) controller.textChanged(next);
@@ -582,6 +590,7 @@ function EditableDraftCanvas({
       onMediaTextChange={(next) => {
         if (!mediaBusyRef.current) controller.textChanged(next);
       }}
+      onDismissMediaOperationError={() => setMediaOperationError(null)}
       onReload={() => void reload()}
       onRemoveMedia={(mediaId) => void removeMedia(mediaId)}
       onRetryMedia={retryMedia}

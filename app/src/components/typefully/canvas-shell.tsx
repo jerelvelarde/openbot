@@ -223,8 +223,10 @@ export type CanvasShellProps = {
   mediaStates?: Readonly<Record<string, MediaItemState>>;
   localMediaUrls?: Readonly<Record<string, string>>;
   mediaBusy?: boolean;
+  mediaOperationError?: string | null;
   onTextChange?: (next: CanonicalDraftDocument) => void;
   onMediaTextChange?: (next: CanonicalDraftDocument) => void;
+  onDismissMediaOperationError?: () => void;
   onMediaReorder?: (next: CanonicalDraftDocument) => void;
   onSelectMedia?: (files: File[]) => void;
   onRetryMedia?: (mediaId: string) => void;
@@ -245,8 +247,10 @@ export function CanvasShell({
   mediaStates = {},
   localMediaUrls = {},
   mediaBusy = false,
+  mediaOperationError = null,
   onTextChange,
   onMediaTextChange,
+  onDismissMediaOperationError,
   onMediaReorder,
   onSelectMedia,
   onRetryMedia,
@@ -460,6 +464,22 @@ export function CanvasShell({
               {interactive ? (
                 <div>
                   <SectionTitle>Media</SectionTitle>
+                  {mediaOperationError ? (
+                    <div
+                      className="mb-3 flex items-start justify-between gap-3 rounded-[4px] bg-destructive/10 px-3 py-2 text-xs text-destructive"
+                      role="alert"
+                    >
+                      <span>{safeDraftError(mediaOperationError)}</span>
+                      <button
+                        aria-label="Dismiss media upload error"
+                        className="rounded-[4px] border border-current px-2 py-1"
+                        onClick={onDismissMediaOperationError}
+                        type="button"
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  ) : null}
                   <MediaEditor
                     document={document}
                     editingDisabled={

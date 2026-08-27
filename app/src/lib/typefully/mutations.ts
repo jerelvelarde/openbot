@@ -5,10 +5,12 @@ import {
   type CanonicalDraftDocument,
   type DraftSummary,
   draftSummary,
+  mediaDescriptor,
   type ProposalStatus,
   type ProposalSummary,
   type PublicationProposal,
   type RemoteDraftState,
+  remoteDraftState,
   TypefullyClientError,
   typefullyKeys,
   typefullyRequest,
@@ -36,6 +38,34 @@ export type TypefullyConnection = {
 };
 
 type CachedDraft = { draft: AuthoritativeDraft };
+
+function parseMediaMutationSuccess(
+  payload: unknown,
+  input: { draftId: string; mediaId?: string },
+): MediaMutationResponse {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new TypefullyClientError("remote_invalid_response");
+  }
+  const record = payload as Record<string, unknown>;
+  const allowed = new Set(["draft", "remote", "media"]);
+  if (Object.keys(record).some((key) => !allowed.has(key))) {
+    throw new TypefullyClientError("remote_invalid_response");
+  }
+  const draft = draftSummary(record.draft);
+  const media = mediaDescriptor(record.media);
+  const remote =
+    record.remote === undefined ? undefined : remoteDraftState(record.remote);
+  if (
+    !draft ||
+    !media ||
+    draft.id !== input.draftId ||
+    (input.mediaId !== undefined && media.id !== input.mediaId) ||
+    (record.remote !== undefined && !remote)
+  ) {
+    throw new TypefullyClientError("remote_invalid_response");
+  }
+  return { draft, media, ...(remote ? { remote } : {}) };
+}
 
 async function convergeDraftCache(
   queryClient: QueryClient | undefined,
@@ -253,7 +283,7 @@ export function reconcileDraftMutationOptions(queryClient?: QueryClient) {
 
 export function uploadMediaMutationOptions(queryClient?: QueryClient) {
   return mutationOptions({
-    mutationFn: (input: {
+    mutationFn: async (input: {
       draftId: string;
       expectedVersion: number;
       kind: "image" | "video";
@@ -274,10 +304,11 @@ export function uploadMediaMutationOptions(queryClient?: QueryClient) {
       form.set("kind", input.kind);
       form.set("altText", input.altText);
       if (input.mediaId !== undefined) form.set("mediaId", input.mediaId);
-      return typefullyRequest(
+      const payload = await typefullyRequest<unknown>(
         `/api/typefully/drafts/${encodeURIComponent(input.draftId)}/media`,
         { method: "POST", form, signal: input.signal },
       );
+      return parseMediaMutationSuccess(payload, input);
     },
     onSuccess: (result, input) =>
       convergeDraftCache(

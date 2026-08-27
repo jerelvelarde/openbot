@@ -963,11 +963,27 @@ export function createTypefullyRoutes(
         return context.json({ code: "media_too_large" }, 413);
       }
       if (persistedDraft && authoritativeMedia) {
+        const current = await store.readDraft(
+          persistedDraft.id,
+          context.var.actor.id,
+        );
+        const currentMedia = current.document.media.find(
+          (item) => item.id === authoritativeMedia?.id,
+        );
+        if (error instanceof VersionConflictError || !currentMedia) {
+          return errorResponse(
+            context,
+            error instanceof VersionConflictError
+              ? error
+              : new VersionConflictError(current.version, current.contentHash),
+            current.id,
+          );
+        }
         return persistedMediaFailureResponse(
           context,
           error,
-          persistedDraft,
-          authoritativeMedia,
+          current,
+          currentMedia,
         );
       }
       return errorResponse(context, error, context.req.param("id"));

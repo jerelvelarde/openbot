@@ -50,12 +50,15 @@ const queuedResults: Array<
 > = [];
 const deniedRefs = new Set<string>();
 let vendorGate: { entered: () => void; wait: Promise<void> } | null = null;
+let decisionHook: ((ref: string) => Promise<void>) | null = null;
 
 const plugin = {
-  decide: async (_kind: "mcp" | "skill", ref: string) =>
-    deniedRefs.has(ref)
+  decide: async (_kind: "mcp" | "skill", ref: string) => {
+    await decisionHook?.(ref);
+    return deniedRefs.has(ref)
       ? ({ allowed: false, reason: "Grant removed." } as const)
-      : ({ allowed: true } as const),
+      : ({ allowed: true } as const);
+  },
   dispatchVendor: async (input: {
     ref: string;
     args: Record<string, unknown>;
@@ -1113,6 +1116,106 @@ describe("Typefully synchronization", () => {
       attemptId: null,
       syncStatus: "synced",
     });
+  });
+
+  test("returns the re-read quarantined authority when an expired upload lease is discovered", async () => {
+    const id = await createDraft();
+    const base = await store.readDraft(id, ownerId);
+    const media = {
+      id: "expired-upload-media",
+      kind: "image" as const,
+      order: 0,
+      altText: "Expired upload",
+      remoteId: null,
+    };
+    const saved = await store.saveDraft({
+      draftId: id,
+      actorId: ownerId,
+      expectedVersion: base.version,
+      document: { ...base.document, media: [media] },
+    });
+    await database
+      .update(typefullyDrafts)
+      .set({
+        attemptId: randomUUID(),
+        attemptKind: "upload_media",
+        attemptState: "in_flight",
+        attemptVersion: saved.version,
+        attemptHash: saved.contentHash,
+        attemptLeaseExpiresAt: new Date(Date.now() - 60_000),
+        syncStatus: "syncing",
+      })
+      .where(eq(typefullyDrafts.id, id));
+
+    const form = new FormData();
+    form.set("expectedVersion", String(saved.version));
+    form.set("mediaId", media.id);
+    form.set("kind", media.kind);
+    form.set("altText", media.altText);
+    form.set("file", new File(["image"], "expired.png", { type: "image/png" }));
+    const response = await app.request(`/api/typefully/drafts/${id}/media`, {
+      method: "POST",
+      body: form,
+    });
+
+    expect(response.status).toBe(409);
+    const body = await response.json();
+    const current = await store.readDraft(id, ownerId);
+    expect(body).toMatchObject({
+      code: "reconciliation_required",
+      draft: {
+        id,
+        version: current.version,
+        syncStatus: "remote_error",
+      },
+      media,
+    });
+    expect(current).toMatchObject({
+      attemptKind: "upload_media",
+      attemptState: "outcome_uncertain",
+      syncStatus: "remote_error",
+    });
+    expect(body.media).toEqual(current.document.media[0]);
+  });
+
+  test("does not return a captured media descriptor after a concurrent removal", async () => {
+    const id = await createDraft();
+    let uploadDecisions = 0;
+    decisionHook = async (ref) => {
+      if (ref !== "typefully/upload_media" || ++uploadDecisions !== 2) return;
+      decisionHook = null;
+      const current = await store.readDraft(id, ownerId);
+      await store.saveDraft({
+        draftId: id,
+        actorId: ownerId,
+        expectedVersion: current.version,
+        document: { ...current.document, media: [] },
+      });
+    };
+    try {
+      const form = new FormData();
+      form.set("expectedVersion", "1");
+      form.set("kind", "image");
+      form.set("altText", "Concurrently removed");
+      form.set(
+        "file",
+        new File(["image"], "removed.png", { type: "image/png" }),
+      );
+      const response = await app.request(`/api/typefully/drafts/${id}/media`, {
+        method: "POST",
+        body: form,
+      });
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({
+        code: "version_conflict",
+        currentVersion: 3,
+      });
+      const current = await store.readDraft(id, ownerId);
+      expect(current.version).toBe(3);
+      expect(current.document.media).toEqual([]);
+    } finally {
+      decisionHook = null;
+    }
   });
 
   test("releases a first-create claim after connection loss advances the local revision", async () => {
