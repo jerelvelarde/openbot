@@ -167,8 +167,12 @@ function fakeComputer(options?: {
         calls.push("cancelAssistance");
         return Response.json({
           cancelled: true,
+          status: "cancelled",
           state: { holder: "bot", since: "now", requested: false },
         });
+      case "/control/assistance/status":
+        calls.push("assistanceStatus");
+        return Response.json({ status: "completed" });
       case "/human/secret":
         calls.push("supplySecret");
         return Response.json({ supplied: true });
@@ -783,6 +787,10 @@ describe("the computer gateway", () => {
       ACTOR,
       "11111111-1111-4111-8111-111111111111",
     );
+    await gateway.assistanceStatus(
+      "bot-1",
+      "11111111-1111-4111-8111-111111111111",
+    );
     await gateway.supplySecret("bot-1", ACTOR, "secret");
     await gateway.humanInput("bot-1", { kind: "click", x: 10, y: 20 });
 
@@ -798,6 +806,7 @@ describe("the computer gateway", () => {
       "/control/release",
       "/control/secret",
       "/control/assistance/cancel",
+      "/control/assistance/status",
       "/human/secret",
       "/human/click",
     ]);

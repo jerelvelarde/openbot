@@ -3,6 +3,7 @@ import {
   assistanceHistoryPath,
   assistanceResponseOutcome,
   assistanceToken,
+  captureAssistanceToken,
 } from "../src/routes/_authed/assist";
 
 describe("Slack assistance route status mapping", () => {
@@ -51,5 +52,23 @@ describe("Slack assistance route status mapping", () => {
     ]) {
       expect(assistanceHistoryPath(href, "sealed-control")).toBeNull();
     }
+  });
+
+  test("captures and strips the token before any network outcome, retaining it for retry", () => {
+    const writes: string[] = [];
+    const storage = new Map<string, string>();
+    const token = captureAssistanceToken(
+      "sealed-control",
+      "https://openbot.test/assist?token=sealed-control",
+      { replace: (path) => writes.push(path) },
+      {
+        getItem: (key) => storage.get(key) ?? null,
+        setItem: (key, value) => storage.set(key, value),
+        removeItem: (key) => storage.delete(key),
+      },
+    );
+    expect(token).toBe("sealed-control");
+    expect(writes).toEqual(["/assist"]);
+    expect([...storage.values()]).toEqual(["sealed-control"]);
   });
 });

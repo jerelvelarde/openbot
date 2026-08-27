@@ -47,12 +47,15 @@ import {
   resolveModelApiKey,
 } from "./credentials";
 import { createDatabase } from "./db/client";
+import { createExternalLinkStore } from "./external/link-store";
+import { createExternalThreadStore } from "./external/thread-store";
 import { createPeopleStore } from "./people/store";
 import { redirectUriFor } from "./plugins/oauth";
 import { createPluginStore } from "./plugins/store";
 import { grantedSkills, grantedTools } from "./plugins/tools";
 import { createIntentRouter } from "./routing/classify";
 import { createModelCompleter } from "./routing/model";
+import { createApprovalAuthorizer } from "./slack/approval-authorizer";
 import { createApprovalDecisionStore } from "./slack/approval-store";
 import { configureApprovalDecisionStore } from "./slack/components";
 import {
@@ -122,7 +125,6 @@ const identifyActor: IdentifyActor = async (request) => {
 const config = loadConfig();
 const port = Number.parseInt(process.env.PORT ?? "3001", 10);
 const database = createDatabase(config.databaseUrl);
-configureApprovalDecisionStore(createApprovalDecisionStore(database));
 await initializeDevActorUser(database, config.singleUser);
 // The vault, built before the agent store because a customer's agent may sit behind a key and that
 // key belongs here rather than on the agent row. See agents/auth-header.ts.
@@ -137,6 +139,15 @@ const agentProfileStore = createAgentProfileStore(
   config.managedAgent?.endpoint,
   agentVault,
 );
+const approvalLinkStore = createExternalLinkStore(database);
+const approvalThreadStore = createExternalThreadStore(database);
+configureApprovalDecisionStore(createApprovalDecisionStore(database), {
+  authorize: createApprovalAuthorizer({
+    links: approvalLinkStore,
+    threads: approvalThreadStore,
+    profiles: agentProfileStore,
+  }),
+});
 // Read here rather than beside the synchronise below, because the package names the deployment and
 // the channel store needs that name before it can mint a thread id.
 const tenantPackage = await loadTenantPackage(config.tenantPackageDirectory);
