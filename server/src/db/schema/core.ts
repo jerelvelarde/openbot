@@ -203,6 +203,34 @@ export const revokedAccess = pgTable("revoked_access", {
   revokedBy: text("revoked_by").notNull(),
 });
 
+/** An external workspace identity, permanently associated with one OpenBot user. */
+export const externalUserLinks = pgTable(
+  "external_user_links",
+  {
+    provider: text("provider").notNull(),
+    providerTenantId: text("provider_tenant_id").notNull(),
+    providerUserId: text("provider_user_id").notNull(),
+    openbotUserId: text("openbot_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    providerEmail: text("provider_email"),
+    linkedAt: timestamp("linked_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: updatedAt(),
+  },
+  (table) => [
+    primaryKey({
+      columns: [table.provider, table.providerTenantId, table.providerUserId],
+    }),
+    uniqueIndex("external_user_links_openbot_workspace_idx").on(
+      table.provider,
+      table.providerTenantId,
+      table.openbotUserId,
+    ),
+  ],
+);
+
 export const deploymentPackages = pgTable("deployment_packages", {
   id: uuid("id").primaryKey().defaultRandom(),
   tenantId: text("tenant_id").notNull().unique(),
