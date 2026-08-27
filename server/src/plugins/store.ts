@@ -1,5 +1,5 @@
 import { and, asc, eq, inArray, isNull, or, sql } from "drizzle-orm";
-import { type AuditStore, recordAuditEvent } from "../audit";
+import { recordAuditEvent, type TransactionalAuditStore } from "../audit";
 import {
   type ActionPolicy,
   evaluateActionPolicy,
@@ -528,7 +528,7 @@ export type AccessToken = {
 
 export type PluginStoreOptions = {
   database: Database;
-  auditStore: AuditStore;
+  auditStore: TransactionalAuditStore;
   /**
    * The vault, read and write.
    *
@@ -1223,6 +1223,24 @@ export function createPluginStore(options: PluginStoreOptions) {
     }
   }
 
+  async function livePersonalCredentialsFor(
+    transaction: Transaction,
+    serverId: string,
+    userId: string,
+  ) {
+    return transaction
+      .select({ id: credentialRows.id, kind: credentialRows.kind })
+      .from(credentialRows)
+      .where(
+        and(
+          inArray(credentialRows.kind, ["mcp_user_token", "mcp_user_api_key"]),
+          eq(credentialRows.provider, serverId),
+          eq(credentialRows.keyId, userId),
+          isNull(credentialRows.revokedAt),
+        ),
+      );
+  }
+
   /**
    * Point one person's connection at a new refresh token, revoking the one it replaces.
    *
@@ -1235,8 +1253,8 @@ export function createPluginStore(options: PluginStoreOptions) {
    * points at is still a live grant at the vendor, and leaving it behind would mean somebody had two
    * valid grants and could only ever see one of them to withdraw it.
    *
-   * Says whether it replaced something, which is the one fact the caller writing the trail needs
-   * and cannot recover afterwards.
+   * The lifecycle audit row is written in the same transaction, after the association points at the
+   * new credential. An audit failure therefore leaves the old credential and association intact.
    *
    * ONE TRANSACTION, because these are two writes and one decision. The secret goes into the vault
    * and the connection row is pointed at it; separately, a failure between them leaves the pointer
@@ -1250,7 +1268,7 @@ export function createPluginStore(options: PluginStoreOptions) {
     userId: string;
     refreshToken: string;
     scope: string;
-  }): Promise<{ replaced: boolean }> {
+  }): Promise<void> {
     const key = {
       kind: "mcp_user_token" as const,
       provider: input.serverId,
@@ -1268,16 +1286,81 @@ export function createPluginStore(options: PluginStoreOptions) {
       await lockServerLifecycle(transaction, input.serverId);
       await lockUserConnections(transaction, input.userId);
       await requireActiveUser(transaction, input.userId);
-      /*
-       * `credentials_active_key_idx` holds one live credential per key, so a second insert for the
-       * same person and server would be refused. Asked of the key rather than of the connection row,
-       * because the row can name a credential that has already been revoked while the key itself is
-       * free, and it is the key the index constrains.
-       */
-      const live = await credentials.findLiveByKey(key, transaction);
-      const stored = live
+      const [current] = await transaction
+        .select({
+          credentialId: mcpUserCredentials.credentialId,
+          authMethod: mcpUserCredentials.authMethod,
+          scope: mcpUserCredentials.scope,
+        })
+        .from(mcpUserCredentials)
+        .where(
+          and(
+            eq(mcpUserCredentials.serverId, input.serverId),
+            eq(mcpUserCredentials.userId, input.userId),
+          ),
+        )
+        .for("update");
+
+      let previousCredentialId: string | null = null;
+      if (current) {
+        if (current.authMethod !== "oauth" || current.scope === null) {
+          throw new PluginRefusedError(
+            "The existing connection uses a different authentication method.",
+            null,
+          );
+        }
+        const [previous] = await transaction
+          .select({
+            kind: credentialRows.kind,
+            provider: credentialRows.provider,
+            keyId: credentialRows.keyId,
+            revokedAt: credentialRows.revokedAt,
+          })
+          .from(credentialRows)
+          .where(eq(credentialRows.id, current.credentialId));
+        if (
+          !previous ||
+          previous.revokedAt ||
+          previous.kind !== key.kind ||
+          previous.provider !== key.provider ||
+          previous.keyId !== key.keyId
+        ) {
+          throw new PluginRefusedError(
+            "The existing connection does not reference this person's live OAuth token.",
+            null,
+          );
+        }
+        previousCredentialId = current.credentialId;
+        const unexpected = (
+          await livePersonalCredentialsFor(
+            transaction,
+            input.serverId,
+            input.userId,
+          )
+        ).find((credential) => credential.id !== current.credentialId);
+        if (unexpected) {
+          throw new PluginRefusedError(
+            "Another live personal credential exists outside this OAuth connection. An administrator must retire it before reconnecting.",
+            null,
+          );
+        }
+      } else {
+        const orphans = await livePersonalCredentialsFor(
+          transaction,
+          input.serverId,
+          input.userId,
+        );
+        if (orphans.length > 0) {
+          throw new PluginRefusedError(
+            "A live personal credential exists without a matching connection. An administrator must retire it before reconnecting.",
+            null,
+          );
+        }
+      }
+
+      const stored = previousCredentialId
         ? await credentials.rotate(
-            { ...value, previousCredentialId: live.id },
+            { ...value, previousCredentialId },
             transaction,
           )
         : await credentials.create(value, transaction);
@@ -1301,7 +1384,17 @@ export function createPluginStore(options: PluginStoreOptions) {
           },
         });
 
-      return { replaced: live !== null };
+      await recordAuditEvent(auditStore.inTransaction(transaction), {
+        eventType: "mcp.account_connected",
+        targetType: "mcp_server",
+        targetId: input.serverId,
+        payload: {
+          actor: input.userId,
+          server: input.serverId,
+          scope: input.scope,
+          reconnected: previousCredentialId !== null,
+        },
+      });
     });
   }
 
@@ -1925,14 +2018,13 @@ export function createPluginStore(options: PluginStoreOptions) {
      *
      * Revoked rather than deleted, because the vault keeps revoked rows for audit.
      *
-     * The revokes go first. These are writes on two tables and the store exposes no transaction that
-     * spans both, so the order decides what a failure between them leaves: revoke-then-delete leaves
-     * a server whose secrets no longer work and which removing again will finish off, while
-     * delete-then-revoke leaves live secrets no server references and no operation can reach.
+     * The revocations, lifecycle audit rows, and server deletion share one transaction. Any failure
+     * leaves the server and all of its credentials exactly as they were before removal began.
      */
     async removeServer(serverId: string, by: string): Promise<void> {
-      const removed = await database.transaction(async (transaction) => {
+      await database.transaction(async (transaction) => {
         await lockServerLifecycle(transaction, serverId);
+        const transactionalAudit = auditStore.inTransaction(transaction);
         const [existing] = await transaction
           .select({ credentialId: mcpServers.credentialId })
           .from(mcpServers)
@@ -1952,6 +2044,16 @@ export function createPluginStore(options: PluginStoreOptions) {
           : [];
         if (deploymentCredential) {
           await credentials.revoke(deploymentCredential.id, transaction);
+          await recordAuditEvent(transactionalAudit, {
+            eventType: "credential.revoked",
+            targetType: "credential",
+            targetId: deploymentCredential.id,
+            payload: {
+              actor: by,
+              reason: "mcp_server_removed",
+              server: serverId,
+            },
+          });
         }
 
         const held = await transaction
@@ -1970,54 +2072,31 @@ export function createPluginStore(options: PluginStoreOptions) {
           .orderBy(asc(credentialRows.keyId));
         for (const grant of held) {
           await credentials.revoke(grant.id, transaction);
+          await recordAuditEvent(transactionalAudit, {
+            eventType: "mcp.account_disconnected",
+            targetType: "mcp_server",
+            targetId: serverId,
+            payload: {
+              actor: by,
+              server: serverId,
+              owner: grant.keyId,
+              reason: "mcp_server_removed",
+              vendorRevoked: false,
+            },
+          });
         }
 
         await transaction.delete(mcpServers).where(eq(mcpServers.id, serverId));
-        return {
-          deploymentCredentialId: deploymentCredential?.id ?? null,
-          grants: held,
-        };
-      });
-
-      if (removed.deploymentCredentialId) {
-        await recordAuditEvent(auditStore, {
-          eventType: "credential.revoked",
-          targetType: "credential",
-          targetId: removed.deploymentCredentialId,
-          payload: {
-            actor: by,
-            reason: "mcp_server_removed",
-            server: serverId,
-          },
-        });
-      }
-
-      for (const grant of removed.grants) {
-        await recordAuditEvent(auditStore, {
-          eventType: "mcp.account_disconnected",
+        await recordAuditEvent(transactionalAudit, {
+          eventType: "configuration.changed",
           targetType: "mcp_server",
           targetId: serverId,
           payload: {
             actor: by,
+            change: "mcp_server_removed",
             server: serverId,
-            // Whose it was. `key_id` holds the user id for this kind, and it is the only place left
-            // to read it from once the join row has been cascaded away.
-            owner: grant.keyId,
-            /*
-             * Not "they disconnected" and not "they were removed": an administrator took the whole
-             * connector away, and the person did nothing. An auditor asking what happened to their
-             * access should see which of the three this was.
-             */
-            reason: "mcp_server_removed",
-            vendorRevoked: false,
           },
         });
-      }
-      await recordAuditEvent(auditStore, {
-        eventType: "configuration.changed",
-        targetType: "mcp_server",
-        targetId: serverId,
-        payload: { actor: by, change: "mcp_server_removed", server: serverId },
       });
     },
 
@@ -2664,8 +2743,8 @@ export function createPluginStore(options: PluginStoreOptions) {
      *
      * The credential swap is {@link swapUserCredential}, and this is its only caller: a person
      * connecting or reconnecting is exactly when there is an older grant to revoke. Rotation writes
-     * the same connection in place instead ({@link rotateConnectionToken}). What is only here is the
-     * audit row: this one IS somebody's act, and the trail should say so.
+     * the same connection in place instead ({@link rotateConnectionToken}). The swap also commits
+     * the lifecycle audit row, so this wrapper cannot return after only half of the act succeeded.
      */
     async recordConnection(input: {
       serverId: string;
@@ -2673,20 +2752,7 @@ export function createPluginStore(options: PluginStoreOptions) {
       refreshToken: string;
       scope: string;
     }): Promise<void> {
-      const { replaced } = await swapUserCredential(input);
-
-      await recordAuditEvent(auditStore, {
-        eventType: "mcp.account_connected",
-        targetType: "mcp_server",
-        targetId: input.serverId,
-        payload: {
-          actor: input.userId,
-          server: input.serverId,
-          // What the vendor granted, so a later refusal for want of a scope can be explained.
-          scope: input.scope,
-          reconnected: replaced,
-        },
-      });
+      await swapUserCredential(input);
     },
 
     async connectUserApiKey(input: {
@@ -2749,7 +2815,7 @@ export function createPluginStore(options: PluginStoreOptions) {
         },
       };
 
-      const stored = await database.transaction(async (transaction) => {
+      await database.transaction(async (transaction) => {
         await lockServerLifecycle(transaction, input.serverId);
         await lockUserConnections(transaction, input.userId);
         await requireActiveUser(transaction, input.userId);
@@ -2815,11 +2881,28 @@ export function createPluginStore(options: PluginStoreOptions) {
             );
           }
           previousCredentialId = current.credentialId;
-        } else {
-          const orphan = await credentials.findLiveByKey(key, transaction);
-          if (orphan) {
+          const unexpected = (
+            await livePersonalCredentialsFor(
+              transaction,
+              input.serverId,
+              input.userId,
+            )
+          ).find((credential) => credential.id !== current.credentialId);
+          if (unexpected) {
             throw new PluginRefusedError(
-              "A live API key exists without a matching connection. An administrator must retire it before reconnecting.",
+              "Another live personal credential exists outside this API-key connection. An administrator must retire it before reconnecting.",
+              null,
+            );
+          }
+        } else {
+          const orphans = await livePersonalCredentialsFor(
+            transaction,
+            input.serverId,
+            input.userId,
+          );
+          if (orphans.length > 0) {
+            throw new PluginRefusedError(
+              "A live personal credential exists without a matching connection. An administrator must retire it before reconnecting.",
               null,
             );
           }
@@ -2852,23 +2935,21 @@ export function createPluginStore(options: PluginStoreOptions) {
               updatedAt: connectedAt,
             },
           });
-        return { id: next.id, previousCredentialId };
-      });
-
-      await recordAuditEvent(auditStore, {
-        eventType: "mcp.account_connected",
-        targetType: "mcp_server",
-        targetId: input.serverId,
-        payload: {
-          actor: input.by,
-          server: input.serverId,
-          owner: input.userId,
-          authMethod: "api_key",
-          accountLabel: metadata.accountLabel,
-          reconnected: stored.previousCredentialId !== null,
-          oldCredentialId: stored.previousCredentialId,
-          newCredentialId: stored.id,
-        },
+        await recordAuditEvent(auditStore.inTransaction(transaction), {
+          eventType: "mcp.account_connected",
+          targetType: "mcp_server",
+          targetId: input.serverId,
+          payload: {
+            actor: input.by,
+            server: input.serverId,
+            owner: input.userId,
+            authMethod: "api_key",
+            accountLabel: metadata.accountLabel,
+            reconnected: previousCredentialId !== null,
+            oldCredentialId: previousCredentialId,
+            newCredentialId: next.id,
+          },
+        });
       });
 
       return {
@@ -2901,7 +2982,7 @@ export function createPluginStore(options: PluginStoreOptions) {
         }
         throw error;
       }
-      const retired = await database.transaction(async (transaction) => {
+      await database.transaction(async (transaction) => {
         await lockServerLifecycle(transaction, input.serverId);
         await lockUserConnections(transaction, input.userId);
         await transaction.execute(
@@ -2972,25 +3053,20 @@ export function createPluginStore(options: PluginStoreOptions) {
               eq(mcpUserCredentials.userId, input.userId),
             ),
           );
-        return {
-          credentialId: association.credentialId,
-          authMethod: association.authMethod,
-        };
-      });
-
-      await recordAuditEvent(auditStore, {
-        eventType: "mcp.account_disconnected",
-        targetType: "mcp_server",
-        targetId: input.serverId,
-        payload: {
-          actor: input.by,
-          server: input.serverId,
-          owner: input.userId,
-          authMethod: retired.authMethod,
-          credentialId: retired.credentialId,
-          reason: "person_disconnected",
-          vendorRevoked: false,
-        },
+        await recordAuditEvent(auditStore.inTransaction(transaction), {
+          eventType: "mcp.account_disconnected",
+          targetType: "mcp_server",
+          targetId: input.serverId,
+          payload: {
+            actor: input.by,
+            server: input.serverId,
+            owner: input.userId,
+            authMethod: association.authMethod,
+            credentialId: association.credentialId,
+            reason: "person_disconnected",
+            vendorRevoked: false,
+          },
+        });
       });
     },
 
@@ -3033,11 +3109,14 @@ export function createPluginStore(options: PluginStoreOptions) {
         .orderBy(asc(mcpUserCredentials.serverId));
 
       return rows.flatMap((row) => {
+        const catalogueAuth = catalogueEntry(row.serverId)?.auth.kind;
         const validOAuth =
+          catalogueAuth === "user-oauth" &&
           row.authMethod === "oauth" &&
           row.scope !== null &&
           row.kind === "mcp_user_token";
         const validApiKey =
+          catalogueAuth === "user-api-key" &&
           row.authMethod === "api_key" &&
           row.scope === null &&
           row.kind === "mcp_user_api_key";
@@ -3099,6 +3178,7 @@ export function createPluginStore(options: PluginStoreOptions) {
       const retiredCredentials = await database.transaction(
         async (transaction) => {
           await lockUserConnections(transaction, userId);
+          const transactionalAudit = auditStore.inTransaction(transaction);
           const owned = await transaction
             .select({
               id: credentialRows.id,
@@ -3122,6 +3202,18 @@ export function createPluginStore(options: PluginStoreOptions) {
             if (credential.revokedAt) continue;
             await credentials.revoke(credential.id, transaction);
             retired.push({ id: credential.id, provider: credential.provider });
+            await recordAuditEvent(transactionalAudit, {
+              eventType: "mcp.account_disconnected",
+              targetType: "mcp_server",
+              targetId: credential.provider,
+              payload: {
+                actor: by,
+                server: credential.provider,
+                owner: userId,
+                reason: "person_removed",
+                vendorRevoked: false,
+              },
+            });
           }
 
           await transaction
@@ -3130,27 +3222,6 @@ export function createPluginStore(options: PluginStoreOptions) {
           return retired;
         },
       );
-
-      for (const credential of retiredCredentials) {
-        await recordAuditEvent(auditStore, {
-          eventType: "mcp.account_disconnected",
-          targetType: "mcp_server",
-          targetId: credential.provider,
-          payload: {
-            actor: by,
-            server: credential.provider,
-            owner: userId,
-            /*
-             * Why, because the two reasons are not the same event to a reader. Somebody disconnecting
-             * their own account is a person changing their mind; an administrator removing somebody
-             * is an offboarding, and an auditor asking "what happened to their access" wants to see
-             * which one this was.
-             */
-            reason: "person_removed",
-            vendorRevoked: false,
-          },
-        });
-      }
       return { retired: retiredCredentials.length };
     },
 

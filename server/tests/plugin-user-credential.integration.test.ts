@@ -44,10 +44,13 @@ const askerId = `user_oauth_asker_${suite}`;
 const otherId = `user_oauth_other_${suite}`;
 const apiKeyUserId = `user_api_key_${suite}`;
 const brokenOauthUserId = `user_oauth_no_scope_${suite}`;
+const listingOauthUserId = `user_oauth_listing_${suite}`;
+const mismatchedCatalogueUserId = `user_catalogue_mismatch_${suite}`;
 const serverId = "google-drive";
 const toolName = "search_files";
 const ref = `${serverId}/${toolName}`;
 const typefullyServerId = "typefully";
+const unknownCatalogueServerId = `unknown-catalogue-${suite}`;
 const typefullyToolName = "list_social_sets";
 const typefullyRef = `${typefullyServerId}/${typefullyToolName}`;
 
@@ -121,6 +124,15 @@ const store = createPluginStore({
     // This suite writes its rows directly, so that what is under test is the selection rather than
     // the connect flow. Loud rather than absent, so a call here shows up instead of passing quietly.
     create: async () => {
+      throw new Error("this suite writes credentials directly");
+    },
+    rotate: async () => {
+      throw new Error("this suite writes credentials directly");
+    },
+    isLive: async () => {
+      throw new Error("this suite reads credential liveness directly");
+    },
+    findLiveByKey: async () => {
       throw new Error("this suite writes credentials directly");
     },
     // Google does not rotate, so no exchange here ever reaches the in-place update. Loud, so that
@@ -311,6 +323,8 @@ beforeAll(async () => {
     [otherId, `${otherId}@openbot.test`],
     [apiKeyUserId, `${apiKeyUserId}@openbot.test`],
     [brokenOauthUserId, `${brokenOauthUserId}@openbot.test`],
+    [listingOauthUserId, `${listingOauthUserId}@openbot.test`],
+    [mismatchedCatalogueUserId, `${mismatchedCatalogueUserId}@openbot.test`],
   ]) {
     await database
       .insert(users)
@@ -367,6 +381,13 @@ beforeAll(async () => {
       provenance: "first-party",
     })
     .onConflictDoNothing();
+  await database.insert(mcpServers).values({
+    id: unknownCatalogueServerId,
+    title: "Unknown catalogue fixture",
+    vendor: "test",
+    url: "https://example.invalid/mcp",
+    provenance: "custom",
+  });
   await database
     .insert(mcpServers)
     .values({
@@ -413,15 +434,14 @@ afterAll(async () => {
   await database
     .delete(mcpUserCredentials)
     .where(
-      and(
-        eq(mcpUserCredentials.serverId, serverId),
-        inArray(mcpUserCredentials.userId, [
-          askerId,
-          otherId,
-          apiKeyUserId,
-          brokenOauthUserId,
-        ]),
-      ),
+      inArray(mcpUserCredentials.userId, [
+        askerId,
+        otherId,
+        apiKeyUserId,
+        brokenOauthUserId,
+        listingOauthUserId,
+        mismatchedCatalogueUserId,
+      ]),
     );
   /*
    * Put the client pointer back before deleting anything, so a suite that borrowed live
@@ -447,6 +467,9 @@ afterAll(async () => {
     .update(mcpServers)
     .set({ credentialId: typefullyCredentialBefore })
     .where(eq(mcpServers.id, typefullyServerId));
+  await database
+    .delete(mcpServers)
+    .where(eq(mcpServers.id, unknownCatalogueServerId));
   for (const id of credentialIds) {
     await database.delete(credentials).where(eq(credentials.id, id));
   }
@@ -495,7 +518,14 @@ afterAll(async () => {
   await database
     .delete(users)
     .where(
-      inArray(users.id, [askerId, otherId, apiKeyUserId, brokenOauthUserId]),
+      inArray(users.id, [
+        askerId,
+        otherId,
+        apiKeyUserId,
+        brokenOauthUserId,
+        listingOauthUserId,
+        mismatchedCatalogueUserId,
+      ]),
     );
 });
 
@@ -880,23 +910,73 @@ describe("a person who has connected", () => {
 });
 
 describe("live connection listing", () => {
-  test("includes safe API-key rows", async () => {
+  test("includes safe rows only when the method matches the catalogue", async () => {
     await connectFixture({
       userId: apiKeyUserId,
       kind: "mcp_user_api_key",
       authMethod: "api_key",
       scope: null,
+      connectionServerId: typefullyServerId,
+    });
+    await connectFixture({
+      userId: listingOauthUserId,
+      kind: "mcp_user_token",
+      authMethod: "oauth",
+      scope: "https://www.googleapis.com/auth/drive.readonly",
     });
 
     expect(await store.connectionsFor(apiKeyUserId)).toEqual([
       {
-        serverId,
+        serverId: typefullyServerId,
         authMethod: "api_key",
         scope: null,
         accountLabel: null,
         connectedAt: expect.any(String),
       },
     ]);
+    expect(await store.connectionsFor(listingOauthUserId)).toEqual([
+      {
+        serverId,
+        authMethod: "oauth",
+        scope: "https://www.googleapis.com/auth/drive.readonly",
+        accountLabel: null,
+        connectedAt: expect.any(String),
+      },
+    ]);
+  });
+
+  test("excludes structurally valid rows whose method disagrees with the catalogue", async () => {
+    await connectFixture({
+      userId: mismatchedCatalogueUserId,
+      kind: "mcp_user_api_key",
+      authMethod: "api_key",
+      scope: null,
+    });
+    expect(await store.connectionsFor(mismatchedCatalogueUserId)).toEqual([]);
+
+    await database
+      .delete(mcpUserCredentials)
+      .where(eq(mcpUserCredentials.userId, mismatchedCatalogueUserId));
+    await connectFixture({
+      userId: mismatchedCatalogueUserId,
+      kind: "mcp_user_token",
+      authMethod: "oauth",
+      scope: "read",
+      connectionServerId: typefullyServerId,
+    });
+    expect(await store.connectionsFor(mismatchedCatalogueUserId)).toEqual([]);
+
+    await database
+      .delete(mcpUserCredentials)
+      .where(eq(mcpUserCredentials.userId, mismatchedCatalogueUserId));
+    await connectFixture({
+      userId: mismatchedCatalogueUserId,
+      kind: "mcp_user_token",
+      authMethod: "oauth",
+      scope: "read",
+      connectionServerId: unknownCatalogueServerId,
+    });
+    expect(await store.connectionsFor(mismatchedCatalogueUserId)).toEqual([]);
   });
 
   test("excludes an OAuth row with no scope", async () => {
