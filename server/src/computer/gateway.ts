@@ -46,6 +46,7 @@ import type { ComputerProvider } from "./provider";
 import type {
   ActionResult,
   AssistanceCancellationResult,
+  AssistanceStatus,
   ClickInput,
   ComputerStatus,
   ControlState,
@@ -192,6 +193,7 @@ export interface ComputerGateway {
     requestId: string,
     signal?: AbortSignal,
   ): Promise<AssistanceCancellationResult>;
+  assistanceStatus(botId: string, requestId: string): Promise<AssistanceStatus>;
   takeControl(botId: string, actor: ActionActor): Promise<ControlState>;
   releaseControl(botId: string, actor: ActionActor): Promise<ControlState>;
   requestSecret(
@@ -641,6 +643,15 @@ export function createComputerGateway(
         });
       }
       return result;
+    },
+
+    async assistanceStatus(botId: string, requestId: string) {
+      const result = await post<{ status: AssistanceStatus }>(
+        botId,
+        "/control/assistance/status",
+        { requestId },
+      );
+      return result.status;
     },
 
     async takeControl(botId: string, actor: ActionActor) {

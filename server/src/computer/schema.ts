@@ -278,12 +278,23 @@ export type ControlState = {
   secretWanted?: string;
   secretRef?: string;
   secretSnapshotId?: number;
+  secretRequestedAt?: string;
   secretRequestId?: string;
 };
+
+export type AssistanceStatus =
+  | "pending"
+  | "human"
+  | "completed"
+  | "expired"
+  | "cancelled"
+  | "superseded"
+  | "unknown";
 
 export type AssistanceCancellationResult = {
   cancelled: boolean;
   state: ControlState;
+  status: AssistanceStatus;
 };
 
 /**

@@ -49,13 +49,25 @@ export type ControlState = {
    */
   secretRef?: string;
   secretSnapshotId?: number;
+  /** When this exact secret generation was requested, so it expires like a help request. */
+  secretRequestedAt?: string;
   /** Opaque generation of the pending secret request, used only for conditional cancellation. */
   secretRequestId?: string;
 };
 
+export type AssistanceStatus =
+  | "pending"
+  | "human"
+  | "completed"
+  | "expired"
+  | "cancelled"
+  | "superseded"
+  | "unknown";
+
 export type AssistanceCancellationResult = {
   cancelled: boolean;
   state: ControlState;
+  status: AssistanceStatus;
 };
 
 /** Refusal because a person is driving. Distinct from a failure, so the Bot can be told to wait. */
@@ -105,6 +117,58 @@ export function createControl(
     since: now(),
     requested: false,
   };
+  const terminalAssistance = new Map<string, AssistanceStatus>();
+  let humanAssistanceId: string | undefined;
+
+  const remember = (
+    requestId: string | undefined,
+    status: AssistanceStatus,
+  ) => {
+    if (!requestId) return;
+    terminalAssistance.delete(requestId);
+    terminalAssistance.set(requestId, status);
+    while (terminalAssistance.size > 128) {
+      const oldest = terminalAssistance.keys().next().value;
+      if (oldest === undefined) break;
+      terminalAssistance.delete(oldest);
+    }
+  };
+
+  const expirePending = () => {
+    const current = Date.parse(now());
+    if (
+      state.holder === "bot" &&
+      state.requested &&
+      state.requestedAt &&
+      current - Date.parse(state.requestedAt) > HELP_REQUEST_TTL_MS
+    ) {
+      remember(state.helpRequestId, "expired");
+      const {
+        helpRequestId: _requestId,
+        reason: _reason,
+        requestedAt: _at,
+        ...rest
+      } = state;
+      state = { ...rest, requested: false };
+    }
+    if (
+      state.holder === "bot" &&
+      state.secretWanted &&
+      state.secretRequestedAt &&
+      current - Date.parse(state.secretRequestedAt) > HELP_REQUEST_TTL_MS
+    ) {
+      remember(state.secretRequestId, "expired");
+      const {
+        secretRequestId: _requestId,
+        secretWanted: _wanted,
+        secretRef: _ref,
+        secretSnapshotId: _snapshotId,
+        secretRequestedAt: _at,
+        ...rest
+      } = state;
+      state = rest;
+    }
+  };
 
   const assistanceRequestId = (candidate: unknown) =>
     typeof candidate === "string" &&
@@ -127,20 +191,7 @@ export function createControl(
      * than any stale prompt.
      */
     get(): ControlState {
-      if (
-        state.requested &&
-        state.holder === "bot" &&
-        state.requestedAt &&
-        Date.parse(now()) - Date.parse(state.requestedAt) > HELP_REQUEST_TTL_MS
-      ) {
-        const {
-          helpRequestId: _requestId,
-          reason: _reason,
-          requestedAt: _at,
-          ...rest
-        } = state;
-        state = { ...rest, requested: false };
-      }
+      expirePending();
       return { ...state };
     },
 
@@ -151,11 +202,14 @@ export function createControl(
      * hand itself to a human could also hand a human a page they never asked to see.
      */
     requestHelp(reason: unknown, requestId?: unknown): ControlState {
+      expirePending();
+      if (state.requested) remember(state.helpRequestId, "superseded");
+      const id = assistanceRequestId(requestId);
       state = {
         ...state,
         requested: true,
         requestedAt: now(),
-        helpRequestId: assistanceRequestId(requestId),
+        helpRequestId: id,
         reason:
           typeof reason === "string" && reason.trim()
             ? reason.trim()
@@ -171,11 +225,14 @@ export function createControl(
       snapshotId?: unknown;
       requestId?: unknown;
     }): ControlState {
+      expirePending();
       if (typeof input.ref !== "string" || !input.ref.trim()) {
         throw new ControlRequestError(
           "Say which field the value goes in, using a ref from your snapshot.",
         );
       }
+      if (state.secretWanted) remember(state.secretRequestId, "superseded");
+      const requestedAt = now();
       state = {
         ...state,
         secretWanted:
@@ -186,6 +243,7 @@ export function createControl(
         secretSnapshotId:
           typeof input.snapshotId === "number" ? input.snapshotId : undefined,
         secretRequestId: assistanceRequestId(input.requestId),
+        secretRequestedAt: requestedAt,
       };
       return this.get();
     },
@@ -195,8 +253,16 @@ export function createControl(
      * A stale delivery timeout is therefore harmless after a newer request or human handoff.
      */
     cancelAssistance(requestId: string): AssistanceCancellationResult {
+      expirePending();
+      if (humanAssistanceId === requestId) {
+        return { cancelled: false, state: this.get(), status: "human" };
+      }
       if (state.holder !== "bot") {
-        return { cancelled: false, state: this.get() };
+        return {
+          cancelled: false,
+          state: this.get(),
+          status: terminalAssistance.get(requestId) ?? "unknown",
+        };
       }
       if (state.helpRequestId === requestId && state.requested) {
         const {
@@ -206,7 +272,8 @@ export function createControl(
           ...rest
         } = state;
         state = { ...rest, requested: false };
-        return { cancelled: true, state: this.get() };
+        remember(requestId, "cancelled");
+        return { cancelled: true, state: this.get(), status: "cancelled" };
       }
       if (state.secretRequestId === requestId && state.secretWanted) {
         const {
@@ -214,12 +281,28 @@ export function createControl(
           secretWanted: _wanted,
           secretRef: _ref,
           secretSnapshotId: _snapshotId,
+          secretRequestedAt: _requestedAt,
           ...rest
         } = state;
         state = rest;
-        return { cancelled: true, state: this.get() };
+        remember(requestId, "cancelled");
+        return { cancelled: true, state: this.get(), status: "cancelled" };
       }
-      return { cancelled: false, state: this.get() };
+      return {
+        cancelled: false,
+        state: this.get(),
+        status: terminalAssistance.get(requestId) ?? "unknown",
+      };
+    },
+
+    assistanceStatus(requestId: string): AssistanceStatus {
+      expirePending();
+      if (humanAssistanceId === requestId) return "human";
+      if (state.requested && state.helpRequestId === requestId)
+        return "pending";
+      if (state.secretWanted && state.secretRequestId === requestId)
+        return "pending";
+      return terminalAssistance.get(requestId) ?? "unknown";
     },
 
     /**
@@ -229,6 +312,7 @@ export function createControl(
      * masked box from being a general-purpose way to type into the page.
      */
     pendingSecret(): { ref: string; snapshotId?: number } | null {
+      expirePending();
       if (!state.secretWanted || !state.secretRef) return null;
       return { ref: state.secretRef, snapshotId: state.secretSnapshotId };
     },
@@ -240,12 +324,14 @@ export function createControl(
      * can try again.
      */
     secretSupplied(): void {
+      remember(state.secretRequestId, "completed");
       state = {
         ...state,
         secretWanted: undefined,
         secretRef: undefined,
         secretSnapshotId: undefined,
         secretRequestId: undefined,
+        secretRequestedAt: undefined,
       };
     },
 
@@ -257,6 +343,9 @@ export function createControl(
      * box left open behind them no longer corresponds to an active request.
      */
     take(): ControlState {
+      expirePending();
+      humanAssistanceId = state.requested ? state.helpRequestId : undefined;
+      if (state.secretWanted) remember(state.secretRequestId, "cancelled");
       state = {
         holder: "human",
         since: now(),
@@ -275,6 +364,8 @@ export function createControl(
      * secret box left open afterwards is asking for a password nothing is waiting for.
      */
     release(): ControlState {
+      remember(humanAssistanceId, "completed");
+      humanAssistanceId = undefined;
       state = {
         holder: "bot",
         since: now(),

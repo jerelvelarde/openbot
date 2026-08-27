@@ -234,6 +234,36 @@ test("computer control URL allows HTTPS and loopback only", () => {
 });
 
 test("approval buttons resume the originating thread with a boolean decision", async () => {
+  const presentations = new Map<string, Record<string, unknown>>();
+  configureApprovalDecisionStore(
+    {
+      async present(value) {
+        presentations.set(value.presentationId, {
+          ...value,
+          createdAt: new Date(),
+        });
+      },
+      async get(id) {
+        return (presentations.get(id) ?? null) as never;
+      },
+      async begin() {
+        return "first";
+      },
+      async complete() {},
+      async cleanup() {
+        return 0;
+      },
+    },
+    {
+      authorize: async () => true,
+      subject: () => ({
+        channelsThreadId: "thread-1",
+        conversationKey: "conversation-1",
+        agentId: "agent-1",
+        createdByUserId: "user-1",
+      }),
+    },
+  );
   const rendered = await ApprovalCard.render(
     { question: "Deploy this release?" },
     { platform: "slack", signal: new AbortController().signal },
@@ -256,14 +286,14 @@ test("approval buttons resume the originating thread with a boolean decision", a
     };
   }>;
   const decisions: unknown[] = [];
-  configureApprovalDecisionStore({ claim: async () => true });
-
   for (const [index, node] of actionNodes.entries()) {
     await node.props.onClick({
       action: { id: `action-${index}`, value: node.props.value },
       thread: {
+        conversationKey: "conversation-1",
         resume: async (decision: unknown) => void decisions.push(decision),
       },
+      user: { id: "user-1", name: "User" },
     });
   }
 
@@ -275,6 +305,96 @@ test("approval buttons resume the originating thread with a boolean decision", a
     "approval-reject",
   ]);
   expect(decisions).toEqual([{ approved: true }, { approved: false }]);
+});
+
+test("approval authorization fails closed and the same winner can retry a pre-resume failure", async () => {
+  const presentations = new Map<string, never>();
+  let winner: { actionId: string; approved: boolean } | null = null;
+  let completed = false;
+  let beginCalls = 0;
+  configureApprovalDecisionStore(
+    {
+      async present(value) {
+        presentations.set(value.presentationId, {
+          ...value,
+          createdAt: new Date(),
+        } as never);
+      },
+      async get(id) {
+        return presentations.get(id) ?? null;
+      },
+      async begin(input) {
+        beginCalls += 1;
+        if (!winner) {
+          winner = { actionId: input.actionId, approved: input.approved };
+          return "first";
+        }
+        return !completed &&
+          winner.actionId === input.actionId &&
+          winner.approved === input.approved
+          ? "retry"
+          : "rejected";
+      },
+      async complete() {
+        completed = true;
+      },
+      async cleanup() {
+        return 0;
+      },
+    },
+    {
+      authorize: async ({ userId }) => userId === "allowed",
+      subject: () => ({
+        channelsThreadId: "thread-1",
+        conversationKey: "conversation-1",
+        agentId: "agent-1",
+        createdByUserId: "creator",
+      }),
+    },
+  );
+  const rendered = (await ApprovalCard.render(
+    { question: "Deploy?" },
+    { platform: "slack", signal: new AbortController().signal },
+  )) as { props: { children: Array<{ props: { children: unknown } }> } };
+  const nodes = (
+    rendered.props.children[1] as {
+      props: { children: Array<{ props: Record<string, unknown> }> };
+    }
+  ).props.children;
+  const click = async (
+    index: number,
+    userId: string | null,
+    resume: () => Promise<void>,
+  ) => {
+    const node = nodes[index]!;
+    await (node.props.onClick as (context: unknown) => Promise<void>)({
+      action: { id: `action-${index}`, value: node.props.value },
+      thread: { conversationKey: "conversation-1", resume },
+      user: userId ? { id: userId, name: userId } : null,
+    });
+  };
+
+  await expect(click(0, null, async () => {})).rejects.toThrow("authorized");
+  await expect(click(0, "denied", async () => {})).rejects.toThrow(
+    "authorized",
+  );
+  expect(beginCalls).toBe(0);
+  await expect(
+    click(0, "allowed", async () => {
+      throw new Error("transient before continuation consumption");
+    }),
+  ).rejects.toThrow("transient");
+  await click(1, "allowed", async () => {
+    throw new Error("sibling must not resume");
+  });
+  let resumes = 0;
+  await click(0, "allowed", async () => {
+    resumes += 1;
+  });
+  await click(0, "allowed", async () => {
+    resumes += 1;
+  });
+  expect(resumes).toBe(1);
 });
 
 function interactiveActionIds(value: unknown): string[] {
@@ -297,6 +417,39 @@ function interactiveActionIds(value: unknown): string[] {
 }
 
 test("registered ApprovalCard binds durable one-use actions that resume its thread", async () => {
+  const presentations = new Map<string, Record<string, unknown>>();
+  const completed = new Set<string>();
+  configureApprovalDecisionStore(
+    {
+      async present(value) {
+        presentations.set(value.presentationId, {
+          ...value,
+          createdAt: new Date(),
+        });
+      },
+      async get(id) {
+        return (presentations.get(id) ?? null) as never;
+      },
+      async begin({ presentationId }) {
+        return completed.has(presentationId) ? "rejected" : "first";
+      },
+      async complete(presentationId) {
+        completed.add(presentationId);
+      },
+      async cleanup() {
+        return 0;
+      },
+    },
+    {
+      authorize: async () => true,
+      subject: () => ({
+        channelsThreadId: "thread-1",
+        conversationKey: "approval-thread",
+        agentId: "agent-1",
+        createdByUserId: "U1",
+      }),
+    },
+  );
   const adapter = new FakeAdapter({ platform: "slack" });
   const lifecycle: Array<{ isResume?: boolean }> = [];
   adapter.runAgentLifecycle = async (args) => {

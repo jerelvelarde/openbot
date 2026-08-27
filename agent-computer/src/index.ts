@@ -580,6 +580,19 @@ serve<StreamData>({
       return json(session.control.cancelAssistance(body.requestId));
     }
 
+    if (
+      url.pathname === "/control/assistance/status" &&
+      request.method === "POST"
+    ) {
+      const body = (await request.json().catch(() => null)) as {
+        requestId?: unknown;
+      } | null;
+      if (typeof body?.requestId !== "string" || !body.requestId) {
+        return json({ error: "An assistance request id is required." }, 400);
+      }
+      return json({ status: session.control.assistanceStatus(body.requestId) });
+    }
+
     /**
      * A person supplying that value.
      *

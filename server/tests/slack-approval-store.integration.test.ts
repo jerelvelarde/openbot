@@ -1,13 +1,18 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
   createChannel,
   FakeAdapter,
   FakeAgent,
   MemoryStore,
 } from "@copilotkit/channels";
-import { inArray } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { createDatabase } from "../src/db/client";
-import { approvalDecisions } from "../src/db/schema";
+import {
+  agents,
+  approvalDecisions,
+  externalThreadBindings,
+  users,
+} from "../src/db/schema";
 import { createApprovalDecisionStore } from "../src/slack/approval-store";
 import {
   ApprovalCard,
@@ -21,6 +26,33 @@ const database = createDatabase(
   TEST_POOL,
 );
 const presentationIds = new Set<string>();
+const channelsThreadId = `approval-thread-${crypto.randomUUID()}`;
+const agentId = `approval-agent-${crypto.randomUUID()}`;
+
+beforeAll(async () => {
+  await database
+    .insert(users)
+    .values([
+      { id: "U1", email: `u1-${crypto.randomUUID()}@example.test` },
+      { id: "U2", email: `u2-${crypto.randomUUID()}@example.test` },
+    ])
+    .onConflictDoNothing();
+  await database.insert(agents).values({
+    id: agentId,
+    name: "Approval Agent",
+    type: "remote_ag_ui",
+    configuration: {},
+  });
+  await database.insert(externalThreadBindings).values({
+    channelsThreadId,
+    provider: "slack",
+    providerTenantId: `tenant-${crypto.randomUUID()}`,
+    providerConversationId: `conversation-${crypto.randomUUID()}`,
+    providerThreadId: `thread-${crypto.randomUUID()}`,
+    agentId,
+    createdByUserId: "U1",
+  });
+});
 
 type BoundAction = {
   id: string;
@@ -58,7 +90,15 @@ function runtime(
   lifecycle: Array<{ isResume?: boolean }>,
   script: ConstructorParameters<typeof FakeAgent>[0],
 ) {
-  configureApprovalDecisionStore(createApprovalDecisionStore(database));
+  configureApprovalDecisionStore(createApprovalDecisionStore(database), {
+    authorize: async ({ userId }) => userId === "U1" || userId === "U2",
+    subject: () => ({
+      channelsThreadId,
+      conversationKey: "approval-thread",
+      agentId,
+      createdByUserId: "U1",
+    }),
+  });
   const adapter = new FakeAdapter({ platform: "slack" });
   adapter.runAgentLifecycle = async (args) => {
     lifecycle.push({ isResume: args.isResume });
@@ -66,7 +106,7 @@ function runtime(
   };
   const channel = createChannel({
     name: "approval-durability-probe",
-    identifyUser: "platform",
+    identifyUser: ({ actor }) => ({ id: actor.id, name: actor.id }),
     adapters: [adapter],
     agent: () => new FakeAgent(script),
     components: [ApprovalCard],
@@ -123,15 +163,28 @@ async function click(
 }
 
 afterAll(async () => {
-  if (presentationIds.size > 0) {
-    await database
-      .delete(approvalDecisions)
-      .where(inArray(approvalDecisions.presentationId, [...presentationIds]));
-  }
+  await database
+    .delete(approvalDecisions)
+    .where(eq(approvalDecisions.channelsThreadId, channelsThreadId));
   await database.$client.end({ timeout: 5 });
 });
 
 describe("durable Slack approval decisions", () => {
+  test("an unlinked or inaccessible participant cannot claim the presentation", async () => {
+    const fixture = await present();
+    try {
+      const before = fixture.lifecycle.length;
+      await expect(
+        click(fixture.adapter, fixture.actions[0]!, "unauthorized", "U3"),
+      ).rejects.toThrow("authorized");
+      expect(fixture.lifecycle).toHaveLength(before);
+      await click(fixture.adapter, fixture.actions[0]!, "authorized", "U1");
+      expect(fixture.lifecycle).toHaveLength(before + 1);
+    } finally {
+      await fixture.channel.ɵruntime.stop();
+    }
+  });
+
   for (const firstApproved of [true, false]) {
     test(`${firstApproved ? "approve" : "reject"} prevents the sibling decision`, async () => {
       const fixture = await present();
@@ -169,6 +222,44 @@ describe("durable Slack approval decisions", () => {
     }
   });
 
+  test("only the original winning actor can retry the same action", async () => {
+    const store = createApprovalDecisionStore(database);
+    const presentationId = crypto.randomUUID();
+    presentationIds.add(presentationId);
+    await store.present({
+      presentationId,
+      channelsThreadId,
+      conversationKey: "approval-thread",
+      agentId,
+      createdByUserId: "U1",
+    });
+
+    expect(
+      await store.begin({
+        presentationId,
+        actionId: "approve-action",
+        approved: true,
+        decidedByUserId: "U1",
+      }),
+    ).toBe("first");
+    expect(
+      await store.begin({
+        presentationId,
+        actionId: "approve-action",
+        approved: true,
+        decidedByUserId: "U2",
+      }),
+    ).toBe("rejected");
+    expect(
+      await store.begin({
+        presentationId,
+        actionId: "approve-action",
+        approved: true,
+        decidedByUserId: "U1",
+      }),
+    ).toBe("retry");
+  });
+
   test("a persisted decision rejects its sibling after a runtime restart", async () => {
     const first = await present();
     const before = first.lifecycle.length;
@@ -184,5 +275,20 @@ describe("durable Slack approval decisions", () => {
     } finally {
       await restarted.channel.ɵruntime.stop();
     }
+  });
+
+  test("retention cleanup preserves live action-window rows", async () => {
+    const store = createApprovalDecisionStore(database);
+    const presentationId = crypto.randomUUID();
+    presentationIds.add(presentationId);
+    await store.present({
+      presentationId,
+      channelsThreadId,
+      conversationKey: "approval-thread",
+      agentId,
+      createdByUserId: "U1",
+    });
+    expect(await store.cleanup(new Date(Date.now() - 60_000))).toBe(0);
+    expect(await store.get(presentationId)).not.toBeNull();
   });
 });

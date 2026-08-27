@@ -9,6 +9,7 @@ export type SlackExecution = {
   readonly providerConversationId: string;
   readonly providerThreadId: string;
   channelsThreadId?: string;
+  channelsConversationKey?: string;
   readonly messageText: string;
   agentId?: string;
 };

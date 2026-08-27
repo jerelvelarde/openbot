@@ -468,12 +468,32 @@ export const auditEvents = pgTable(
 );
 
 /** One durable winner for the two actions rendered by an approval presentation. */
-export const approvalDecisions = pgTable("approval_decisions", {
-  presentationId: uuid("presentation_id").primaryKey(),
-  actionId: text("action_id").notNull(),
-  approved: boolean("approved").notNull(),
-  createdAt: createdAt(),
-});
+export const approvalDecisions = pgTable(
+  "approval_decisions",
+  {
+    presentationId: uuid("presentation_id").primaryKey(),
+    channelsThreadId: text("channels_thread_id")
+      .notNull()
+      .references(() => externalThreadBindings.channelsThreadId, {
+        onDelete: "cascade",
+      }),
+    conversationKey: text("conversation_key").notNull(),
+    agentId: text("agent_id")
+      .notNull()
+      .references(() => agents.id, { onDelete: "restrict" }),
+    createdByUserId: text("created_by_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "restrict" }),
+    actionId: text("action_id"),
+    approved: boolean("approved"),
+    decidedByUserId: text("decided_by_user_id").references(() => users.id, {
+      onDelete: "restrict",
+    }),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+    createdAt: createdAt(),
+  },
+  (table) => [index("approval_decisions_created_at_idx").on(table.createdAt)],
+);
 
 export const intelligenceChannelMappings = pgTable(
   "intelligence_channel_mappings",

@@ -85,6 +85,20 @@ describe("the happy path: ask, hand over, hand back", () => {
 });
 
 describe("the crappy paths: two drivers, one page", () => {
+  test("tracks one help generation through supersession and human completion", () => {
+    const { control } = fixture();
+    const first = "11111111-1111-4111-8111-111111111111";
+    const second = "22222222-2222-4222-8222-222222222222";
+    control.requestHelp("First request", first);
+    control.requestHelp("Second request", second);
+    expect(control.assistanceStatus(first)).toBe("superseded");
+    expect(control.assistanceStatus(second)).toBe("pending");
+    control.take();
+    expect(control.assistanceStatus(second)).toBe("human");
+    control.release();
+    expect(control.assistanceStatus(second)).toBe("completed");
+  });
+
   test("cancels only the exact pending help generation", () => {
     const { control } = fixture();
     control.requestHelp(
@@ -194,6 +208,19 @@ describe("the crappy paths: two drivers, one page", () => {
 });
 
 describe("the crappy paths: secrets", () => {
+  test("expires one unanswered secret generation without touching its successor", () => {
+    let now = Date.parse("2026-08-14T00:00:00.000Z");
+    const control = createControl(() => new Date(now).toISOString());
+    const first = "11111111-1111-4111-8111-111111111111";
+    const second = "22222222-2222-4222-8222-222222222222";
+    control.requestSecret({ ref: "e1", label: "code", requestId: first });
+    control.requestSecret({ ref: "e2", label: "new code", requestId: second });
+    expect(control.assistanceStatus(first)).toBe("superseded");
+    now += 10 * 60 * 1000 + 1;
+    expect(control.assistanceStatus(second)).toBe("expired");
+    expect(control.pendingSecret()).toBeNull();
+  });
+
   test("cancels only the exact pending secret generation", () => {
     const { control } = fixture();
     control.requestSecret({
@@ -311,6 +338,7 @@ describe("the crappy paths: secrets", () => {
     ).toEqual([
       "secretRef",
       "secretRequestId",
+      "secretRequestedAt",
       "secretSnapshotId",
       "secretWanted",
     ]);

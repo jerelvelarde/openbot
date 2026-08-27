@@ -11,6 +11,9 @@ type AssistanceOutcome =
   | { kind: "wrong-user" }
   | { kind: "error" };
 
+const ASSISTANCE_SESSION_KEY = "openbot.slack-assistance-token";
+type AssistanceStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">;
+
 export const Route = createFileRoute("/_authed/assist")({
   validateSearch: (search: Record<string, unknown>): { token?: string } => {
     const token = assistanceToken(search);
@@ -70,6 +73,23 @@ export function assistanceHistoryPath(
   }
 }
 
+/** Capture the claim in tab-scoped memory and remove it from visible history immediately. */
+export function captureAssistanceToken(
+  token: string | undefined,
+  currentHref: string,
+  history: { replace(path: string): void },
+  storage: AssistanceStorage,
+): string | null {
+  const captured = token?.trim() || null;
+  if (captured) {
+    storage.setItem(ASSISTANCE_SESSION_KEY, captured);
+    const cleanPath = assistanceHistoryPath(currentHref, captured);
+    if (cleanPath) history.replace(cleanPath);
+    return captured;
+  }
+  return storage.getItem(ASSISTANCE_SESSION_KEY)?.trim() || null;
+}
+
 async function loadAssistance(
   token: string,
   signal: AbortSignal,
@@ -90,8 +110,19 @@ async function loadAssistance(
 
 function AssistancePage() {
   const { token } = Route.useSearch();
-  if (!token) return <AssistanceStatus outcome={{ kind: "invalid" }} />;
-  return <AssistanceLoader key={token} token={token} />;
+  const [captured] = useState(() =>
+    captureAssistanceToken(
+      token,
+      window.location.href,
+      {
+        replace: (path) =>
+          window.history.replaceState(window.history.state, "", path),
+      },
+      window.sessionStorage,
+    ),
+  );
+  if (!captured) return <AssistanceStatus outcome={{ kind: "invalid" }} />;
+  return <AssistanceLoader key={captured} token={captured} />;
 }
 
 function AssistanceLoader({ token }: { token: string }) {
@@ -107,13 +138,7 @@ function AssistanceLoader({ token }: { token: string }) {
         if (!controller.signal.aborted) {
           setOutcome(loaded);
           if (loaded.kind !== "error") {
-            const cleanPath = assistanceHistoryPath(
-              window.location.href,
-              token,
-            );
-            if (cleanPath) {
-              window.history.replaceState(window.history.state, "", cleanPath);
-            }
+            window.sessionStorage.removeItem(ASSISTANCE_SESSION_KEY);
           }
         }
       },
