@@ -12,10 +12,10 @@ const postSchema = {
   type: "object",
   additionalProperties: false,
   properties: {
-    text: { type: "string", maxLength: 100_000 },
+    text: { type: "string", maxLength: 50_000 },
     mediaIds: {
       type: "array",
-      maxItems: 20,
+      maxItems: 10,
       items: { type: "string", minLength: 1, maxLength: 240 },
     },
   },
@@ -78,7 +78,6 @@ const draftFields = {
     maxLength: 512,
     description: "An internal title; it is not posted.",
   },
-  share: { type: ["boolean", "null"] },
   planAt: {
     type: ["string", "null"],
     description:
@@ -124,7 +123,11 @@ const TOOLS: readonly McpTool[] = Object.freeze([
     inputSchema: {
       type: "object",
       additionalProperties: false,
-      properties: { socialSetId: socialSetIdSchema, ...draftFields },
+      properties: {
+        socialSetId: socialSetIdSchema,
+        ...draftFields,
+        share: { type: "boolean" },
+      },
       required: ["socialSetId", "platforms"],
     },
   },
@@ -139,6 +142,7 @@ const TOOLS: readonly McpTool[] = Object.freeze([
         socialSetId: socialSetIdSchema,
         draftId: draftIdSchema,
         ...draftFields,
+        share: { type: ["boolean", "null"] },
       },
       required: ["socialSetId", "draftId"],
     },
@@ -341,17 +345,17 @@ function reviewedPlatforms(
           message: `platforms.${platformName}.posts[${index}].${extraPostField} is not allowed.`,
         };
       }
-      if (typeof rawPost.text !== "string" || rawPost.text.length > 100_000) {
+      if (typeof rawPost.text !== "string" || rawPost.text.length > 50_000) {
         return {
           ok: false,
-          message: `platforms.${platformName}.posts[${index}].text must be a string of at most 100000 characters.`,
+          message: `platforms.${platformName}.posts[${index}].text must be a string of at most 50000 characters.`,
         };
       }
       const post: Record<string, unknown> = { text: rawPost.text };
       if (rawPost.mediaIds !== undefined) {
         if (
           !Array.isArray(rawPost.mediaIds) ||
-          rawPost.mediaIds.length > 20 ||
+          rawPost.mediaIds.length > 10 ||
           rawPost.mediaIds.some(
             (id) => typeof id !== "string" || id.length < 1 || id.length > 240,
           )
@@ -373,11 +377,75 @@ function reviewedPlatforms(
 function futureDateOrSlot(value: unknown): value is string {
   if (value === "next-free-slot") return true;
   if (typeof value !== "string") return false;
-  if (!/^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/.test(value)) {
+  const match = value.match(
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|([+-])(\d{2}):(\d{2}))$/,
+  );
+  if (!match) return false;
+
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText] =
+    match;
+  const fractionText = match[7] ?? "0";
+  const zone = match[8];
+  const offsetSign = match[9];
+  const offsetHourText = match[10];
+  const offsetMinuteText = match[11];
+  if (
+    yearText === undefined ||
+    monthText === undefined ||
+    dayText === undefined ||
+    hourText === undefined ||
+    minuteText === undefined ||
+    secondText === undefined ||
+    zone === undefined
+  ) {
     return false;
   }
+
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const second = Number(secondText);
+  const millisecond = Number(fractionText.padEnd(3, "0"));
+  const local = new Date(0);
+  local.setUTCFullYear(year, month - 1, day);
+  local.setUTCHours(hour, minute, second, millisecond);
+  if (
+    local.getUTCFullYear() !== year ||
+    local.getUTCMonth() !== month - 1 ||
+    local.getUTCDate() !== day ||
+    local.getUTCHours() !== hour ||
+    local.getUTCMinutes() !== minute ||
+    local.getUTCSeconds() !== second ||
+    local.getUTCMilliseconds() !== millisecond
+  ) {
+    return false;
+  }
+
+  let offsetMinutes = 0;
+  if (zone !== "Z") {
+    const offsetHour = Number(offsetHourText);
+    const offsetMinute = Number(offsetMinuteText);
+    if (offsetHour > 23 || offsetMinute > 59 || offsetSign === undefined) {
+      return false;
+    }
+    offsetMinutes =
+      (offsetSign === "+" ? 1 : -1) * (offsetHour * 60 + offsetMinute);
+  }
   const timestamp = Date.parse(value);
-  return Number.isFinite(timestamp) && timestamp > Date.now();
+  if (!Number.isFinite(timestamp) || timestamp <= Date.now()) return false;
+
+  const roundTrip = new Date(timestamp + offsetMinutes * 60_000);
+  return (
+    roundTrip.getUTCFullYear() === year &&
+    roundTrip.getUTCMonth() === month - 1 &&
+    roundTrip.getUTCDate() === day &&
+    roundTrip.getUTCHours() === hour &&
+    roundTrip.getUTCMinutes() === minute &&
+    roundTrip.getUTCSeconds() === second &&
+    roundTrip.getUTCMilliseconds() === millisecond
+  );
 }
 
 type RequestSpec = {
@@ -400,7 +468,7 @@ function idError(key: "socialSetId" | "draftId"): BuiltRequest {
 
 function buildDraftBody(
   args: Record<string, unknown>,
-  requirePlatforms: boolean,
+  createDraft: boolean,
 ):
   | { ok: true; body: Record<string, unknown> }
   | { ok: false; message: string } {
@@ -409,7 +477,7 @@ function buildDraftBody(
     const platforms = reviewedPlatforms(args.platforms);
     if (!platforms.ok) return platforms;
     body.platforms = platforms.value;
-  } else if (requirePlatforms) {
+  } else if (createDraft) {
     return { ok: false, message: "platforms is required." };
   }
   if (args.draftTitle !== undefined) {
@@ -426,8 +494,16 @@ function buildDraftBody(
     body.draft_title = args.draftTitle;
   }
   if (args.share !== undefined) {
-    if (args.share !== null && typeof args.share !== "boolean") {
-      return { ok: false, message: "share must be null or a boolean." };
+    if (
+      typeof args.share !== "boolean" &&
+      !(args.share === null && !createDraft)
+    ) {
+      return {
+        ok: false,
+        message: createDraft
+          ? "share must be a boolean when creating a draft."
+          : "share must be null or a boolean.",
+      };
     }
     body.share = args.share;
   }

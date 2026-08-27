@@ -101,6 +101,38 @@ describe("the reviewed Typefully tool surface", () => {
     for (const tool of tools) visit(tool.inputSchema);
   });
 
+  test("pins the live v2 post, media, and create-share bounds in the schema", async () => {
+    const tools = await listTools({ url: connection.url });
+    const create = tools.find((tool) => tool.name === "create_draft");
+    const schema = create?.inputSchema as {
+      properties?: {
+        share?: { type?: unknown };
+        platforms?: {
+          properties?: {
+            x?: {
+              properties?: {
+                posts?: {
+                  maxItems?: unknown;
+                  items?: {
+                    properties?: {
+                      text?: { maxLength?: unknown };
+                      mediaIds?: { maxItems?: unknown };
+                    };
+                  };
+                };
+              };
+            };
+          };
+        };
+      };
+    };
+
+    const post = schema.properties?.platforms?.properties?.x?.properties?.posts;
+    expect(post?.items?.properties?.text?.maxLength).toBe(50_000);
+    expect(post?.items?.properties?.mediaIds?.maxItems).toBe(10);
+    expect(schema.properties?.share?.type).toBe("boolean");
+  });
+
   test("is registered for the frozen Typefully catalogue entry", () => {
     const entry = catalogueEntry("typefully");
     expect(entry?.transport).toBe("typefully-rest");
@@ -342,13 +374,59 @@ describe("fail-closed validation", () => {
     expect(calls).toHaveLength(0);
   });
 
-  test("rejects immediate scheduling and non-future dates before fetch", async () => {
+  test("rejects post text and media ids beyond the live v2 bounds before fetch", async () => {
+    const { fetch, calls } = recordingFetch();
+    const transport = createTypefullyRestTransport(fetch);
+    const tooLong = await transport.callTool(connection, "create_draft", {
+      socialSetId: 1,
+      platforms: {
+        x: { enabled: true, posts: [{ text: "x".repeat(50_001) }] },
+      },
+    });
+    const tooManyMedia = await transport.callTool(connection, "create_draft", {
+      socialSetId: 1,
+      platforms: {
+        x: {
+          enabled: true,
+          posts: [
+            {
+              text: "bounded",
+              mediaIds: Array.from({ length: 11 }, (_, index) => String(index)),
+            },
+          ],
+        },
+      },
+    });
+
+    expect(tooLong.isError).toBe(true);
+    expect(tooManyMedia.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+
+  test("requires create_draft share to be boolean before fetch", async () => {
+    const { fetch, calls } = recordingFetch();
+    const transport = createTypefullyRestTransport(fetch);
+    for (const share of [null, "true", 1]) {
+      const result = await transport.callTool(connection, "create_draft", {
+        socialSetId: 1,
+        platforms,
+        share,
+      });
+      expect(result.isError).toBe(true);
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  test("rejects now, past, impossible, and timezone-less schedules before fetch", async () => {
     const { fetch, calls } = recordingFetch();
     const transport = createTypefullyRestTransport(fetch);
     for (const publishAt of [
       "now",
       "NOW",
       "2020-01-01T00:00:00Z",
+      "2099-02-30T12:00:00Z",
+      "2099-13-01T12:00:00Z",
+      "2099-01-01T12:00:00",
       "tomorrow",
       "2099-01-01",
     ]) {
@@ -360,6 +438,27 @@ describe("fail-closed validation", () => {
       expect(result.isError).toBe(true);
     }
     expect(calls).toHaveLength(0);
+  });
+
+  test("accepts future Z and offset schedules", async () => {
+    const { fetch, calls } = recordingFetch();
+    const transport = createTypefullyRestTransport(fetch);
+    for (const publishAt of [
+      "2099-08-27T12:00:00Z",
+      "2099-08-27T12:00:00-07:00",
+      "next-free-slot",
+    ]) {
+      const result = await transport.callTool(connection, "schedule_draft", {
+        socialSetId: 1,
+        draftId: 2,
+        publishAt,
+      });
+      expect(result.isError).toBe(false);
+      expect(JSON.parse(calls.at(-1)?.body ?? "null")).toEqual({
+        publish_at: publishAt,
+      });
+    }
+    expect(calls).toHaveLength(3);
   });
 
   test("bounds pagination before fetch", async () => {
