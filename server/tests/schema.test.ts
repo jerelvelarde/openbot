@@ -56,13 +56,13 @@ describe("OpenBot database schema", () => {
     ]);
   });
 
-  test("names the two kinds of OAuth secret separately from a shared token", () => {
+  test("names each MCP credential kind separately from a shared token", () => {
     /*
-     * Three different things, three names. `mcp` is one token an administrator holds for everybody.
+     * Four different things, four names. `mcp` is one token an administrator holds for everybody.
      * An OAuth client belongs to the deployment and reaches nobody's data by itself; a refresh token
-     * belongs to one person and reaches everything they can see. Filing all three under `mcp` would
-     * make "what does this deployment hold" unanswerable without reading the metadata of every row,
-     * and it is the question the vault exists to answer.
+     * or API key belongs to one person and reaches everything they can see. Filing all four under
+     * `mcp` would make "what does this deployment hold" unanswerable without reading the metadata of
+     * every row, and it is the question the vault exists to answer.
      */
     expect(credentialKind.enumValues).toEqual([
       "model",
@@ -71,6 +71,7 @@ describe("OpenBot database schema", () => {
       "mcp",
       "mcp_oauth_client",
       "mcp_user_token",
+      "mcp_user_api_key",
     ]);
   });
 
@@ -102,7 +103,8 @@ describe("OpenBot database schema", () => {
       { name: "server_id", notNull: true },
       { name: "user_id", notNull: true },
       { name: "credential_id", notNull: true },
-      { name: "scope", notNull: true },
+      { name: "auth_method", notNull: true },
+      { name: "scope", notNull: false },
       { name: "connected_at", notNull: true },
       { name: "updated_at", notNull: true },
     ]);

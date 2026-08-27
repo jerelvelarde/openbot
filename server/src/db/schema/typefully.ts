@@ -32,7 +32,7 @@ export const typefullyDrafts = pgTable(
     botId: text("bot_id")
       .notNull()
       .references(() => agents.id, { onDelete: "restrict" }),
-    remoteId: text("remote_id"),
+    remoteDraftId: text("remote_draft_id"),
     document: jsonb("document").notNull(),
     version: integer("version").notNull().default(1),
     contentHash: text("content_hash").notNull(),

@@ -5,7 +5,7 @@ CREATE TABLE "typefully_drafts" (
 	"owner_user_id" text NOT NULL,
 	"channel_id" text NOT NULL,
 	"bot_id" text NOT NULL,
-	"remote_id" text,
+	"remote_draft_id" text,
 	"document" jsonb NOT NULL,
 	"version" integer DEFAULT 1 NOT NULL,
 	"content_hash" text NOT NULL,

@@ -124,9 +124,13 @@ describe("Typefully persistence ownership", () => {
         contentHash: `sha256:${suite}`,
         syncStatus: "local",
       })
-      .returning({ id: typefullyDrafts.id });
+      .returning({
+        id: typefullyDrafts.id,
+        remoteDraftId: typefullyDrafts.remoteDraftId,
+      });
     if (!draft) throw new Error("draft fixture was not stored");
     draftId = draft.id;
+    expect(draft.remoteDraftId).toBeNull();
 
     await database.insert(typefullyPublicationProposals).values({
       draftId,

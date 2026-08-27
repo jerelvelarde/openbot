@@ -1,5 +1,5 @@
 {
-  "id": "76f6d7be-ce02-4bd0-a57b-f3822a079305",
+  "id": "cdcb479b-a251-4fc1-9212-adda32b58ad6",
   "prevId": "77ac2143-c594-48d7-9a86-c16c51e0b728",
   "version": "7",
   "dialect": "postgresql",
@@ -2731,8 +2731,8 @@
           "primaryKey": false,
           "notNull": true
         },
-        "remote_id": {
-          "name": "remote_id",
+        "remote_draft_id": {
+          "name": "remote_draft_id",
           "type": "text",
           "primaryKey": false,
           "notNull": false
