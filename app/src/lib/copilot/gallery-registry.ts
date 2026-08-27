@@ -59,6 +59,17 @@ export type GalleryComponent = {
 };
 
 /**
+ * Keep a gallery definition checked at its module boundary without widening its literal fields.
+ * The registry still discovers the returned value through `GALLERY`; this helper adds no runtime
+ * registration or data access.
+ */
+export function defineGalleryComponent<T extends GalleryComponent>(
+  component: T,
+): T {
+  return component;
+}
+
+/**
  * Every gallery module, loaded eagerly because the list has to exist before the first render: it
  * decides how many hooks are registered, and a hook count that arrives late is a hook count that
  * changed.
