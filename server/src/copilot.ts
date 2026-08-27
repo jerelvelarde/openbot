@@ -272,6 +272,22 @@ export function builtInAgentConfiguration(
 const TOOL_STEPS = 8;
 
 /**
+ * The deployment could not establish which connected vendors exist.
+ *
+ * Deliberately carries no cause: this error crosses into agent construction, where a database or
+ * connector error may otherwise become model-visible. The category is stable for operations while
+ * the message reveals nothing about the failed infrastructure.
+ */
+export class VendorCatalogueUnavailableError extends Error {
+  readonly code = "vendor_catalogue_unavailable" as const;
+
+  constructor() {
+    super("Connected vendor catalogue is unavailable.");
+    this.name = "VendorCatalogueUnavailableError";
+  }
+}
+
+/**
  * Build the built-in and remote AG-UI agent map the runtime serves.
  *
  * Keyed by the registry id, which is what the browser sends as the agent name, so the two cannot
@@ -304,7 +320,12 @@ export async function buildAgents(
    */
   agentFetch?: AgentFetch,
 ): Promise<Record<string, AbstractAgent>> {
-  const vendors = await loadVendors().catch(() => [] as readonly string[]);
+  let vendors: readonly string[];
+  try {
+    vendors = await loadVendors();
+  } catch {
+    throw new VendorCatalogueUnavailableError();
+  }
   return Object.fromEntries(
     await Promise.all(
       agents.map(async (agent) => [

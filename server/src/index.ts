@@ -494,16 +494,12 @@ const actorAgentResolver = createActorAgentResolver({
    * Google's sign-in page and asked a person to sign in to an account the deployment had already
    * connected. Naming them lets it say which one it has not been granted instead.
    *
-   * Read per request rather than held, because a connector added a minute ago has to count, and
-   * failing is the same as having none: a Bot that cannot be told loses a sentence, not a run.
+   * Read per request rather than held, because a connector added a minute ago has to count. A read
+   * failure must stop the run: treating unavailable infrastructure as an empty catalogue sends a
+   * Bot to vendor websites under a false statement about what the deployment has connected.
    */
-  loadVendors: async () => {
-    try {
-      return (await pluginStore.listServers()).map((server) => server.id);
-    } catch {
-      return [];
-    }
-  },
+  loadVendors: async () =>
+    (await pluginStore.listServers()).map((server) => server.id),
   /*
    * How a run's tools are narrowed to the ones it is about.
    *
