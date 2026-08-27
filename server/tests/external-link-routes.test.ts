@@ -1,0 +1,261 @@
+import { describe, expect, test } from "bun:test";
+import type { MiddlewareHandler } from "hono";
+import { Hono } from "hono";
+import { createApp } from "../src/app";
+import type { AuditEventInput, AuditStore } from "../src/audit";
+import type { AppVariables } from "../src/auth/guards";
+import { loadConfig } from "../src/config";
+import type { ExternalLinkStore } from "../src/external/link-store";
+import { mintExternalLinkToken } from "../src/external/link-token";
+import { createExternalLinkRoutes } from "../src/external/routes";
+import { testEnvironment } from "./support/environment";
+
+const KEY = "external-link-routes-test-key";
+const NOW = 1_700_000_000_000;
+const INVALID = "This Slack link has expired or is invalid.";
+const CONFLICT = "That Slack identity is already linked.";
+const identity = {
+  provider: "slack" as const,
+  providerTenantId: "T1",
+  providerUserId: "U1",
+  providerEmail: "person@example.com",
+};
+const actor = {
+  id: "openbot-user-1",
+  email: "member@openbot.test",
+  role: "user",
+} as const;
+
+function authenticatedAs(
+  authenticatedActor = actor,
+): MiddlewareHandler<{ Variables: AppVariables }> {
+  return async (context, next) => {
+    context.set("actor", authenticatedActor);
+    await next();
+  };
+}
+
+const unauthenticated: MiddlewareHandler<{ Variables: AppVariables }> = async (
+  context,
+) => context.json({ error: "Authentication required." }, 401);
+
+function linkFor(openbotUserId: string) {
+  return {
+    ...identity,
+    openbotUserId,
+    linkedAt: new Date(NOW),
+    updatedAt: new Date(NOW),
+  };
+}
+
+function fakeStore(
+  overrides: Partial<ExternalLinkStore> = {},
+): ExternalLinkStore & { links: ReturnType<typeof linkFor>[] } {
+  const links: ReturnType<typeof linkFor>[] = [];
+  return Object.assign(
+    {
+      links,
+      async find() {
+        return null;
+      },
+      async findVerifiedUserByEmail() {
+        return null;
+      },
+      async link(input) {
+        const found = links.find(
+          (link) =>
+            link.provider === input.provider &&
+            link.providerTenantId === input.providerTenantId &&
+            link.providerUserId === input.providerUserId,
+        );
+        if (found?.openbotUserId === input.openbotUserId) return found;
+        if (found) throw new Error(CONFLICT);
+        const link = linkFor(input.openbotUserId);
+        links.push(link);
+        return link;
+      },
+    } satisfies ExternalLinkStore,
+    overrides,
+  );
+}
+
+function appFor(
+  store = fakeStore(),
+  requireUser = authenticatedAs(),
+  rows: AuditEventInput[] = [],
+) {
+  const auditStore: AuditStore = {
+    insert: async (event) => void rows.push(event),
+  };
+  const app = new Hono<{ Variables: AppVariables }>();
+  app.route(
+    "/api/external-links",
+    createExternalLinkRoutes({
+      store,
+      encryptionKey: KEY,
+      requireUser,
+      auditStore,
+    }),
+  );
+  return { app, rows, store };
+}
+
+function requestToken(token: string) {
+  return `?token=${encodeURIComponent(token)}`;
+}
+
+async function liveToken() {
+  return mintExternalLinkToken(identity, KEY);
+}
+
+describe("external Slack link confirmation routes", () => {
+  test("GET shows only the safe Slack display metadata after authentication", async () => {
+    const { app } = appFor();
+    const token = await liveToken();
+
+    const response = await app.request(
+      `http://openbot.test/api/external-links/slack${requestToken(token)}`,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      providerTenantId: "T1",
+      providerUserId: "U1",
+      providerEmail: "person@example.com",
+    });
+  });
+
+  test("GET maps a missing or invalid claim to one stable public refusal", async () => {
+    const { app } = appFor();
+    const expired = await mintExternalLinkToken(identity, KEY, NOW);
+
+    for (const suffix of ["", "?token=invalid", requestToken(expired)]) {
+      const response = await app.request(
+        `http://openbot.test/api/external-links/slack${suffix}`,
+      );
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: INVALID });
+    }
+  });
+
+  test("POST uses the authenticated actor rather than a body-supplied user id", async () => {
+    const { app, rows, store } = appFor();
+    const token = await liveToken();
+
+    const response = await app.request(
+      "http://openbot.test/api/external-links/slack",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token, openbotUserId: "forged-user" }),
+      },
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ linked: true });
+    expect(store.links).toEqual([linkFor(actor.id)]);
+    expect(rows).toEqual([
+      {
+        eventType: "external_identity.linked",
+        targetType: "user",
+        targetId: actor.id,
+        actorUserId: actor.id,
+        payload: {
+          provider: "slack",
+          providerTenantId: "T1",
+          providerUserId: "U1",
+        },
+      },
+    ]);
+  });
+
+  test("POST is idempotent for the same actor when the store is idempotent", async () => {
+    const { app, store } = appFor();
+    const token = await liveToken();
+
+    for (let call = 0; call < 2; call += 1) {
+      const response = await app.request(
+        "http://openbot.test/api/external-links/slack",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ token }),
+        },
+      );
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ linked: true });
+    }
+
+    expect(store.links).toEqual([linkFor(actor.id)]);
+  });
+
+  test("POST refuses a replay for another actor without reassigning the link", async () => {
+    const { app, store, rows } = appFor();
+    const token = await liveToken();
+    await app.request("http://openbot.test/api/external-links/slack", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token }),
+    });
+
+    const differentActor = { ...actor, id: "openbot-user-2" } as const;
+    const replay = appFor(store, authenticatedAs(differentActor), rows).app;
+    const response = await replay.request(
+      "http://openbot.test/api/external-links/slack",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token }),
+      },
+    );
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: CONFLICT });
+    expect(store.links).toEqual([linkFor(actor.id)]);
+    expect(rows).toHaveLength(1);
+  });
+
+  test("GET and POST are both rejected without authentication", async () => {
+    const { app, store } = appFor(fakeStore(), unauthenticated);
+    const token = await liveToken();
+
+    const get = await app.request(
+      `http://openbot.test/api/external-links/slack${requestToken(token)}`,
+    );
+    const post = await app.request(
+      "http://openbot.test/api/external-links/slack",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token }),
+      },
+    );
+
+    expect(get.status).toBe(401);
+    expect(post.status).toBe(401);
+    expect(store.links).toEqual([]);
+  });
+
+  test("createApp mounts the optional external link routes under its authenticated API prefix", async () => {
+    const token = await liveToken();
+    const externalLinkRoutes = createExternalLinkRoutes({
+      store: fakeStore(),
+      encryptionKey: KEY,
+      requireUser: authenticatedAs(),
+      auditStore: { insert: async () => undefined },
+    });
+    const app = createApp(
+      loadConfig(testEnvironment()),
+      undefined,
+      undefined,
+      ...(Array.from({ length: 18 }) as never[]),
+      externalLinkRoutes,
+    );
+
+    const response = await app.request(
+      `http://openbot.test/api/external-links/slack${requestToken(token)}`,
+    );
+
+    expect(response.status).toBe(200);
+  });
+});
