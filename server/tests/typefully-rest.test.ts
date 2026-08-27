@@ -3,7 +3,6 @@ import { catalogueEntry } from "../src/plugins/catalogue";
 import { MAX_RESULT_CHARS } from "../src/plugins/mcp";
 import { transportFor } from "../src/plugins/transport";
 import { vendorInputSchemaFor } from "../src/plugins/typefully-contracts";
-import { remoteMatchesSnapshot } from "../src/typefully/publication";
 import {
   callTool,
   createTypefullyMediaPreviewTransport,
@@ -15,6 +14,7 @@ import {
   TypefullyApiKeyValidationError,
   validateTypefullyApiKey,
 } from "../src/plugins/typefully-rest";
+import { remoteMatchesSnapshot } from "../src/typefully/publication";
 import { startFakeTypefullyVendor } from "./support/fake-typefully-vendor";
 
 test("the smoke transport rewrites only the pinned Typefully origin", async () => {
