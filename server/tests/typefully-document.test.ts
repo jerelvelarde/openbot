@@ -22,6 +22,15 @@ const baseDraft = () => ({
 });
 
 describe("canonicalizeDraft", () => {
+  test("the document schema itself canonicalizes destination order", () => {
+    const document = draftDocumentSchema.parse({
+      ...baseDraft(),
+      destinations: ["linkedin", "x"],
+    });
+
+    expect(document.destinations).toEqual(["x", "linkedin"]);
+  });
+
   test("serializes and hashes semantic values independently of object key insertion order", () => {
     const ordinary = baseDraft();
     const reordered = {
@@ -158,7 +167,43 @@ describe("canonicalizeDraft", () => {
     ).toThrow("Mastodon is not supported in OpenBot yet.");
   });
 
-  test("enforces document, post, media, and identifier bounds", () => {
+  test("enforces destination minimum, maximum, and uniqueness", () => {
+    expect(
+      draftDocumentSchema.parse({
+        ...baseDraft(),
+        destinations: ["linkedin", "x"],
+      }).destinations,
+    ).toEqual(["x", "linkedin"]);
+    expect(() =>
+      draftDocumentSchema.parse({ ...baseDraft(), destinations: [] }),
+    ).toThrow();
+    expect(() =>
+      draftDocumentSchema.parse({
+        ...baseDraft(),
+        destinations: ["x", "linkedin", "x"],
+      }),
+    ).toThrow();
+    expect(() =>
+      draftDocumentSchema.parse({
+        ...baseDraft(),
+        destinations: ["x", "x"],
+      }),
+    ).toThrow("Duplicate destination: x.");
+  });
+
+  test("enforces title, social-set, and account-label boundaries", () => {
+    expect(
+      draftDocumentSchema.parse({
+        ...baseDraft(),
+        title: "t".repeat(160),
+        socialSetId: "s".repeat(120),
+        accountLabel: "a".repeat(160),
+      }),
+    ).toMatchObject({
+      title: "t".repeat(160),
+      socialSetId: "s".repeat(120),
+      accountLabel: "a".repeat(160),
+    });
     expect(() =>
       draftDocumentSchema.parse({
         ...baseDraft(),
@@ -168,23 +213,33 @@ describe("canonicalizeDraft", () => {
     expect(() =>
       draftDocumentSchema.parse({
         ...baseDraft(),
-        posts: Array.from({ length: 51 }, (_, index) => ({
-          id: `post-${index}`,
-          x: "x",
-          linkedin: "linkedin",
-        })),
+        socialSetId: "s".repeat(121),
       }),
     ).toThrow();
     expect(() =>
       draftDocumentSchema.parse({
         ...baseDraft(),
-        media: Array.from({ length: 21 }, (_, order) => ({
-          id: `media-${order}`,
-          kind: "image",
-          order,
-          altText: "",
-          remoteId: null,
-        })),
+        accountLabel: "a".repeat(161),
+      }),
+    ).toThrow();
+  });
+
+  test("enforces post count, id, and body boundaries", () => {
+    const posts = Array.from({ length: 50 }, (_, index) => ({
+      id: `post-${index}`,
+      x: index === 0 ? "x".repeat(100_000) : "",
+      linkedin: "",
+    }));
+    expect(
+      draftDocumentSchema.parse({ ...baseDraft(), posts }).posts,
+    ).toHaveLength(50);
+    expect(() =>
+      draftDocumentSchema.parse({ ...baseDraft(), posts: [] }),
+    ).toThrow();
+    expect(() =>
+      draftDocumentSchema.parse({
+        ...baseDraft(),
+        posts: [...posts, { id: "post-50", x: "", linkedin: "" }],
       }),
     ).toThrow();
     expect(() =>
@@ -197,6 +252,58 @@ describe("canonicalizeDraft", () => {
       draftDocumentSchema.parse({
         ...baseDraft(),
         posts: [{ id: "post-1", x: "x".repeat(100_001), linkedin: "" }],
+      }),
+    ).toThrow();
+  });
+
+  test("enforces media count and descriptor boundaries", () => {
+    const media = Array.from({ length: 20 }, (_, order) => ({
+      id: order === 0 ? "i".repeat(120) : `media-${order}`,
+      kind: "image",
+      order,
+      altText: order === 0 ? "a".repeat(10_000) : "",
+      remoteId: order === 0 ? "r".repeat(240) : null,
+    }));
+    expect(
+      draftDocumentSchema.parse({ ...baseDraft(), media }).media,
+    ).toHaveLength(20);
+    expect(() =>
+      draftDocumentSchema.parse({
+        ...baseDraft(),
+        media: [...media, { ...media[0], id: "media-20", order: 20 }],
+      }),
+    ).toThrow();
+    expect(() =>
+      draftDocumentSchema.parse({
+        ...baseDraft(),
+        media: [{ ...media[0], id: "i".repeat(121) }],
+      }),
+    ).toThrow();
+    expect(() =>
+      draftDocumentSchema.parse({
+        ...baseDraft(),
+        media: [{ ...media[0], altText: "a".repeat(10_001) }],
+      }),
+    ).toThrow();
+    expect(() =>
+      draftDocumentSchema.parse({
+        ...baseDraft(),
+        media: [{ ...media[0], remoteId: "r".repeat(241) }],
+      }),
+    ).toThrow();
+  });
+
+  test("accepts ISO datetimes and rejects invalid schedule values", () => {
+    expect(
+      draftDocumentSchema.parse({
+        ...baseDraft(),
+        scheduleAt: "2026-08-27T12:34:56.000Z",
+      }).scheduleAt,
+    ).toBe("2026-08-27T12:34:56.000Z");
+    expect(() =>
+      draftDocumentSchema.parse({
+        ...baseDraft(),
+        scheduleAt: "August 27 sometime after lunch",
       }),
     ).toThrow();
   });
@@ -272,5 +379,33 @@ describe("draftSummary", () => {
     expect(summary.title).not.toContain("disabled X text");
     expect(summary.title).not.toContain(privateTail);
     expect(summary.proposalStatus).toBe("pending");
+  });
+
+  test("checks enabled variants within each post before moving to a later post", () => {
+    const document = canonicalizeDraft({
+      ...baseDraft(),
+      title: "",
+      posts: [
+        {
+          id: "post-1",
+          x: "",
+          linkedin: "earliest post LinkedIn text",
+        },
+        {
+          id: "post-2",
+          x: "later post X text",
+          linkedin: "later post LinkedIn text",
+        },
+      ],
+    }).document;
+
+    const summary = draftSummary({
+      id: "draft-3",
+      document,
+      version: 2,
+      syncStatus: "local",
+    });
+
+    expect(summary.title).toBe("earliest post LinkedIn text");
   });
 });

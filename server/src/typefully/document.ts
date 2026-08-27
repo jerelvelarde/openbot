@@ -48,7 +48,12 @@ const destinationsSchema = z
       }
       seen.add(destination);
     }
-  });
+  })
+  .transform((destinations) =>
+    [...destinations].sort(
+      (left, right) => destinationRank[left] - destinationRank[right],
+    ),
+  );
 
 const postsSchema = z
   .array(postBlockSchema)
@@ -159,9 +164,6 @@ export function canonicalizeDraft(input: unknown): {
   const parsed = draftDocumentSchema.parse(input);
   const document: CanonicalDraftDocument = {
     ...parsed,
-    destinations: [...parsed.destinations].sort(
-      (left, right) => destinationRank[left] - destinationRank[right],
-    ),
     media: [...parsed.media].sort(
       (left, right) =>
         left.order - right.order ||
@@ -192,9 +194,9 @@ export function draftSummary(input: {
 } {
   let title = input.document.title.trim();
   if (title.length === 0) {
-    for (const destination of input.document.destinations) {
-      const body = input.document.posts
-        .map((post) => post[destination].trim())
+    for (const post of input.document.posts) {
+      const body = input.document.destinations
+        .map((destination) => post[destination].trim())
         .find((candidate) => candidate.length > 0);
       if (body !== undefined) {
         title = body.replace(/\s+/g, " ").slice(0, SUMMARY_TITLE_MAX_LENGTH);
