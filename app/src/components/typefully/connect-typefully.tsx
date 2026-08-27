@@ -26,7 +26,7 @@ import {
 const TYPEFULLY_API_SETTINGS = "https://typefully.com/settings/api";
 
 export type PendingTypefullyOperation =
-  | { kind: "sync"; draftId: string }
+  | { kind: "sync"; draftId: string; expectedVersion: number }
   | { kind: "schedule"; draftId: string; expectedVersion: number }
   | {
       kind: "prepare_publication";
@@ -53,7 +53,12 @@ export type TypefullyResumeResult =
 export type TypefullyResumeDependencies = {
   loadConnection(signal?: AbortSignal): Promise<void>;
   loadDraft(draftId: string, signal?: AbortSignal): Promise<AuthoritativeDraft>;
-  sync(draftId: string, signal?: AbortSignal): Promise<{ version: number }>;
+  sync(
+    draftId: string,
+    expectedVersion: number,
+    contentHash: string,
+    signal?: AbortSignal,
+  ): Promise<{ version: number }>;
   preparePublication(
     draftId: string,
     expectedVersion: number,
@@ -71,9 +76,8 @@ export async function resumePendingTypefullyOperation(
   options.signal?.throwIfAborted();
   const draft = await dependencies.loadDraft(pending.draftId, options.signal);
   options.signal?.throwIfAborted();
-  const expectedVersion =
-    pending.kind === "sync" ? options.expectedVersion : pending.expectedVersion;
-  if (expectedVersion !== undefined && draft.version !== expectedVersion) {
+  const expectedVersion = pending.expectedVersion;
+  if (draft.version !== expectedVersion) {
     return {
       outcome: "stale",
       draftId: pending.draftId,
@@ -96,7 +100,12 @@ export async function resumePendingTypefullyOperation(
       proposalId: resumed.proposalId,
     };
   }
-  const resumed = await dependencies.sync(pending.draftId, options.signal);
+  const resumed = await dependencies.sync(
+    pending.draftId,
+    expectedVersion,
+    draft.contentHash,
+    options.signal,
+  );
   return {
     outcome: "resumed",
     draftId: pending.draftId,
@@ -137,8 +146,13 @@ export async function resumeTypefullyAfterConnection(
         });
         return loaded.draft;
       },
-      sync: async (draftId, signal) => {
-        const synced = await syncTypefullyDraft({ draftId, signal });
+      sync: async (draftId, expectedVersion, expectedHash, signal) => {
+        const synced = await syncTypefullyDraft({
+          draftId,
+          expectedVersion,
+          expectedHash,
+          signal,
+        });
         return { version: synced.draft.version };
       },
       preparePublication: async (draftId, expectedVersion, signal) => {
@@ -194,6 +208,11 @@ export function ConnectTypefully({
   const keyInput = useRef<HTMLInputElement>(null);
   const request = useRef<AbortController | null>(null);
 
+  const clearApiKey = () => {
+    if (keyInput.current) keyInput.current.value = "";
+    setApiKey("");
+  };
+
   useEffect(() => setCurrent(connection), [connection]);
   useEffect(
     () => () => {
@@ -216,8 +235,7 @@ export function ConnectTypefully({
         controller.signal,
       );
       if (request.current !== controller) return;
-      if (keyInput.current) keyInput.current.value = "";
-      setApiKey("");
+      clearApiKey();
       setCurrent(connected);
       setReplacing(false);
       await onConnected?.(connected);
@@ -235,6 +253,7 @@ export function ConnectTypefully({
     setError(null);
     try {
       await disconnectPersonalTypefully(queryClient);
+      clearApiKey();
       setCurrent(null);
       setReplacing(false);
       await onDisconnected?.();
@@ -262,7 +281,10 @@ export function ConnectTypefully({
         <div className="flex flex-wrap gap-2">
           <Button
             disabled={pending !== null}
-            onClick={() => setReplacing(true)}
+            onClick={() => {
+              clearApiKey();
+              setReplacing(true);
+            }}
             size="sm"
             type="button"
             variant="outline"
@@ -376,6 +398,7 @@ export function ConnectTypefully({
             disabled={pending !== null}
             onClick={() => {
               setError(null);
+              clearApiKey();
               if (current) setReplacing(false);
               else onCancel?.();
             }}

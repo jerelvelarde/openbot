@@ -37,7 +37,11 @@ type ConnectionDecisionProps = {
 
 function pendingOperation(args: ConnectionArgs): PendingTypefullyOperation {
   if (args.operation === "sync") {
-    return { kind: "sync", draftId: args.draftId };
+    return {
+      kind: "sync",
+      draftId: args.draftId,
+      expectedVersion: args.expectedVersion,
+    };
   }
   return {
     kind: args.operation,
@@ -62,13 +66,13 @@ export function TypefullyConnectionDecision({
   const [failure, setFailure] = useState<string | null>(null);
   const draftId = parsed.success ? parsed.data.draftId : undefined;
 
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
       mounted.current = false;
       resumeController.current?.abort();
-    },
-    [],
-  );
+    };
+  }, []);
   useEffect(() => {
     if (draftId) onOpenDraft?.(draftId);
   }, [draftId, onOpenDraft]);

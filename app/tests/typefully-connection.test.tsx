@@ -174,6 +174,35 @@ test("an invalid key stays only in the current field and supports retry", async 
   expect(field.value).toBe("");
 });
 
+test("cancelling key replacement clears the controlled secret before reopening", async () => {
+  const { ConnectTypefully } = await import(
+    "../src/components/typefully/connect-typefully"
+  );
+  const connection = {
+    serverId: "typefully",
+    authMethod: "api_key" as const,
+    scope: null,
+    accountLabel: "Product team",
+    connectedAt: "2026-08-27T08:00:00.000Z",
+  };
+  const view = render(
+    <QueryClientProvider client={new QueryClient()}>
+      <ConnectTypefully connection={connection} />
+    </QueryClientProvider>,
+  );
+  const user = userEvent.setup({ document });
+  await user.click(view.getByRole("button", { name: "Replace API key" }));
+  const secret = "tf_replacement_must_be_erased";
+  await user.type(view.getByLabelText("Typefully API key"), secret);
+  await user.click(view.getByRole("button", { name: "Cancel" }));
+
+  expect(view.container.innerHTML).not.toContain(secret);
+  await user.click(view.getByRole("button", { name: "Replace API key" }));
+  expect(
+    (view.getByLabelText("Typefully API key") as HTMLInputElement).value,
+  ).toBe("");
+});
+
 test("a Typefully timeout leaves an explicit retry without exposing the key", async () => {
   const { ConnectTypefully } = await import(
     "../src/components/typefully/connect-typefully"

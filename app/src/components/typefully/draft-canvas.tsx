@@ -185,7 +185,11 @@ function EditableDraftCanvas({
               draftId: draft.id,
               expectedVersion: draft.version,
             }
-          : { kind: "sync", draftId: draft.id }
+          : {
+              kind: "sync",
+              draftId: draft.id,
+              expectedVersion: draft.version,
+            }
         : null,
     );
   const [connectionDismissed, setConnectionDismissed] = useState(false);
@@ -304,7 +308,11 @@ function EditableDraftCanvas({
               draftId: draft.id,
               expectedVersion: draft.version,
             }
-          : { kind: "sync", draftId: draft.id }),
+          : {
+              kind: "sync",
+              draftId: draft.id,
+              expectedVersion: draft.version,
+            }),
     );
   }, [connectionDismissed, draft]);
 
@@ -834,6 +842,7 @@ function EditableDraftCanvas({
                       : {
                           kind: "sync",
                           draftId: current.target.draftId,
+                          expectedVersion: current.target.version,
                         },
                   );
                 }

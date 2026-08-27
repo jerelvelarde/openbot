@@ -428,11 +428,20 @@ export function saveDraftMutationOptions(queryClient?: QueryClient) {
 
 export function syncTypefullyDraft(input: {
   draftId: string;
+  expectedVersion: number;
+  expectedHash: string;
   signal?: AbortSignal;
 }): Promise<DraftMutationResponse> {
   return typefullyRequest<DraftMutationResponse>(
     `/api/typefully/drafts/${encodeURIComponent(input.draftId)}/sync`,
-    { method: "POST", signal: input.signal },
+    {
+      method: "POST",
+      body: {
+        expectedVersion: input.expectedVersion,
+        expectedHash: input.expectedHash,
+      },
+      signal: input.signal,
+    },
   );
 }
 
@@ -440,10 +449,20 @@ export function syncDraftMutationOptions(queryClient?: QueryClient) {
   return mutationOptions({
     mutationFn: syncTypefullyDraft,
     onSuccess: (result, input) =>
-      convergeDraftCache(queryClient, input.draftId, result),
+      convergeDraftCache(
+        queryClient,
+        input.draftId,
+        result,
+        input.expectedVersion,
+      ),
     onError: (error, input) => {
       if (error instanceof TypefullyClientError)
-        return convergeDraftCache(queryClient, input.draftId, error);
+        return convergeDraftCache(
+          queryClient,
+          input.draftId,
+          error,
+          input.expectedVersion,
+        );
     },
   });
 }

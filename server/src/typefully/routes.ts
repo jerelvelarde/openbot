@@ -276,6 +276,28 @@ async function jsonBody(context: {
   return body as Record<string, unknown>;
 }
 
+async function syncAuthority(context: {
+  req: { raw: Request; json(): Promise<unknown> };
+}) {
+  const body = await jsonBody(context);
+  if (
+    Object.keys(body).some(
+      (key) => key !== "expectedVersion" && key !== "expectedHash",
+    ) ||
+    !Number.isSafeInteger(body.expectedVersion) ||
+    (body.expectedVersion as number) < 1 ||
+    typeof body.expectedHash !== "string" ||
+    body.expectedHash.length < 1 ||
+    body.expectedHash.length > 200
+  ) {
+    throw new Error("A valid expected draft version and hash are required.");
+  }
+  return {
+    version: body.expectedVersion as number,
+    hash: body.expectedHash,
+  };
+}
+
 async function synchronize(
   store: TypefullyStore,
   draftId: string,
@@ -623,7 +645,13 @@ export function createTypefullyRoutes(
   routes.post("/drafts/:id/sync", async (context) => {
     const draftId = context.req.param("id");
     try {
-      const synced = await synchronize(store, draftId, context.var.actor.id);
+      const expected = await syncAuthority(context);
+      const synced = await synchronize(
+        store,
+        draftId,
+        context.var.actor.id,
+        expected,
+      );
       if (!synced.ok) {
         return context.json(
           {

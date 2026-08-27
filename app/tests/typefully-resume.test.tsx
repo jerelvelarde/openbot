@@ -3,6 +3,7 @@ import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { StrictMode } from "react";
 import {
   ConnectTypefully,
   type PendingTypefullyOperation,
@@ -85,8 +86,8 @@ test("refetches connection and authoritative draft before resuming exactly once"
       calls.push("draft");
       return authoritativeDraft();
     },
-    sync: async () => {
-      calls.push("sync");
+    sync: async (_draftId, expectedVersion, contentHash) => {
+      calls.push(`sync:${expectedVersion}:${contentHash}`);
       return { version: 5 };
     },
     preparePublication: async () => {
@@ -103,6 +104,34 @@ test("refetches connection and authoritative draft before resuming exactly once"
     version: 5,
     proposalId: "proposal-1",
   });
+});
+
+test("resumed sync and schedule bind the revalidated version and hash", async () => {
+  const calls: unknown[][] = [];
+  const dependencies = {
+    loadConnection: async () => {},
+    loadDraft: async () => authoritativeDraft(),
+    sync: async (...args) => {
+      calls.push(args);
+      return { version: 5 };
+    },
+    preparePublication: async () => {
+      throw new Error("not used");
+    },
+  };
+  await resumePendingTypefullyOperation(
+    { kind: "sync", draftId, expectedVersion: 5 },
+    dependencies,
+  );
+  await resumePendingTypefullyOperation(
+    { kind: "schedule", draftId, expectedVersion: 5 },
+    dependencies,
+  );
+
+  expect(calls).toEqual([
+    [draftId, 5, "hash-5", undefined],
+    [draftId, 5, "hash-5", undefined],
+  ]);
 });
 
 test("a changed authoritative version refuses stale schedule input", async () => {
@@ -288,6 +317,61 @@ test("a Bot-initiated connection resumes the bounded operation and responds once
   expect(resume.mock.calls[0]?.[1]).toBe(5);
   expect(respond.mock.calls[0]?.[0]).toEqual(outcome);
   expect(view.container.textContent).not.toContain("tf_component_local_secret");
+});
+
+test("StrictMode connection recovery remains mounted and responds exactly once", async () => {
+  const { TypefullyConnectionDecision } = await import(
+    "../src/components/gallery/typefully-connection"
+  );
+  const respond = mock(async () => {});
+  let resumeAttempts = 0;
+  const resume = mock(async () => {
+    resumeAttempts += 1;
+    if (resumeAttempts === 1) throw new Error("temporary resume failure");
+    return {
+      outcome: "resumed" as const,
+      draftId,
+      operation: "sync" as const,
+      version: 5,
+    };
+  });
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({ connection: typefullyConnection }), {
+      headers: { "content-type": "application/json" },
+    })) as typeof fetch;
+  const view = render(
+    <StrictMode>
+      <QueryClientProvider client={new QueryClient()}>
+        <TypefullyConnectionDecision
+          args={{ draftId, operation: "sync", expectedVersion: 5 }}
+          respond={respond}
+          resumeOperation={resume}
+          status="executing"
+        />
+      </QueryClientProvider>
+    </StrictMode>,
+  );
+  const user = userEvent.setup({ document });
+  await user.type(view.getByLabelText("Typefully API key"), "tf_first_key");
+  await user.click(view.getByRole("button", { name: "Connect Typefully" }));
+
+  expect((await view.findByRole("alert")).textContent).toContain(
+    "could not resume",
+  );
+  expect(resume).toHaveBeenCalledTimes(1);
+  expect(respond).not.toHaveBeenCalled();
+
+  await user.click(view.getByRole("button", { name: "Replace API key" }));
+  await user.type(view.getByLabelText("Typefully API key"), "tf_second_key");
+  await user.click(view.getByRole("button", { name: "Replace API key" }));
+
+  await waitFor(() => expect(respond).toHaveBeenCalledTimes(1));
+  expect(resume).toHaveBeenCalledTimes(2);
+  expect(resume.mock.calls[1]?.[0]).toEqual({
+    kind: "sync",
+    draftId,
+    expectedVersion: 5,
+  });
 });
 
 test("unmounting during connection never executes the pending operation", async () => {

@@ -265,7 +265,11 @@ describe("Typefully mutation contracts", () => {
       expectedVersion: 4,
       document,
     });
-    await mutate(syncDraftMutationOptions(), { draftId: "draft/1" });
+    await mutate(syncDraftMutationOptions(), {
+      draftId: "draft/1",
+      expectedVersion: 4,
+      expectedHash: "hash-4",
+    });
     await mutate(reconcileDraftMutationOptions(), {
       draftId: "draft/1",
       expectedVersion: 5,
@@ -303,7 +307,11 @@ describe("Typefully mutation contracts", () => {
         "PUT",
         { expectedVersion: 4, document },
       ],
-      ["/api/typefully/drafts/draft%2F1/sync", "POST", undefined],
+      [
+        "/api/typefully/drafts/draft%2F1/sync",
+        "POST",
+        { expectedVersion: 4, expectedHash: "hash-4" },
+      ],
       [
         "/api/typefully/drafts/draft%2F1/reconcile",
         "POST",
@@ -2308,7 +2316,11 @@ describe("Typefully mutation contracts", () => {
       queryClient,
       syncDraftMutationOptions(queryClient),
     );
-    const late = observer.mutate({ draftId: "draft-1" });
+    const late = observer.mutate({
+      draftId: "draft-1",
+      expectedVersion: 2,
+      expectedHash: "hash-2",
+    });
     while (!finishRequest) await Promise.resolve();
     const confirmedDocument = { ...document, title: "Confirmed document" };
     queryClient.setQueryData(typefullyKeys.draft("draft-1"), {
@@ -2368,7 +2380,11 @@ describe("Typefully mutation contracts", () => {
       syncDraftMutationOptions(queryClient),
     );
 
-    await observer.mutate({ draftId: "draft-1" });
+    await observer.mutate({
+      draftId: "draft-1",
+      expectedVersion: 2,
+      expectedHash: "hash-2",
+    });
 
     expect(
       queryClient.getQueryData(typefullyKeys.draft("draft-1")),
@@ -2409,7 +2425,11 @@ describe("Typefully mutation contracts", () => {
       syncDraftMutationOptions(queryClient),
     );
 
-    await observer.mutate({ draftId: "draft-1" });
+    await observer.mutate({
+      draftId: "draft-1",
+      expectedVersion: 2,
+      expectedHash: "hash-2",
+    });
 
     expect(
       queryClient.getQueryData(typefullyKeys.draft("draft-1")),
@@ -2645,7 +2665,11 @@ describe("Typefully mutation contracts", () => {
     for (const code of ["constructor", "toString", "__proto__"]) {
       globalThis.fetch = (async () => json({ code }, 400)) as typeof fetch;
       await expect(
-        mutate(syncDraftMutationOptions(), { draftId: "draft-1" }),
+        mutate(syncDraftMutationOptions(), {
+          draftId: "draft-1",
+          expectedVersion: 1,
+          expectedHash: "hash-1",
+        }),
       ).rejects.toMatchObject({
         code: "invalid_request",
         message: "That Typefully request could not be completed.",

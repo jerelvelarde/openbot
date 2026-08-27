@@ -188,6 +188,21 @@ async function createDraft() {
   return body.draft.id;
 }
 
+async function syncDraft(id: string) {
+  const loaded = await app.request(`/api/typefully/drafts/${id}`);
+  const authority = (await loaded.json()) as {
+    draft: { version: number; contentHash: string };
+  };
+  return app.request(`/api/typefully/drafts/${id}/sync`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      expectedVersion: authority.draft.version,
+      expectedHash: authority.draft.contentHash,
+    }),
+  });
+}
+
 describe("Typefully synchronization", () => {
   function deferred() {
     let resolve!: () => void;
@@ -198,9 +213,7 @@ describe("Typefully synchronization", () => {
   }
   test("first sync creates remotely and the next revision updates the same remote id", async () => {
     const id = await createDraft();
-    const initial = await app.request(`/api/typefully/drafts/${id}/sync`, {
-      method: "POST",
-    });
+    const initial = await syncDraft(id);
     expect(initial.status).toBe(200);
     expect(await initial.json()).toMatchObject({
       draft: { id, version: 1, syncStatus: "synced" },
@@ -231,9 +244,7 @@ describe("Typefully synchronization", () => {
   test("vendor failure preserves the local revision, records a bounded error, and retry confirms it", async () => {
     const id = await createDraft();
     failure = { text: `vendor failed ${"x".repeat(800)}` };
-    const failed = await app.request(`/api/typefully/drafts/${id}/sync`, {
-      method: "POST",
-    });
+    const failed = await syncDraft(id);
     expect(failed.status).toBe(502);
     const failedBody = await failed.json();
     expect(failedBody).toMatchObject({ code: "remote_error" });
@@ -246,9 +257,7 @@ describe("Typefully synchronization", () => {
 
     failure = null;
     nextRemoteId = "502";
-    const retried = await app.request(`/api/typefully/drafts/${id}/sync`, {
-      method: "POST",
-    });
+    const retried = await syncDraft(id);
     expect(retried.status).toBe(200);
     expect(await retried.json()).toMatchObject({
       draft: { version: 1, syncStatus: "synced" },
@@ -262,9 +271,7 @@ describe("Typefully synchronization", () => {
     failure = {
       text: "Typefully rate limited this request (429). Retry-After: 60.",
     };
-    const response = await app.request(`/api/typefully/drafts/${id}/sync`, {
-      method: "POST",
-    });
+    const response = await syncDraft(id);
     failure = null;
     expect(response.status).toBe(502);
     expect(calls.length).toBe(before + 1);
@@ -281,9 +288,7 @@ describe("Typefully synchronization", () => {
     failure = {
       text: `Typefully rate limited this request (429). Retry-After: ${date}.`,
     };
-    const response = await app.request(`/api/typefully/drafts/${id}/sync`, {
-      method: "POST",
-    });
+    const response = await syncDraft(id);
     failure = null;
     const body = await response.json();
     expect(response.status).toBe(502);
@@ -298,18 +303,14 @@ describe("Typefully synchronization", () => {
         text: JSON.stringify({ id: invalid }),
         isError: false,
       });
-      const response = await app.request(`/api/typefully/drafts/${id}/sync`, {
-        method: "POST",
-      });
+      const response = await syncDraft(id);
       expect(response.status).toBe(409);
       expect(await response.json()).toMatchObject({
         code: "reconciliation_required",
         draftId: id,
       });
       const callsAfter = calls.length;
-      const retry = await app.request(`/api/typefully/drafts/${id}/sync`, {
-        method: "POST",
-      });
+      const retry = await syncDraft(id);
       expect(retry.status).toBe(409);
       expect(calls.length).toBe(callsAfter);
     }
@@ -322,9 +323,7 @@ describe("Typefully synchronization", () => {
       isError: true,
       sideEffectOutcome: "uncertain",
     });
-    const response = await app.request(`/api/typefully/drafts/${id}/sync`, {
-      method: "POST",
-    });
+    const response = await syncDraft(id);
     expect(response.status).toBe(409);
     expect(await response.json()).toMatchObject({
       code: "reconciliation_required",
@@ -337,17 +336,13 @@ describe("Typefully synchronization", () => {
       const id = await createDraft();
       const before = calls.length;
       restStatuses.push(status);
-      const uncertain = await app.request(`/api/typefully/drafts/${id}/sync`, {
-        method: "POST",
-      });
+      const uncertain = await syncDraft(id);
       expect(uncertain.status).toBe(409);
       expect(await uncertain.json()).toMatchObject({
         code: "reconciliation_required",
         draftId: id,
       });
-      const repeated = await app.request(`/api/typefully/drafts/${id}/sync`, {
-        method: "POST",
-      });
+      const repeated = await syncDraft(id);
       expect(repeated.status).toBe(409);
       expect(calls).toHaveLength(before + 1);
     }
@@ -356,14 +351,10 @@ describe("Typefully synchronization", () => {
       const id = await createDraft();
       const before = calls.length;
       restStatuses.push(status);
-      const refused = await app.request(`/api/typefully/drafts/${id}/sync`, {
-        method: "POST",
-      });
+      const refused = await syncDraft(id);
       expect(refused.status).toBe(502);
       expect((await store.readDraft(id, ownerId)).attemptId).toBeNull();
-      const retried = await app.request(`/api/typefully/drafts/${id}/sync`, {
-        method: "POST",
-      });
+      const retried = await syncDraft(id);
       expect(retried.status).toBe(200);
       expect(calls).toHaveLength(before + 2);
     }
@@ -377,15 +368,11 @@ describe("Typefully synchronization", () => {
       isError: true,
       sideEffectOutcome: "uncertain",
     });
-    const uncertain = await app.request(`/api/typefully/drafts/${id}/sync`, {
-      method: "POST",
-    });
+    const uncertain = await syncDraft(id);
     expect(uncertain.status).toBe(409);
     expect(calls.length).toBe(before + 1);
 
-    const repeated = await app.request(`/api/typefully/drafts/${id}/sync`, {
-      method: "POST",
-    });
+    const repeated = await syncDraft(id);
     expect(repeated.status).toBe(409);
     expect(calls.length).toBe(before + 1);
 
@@ -955,9 +942,7 @@ describe("Typefully synchronization", () => {
     const release = deferred();
     vendorGate = { entered: entered.resolve, wait: release.wait };
     failure = { text: "The claimed revision failed remotely." };
-    const firstSync = app.request(`/api/typefully/drafts/${id}/sync`, {
-      method: "POST",
-    });
+    const firstSync = syncDraft(id);
     await entered.wait;
     const saved = await app.request(`/api/typefully/drafts/${id}`, {
       method: "PUT",
@@ -983,9 +968,7 @@ describe("Typefully synchronization", () => {
       },
     });
     nextRemoteId = "602";
-    const retry = await app.request(`/api/typefully/drafts/${id}/sync`, {
-      method: "POST",
-    });
+    const retry = await syncDraft(id);
     expect(retry.status).toBe(200);
     expect(await retry.json()).toMatchObject({
       draft: { version: 2, syncStatus: "synced" },
@@ -999,9 +982,7 @@ describe("Typefully synchronization", () => {
     const release = deferred();
     vendorGate = { entered: entered.resolve, wait: release.wait };
     nextRemoteId = "601";
-    const firstSync = app.request(`/api/typefully/drafts/${id}/sync`, {
-      method: "POST",
-    });
+    const firstSync = syncDraft(id);
     await entered.wait;
     const saved = await app.request(`/api/typefully/drafts/${id}`, {
       method: "PUT",
@@ -1026,9 +1007,7 @@ describe("Typefully synchronization", () => {
         document: document("Newer local"),
       },
     });
-    const reconciled = await app.request(`/api/typefully/drafts/${id}/sync`, {
-      method: "POST",
-    });
+    const reconciled = await syncDraft(id);
     expect(reconciled.status).toBe(200);
     expect(calls.at(-1)).toMatchObject({
       ref: "typefully/update_draft",
@@ -1042,13 +1021,9 @@ describe("Typefully synchronization", () => {
     const release = deferred();
     vendorGate = { entered: entered.resolve, wait: release.wait };
     const before = calls.length;
-    const first = app.request(`/api/typefully/drafts/${id}/sync`, {
-      method: "POST",
-    });
+    const first = syncDraft(id);
     await entered.wait;
-    const second = await app.request(`/api/typefully/drafts/${id}/sync`, {
-      method: "POST",
-    });
+    const second = await syncDraft(id);
     expect(second.status).toBe(409);
     expect(await second.json()).toEqual({ code: "sync_in_progress" });
     expect(calls.length).toBe(before + 1);
@@ -1060,13 +1035,7 @@ describe("Typefully synchronization", () => {
   test("serializes existing-draft updates until the older snapshot settles", async () => {
     const id = await createDraft();
     nextRemoteId = "701";
-    expect(
-      (
-        await app.request(`/api/typefully/drafts/${id}/sync`, {
-          method: "POST",
-        })
-      ).status,
-    ).toBe(200);
+    expect((await syncDraft(id)).status).toBe(200);
     const firstEntered = deferred();
     const overlap = deferred();
     const release = deferred();
@@ -1118,9 +1087,7 @@ describe("Typefully synchronization", () => {
         document: document("Newer local update"),
       },
     });
-    const retry = await app.request(`/api/typefully/drafts/${id}/sync`, {
-      method: "POST",
-    });
+    const retry = await syncDraft(id);
     expect(retry.status).toBe(200);
     expect(calls.at(-1)).toMatchObject({
       ref: "typefully/update_draft",
@@ -1137,13 +1104,7 @@ describe("Typefully synchronization", () => {
   test("keeps sync and a second media workflow off the vendor while an upload claim is held", async () => {
     const id = await createDraft();
     nextRemoteId = "910";
-    expect(
-      (
-        await app.request(`/api/typefully/drafts/${id}/sync`, {
-          method: "POST",
-        })
-      ).status,
-    ).toBe(200);
+    expect((await syncDraft(id)).status).toBe(200);
 
     const entered = deferred();
     const release = deferred();
@@ -1167,9 +1128,7 @@ describe("Typefully synchronization", () => {
     await entered.wait;
     const callsWhileHeld = calls.length;
 
-    const sync = await app.request(`/api/typefully/drafts/${id}/sync`, {
-      method: "POST",
-    });
+    const sync = await syncDraft(id);
     expect(sync.status).toBe(409);
     expect(await sync.json()).toEqual({ code: "sync_in_progress" });
 
@@ -1335,9 +1294,7 @@ describe("Typefully synchronization", () => {
     const release = deferred();
     vendorGate = { entered: entered.resolve, wait: release.wait };
     thrownFailure = new ConnectionRequiredError("typefully", "Typefully");
-    const syncing = app.request(`/api/typefully/drafts/${id}/sync`, {
-      method: "POST",
-    });
+    const syncing = syncDraft(id);
     await entered.wait;
     const saved = await app.request(`/api/typefully/drafts/${id}`, {
       method: "PUT",
@@ -1366,13 +1323,7 @@ describe("Typefully synchronization", () => {
       },
     });
     nextRemoteId = "702";
-    expect(
-      (
-        await app.request(`/api/typefully/drafts/${id}/sync`, {
-          method: "POST",
-        })
-      ).status,
-    ).toBe(200);
+    expect((await syncDraft(id)).status).toBe(200);
   });
 
   test("releases a first-create claim after policy refusal advances the local revision", async () => {
@@ -1381,9 +1332,7 @@ describe("Typefully synchronization", () => {
     const release = deferred();
     vendorGate = { entered: entered.resolve, wait: release.wait };
     thrownFailure = new PluginRefusedError("Policy changed.", null);
-    const syncing = app.request(`/api/typefully/drafts/${id}/sync`, {
-      method: "POST",
-    });
+    const syncing = syncDraft(id);
     await entered.wait;
     const saved = await app.request(`/api/typefully/drafts/${id}`, {
       method: "PUT",
@@ -1408,13 +1357,7 @@ describe("Typefully synchronization", () => {
       },
     });
     nextRemoteId = "703";
-    expect(
-      (
-        await app.request(`/api/typefully/drafts/${id}/sync`, {
-          method: "POST",
-        })
-      ).status,
-    ).toBe(200);
+    expect((await syncDraft(id)).status).toBe(200);
   });
 
   test("releases a first-create claim after attachment loss advances the local revision", async () => {
@@ -1423,9 +1366,7 @@ describe("Typefully synchronization", () => {
     const release = deferred();
     vendorGate = { entered: entered.resolve, wait: release.wait };
     thrownFailure = new BotNotAttachedError();
-    const syncing = app.request(`/api/typefully/drafts/${id}/sync`, {
-      method: "POST",
-    });
+    const syncing = syncDraft(id);
     await entered.wait;
     const saved = await app.request(`/api/typefully/drafts/${id}`, {
       method: "PUT",
@@ -1455,13 +1396,7 @@ describe("Typefully synchronization", () => {
   test("media DELETE is stale-safe, local-first, exhaustive, and syncs its exact revision", async () => {
     const id = await createDraft();
     nextRemoteId = "704";
-    expect(
-      (
-        await app.request(`/api/typefully/drafts/${id}/sync`, {
-          method: "POST",
-        })
-      ).status,
-    ).toBe(200);
+    expect((await syncDraft(id)).status).toBe(200);
     const current = await store.readDraft(id, ownerId);
     const withMedia = await store.saveDraft({
       draftId: id,
@@ -1484,13 +1419,7 @@ describe("Typefully synchronization", () => {
         ],
       },
     });
-    expect(
-      (
-        await app.request(`/api/typefully/drafts/${id}/sync`, {
-          method: "POST",
-        })
-      ).status,
-    ).toBe(200);
+    expect((await syncDraft(id)).status).toBe(200);
 
     const beforeStale = calls.length;
     const stale = await app.request(
@@ -1543,13 +1472,7 @@ describe("Typefully synchronization", () => {
   test("failed remote media removal is explicit and retryable from the saved local revision", async () => {
     const id = await createDraft();
     nextRemoteId = "705";
-    expect(
-      (
-        await app.request(`/api/typefully/drafts/${id}/sync`, {
-          method: "POST",
-        })
-      ).status,
-    ).toBe(200);
+    expect((await syncDraft(id)).status).toBe(200);
     const current = await store.readDraft(id, ownerId);
     const withMedia = await store.saveDraft({
       draftId: id,
@@ -1585,22 +1508,14 @@ describe("Typefully synchronization", () => {
     });
     const local = await store.readDraft(id, ownerId);
     expect(local.document.media).toEqual([]);
-    const retry = await app.request(`/api/typefully/drafts/${id}/sync`, {
-      method: "POST",
-    });
+    const retry = await syncDraft(id);
     expect(retry.status).toBe(200);
   });
 
   test("a partial remote removal exception releases its claim and remains recoverable", async () => {
     const id = await createDraft();
     nextRemoteId = "911";
-    expect(
-      (
-        await app.request(`/api/typefully/drafts/${id}/sync`, {
-          method: "POST",
-        })
-      ).status,
-    ).toBe(200);
+    expect((await syncDraft(id)).status).toBe(200);
     const current = await store.readDraft(id, ownerId);
     const withMedia = await store.saveDraft({
       draftId: id,
@@ -1652,9 +1567,7 @@ describe("Typefully synchronization", () => {
     ).toHaveLength(2);
 
     nextRemoteId = "911";
-    const reconciled = await app.request(`/api/typefully/drafts/${id}/sync`, {
-      method: "POST",
-    });
+    const reconciled = await syncDraft(id);
     expect(reconciled.status).toBe(200);
     expect(await reconciled.json()).toMatchObject({
       draft: { version: local.version, syncStatus: "synced", mediaCount: 0 },
@@ -1669,13 +1582,7 @@ describe("Typefully synchronization", () => {
   test("media DELETE connection_required includes the saved draft id", async () => {
     const id = await createDraft();
     nextRemoteId = "706";
-    expect(
-      (
-        await app.request(`/api/typefully/drafts/${id}/sync`, {
-          method: "POST",
-        })
-      ).status,
-    ).toBe(200);
+    expect((await syncDraft(id)).status).toBe(200);
     const current = await store.readDraft(id, ownerId);
     const withMedia = await store.saveDraft({
       draftId: id,
@@ -1717,9 +1624,7 @@ describe("Typefully synchronization", () => {
       attemptId: null,
     });
     nextRemoteId = "706";
-    const immediate = await app.request(`/api/typefully/drafts/${id}/sync`, {
-      method: "POST",
-    });
+    const immediate = await syncDraft(id);
     expect(immediate.status).toBe(200);
   });
 });

@@ -1457,4 +1457,55 @@ describe("owned local Typefully drafts", () => {
     expect(confirmedNoop.draft.remoteDraftId).toBe("804");
     expect(contenderCalls).toEqual([]);
   });
+
+  test("a save racing sync authorization conflicts before any vendor call", async () => {
+    const current = await store.createDraft({
+      ownerUserId: ownerId,
+      channelId,
+      botId,
+      document: { ...document(), socialSetId: "12" },
+    });
+    draftIds.push(current.id);
+    let saved = false;
+    const vendorCalls: string[] = [];
+    const contender = createTypefullyStore({
+      database,
+      auditStore: createAuditStore(database),
+      plugin: () => ({
+        decide: async () => {
+          if (!saved) {
+            saved = true;
+            await store.saveDraft({
+              draftId: current.id,
+              actorId: ownerId,
+              expectedVersion: current.version,
+              document: {
+                ...current.document,
+                title: "Concurrent revision",
+              },
+            });
+          }
+          return { allowed: true } as const;
+        },
+        dispatchVendor: async ({ ref }) => {
+          vendorCalls.push(ref);
+          return { text: '{"id":"never"}', isError: false };
+        },
+      }),
+      vendor: "typefully",
+    });
+
+    await expect(
+      contender.syncDraft({
+        draftId: current.id,
+        actorId: ownerId,
+        expectedVersion: current.version,
+        expectedHash: current.contentHash,
+      }),
+    ).rejects.toMatchObject({
+      code: "version_conflict",
+      currentVersion: current.version + 1,
+    });
+    expect(vendorCalls).toEqual([]);
+  });
 });

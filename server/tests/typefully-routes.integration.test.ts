@@ -700,12 +700,26 @@ describe("Typefully draft routes", () => {
     });
   });
 
-  test("sync without a personal key returns stable connection_required JSON", async () => {
+  test("sync requires bound authority before checking the personal key", async () => {
     const { body } = await createDraft();
+    const missingAuthority = await app.request(
+      `/api/typefully/drafts/${body.draft.id}/sync`,
+      { method: "POST" },
+    );
+    expect(missingAuthority.status).toBe(400);
+    expect(await missingAuthority.json()).toMatchObject({
+      code: "invalid_request",
+    });
+    const current = await store.readDraft(body.draft.id, ownerId);
     const response = await app.request(
       `/api/typefully/drafts/${body.draft.id}/sync`,
       {
         method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          expectedVersion: current.version,
+          expectedHash: current.contentHash,
+        }),
       },
     );
     expect(response.status).toBe(409);
@@ -1073,10 +1087,16 @@ describe("Typefully draft routes", () => {
       draft: { version: 2, syncStatus: "grant_blocked" },
       remote: { state: "grant_blocked" },
     });
+    const current = await store.readDraft(body.draft.id, ownerId);
     const sync = await app.request(
       `/api/typefully/drafts/${body.draft.id}/sync`,
       {
         method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          expectedVersion: current.version,
+          expectedHash: current.contentHash,
+        }),
       },
     );
     granted = true;

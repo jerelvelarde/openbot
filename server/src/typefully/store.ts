@@ -1145,6 +1145,7 @@ export function createTypefullyStore(options: {
   async function claimSyncAttempt(
     authorized: TypefullyDraft,
     actorId: string,
+    expected?: { version?: number; hash?: string },
   ): Promise<
     | { kind: "noop"; draft: TypefullyDraft }
     | { kind: "claimed"; draft: TypefullyDraft; attemptId: string }
@@ -1152,6 +1153,13 @@ export function createTypefullyStore(options: {
   > {
     return database.transaction(async (transaction) => {
       let current = await lockedOwnedDraft(transaction, authorized.id, actorId);
+      if (
+        (expected?.version !== undefined &&
+          current.version !== expected.version) ||
+        (expected?.hash !== undefined && current.contentHash !== expected.hash)
+      ) {
+        throw new VersionConflictError(current.version, current.contentHash);
+      }
       const instant = now();
       if (current.attemptId !== null) {
         if (current.attemptState === "outcome_uncertain") {
@@ -2730,7 +2738,10 @@ export function createTypefullyStore(options: {
               attemptId: input.attemptId,
             };
           } else {
-            claim = await claimSyncAttempt(authorized.draft, input.actorId);
+            claim = await claimSyncAttempt(authorized.draft, input.actorId, {
+              version: input.expectedVersion,
+              hash: input.expectedHash,
+            });
           }
           break;
         } catch (error) {
