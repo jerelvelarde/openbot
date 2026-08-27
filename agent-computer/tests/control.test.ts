@@ -99,6 +99,17 @@ describe("the crappy paths: two drivers, one page", () => {
     expect(control.assistanceStatus(second)).toBe("completed");
   });
 
+  test("taking control twice preserves the exact human assistance generation", () => {
+    const { control } = fixture();
+    const requestId = "11111111-1111-4111-8111-111111111111";
+    control.requestHelp("Sign in", requestId);
+    control.take();
+    control.take();
+    expect(control.assistanceStatus(requestId)).toBe("human");
+    control.release();
+    expect(control.assistanceStatus(requestId)).toBe("completed");
+  });
+
   test("cancels only the exact pending help generation", () => {
     const { control } = fixture();
     control.requestHelp(

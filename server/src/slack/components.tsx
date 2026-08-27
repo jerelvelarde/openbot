@@ -6,19 +6,14 @@ import type {
   ApprovalDecisionStore,
   ApprovalPresentation,
 } from "./approval-store";
-import { currentSlackExecution } from "./execution-context";
+import { maybeCurrentSlackExecution } from "./execution-context";
 
-type ApprovalSubject = Omit<
-  ApprovalPresentation,
-  "presentationId" | "createdAt"
->;
 type ApprovalDependencies = {
   store: ApprovalDecisionStore;
   authorize(input: {
     userId: string;
     presentation: ApprovalPresentation;
   }): Promise<boolean>;
-  subject(): ApprovalSubject;
   now(): number;
   retentionMs: number;
 };
@@ -33,24 +28,6 @@ export function configureApprovalDecisionStore(
   approvalDependencies = {
     store,
     authorize: options.authorize ?? (async () => false),
-    subject:
-      options.subject ??
-      (() => {
-        const execution = currentSlackExecution();
-        if (
-          !execution.channelsThreadId ||
-          !execution.channelsConversationKey ||
-          !execution.agentId
-        ) {
-          throw new Error("ApprovalCard requires a pinned Slack thread.");
-        }
-        return {
-          channelsThreadId: execution.channelsThreadId,
-          conversationKey: execution.channelsConversationKey,
-          agentId: execution.agentId,
-          createdByUserId: execution.actor.id,
-        };
-      }),
     now: options.now ?? Date.now,
     // Channels keeps actions for seven days by default. Keep the authorization row one day longer
     // so cleanup can never outpace the continuation it protects.
@@ -58,10 +35,34 @@ export function configureApprovalDecisionStore(
   };
 }
 
-const approvalAction = z.object({
-  presentationId: z.string().uuid(),
-  approved: z.boolean(),
-});
+const approvalAction = z
+  .object({
+    presentationId: z.string().uuid(),
+    channelsThreadId: z.string().min(1),
+    conversationKey: z.string().min(1),
+    agentId: z.string().min(1),
+    createdByUserId: z.string().min(1),
+    approved: z.boolean(),
+  })
+  .strict();
+
+/*
+ * Channels 0.9 persists each non-undefined button actionValue in its ActionRegistry and replaces
+ * the provider callback value with that stored value on hot and cold dispatch. These buttons use
+ * either a complete object or null, never undefined, so provider input is never the fallback.
+ */
+
+function sameSubject(
+  presentation: ApprovalPresentation,
+  decision: z.infer<typeof approvalAction>,
+): boolean {
+  return (
+    presentation.channelsThreadId === decision.channelsThreadId &&
+    presentation.conversationKey === decision.conversationKey &&
+    presentation.agentId === decision.agentId &&
+    presentation.createdByUserId === decision.createdByUserId
+  );
+}
 
 async function claimAndResume(
   value: unknown,
@@ -78,10 +79,22 @@ async function claimAndResume(
     throw new Error("This approval interaction could not be authorized.");
   }
   const decision = approvalAction.parse(value);
+  if (decision.conversationKey !== conversationKey) {
+    throw new Error("This approval interaction could not be authorized.");
+  }
+  const now = dependencies.now();
+  await dependencies.store.cleanup(new Date(now - dependencies.retentionMs));
+  await dependencies.store.present({
+    presentationId: decision.presentationId,
+    channelsThreadId: decision.channelsThreadId,
+    conversationKey: decision.conversationKey,
+    agentId: decision.agentId,
+    createdByUserId: decision.createdByUserId,
+  });
   const presentation = await dependencies.store.get(decision.presentationId);
   if (
     !presentation ||
-    presentation.conversationKey !== conversationKey ||
+    !sameSubject(presentation, decision) ||
     !(await dependencies.authorize({ userId, presentation }))
   ) {
     throw new Error("This approval interaction could not be authorized.");
@@ -110,19 +123,21 @@ export const ApprovalCard = defineChannelComponent({
     question: z.string().min(1).describe("The decision the person must make"),
   }),
   async render({ question }) {
-    const dependencies = approvalDependencies;
-    if (!dependencies) {
-      throw new Error(
-        "ApprovalCard requires a durable approval decision store.",
-      );
-    }
-    const presentationId = crypto.randomUUID();
-    const now = dependencies.now();
-    await dependencies.store.cleanup(new Date(now - dependencies.retentionMs));
-    await dependencies.store.present({
-      presentationId,
-      ...dependencies.subject(),
-    });
+    const execution = maybeCurrentSlackExecution();
+    const subject =
+      execution?.channelsThreadId &&
+      execution.channelsConversationKey &&
+      execution.agentId
+        ? {
+            channelsThreadId: execution.channelsThreadId,
+            conversationKey: execution.channelsConversationKey,
+            agentId: execution.agentId,
+            createdByUserId: execution.actor.id,
+          }
+        : null;
+    const presentation = subject
+      ? { presentationId: crypto.randomUUID(), ...subject }
+      : null;
     return (
       <Message fallbackText={question}>
         <Section>{question}</Section>
@@ -139,7 +154,7 @@ export const ApprovalCard = defineChannelComponent({
               );
             }}
             style="primary"
-            value={{ presentationId, approved: true }}
+            value={presentation ? { ...presentation, approved: true } : null}
           >
             Approve
           </Button>
@@ -154,7 +169,7 @@ export const ApprovalCard = defineChannelComponent({
                 (decision) => thread.resume(decision),
               );
             }}
-            value={{ presentationId, approved: false }}
+            value={presentation ? { ...presentation, approved: false } : null}
           >
             Reject
           </Button>

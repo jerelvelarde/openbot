@@ -344,7 +344,9 @@ export function createControl(
      */
     take(): ControlState {
       expirePending();
-      humanAssistanceId = state.requested ? state.helpRequestId : undefined;
+      if (state.holder === "bot") {
+        humanAssistanceId = state.requested ? state.helpRequestId : undefined;
+      }
       if (state.secretWanted) remember(state.secretRequestId, "cancelled");
       state = {
         holder: "human",

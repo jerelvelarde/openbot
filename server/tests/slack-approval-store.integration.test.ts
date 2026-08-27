@@ -5,7 +5,7 @@ import {
   FakeAgent,
   MemoryStore,
 } from "@copilotkit/channels";
-import { eq } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { createDatabase } from "../src/db/client";
 import {
   agents,
@@ -18,6 +18,7 @@ import {
   ApprovalCard,
   configureApprovalDecisionStore,
 } from "../src/slack/components";
+import { runWithSlackExecution } from "../src/slack/execution-context";
 import { TEST_POOL } from "./support/database";
 
 const database = createDatabase(
@@ -28,13 +29,15 @@ const database = createDatabase(
 const presentationIds = new Set<string>();
 const channelsThreadId = `approval-thread-${crypto.randomUUID()}`;
 const agentId = `approval-agent-${crypto.randomUUID()}`;
+const user1 = `approval-user-${crypto.randomUUID()}`;
+const user2 = `approval-user-${crypto.randomUUID()}`;
 
 beforeAll(async () => {
   await database
     .insert(users)
     .values([
-      { id: "U1", email: `u1-${crypto.randomUUID()}@example.test` },
-      { id: "U2", email: `u2-${crypto.randomUUID()}@example.test` },
+      { id: user1, email: `u1-${crypto.randomUUID()}@example.test` },
+      { id: user2, email: `u2-${crypto.randomUUID()}@example.test` },
     ])
     .onConflictDoNothing();
   await database.insert(agents).values({
@@ -50,13 +53,20 @@ beforeAll(async () => {
     providerConversationId: `conversation-${crypto.randomUUID()}`,
     providerThreadId: `thread-${crypto.randomUUID()}`,
     agentId,
-    createdByUserId: "U1",
+    createdByUserId: user1,
   });
 });
 
 type BoundAction = {
   id: string;
-  value: { presentationId: string; approved: boolean };
+  value: {
+    presentationId: string;
+    channelsThreadId: string;
+    conversationKey: string;
+    agentId: string;
+    createdByUserId: string;
+    approved: boolean;
+  };
 };
 
 function boundActions(value: unknown): BoundAction[] {
@@ -91,13 +101,7 @@ function runtime(
   script: ConstructorParameters<typeof FakeAgent>[0],
 ) {
   configureApprovalDecisionStore(createApprovalDecisionStore(database), {
-    authorize: async ({ userId }) => userId === "U1" || userId === "U2",
-    subject: () => ({
-      channelsThreadId,
-      conversationKey: "approval-thread",
-      agentId,
-      createdByUserId: "U1",
-    }),
+    authorize: async ({ userId }) => userId === user1 || userId === user2,
   });
   const adapter = new FakeAdapter({ platform: "slack" });
   adapter.runAgentLifecycle = async (args) => {
@@ -133,15 +137,43 @@ async function present() {
   const state = new MemoryStore();
   const running = runtime(state, lifecycle, [presentApproval, () => undefined]);
   await running.channel.ɵruntime.start();
-  await running.adapter.getSink().onTurn({
-    conversationKey: "approval-thread",
-    replyTarget: {},
-    userText: "ask first",
-    platform: "slack",
-    actor: { id: "U1", kind: "human" },
-  });
+  await runWithSlackExecution(
+    {
+      actor: { id: user1, role: "user" },
+      applicationUser: { id: user1, name: "Approval User" },
+      provider: "slack",
+      providerTenantId: "approval-tenant",
+      providerConversationId: "approval-conversation",
+      providerThreadId: "approval-provider-thread",
+      channelsThreadId,
+      channelsConversationKey: "approval-thread",
+      messageText: "ask first",
+      agentId,
+    },
+    () =>
+      running.adapter.getSink().onTurn({
+        conversationKey: "approval-thread",
+        replyTarget: {},
+        userText: "ask first",
+        platform: "slack",
+        actor: { id: user1, kind: "human" },
+      }),
+  );
   const actions = (running.adapter.posted[0] ?? []).flatMap(boundActions);
   expect(actions).toHaveLength(2);
+  expect(actions.map(({ value }) => value.presentationId)).toEqual([
+    actions[0]!.value.presentationId,
+    actions[0]!.value.presentationId,
+  ]);
+  expect(actions.map(({ value }) => value.approved)).toEqual([true, false]);
+  for (const action of actions) {
+    expect(action.value).toMatchObject({
+      channelsThreadId,
+      conversationKey: "approval-thread",
+      agentId,
+      createdByUserId: user1,
+    });
+  }
   presentationIds.add(actions[0]!.value.presentationId);
   return { ...running, actions, lifecycle, state };
 }
@@ -151,10 +183,11 @@ async function click(
   action: BoundAction,
   eventId: string,
   actorId: string,
+  providerValue: unknown = action.value,
 ) {
   await adapter.getSink().onInteraction({
     id: action.id,
-    value: action.value,
+    value: providerValue,
     conversationKey: "approval-thread",
     replyTarget: {},
     eventId,
@@ -166,6 +199,19 @@ afterAll(async () => {
   await database
     .delete(approvalDecisions)
     .where(eq(approvalDecisions.channelsThreadId, channelsThreadId));
+  await database.transaction(async (transaction) => {
+    await transaction.execute(
+      sql`alter table ${externalThreadBindings} disable trigger external_thread_bindings_append_only`,
+    );
+    await transaction
+      .delete(externalThreadBindings)
+      .where(eq(externalThreadBindings.channelsThreadId, channelsThreadId));
+    await transaction.execute(
+      sql`alter table ${externalThreadBindings} enable trigger external_thread_bindings_append_only`,
+    );
+  });
+  await database.delete(agents).where(eq(agents.id, agentId));
+  await database.delete(users).where(inArray(users.id, [user1, user2]));
   await database.$client.end({ timeout: 5 });
 });
 
@@ -178,7 +224,7 @@ describe("durable Slack approval decisions", () => {
         click(fixture.adapter, fixture.actions[0]!, "unauthorized", "U3"),
       ).rejects.toThrow("authorized");
       expect(fixture.lifecycle).toHaveLength(before);
-      await click(fixture.adapter, fixture.actions[0]!, "authorized", "U1");
+      await click(fixture.adapter, fixture.actions[0]!, "authorized", user1);
       expect(fixture.lifecycle).toHaveLength(before + 1);
     } finally {
       await fixture.channel.ɵruntime.stop();
@@ -197,8 +243,8 @@ describe("durable Slack approval decisions", () => {
         )!;
         const before = fixture.lifecycle.length;
 
-        await click(fixture.adapter, first, "first-decision", "U1");
-        await click(fixture.adapter, sibling, "sibling-decision", "U2");
+        await click(fixture.adapter, first, "first-decision", user1);
+        await click(fixture.adapter, sibling, "sibling-decision", user2);
 
         expect(fixture.lifecycle).toHaveLength(before + 1);
         expect(fixture.lifecycle.at(-1)?.isResume).toBe(true);
@@ -213,8 +259,13 @@ describe("durable Slack approval decisions", () => {
     try {
       const before = fixture.lifecycle.length;
       await Promise.all([
-        click(fixture.adapter, fixture.actions[0]!, "concurrent-approve", "U1"),
-        click(fixture.adapter, fixture.actions[1]!, "concurrent-reject", "U2"),
+        click(
+          fixture.adapter,
+          fixture.actions[0]!,
+          "concurrent-approve",
+          user1,
+        ),
+        click(fixture.adapter, fixture.actions[1]!, "concurrent-reject", user2),
       ]);
       expect(fixture.lifecycle).toHaveLength(before + 1);
     } finally {
@@ -231,7 +282,7 @@ describe("durable Slack approval decisions", () => {
       channelsThreadId,
       conversationKey: "approval-thread",
       agentId,
-      createdByUserId: "U1",
+      createdByUserId: user1,
     });
 
     expect(
@@ -239,7 +290,7 @@ describe("durable Slack approval decisions", () => {
         presentationId,
         actionId: "approve-action",
         approved: true,
-        decidedByUserId: "U1",
+        decidedByUserId: user1,
       }),
     ).toBe("first");
     expect(
@@ -247,7 +298,7 @@ describe("durable Slack approval decisions", () => {
         presentationId,
         actionId: "approve-action",
         approved: true,
-        decidedByUserId: "U2",
+        decidedByUserId: user2,
       }),
     ).toBe("rejected");
     expect(
@@ -255,7 +306,7 @@ describe("durable Slack approval decisions", () => {
         presentationId,
         actionId: "approve-action",
         approved: true,
-        decidedByUserId: "U1",
+        decidedByUserId: user1,
       }),
     ).toBe("retry");
   });
@@ -263,15 +314,41 @@ describe("durable Slack approval decisions", () => {
   test("a persisted decision rejects its sibling after a runtime restart", async () => {
     const first = await present();
     const before = first.lifecycle.length;
-    await click(first.adapter, first.actions[0]!, "before-restart", "U1");
+    await click(first.adapter, first.actions[0]!, "before-restart", user1);
     expect(first.lifecycle).toHaveLength(before + 1);
     await first.channel.ɵruntime.stop();
 
     const restarted = runtime(first.state, first.lifecycle, [() => undefined]);
     await restarted.channel.ɵruntime.start();
     try {
-      await click(restarted.adapter, first.actions[1]!, "after-restart", "U2");
+      await click(restarted.adapter, first.actions[1]!, "after-restart", user2);
       expect(first.lifecycle).toHaveLength(before + 1);
+    } finally {
+      await restarted.channel.ɵruntime.stop();
+    }
+  });
+
+  test("cold action recovery re-renders without ALS or DB side effects and resumes from stored subject", async () => {
+    const first = await present();
+    const before = first.lifecycle.length;
+    await first.channel.ɵruntime.stop();
+
+    const restarted = runtime(first.state, first.lifecycle, [() => undefined]);
+    await restarted.channel.ɵruntime.start();
+    try {
+      await click(
+        restarted.adapter,
+        first.actions[0]!,
+        "cold-recovery",
+        user1,
+        {
+          ...first.actions[0]!.value,
+          agentId: "provider-tampered-agent",
+          approved: false,
+        },
+      );
+      expect(first.lifecycle).toHaveLength(before + 1);
+      expect(first.lifecycle.at(-1)?.isResume).toBe(true);
     } finally {
       await restarted.channel.ɵruntime.stop();
     }
@@ -286,7 +363,7 @@ describe("durable Slack approval decisions", () => {
       channelsThreadId,
       conversationKey: "approval-thread",
       agentId,
-      createdByUserId: "U1",
+      createdByUserId: user1,
     });
     expect(await store.cleanup(new Date(Date.now() - 60_000))).toBe(0);
     expect(await store.get(presentationId)).not.toBeNull();
