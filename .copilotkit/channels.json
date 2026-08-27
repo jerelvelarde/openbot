@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "channels": [
+    {
+      "name": "openbot",
+      "displayName": "OpenBot",
+      "providers": {
+        "slack": {
+          "env": {
+            "botToken": "INTELLIGENCE_CHANNEL_OPENBOT_SLACK_BOT_TOKEN",
+            "signingSecret": "INTELLIGENCE_CHANNEL_OPENBOT_SLACK_SIGNING_SECRET"
+          }
+        }
+      }
+    }
+  ]
+}
