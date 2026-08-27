@@ -3,6 +3,7 @@ import {
   canonicalizeDraft,
   draftDocumentSchema,
   draftSummary,
+  nextMediaOrder,
   syncStatusSchema,
 } from "../src/typefully/document";
 
@@ -366,6 +367,28 @@ describe("canonicalizeDraft", () => {
         media: [{ ...media[0], remoteId: "r".repeat(241) }],
       }),
     ).toThrow();
+    expect(() =>
+      draftDocumentSchema.parse({
+        ...baseDraft(),
+        media: [{ ...media[0], order: -1 }],
+      }),
+    ).toThrow();
+    expect(() =>
+      draftDocumentSchema.parse({
+        ...baseDraft(),
+        media: [{ ...media[0], order: 20 }],
+      }),
+    ).toThrow();
+  });
+
+  test("allocates media after the highest order and refuses exhausted layouts", () => {
+    expect(nextMediaOrder([])).toBe(0);
+    expect(nextMediaOrder([{ order: 1 }])).toBe(2);
+    expect(nextMediaOrder([{ order: 0 }, { order: 5 }])).toBe(6);
+    expect(nextMediaOrder([{ order: 19 }])).toBeUndefined();
+    expect(
+      nextMediaOrder(Array.from({ length: 20 }, (_, order) => ({ order }))),
+    ).toBeUndefined();
   });
 
   test("accepts ISO datetimes and rejects invalid schedule values", () => {

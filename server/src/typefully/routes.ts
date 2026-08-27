@@ -6,7 +6,7 @@ import { checkNavigationTarget } from "../computer/target";
 import { readBoundedJson } from "../http/bounded-json";
 import { ConnectionRequiredError, PluginRefusedError } from "../plugins/store";
 import { createTypefullyMediaPreviewTransport } from "../plugins/typefully-rest";
-import { draftSummary } from "./document";
+import { draftSummary, nextMediaOrder } from "./document";
 import {
   type MediaUploadDependencies,
   uploadPresignedMedia,
@@ -780,6 +780,12 @@ export function createTypefullyRoutes(
       if (existing && expectedVersion !== current.version) {
         throw new VersionConflictError(current.version, current.contentHash);
       }
+      const allocatedOrder = existing
+        ? existing.order
+        : nextMediaOrder(current.document.media);
+      if (allocatedOrder === undefined) {
+        throw new Error("This draft cannot accept more media.");
+      }
       await store.authorizeTool({
         draftId: current.id,
         actorId: context.var.actor.id,
@@ -788,7 +794,7 @@ export function createTypefullyRoutes(
       const media: MediaDescriptor = existing ?? {
         id: randomUUID(),
         kind,
-        order: current.document.media.length,
+        order: allocatedOrder,
         altText,
         remoteId: null,
       };

@@ -454,6 +454,117 @@ describe("Typefully synchronization", () => {
     });
   });
 
+  test.each([
+    { existingOrders: [1], expectedOrder: 2 },
+    { existingOrders: [0, 5], expectedOrder: 6 },
+  ])(
+    "allocates a new media descriptor after gapped orders $existingOrders",
+    async ({ existingOrders, expectedOrder }) => {
+      const id = await createDraft();
+      const current = await store.readDraft(id, ownerId);
+      const seededMedia = existingOrders.map((order) => ({
+        id: `seed-${order}`,
+        kind: "image" as const,
+        order,
+        altText: `Seed ${order}`,
+        remoteId: `remote-seed-${order}`,
+      }));
+      const seeded = await store.saveDraft({
+        draftId: id,
+        actorId: ownerId,
+        expectedVersion: current.version,
+        document: { ...current.document, media: seededMedia },
+      });
+      failure = { text: "Upload initiation failed." };
+      try {
+        const form = new FormData();
+        form.set("expectedVersion", String(seeded.version));
+        form.set("kind", "image");
+        form.set("altText", "Gap-safe upload");
+        form.set("file", new File(["image"], "gap.png", { type: "image/png" }));
+        const response = await app.request(
+          `/api/typefully/drafts/${id}/media`,
+          { method: "POST", body: form },
+        );
+        expect(response.status).toBe(502);
+        const body = await response.json();
+        expect(body).toMatchObject({
+          code: "remote_error",
+          draft: {
+            version: seeded.version + 1,
+            mediaCount: seededMedia.length + 1,
+          },
+          media: { order: expectedOrder, remoteId: null },
+        });
+        const stored = await store.readDraft(id, ownerId);
+        expect(stored.document.media.map((media) => media.order)).toEqual([
+          ...existingOrders,
+          expectedOrder,
+        ]);
+        expect(
+          new Set(stored.document.media.map((media) => media.order)).size,
+        ).toBe(stored.document.media.length);
+      } finally {
+        failure = null;
+      }
+    },
+  );
+
+  test.each([
+    {
+      name: "maximum order",
+      orders: [19],
+    },
+    {
+      name: "media capacity",
+      orders: Array.from({ length: 20 }, (_, order) => order),
+    },
+  ])(
+    "refuses $name before persisting or calling Typefully",
+    async ({ orders }) => {
+      const id = await createDraft();
+      const current = await store.readDraft(id, ownerId);
+      const seeded = await store.saveDraft({
+        draftId: id,
+        actorId: ownerId,
+        expectedVersion: current.version,
+        document: {
+          ...current.document,
+          media: orders.map((order) => ({
+            id: `capacity-${order}`,
+            kind: "image" as const,
+            order,
+            altText: "",
+            remoteId: `remote-capacity-${order}`,
+          })),
+        },
+      });
+      const beforeCalls = calls.length;
+      const form = new FormData();
+      form.set("expectedVersion", String(seeded.version));
+      form.set("kind", "image");
+      form.set("altText", "Refused upload");
+      form.set(
+        "file",
+        new File(["image"], "refused.png", { type: "image/png" }),
+      );
+
+      const response = await app.request(`/api/typefully/drafts/${id}/media`, {
+        method: "POST",
+        body: form,
+      });
+
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ code: "invalid_request" });
+      expect(calls).toHaveLength(beforeCalls);
+      const unchanged = await store.readDraft(id, ownerId);
+      expect(unchanged.version).toBe(seeded.version);
+      expect(unchanged.document.media.map((media) => media.order)).toEqual(
+        orders,
+      );
+    },
+  );
+
   test("a failed media descriptor can be retried without duplicating it", async () => {
     const id = await createDraft();
     failure = { text: "Upload initiation failed." };

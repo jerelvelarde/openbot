@@ -6,6 +6,8 @@ const POST_BODY_MAX_LENGTH = 100_000;
 const ALT_TEXT_MAX_LENGTH = 10_000;
 const REMOTE_ID_MAX_LENGTH = 240;
 const SUMMARY_TITLE_MAX_LENGTH = 160;
+export const MAX_DRAFT_MEDIA = 20;
+export const MAX_MEDIA_ORDER = MAX_DRAFT_MEDIA - 1;
 const destinationRank = { x: 0, linkedin: 1 } as const;
 
 const normalizeLineEndings = (value: string): string =>
@@ -28,7 +30,7 @@ export const postBlockSchema = z.strictObject({
 export const mediaDescriptorSchema = z.strictObject({
   id: stableIdSchema,
   kind: z.enum(["image", "video"]),
-  order: z.number().int(),
+  order: z.number().int().min(0).max(MAX_MEDIA_ORDER),
   altText: z.string().max(ALT_TEXT_MAX_LENGTH).transform(normalizeLineEndings),
   remoteId: z.string().trim().min(1).max(REMOTE_ID_MAX_LENGTH).nullable(),
 });
@@ -74,7 +76,7 @@ const postsSchema = z
 
 const mediaSchema = z
   .array(mediaDescriptorSchema)
-  .max(20)
+  .max(MAX_DRAFT_MEDIA)
   .superRefine((media, context) => {
     const ids = new Set<string>();
     const orders = new Set<number>();
@@ -107,6 +109,18 @@ export const draftDocumentSchema = z.strictObject({
 });
 
 export type CanonicalDraftDocument = z.infer<typeof draftDocumentSchema>;
+
+export function nextMediaOrder(
+  media: readonly Pick<CanonicalDraftDocument["media"][number], "order">[],
+): number | undefined {
+  if (media.length >= MAX_DRAFT_MEDIA) return;
+  const order =
+    media.reduce(
+      (highest, descriptor) => Math.max(highest, descriptor.order),
+      -1,
+    ) + 1;
+  return order <= MAX_MEDIA_ORDER ? order : undefined;
+}
 
 function unsupportedDestination(input: unknown): string | null {
   if (typeof input !== "object" || input === null) {
