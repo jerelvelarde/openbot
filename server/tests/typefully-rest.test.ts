@@ -3,9 +3,11 @@ import { catalogueEntry } from "../src/plugins/catalogue";
 import { MAX_RESULT_CHARS } from "../src/plugins/mcp";
 import { transportFor } from "../src/plugins/transport";
 import { vendorInputSchemaFor } from "../src/plugins/typefully-contracts";
+import { remoteMatchesSnapshot } from "../src/typefully/publication";
 import {
   callTool,
   createTypefullyMediaPreviewTransport,
+  createTypefullyPublicationVendor,
   createTypefullyRestTransport,
   createTypefullySmokeFetch,
   listTools,
@@ -13,6 +15,7 @@ import {
   TypefullyApiKeyValidationError,
   validateTypefullyApiKey,
 } from "../src/plugins/typefully-rest";
+import { startFakeTypefullyVendor } from "./support/fake-typefully-vendor";
 
 test("the smoke transport rewrites only the pinned Typefully origin", async () => {
   const calls: string[] = [];
@@ -29,6 +32,72 @@ test("the smoke transport rewrites only the pinned Typefully origin", async () =
   await expect(smokeFetch("https://example.com/v2/me")).rejects.toThrow(
     "refused a non-Typefully URL",
   );
+});
+
+test("the fake vendor returns an authoritative reviewed draft before one publish PATCH", async () => {
+  const fake = startFakeTypefullyVendor("http://127.0.0.1:0/v2");
+  const token = "tf-fake-contract";
+  const snapshot = {
+    title: "Launch",
+    destinations: ["x", "linkedin"] as ("x" | "linkedin")[],
+    socialSetId: "12",
+    accountLabel: "Smoke",
+    posts: [{ id: "post-1", x: "Exact X", linkedin: "Exact LinkedIn" }],
+    media: [],
+    scheduleAt: null,
+  };
+  try {
+    const smokeFetch = createTypefullySmokeFetch(fake.apiUrl);
+    const transport = createTypefullyRestTransport(smokeFetch);
+    const created = await transport.callTool(
+      { url: "https://api.typefully.com/v2", token },
+      "create_draft",
+      {
+        socialSetId: 12,
+        draftTitle: snapshot.title,
+        planAt: null,
+        platforms: {
+          x: { enabled: true, posts: [{ text: "Exact X" }] },
+          linkedin: {
+            enabled: true,
+            posts: [{ text: "Exact LinkedIn" }],
+          },
+        },
+      },
+    );
+    expect(created.isError).toBe(false);
+    const detail = JSON.parse(created.text);
+    expect(detail).toMatchObject({ status: "draft", scheduled_date: null });
+    expect(remoteMatchesSnapshot(detail, snapshot, "unused")).toBe(true);
+
+    const remoteDraftId = detail.id;
+    if (!Number.isSafeInteger(remoteDraftId)) {
+      throw new Error("The fake vendor did not assign a draft id.");
+    }
+    const vendor = createTypefullyPublicationVendor(smokeFetch);
+    const fetched = await vendor.fetchDraft({
+      token,
+      socialSetId: 12,
+      remoteDraftId,
+      destinations: snapshot.destinations,
+    });
+    expect(remoteMatchesSnapshot(fetched.document, snapshot, "unused")).toBe(
+      true,
+    );
+    expect(
+      await vendor.publishDraft({
+        token,
+        socialSetId: 12,
+        remoteDraftId,
+        destinations: snapshot.destinations,
+      }),
+    ).toMatchObject({ outcome: "published" });
+    expect(fake.createDraftCalls).toBe(1);
+    expect(fake.updateDraftCalls).toBe(0);
+    expect(fake.publishCalls).toBe(1);
+  } finally {
+    fake.close();
+  }
 });
 
 describe("Typefully media preview transport", () => {

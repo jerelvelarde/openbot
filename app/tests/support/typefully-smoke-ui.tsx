@@ -3,17 +3,31 @@ import { ProxiedCopilotRuntimeAgent } from "@copilotkit/core";
 import { CopilotKitCoreReact } from "@copilotkit/react-core/v2";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, waitFor } from "@testing-library/react";
+import {
+  createMemoryHistory,
+  createRootRoute,
+  createRouter,
+  Outlet,
+  RouterProvider,
+} from "@tanstack/react-router";
+import { act, cleanup, render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import {
   TypefullyConnectionArgs,
   TypefullyConnectionDecision,
 } from "../../src/components/gallery/typefully-connection";
 import {
+  TypefullyDraft,
+  TypefullyDraftProps,
+} from "../../src/components/gallery/typefully-draft";
+import {
   TypefullyPublicationArgs,
   TypefullyPublicationDecision,
 } from "../../src/components/gallery/typefully-publication";
-import { DraftCanvas } from "../../src/components/typefully/draft-canvas";
+import {
+  channelPaneSearch,
+  Route as ProductionChannelRoute,
+} from "../../src/routes/_authed/_app/channel/$channelId";
 
 type ToolHandler = (args: Record<string, unknown>) => Promise<unknown>;
 
@@ -79,18 +93,52 @@ export function openTypefullySmokeUi(apiUrl: string) {
     });
 
   return {
-    async editDraft(input: {
-      draftId: string;
+    async reviewEditReloadAndClose(input: {
+      args: Record<string, unknown>;
+      channelId: string;
       xText: string;
       altText: string;
     }) {
+      const draft = TypefullyDraftProps.parse(input.args);
       const queryClient = client();
+      function SmokeRoot() {
+        return (
+          <>
+            <TypefullyDraft {...draft} />
+            <Outlet />
+          </>
+        );
+      }
+      const root = createRootRoute({ component: SmokeRoot });
+      const productionChannel = ProductionChannelRoute.update({
+        id: "/channel/$channelId",
+        path: "/channel/$channelId",
+        getParentRoute: () => root,
+      });
+      const routeTree = root.addChildren([productionChannel]);
+      const router = createRouter({
+        routeTree,
+        history: createMemoryHistory({
+          initialEntries: [`/channel/${input.channelId}`],
+        }),
+        context: { queryClient },
+      });
+      await router.load();
       const view = render(
         <QueryClientProvider client={queryClient}>
-          <DraftCanvas draftId={input.draftId} />
+          <RouterProvider router={router} />
         </QueryClientProvider>,
       );
       const user = userEvent.setup({ document });
+      await user.click(
+        await view.findByRole("button", { name: "Review draft" }),
+      );
+      await waitFor(() => {
+        if (router.state.location.search.draft !== draft.draftId) {
+          throw new Error("The compiled card did not open its draft route.");
+        }
+      });
+      const directHref = router.state.location.href;
       const xEditor = await view.findByLabelText("X post 1");
       await user.clear(xEditor);
       await user.type(xEditor, input.xText);
@@ -104,8 +152,55 @@ export function openTypefullySmokeUi(apiUrl: string) {
         },
         { timeout: 15_000 },
       );
+
+      await act(async () => router.history.back());
+      await waitFor(() => {
+        if (router.state.location.search.draft !== undefined) {
+          throw new Error("Back did not close the draft route.");
+        }
+      });
+      await act(async () => {
+        await router.navigate({
+          search: (previous) =>
+            channelPaneSearch(previous, { draft: draft.draftId }),
+        });
+      });
+      await user.click(
+        await view.findByRole("button", { name: "Close detail panel" }),
+      );
+      await waitFor(() => {
+        if (router.state.location.search.draft !== undefined) {
+          throw new Error("Close did not clear the draft route.");
+        }
+      });
       view.unmount();
       queryClient.clear();
+
+      const directClient = client();
+      const directRouter = createRouter({
+        routeTree,
+        history: createMemoryHistory({ initialEntries: [directHref] }),
+        context: { queryClient: directClient },
+      });
+      await directRouter.load();
+      const directView = render(
+        <QueryClientProvider client={directClient}>
+          <RouterProvider router={directRouter} />
+        </QueryClientProvider>,
+      );
+      await directView.findByLabelText("X post 1");
+      if (directRouter.state.location.search.draft !== draft.draftId) {
+        throw new Error("The direct draft URL did not survive a reload.");
+      }
+      directView.unmount();
+      directClient.clear();
+
+      return {
+        reviewedDraftId: draft.draftId,
+        directHref,
+        backClosed: true,
+        closeCleared: true,
+      };
     },
 
     async connectAndResume(input: {

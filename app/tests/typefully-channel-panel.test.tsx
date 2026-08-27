@@ -7,12 +7,11 @@ import {
   createRouter,
   Outlet,
   RouterProvider,
-  useNavigate,
 } from "@tanstack/react-router";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
-import { TypefullyDraftSummary } from "../src/components/gallery/typefully-draft";
+import { TypefullyDraft } from "../src/components/gallery/typefully-draft";
 import { DetailPanel } from "../src/components/layout/detail-panel";
 import { agentKeys } from "../src/lib/agents/queries";
 import { channelKeys } from "../src/lib/channels/queries";
@@ -68,23 +67,12 @@ const channel = {
 };
 
 function ProductionTestRoot() {
-  const navigate = useNavigate();
   return (
     <>
-      <TypefullyDraftSummary
+      <TypefullyDraft
         destinations={["x"]}
         draftId={draftId}
         mediaCount={0}
-        onReview={() => {
-          void navigate({
-            params: { channelId: channel.id },
-            search: (previous) =>
-              channelPaneSearch(previous as { watch?: true }, {
-                draft: draftId,
-              }),
-            to: "/channel/$channelId",
-          });
-        }}
         socialSetLabel="Route account"
         status="synced"
         title="Draft summary"

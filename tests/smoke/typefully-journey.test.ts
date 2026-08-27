@@ -20,11 +20,14 @@ import {
   credentials,
   mcpServers,
   mcpTools,
+  mcpUserCredentials,
   pluginGrants,
   typefullyDrafts,
   typefullyPublicationProposals,
 } from "../../server/src/db/schema";
 import { TEST_POOL } from "../../server/tests/support/database";
+import { startFakeTypefullyVendor } from "../../server/tests/support/fake-typefully-vendor";
+import { ownedSmokeTypefullyAssociation } from "../../server/tests/support/typefully-smoke-isolation";
 
 /**
  * The Typefully journey through a deployment that is really running.
@@ -192,85 +195,6 @@ function fakeAgent(endpoint: string) {
   };
 }
 
-function fakeTypefully(apiUrl: string) {
-  const parsed = new URL(apiUrl);
-  if (
-    parsed.protocol !== "http:" ||
-    parsed.hostname !== "127.0.0.1" ||
-    !parsed.port
-  ) {
-    throw new Error(
-      "OPENBOT_TYPEFULLY_SMOKE_API_URL must be http://127.0.0.1:<port>/v2.",
-    );
-  }
-  let publishCalls = 0;
-  let sequence = 7000;
-  const drafts = new Map<string, JsonObject>();
-  const authorizations: Array<string | null> = [];
-  const server = Bun.serve({
-    hostname: parsed.hostname,
-    port: Number(parsed.port),
-    fetch: async (incoming) => {
-      authorizations.push(incoming.headers.get("authorization"));
-      const url = new URL(incoming.url);
-      if (
-        url.pathname === `${parsed.pathname}/me` &&
-        incoming.method === "GET"
-      ) {
-        return Response.json({
-          id: "smoke-account",
-          name: "Fake Typefully smoke account",
-          api_key_label: "Smoke only",
-        });
-      }
-      const collection = new RegExp(
-        `^${parsed.pathname}/social-sets/12/drafts/?$`,
-      );
-      const member = new RegExp(
-        `^${parsed.pathname}/social-sets/12/drafts/(\\d+)$`,
-      ).exec(url.pathname);
-      if (collection.test(url.pathname) && incoming.method === "POST") {
-        sequence += 1;
-        const id = String(sequence);
-        drafts.set(id, (await incoming.json()) as JsonObject);
-        return Response.json({ id: Number(id) });
-      }
-      if (member && incoming.method === "GET") {
-        const stored = drafts.get(member[1] ?? "");
-        return stored
-          ? Response.json(stored)
-          : Response.json({ detail: "missing" }, { status: 404 });
-      }
-      if (member && incoming.method === "PATCH") {
-        const body = (await incoming.json()) as JsonObject;
-        const id = member[1] ?? "";
-        if (body.publish_at === "now") {
-          publishCalls += 1;
-          return Response.json({
-            id: Number(id),
-            publish_state: "finished",
-            status: "published",
-            x_published_url: `https://x.com/openbot/status/${id}`,
-          });
-        }
-        drafts.set(id, body);
-        return Response.json({ id: Number(id), ...body });
-      }
-      return Response.json(
-        { detail: "unsupported smoke request" },
-        { status: 404 },
-      );
-    },
-  });
-  return {
-    authorizations,
-    get publishCalls() {
-      return publishCalls;
-    },
-    close: () => server.stop(true),
-  };
-}
-
 beforeAll(async () => {
   if (!asked) return;
   if (!fakeApi) {
@@ -309,13 +233,15 @@ describe.skipIf(!asked)("the running Typefully deployment journey", () => {
     const altText = `Smoke media alt ${suffix}`;
     const startedAt = Date.now() - 1_000;
     if (!smokeBot || !smokeAgentUrl) throw new Error("Missing smoke Bot.");
-    const vendor = fakeTypefully(fakeApi);
+    const vendor = startFakeTypefullyVendor(fakeApi);
     const agentEndpoint = fakeAgent(smokeAgentUrl);
     const createdComponents: string[] = [];
     const botId = smokeBot;
     let channelId: string | undefined;
     let draftId: string | undefined;
+    let connectionAttempted = false;
     let connectionCreated = false;
+    let createdCredentialId: string | undefined;
     let serverCreated = false;
     let ui: ReturnType<typeof openTypefullySmokeUi> | undefined;
 
@@ -332,6 +258,10 @@ describe.skipIf(!asked)("the running Typefully deployment journey", () => {
       .select()
       .from(credentials)
       .where(eq(credentials.provider, "typefully"));
+    const beforeAssociations = await database
+      .select()
+      .from(mcpUserCredentials)
+      .where(eq(mcpUserCredentials.serverId, "typefully"));
     const componentNames = [
       "connectTypefullyAccount",
       "approveTypefullyPublication",
@@ -492,30 +422,33 @@ describe.skipIf(!asked)("the running Typefully deployment journey", () => {
       let pendingPublication:
         | { args: JsonObject; resolve: (value: unknown) => void }
         | undefined;
+      let draftRouteEvidence:
+        | {
+            reviewedDraftId: string;
+            directHref: string;
+            backClosed: boolean;
+            closeCleared: boolean;
+          }
+        | undefined;
       const componentArgs: Array<{ name: string; args: JsonObject }> = [];
+      ui = openTypefullySmokeUi(API);
       const protocol = await createRunningComponentProtocol({
         apiUrl: API,
         botId,
         handlers: {
           showTypefullyDraft: async (args) => {
             componentArgs.push({ name: "showTypefullyDraft", args });
-            const result = await json<{
-              draft: {
-                id: string;
-                title: string;
-                destinations: string[];
-                mediaCount: number;
-                version: number;
-                syncStatus: string;
-              };
-            }>(`/api/typefully/drafts/${String(args.draftId)}`);
+            if (!ui) throw new Error("The smoke UI is unavailable.");
+            draftRouteEvidence = await ui.reviewEditReloadAndClose({
+              args,
+              channelId,
+              xText: firstBody,
+              altText,
+            });
             return {
-              draftId: result.draft.id,
-              title: result.draft.title,
-              destinations: result.draft.destinations,
-              mediaCount: result.draft.mediaCount,
-              version: result.draft.version,
-              status: result.draft.syncStatus,
+              reviewedDraftId: draftRouteEvidence.reviewedDraftId,
+              backClosed: draftRouteEvidence.backClosed,
+              closeCleared: draftRouteEvidence.closeCleared,
             };
           },
           connectTypefullyAccount: async (args) => {
@@ -548,8 +481,12 @@ describe.skipIf(!asked)("the running Typefully deployment journey", () => {
       );
       await protocol.run("Create a local X and LinkedIn launch draft.");
 
-      ui = openTypefullySmokeUi(API);
-      await ui.editDraft({ draftId, xText: firstBody, altText });
+      expect(draftRouteEvidence).toMatchObject({
+        reviewedDraftId: draftId,
+        backClosed: true,
+        closeCleared: true,
+      });
+      expect(draftRouteEvidence?.directHref).toContain(`draft=${draftId}`);
       const local = await json<{
         draft: { version: number; contentHash: string; document: JsonObject };
       }>(`/api/typefully/drafts/${draftId}`);
@@ -585,13 +522,31 @@ describe.skipIf(!asked)("the running Typefully deployment journey", () => {
       const connectionRun = protocol.run("Sync the reviewed local draft.");
       await waitForValue(() => pendingConnection, "connection decision");
       if (!pendingConnection) throw new Error("Connection decision missing.");
+      connectionAttempted = true;
       await ui.connectAndResume({
         args: pendingConnection.args,
         apiKey,
         respond: async (result) => pendingConnection?.resolve(result),
       });
+      const afterConnectAssociations = await database
+        .select()
+        .from(mcpUserCredentials)
+        .where(eq(mcpUserCredentials.serverId, "typefully"));
+      const createdAssociation = ownedSmokeTypefullyAssociation({
+        before: beforeAssociations,
+        current: afterConnectAssociations,
+        connectionAttempted,
+      });
+      if (!createdAssociation) {
+        throw new Error(
+          "The connection did not create a traceable Typefully credential association.",
+        );
+      }
+      createdCredentialId = createdAssociation.credentialId;
       connectionCreated = true;
       await connectionRun;
+      expect(vendor.createDraftCalls).toBe(1);
+      expect(vendor.updateDraftCalls).toBe(0);
 
       const synced = await json<{
         draft: { version: number; contentHash: string; document: JsonObject };
@@ -642,9 +597,21 @@ describe.skipIf(!asked)("the running Typefully deployment journey", () => {
         ),
       ).toMatchObject({ proposal: { status: "expired" } });
 
-      const changed = await json<{ draft: { version: number } }>(
-        `/api/typefully/drafts/${draftId}`,
+      const changed = await json<{
+        draft: { version: number; contentHash: string };
+      }>(`/api/typefully/drafts/${draftId}`);
+      const resynced = await json<{ draft: { version: number } }>(
+        `/api/typefully/drafts/${draftId}/sync`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            expectedVersion: changed.draft.version,
+            expectedHash: changed.draft.contentHash,
+          }),
+        },
       );
+      expect(vendor.createDraftCalls).toBe(1);
+      expect(vendor.updateDraftCalls).toBe(1);
       const secondProposalCall = await json<{ text: string; isError: boolean }>(
         "/api/plugins/call",
         {
@@ -652,7 +619,7 @@ describe.skipIf(!asked)("the running Typefully deployment journey", () => {
           body: JSON.stringify({
             ref: "typefully/prepare_publication",
             agentId: botId,
-            args: { draftId, expectedVersion: changed.draft.version },
+            args: { draftId, expectedVersion: resynced.draft.version },
           }),
         },
       );
@@ -732,15 +699,21 @@ describe.skipIf(!asked)("the running Typefully deployment journey", () => {
       expect(agentEndpoint.runs.length).toBeGreaterThanOrEqual(6);
     } finally {
       ui?.close();
-      const currentConnections = await json<{
-        connections: { serverId: string }[];
-      }>("/api/plugins/connections").catch(() => ({ connections: [] }));
-      if (
-        connectionCreated ||
-        currentConnections.connections.some(
-          ({ serverId }) => serverId === "typefully",
-        )
-      ) {
+      const currentAssociations = await database
+        .select()
+        .from(mcpUserCredentials)
+        .where(eq(mcpUserCredentials.serverId, "typefully"));
+      const createdAssociation = ownedSmokeTypefullyAssociation({
+        before: beforeAssociations,
+        current: currentAssociations,
+        connectionAttempted,
+        ...(createdCredentialId ? { credentialId: createdCredentialId } : {}),
+      });
+      if (createdAssociation && !createdCredentialId) {
+        createdCredentialId = createdAssociation.credentialId;
+        connectionCreated = true;
+      }
+      if (connectionCreated && createdAssociation) {
         await request("/api/plugins/connections/typefully", {
           method: "DELETE",
         });
@@ -798,17 +771,11 @@ describe.skipIf(!asked)("the running Typefully deployment journey", () => {
           .delete(components)
           .where(inArray(components.name, createdComponents));
       }
-      const beforeCredentialIds = beforeCredentials.map(({ id }) => id);
-      await database
-        .delete(credentials)
-        .where(
-          beforeCredentialIds.length
-            ? and(
-                eq(credentials.provider, "typefully"),
-                notInArray(credentials.id, beforeCredentialIds),
-              )
-            : eq(credentials.provider, "typefully"),
-        );
+      if (createdCredentialId) {
+        await database
+          .delete(credentials)
+          .where(eq(credentials.id, createdCredentialId));
+      }
       if (serverCreated) {
         await database
           .delete(mcpTools)
@@ -836,6 +803,12 @@ describe.skipIf(!asked)("the running Typefully deployment journey", () => {
           .from(credentials)
           .where(eq(credentials.provider, "typefully")),
       ).toEqual(beforeCredentials);
+      expect(
+        await database
+          .select()
+          .from(mcpUserCredentials)
+          .where(eq(mcpUserCredentials.serverId, "typefully")),
+      ).toEqual(beforeAssociations);
       expect(
         await database
           .select()
