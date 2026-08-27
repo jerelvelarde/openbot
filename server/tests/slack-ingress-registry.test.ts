@@ -121,4 +121,17 @@ describe("managed Slack ingress registry", () => {
 
     expect(registry.take("Ev1")).toBe(latest);
   });
+
+  test("uses one trimmed event key for replacement, expiry, and take", () => {
+    const timer = clock();
+    const registry = new SlackIngressRegistry(timer);
+    const first = { identityContext: context(), identityResult };
+    const latest = { identityContext: context(), identityResult };
+    registry.remember(" Ev1 ", first);
+    registry.remember("Ev1", latest);
+
+    timer.scheduled[0]?.callback();
+
+    expect(registry.take(" Ev1 ")).toBe(latest);
+  });
 });

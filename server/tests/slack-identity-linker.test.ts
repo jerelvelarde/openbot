@@ -1,10 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ChannelIdentityContext } from "@copilotkit/channels";
 import type { AgentActor } from "../src/agents/profile-types";
-import type {
-  ExternalLinkStore,
-  SlackActiveUserLinkStore,
-} from "../src/external/link-store";
+import type { ExternalLinkAuthorizationStore } from "../src/external/link-store";
 import type {
   ExternalProviderIdentity,
   ExternalUserLink,
@@ -57,20 +54,33 @@ function storeFor(
     active?: Map<string, ActiveUser>;
     onLink?: () => { link: ExternalUserLink; error?: Error };
   } = {},
-): ExternalLinkStore &
-  SlackActiveUserLinkStore & { linkedWith: ExternalProviderIdentity[] } {
+): ExternalLinkAuthorizationStore & {
+  linkedWith: ExternalProviderIdentity[];
+  findKeys: [string, string, string][];
+  verifiedEmails: string[];
+  activeIds: string[];
+} {
   let currentLink = input.link ?? null;
   const linkedWith: ExternalProviderIdentity[] = [];
+  const findKeys: [string, string, string][] = [];
+  const verifiedEmails: string[] = [];
+  const activeIds: string[] = [];
   const active = input.active ?? new Map<string, ActiveUser>();
   return {
     linkedWith,
-    async find() {
+    findKeys,
+    verifiedEmails,
+    activeIds,
+    async find(provider, tenantId, providerUserId) {
+      findKeys.push([provider, tenantId, providerUserId]);
       return currentLink;
     },
-    async findVerifiedUserByEmail() {
+    async findVerifiedUserByEmail(email) {
+      verifiedEmails.push(email);
       return input.found ?? null;
     },
     async resolveActiveUser(id) {
+      activeIds.push(id);
       return active.get(id) ?? null;
     },
     async link(value) {
@@ -88,7 +98,7 @@ function storeFor(
 }
 
 function linker(
-  store: ExternalLinkStore & SlackActiveUserLinkStore,
+  store: ExternalLinkAuthorizationStore,
   appUrl = "https://openbot.test",
 ) {
   return new SlackIdentityLinker({ store, encryptionKey: KEY, appUrl });
@@ -129,7 +139,7 @@ describe("SlackIdentityLinker", () => {
 
     await expect(
       linker(store).resolve(context({ actor: { id: "B1", kind: "bot" } })),
-    ).rejects.toThrow("Slack identity requires a human actor.");
+    ).rejects.toThrow("Slack identity requires a known tenant and actor id.");
     expect(store.linkedWith).toEqual([]);
   });
 
@@ -250,5 +260,129 @@ describe("SlackIdentityLinker", () => {
         providerUserId: "U-trusted",
       },
     });
+  });
+
+  test("rejects noncanonical Slack tenant and actor identities before every store operation", async () => {
+    for (const input of [
+      { tenant: { id: "" } },
+      { tenant: { id: "   " } },
+      { tenant: { id: "UnKnOwN" } },
+      { actor: { id: "" } },
+      { actor: { id: "  " } },
+      { actor: { id: " unknown " } },
+      { provider: "discord" },
+    ]) {
+      const store = storeFor();
+      await expect(
+        linker(store).resolve(
+          context({
+            ...input,
+            actor: {
+              id: "U1",
+              kind: "human",
+              ...(input.actor ?? {}),
+            },
+          }),
+        ),
+      ).rejects.toThrow("Slack identity requires a known tenant and actor id.");
+      expect(store.findKeys).toEqual([]);
+      expect(store.verifiedEmails).toEqual([]);
+      expect(store.linkedWith).toEqual([]);
+      expect(store.activeIds).toEqual([]);
+    }
+  });
+
+  test("uses canonical trimmed tenant and actor ids for every store key and link", async () => {
+    const store = storeFor({
+      found: { id: "alice", name: "Alice" },
+      active: new Map([
+        ["alice", { id: "alice", name: "Alice", role: "user" }],
+      ]),
+    });
+    await linker(store).resolve(
+      context({
+        tenant: { id: " T1 " },
+        actor: { id: " U1 ", kind: "human" },
+        lookupProfile: async () => ({
+          id: " U1 ",
+          kind: "human",
+          email: "adapter@example.test",
+        }),
+      }),
+    );
+
+    expect(store.findKeys).toEqual([
+      ["slack", "T1", "U1"],
+      ["slack", "T1", "U1"],
+    ]);
+    expect(store.linkedWith).toEqual([{ ...IDENTITY, openbotUserId: "alice" }]);
+  });
+
+  test("requires a matching human adapter profile before automatic linking", async () => {
+    for (const profile of [
+      { id: "another-user", kind: "human" as const, email: "other@test" },
+      { id: "U1", kind: "bot" as const, email: "other@test" },
+    ]) {
+      const store = storeFor({
+        found: { id: "alice", name: "Alice" },
+        active: new Map([
+          ["alice", { id: "alice", name: "Alice", role: "user" }],
+        ]),
+      });
+      const result = await linker(store).resolve(
+        context({ lookupProfile: async () => profile }),
+      );
+
+      expect(result.kind).toBe("unlinked");
+      if (result.kind === "unlinked") {
+        expect(result.identity.providerEmail).toBeNull();
+      }
+      expect(store.verifiedEmails).toEqual([]);
+      expect(store.linkedWith).toEqual([]);
+    }
+  });
+
+  test("uses an explicit link flow when adapter profile lookup rejects", async () => {
+    const store = storeFor();
+    const result = await linker(store).resolve(
+      context({
+        lookupProfile: async () => {
+          throw new Error("adapter unavailable");
+        },
+      }),
+    );
+
+    expect(result.kind).toBe("unlinked");
+    if (result.kind === "unlinked") {
+      expect(result.identity.providerEmail).toBeNull();
+    }
+    expect(store.verifiedEmails).toEqual([]);
+    expect(store.linkedWith).toEqual([]);
+  });
+
+  test("rejects unsafe app URLs and permits only loopback HTTP development URLs", async () => {
+    for (const appUrl of [
+      "https://user:secret@example.com",
+      "http://example.com",
+      "ftp://example.com",
+    ]) {
+      await expect(
+        linker(storeFor(), appUrl).resolve(context()),
+      ).rejects.toThrow(
+        "Slack link setup requires an absolute OPENBOT_APP_URL.",
+      );
+    }
+    for (const appUrl of [
+      "http://localhost:3000",
+      "http://127.0.0.1:3000",
+      "http://[::1]:3000",
+    ]) {
+      const result = await linker(storeFor(), appUrl).resolve(context());
+      expect(result.kind).toBe("unlinked");
+      if (result.kind === "unlinked") {
+        expect(result.linkUrl).toStartWith(`${appUrl}/link/slack?token=`);
+        expect(result.linkUrl).not.toContain("@example.com");
+      }
+    }
   });
 });

@@ -33,7 +33,7 @@ export type ExternalLinkStore = {
 };
 
 /** Fresh OpenBot authorization state for an external identity already stored in the database. */
-export type SlackActiveUserLinkStore = {
+export type ExternalLinkAuthorizationStore = ExternalLinkStore & {
   resolveActiveUser: (openbotUserId: string) => Promise<{
     id: string;
     name: string;
@@ -69,7 +69,7 @@ function asLink(row: typeof externalUserLinks.$inferSelect): ExternalUserLink {
 
 export function createExternalLinkStore(
   database: Database,
-): ExternalLinkCreationStore & SlackActiveUserLinkStore {
+): ExternalLinkCreationStore & ExternalLinkAuthorizationStore {
   async function find(
     provider: ExternalProvider,
     tenantId: string,

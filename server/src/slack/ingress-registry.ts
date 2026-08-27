@@ -29,7 +29,7 @@ const systemTimer: SlackIngressTimer = {
 
 function requiredEventId(eventId: string | undefined): string {
   if (!eventId?.trim()) throw new Error(EVENT_ID_ERROR);
-  return eventId;
+  return eventId.trim();
 }
 
 /** One-use, short-lived identity facts bridging managed Channels ingress to agent execution. */
