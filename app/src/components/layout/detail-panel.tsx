@@ -1,6 +1,6 @@
 import { IconX } from "@tabler/icons-react";
 import { motion, useReducedMotion } from "motion/react";
-import type { ReactNode } from "react";
+import { type ReactNode, useEffect, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { EASE_OUT } from "@/lib/motion";
 
@@ -33,6 +33,7 @@ export function DetailPanel({
   detail,
   detailWidth = DEFAULT_DETAIL_WIDTH,
   collapseAtNarrow = false,
+  focusKey,
   children,
 }: {
   open: boolean;
@@ -44,10 +45,49 @@ export function DetailPanel({
   detailWidth?: number;
   /** On the app's narrow layout, let a large detail replace the main surface instead of squeezing it. */
   collapseAtNarrow?: boolean;
+  /** Changes when an already-open pane becomes a new focus destination, such as a selected draft. */
+  focusKey?: string;
   children: ReactNode;
 }) {
   // Reduced motion keeps the fade, which explains the change, and drops the movement.
   const shouldReduceMotion = useReducedMotion();
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const closeRef = useRef<HTMLButtonElement>(null);
+  const returnFocusRef = useRef<HTMLElement | null>(null);
+  const wasOpenRef = useRef(false);
+  const previousFocusKeyRef = useRef<string | undefined>(undefined);
+  const hasTitle = title !== undefined && title !== null;
+
+  useEffect(() => {
+    const opening =
+      open &&
+      (!wasOpenRef.current ||
+        (focusKey !== undefined && focusKey !== previousFocusKeyRef.current));
+    if (opening) {
+      const active = document.activeElement;
+      returnFocusRef.current =
+        active instanceof HTMLElement && active !== document.body
+          ? active
+          : null;
+      queueMicrotask(() => {
+        const destination = hasTitle ? headingRef.current : closeRef.current;
+        if (destination?.isConnected) destination.focus();
+      });
+    }
+    if (!open && wasOpenRef.current) {
+      const origin = returnFocusRef.current;
+      queueMicrotask(() => {
+        const fallback = document.querySelector<HTMLElement>(
+          "[data-channel-focus-fallback]",
+        );
+        const destination = origin?.isConnected ? origin : fallback;
+        destination?.focus();
+      });
+      returnFocusRef.current = null;
+    }
+    wasOpenRef.current = open;
+    previousFocusKeyRef.current = focusKey;
+  }, [focusKey, hasTitle, open]);
 
   return (
     <div
@@ -84,13 +124,22 @@ export function DetailPanel({
         >
           {/* Rendered for the whole animation, so the way out is available immediately. */}
           <div className="h-12 shrink-0 sticky top-0 flex flex-row items-center justify-between px-2 gap-2">
-            <div className="flex min-w-0 w-full items-center gap-1.5">
-              {title}
-            </div>
+            {hasTitle ? (
+              <h2
+                className="flex min-w-0 w-full items-center gap-1.5 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                ref={headingRef}
+                tabIndex={-1}
+              >
+                {title}
+              </h2>
+            ) : (
+              <div className="flex min-w-0 w-full items-center gap-1.5" />
+            )}
             <div className="flex flex-row gap-1.5">
               <Button
                 aria-label="Close detail panel"
                 onClick={onClose}
+                ref={closeRef}
                 variant="ghost"
                 size="icon"
               >

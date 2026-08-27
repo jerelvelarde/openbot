@@ -256,6 +256,7 @@ function RouteComponent() {
   return (
     <DetailPanel
       collapseAtNarrow={detailPresentation.collapseAtNarrow}
+      focusKey={draft}
       onClose={() => show(null)}
       open={detailPresentation.open}
       detailWidth={detailPresentation.width}
@@ -278,7 +279,11 @@ function RouteComponent() {
       <div className="flex flex-col">
         <div className="h-12 border-b border-border sticky top-0 flex flex-row items-center justify-between px-3 gap-2">
           {/* Keyed on the displayed name so cold channel loads animate the resolved name, not the id. */}
-          <div className="flex min-w-0 items-center gap-1.5">
+          <div
+            className="flex min-w-0 items-center gap-1.5 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            data-channel-focus-fallback
+            tabIndex={-1}
+          >
             <motion.div
               animate={{ opacity: 1 }}
               className="shrink-0"

@@ -29,7 +29,7 @@ const draft: AuthoritativeDraft = {
   contentHash: "hash-7",
   remoteDraftId: "remote-7",
   remoteVersion: 7,
-  remoteHash: "remote-hash-7",
+  remoteHash: "hash-7",
   syncStatus: "synced",
   lastError: null,
   createdAt: "2026-08-27T08:00:00.000Z",
@@ -58,18 +58,53 @@ test("platform and viewport tabs are keyboard reachable and switch content", asy
   const view = render(<CanvasShell draft={draft} />);
   const user = userEvent.setup({ document });
 
+  const x = view.getByRole("tab", { name: "X" });
   const linkedin = view.getByRole("tab", { name: "LinkedIn" });
-  linkedin.focus();
-  await user.keyboard("{Enter}");
+  expect(x.tabIndex).toBe(0);
+  expect(linkedin.tabIndex).toBe(-1);
+  x.focus();
+  await user.keyboard("{ArrowRight}");
   expect(linkedin.getAttribute("aria-selected")).toBe("true");
-  expect(
-    view.getAllByText("A more detailed LinkedIn launch post."),
-  ).toHaveLength(2);
+  expect(document.activeElement).toBe(linkedin);
+  expect(linkedin.tabIndex).toBe(0);
+  expect(x.tabIndex).toBe(-1);
+  const controlled = linkedin.getAttribute("aria-controls");
+  expect(controlled).toBeTruthy();
+  const platformPanel = controlled
+    ? document.getElementById(controlled)
+    : undefined;
+  expect(platformPanel?.getAttribute("role")).toBe("tabpanel");
+  expect(platformPanel?.getAttribute("aria-labelledby")).toBe(linkedin.id);
+  expect(platformPanel?.textContent).toContain(
+    "A more detailed LinkedIn launch post.",
+  );
+
+  await user.keyboard("{Home}");
+  expect(document.activeElement).toBe(x);
+  expect(x.getAttribute("aria-selected")).toBe("true");
+  await user.keyboard("{End}");
+  expect(document.activeElement).toBe(linkedin);
 
   const mobile = view.getByRole("tab", { name: "Mobile" });
-  mobile.focus();
-  await user.keyboard(" ");
+  const desktop = view.getByRole("tab", { name: "Desktop" });
+  desktop.focus();
+  await user.keyboard("{ArrowLeft}");
   expect(mobile.getAttribute("aria-selected")).toBe("true");
+  expect(document.activeElement).toBe(mobile);
+  expect(mobile.getAttribute("aria-controls")).toBeTruthy();
+  expect(
+    document
+      .getElementById(mobile.getAttribute("aria-controls") ?? "")
+      ?.getAttribute("role"),
+  ).toBe("tabpanel");
+  expect(
+    document.getElementById(desktop.getAttribute("aria-controls") ?? "")
+      ?.hidden,
+  ).toBe(true);
+  expect(
+    document.getElementById(mobile.getAttribute("aria-controls") ?? "")
+      ?.textContent,
+  ).toContain("A more detailed LinkedIn launch post.");
   expect(view.getByRole("region", { name: "Preview" }).className).toContain(
     "max-w-[360px]",
   );
@@ -83,7 +118,7 @@ test("canvas exposes local CopilotKit glass patterns and reduced-motion-safe tra
 
   expect(view.getByTestId("typefully-canvas").className).toContain("font-sans");
   expect(view.getAllByTestId("canvas-card")[0]?.className).toContain(
-    "bg-white/50",
+    "bg-card/50",
   );
   expect(view.getAllByTestId("canvas-card")[0]?.className).toContain(
     "border-2",
@@ -91,6 +126,18 @@ test("canvas exposes local CopilotKit glass patterns and reduced-motion-safe tra
   expect(view.getByTestId("typefully-canvas").className).toContain(
     "motion-reduce:scroll-auto",
   );
+  expect(view.container.innerHTML).not.toContain("text-[#");
+  expect(view.container.innerHTML).not.toContain("bg-white");
+  expect(view.container.innerHTML).not.toContain("border-white");
+
+  document.documentElement.classList.add("dark");
+  expect(view.getByTestId("typefully-canvas").className).toContain(
+    "text-foreground",
+  );
+  expect(view.getAllByTestId("canvas-card")[0]?.className).toContain(
+    "border-border",
+  );
+  document.documentElement.classList.remove("dark");
 });
 
 test("canvas explains an empty destination instead of inventing a preview", async () => {
@@ -109,4 +156,58 @@ test("canvas explains an empty destination instead of inventing a preview", asyn
   expect(view.getAllByText(/select a destination/i).length).toBeGreaterThan(0);
   expect(view.queryByRole("tab", { name: "X" })).toBeNull();
   expect(view.queryByRole("tab", { name: "LinkedIn" })).toBeNull();
+});
+
+test("publish readiness follows authoritative sync state and never offers direct publish", async () => {
+  const { CanvasShell } = await import(
+    "../src/components/typefully/canvas-shell"
+  );
+  const readiness = {
+    synced: "Ready for approval",
+    local: "Sync to Typefully before requesting approval",
+    syncing: "Wait for saving to finish",
+    connection_required: "Connect Typefully before requesting approval",
+    remote_error: "Resolve the Typefully sync error before requesting approval",
+    grant_blocked: "Typefully access is required before requesting approval",
+  } as const;
+
+  for (const [syncStatus, expected] of Object.entries(readiness)) {
+    const view = render(
+      <CanvasShell
+        draft={{ ...draft, syncStatus: syncStatus as typeof draft.syncStatus }}
+      />,
+    );
+    expect(view.getByTestId("publish-readiness").textContent).toContain(
+      expected,
+    );
+    expect(view.queryByRole("button", { name: /publish now/i })).toBeNull();
+    cleanup();
+  }
+
+  const unconfirmed = render(
+    <CanvasShell draft={{ ...draft, remoteHash: "older-hash" }} />,
+  );
+  expect(unconfirmed.getByTestId("publish-readiness").textContent).toContain(
+    "Wait for Typefully confirmation",
+  );
+});
+
+test("remote errors surface a bounded redacted authoritative detail", async () => {
+  const { CanvasShell } = await import(
+    "../src/components/typefully/canvas-shell"
+  );
+  const secret = `Bearer ${"s".repeat(80)}`;
+  const view = render(
+    <CanvasShell
+      draft={{
+        ...draft,
+        syncStatus: "remote_error",
+        lastError: `${secret} ${"problem ".repeat(80)}`,
+      }}
+    />,
+  );
+  const alert = view.getByRole("alert");
+  expect(alert.textContent).toContain("[redacted]");
+  expect(alert.textContent).not.toContain("s".repeat(80));
+  expect(Array.from(alert.textContent ?? "").length).toBeLessThanOrEqual(240);
 });
