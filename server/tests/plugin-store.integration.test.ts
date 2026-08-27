@@ -412,11 +412,11 @@ describe("the trail says what happened, not what was permitted", () => {
 
     const failed = mine.filter((row) => row.eventType === "mcp.call_failed");
     expect(failed.length).toBe(1);
-    // The reason travels with the row. For a 403 this is where the vendor names the API that is not
-    // enabled, which is the sentence that turns a guess into a fix.
-    expect((failed[0].payload as { failure?: string }).failure).toContain(
-      "connected",
+    // The class travels with the row, while the actor-facing vendor sentence stays out of audit.
+    expect((failed[0].payload as { failureClass?: string }).failureClass).toBe(
+      "refused",
     );
+    expect(JSON.stringify(failed[0].payload)).not.toContain("connected");
 
     // The point of the whole test: nothing claims this worked.
     expect(

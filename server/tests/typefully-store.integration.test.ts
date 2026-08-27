@@ -1074,4 +1074,282 @@ describe("owned local Typefully drafts", () => {
       ]);
     }
   });
+
+  test("reclaims expired update and remove leases but quarantines expired create and upload attempts", async () => {
+    const instant = new Date("2026-08-27T12:00:00.000Z");
+    const remoteCalls: string[] = [];
+    const leaseStore = createTypefullyStore({
+      database,
+      auditStore: createAuditStore(database),
+      plugin: () => ({
+        decide: async () => ({ allowed: true }) as const,
+        dispatchVendor: async ({ ref }) => {
+          remoteCalls.push(ref);
+          return { text: JSON.stringify({ id: "801" }), isError: false };
+        },
+      }),
+      vendor: "typefully",
+      now: () => instant,
+      attemptLeaseMs: 1_000,
+    });
+
+    const updateDraft = await createOwnedDraft();
+    await leaseStore.recordRemoteConfirmation({
+      draftId: updateDraft.id,
+      actorId: ownerId,
+      expectedVersion: 1,
+      remoteDraftId: "801",
+    });
+    const updateRevision = await leaseStore.saveDraft({
+      draftId: updateDraft.id,
+      actorId: ownerId,
+      expectedVersion: 1,
+      document: {
+        ...document("Expired update lease"),
+        socialSetId: "12",
+      },
+    });
+    const expiredUpdateId = randomUUID();
+    await database
+      .update(typefullyDrafts)
+      .set({
+        attemptId: expiredUpdateId,
+        attemptKind: "update_draft",
+        attemptState: "in_flight",
+        attemptVersion: updateRevision.version,
+        attemptHash: updateRevision.contentHash,
+        attemptRemoteDraftId: "801",
+        attemptLeaseExpiresAt: new Date(instant.getTime() - 1),
+        syncStatus: "syncing",
+      })
+      .where(eq(typefullyDrafts.id, updateDraft.id));
+    const updated = await leaseStore.syncDraft({
+      draftId: updateDraft.id,
+      actorId: ownerId,
+    });
+    expect(updated.draft).toMatchObject({
+      syncStatus: "synced",
+      attemptId: null,
+      remoteDraftId: "801",
+    });
+
+    const removeDraft = await createOwnedDraft();
+    const expiredRemoveId = randomUUID();
+    await database
+      .update(typefullyDrafts)
+      .set({
+        attemptId: expiredRemoveId,
+        attemptKind: "remove_media",
+        attemptState: "in_flight",
+        attemptVersion: removeDraft.version,
+        attemptHash: removeDraft.contentHash,
+        attemptLeaseExpiresAt: new Date(instant.getTime() - 1),
+        syncStatus: "syncing",
+      })
+      .where(eq(typefullyDrafts.id, removeDraft.id));
+    const reclaimedRemove = await leaseStore.beginMediaAttempt({
+      draftId: removeDraft.id,
+      actorId: ownerId,
+      toolName: "remove_media",
+      expectedVersion: removeDraft.version,
+      expectedHash: removeDraft.contentHash,
+    });
+    expect(reclaimedRemove.attemptId).not.toBe(expiredRemoveId);
+    expect(reclaimedRemove.draft.attemptKind).toBe("remove_media");
+
+    for (const kind of ["create_draft", "upload_media"] as const) {
+      const uncertainDraft = await createOwnedDraft();
+      const expiredAttemptId = randomUUID();
+      await database
+        .update(typefullyDrafts)
+        .set({
+          attemptId: expiredAttemptId,
+          attemptKind: kind,
+          attemptState: "in_flight",
+          attemptVersion: uncertainDraft.version,
+          attemptHash: uncertainDraft.contentHash,
+          attemptLeaseExpiresAt: new Date(instant.getTime() - 1),
+          syncStatus: "syncing",
+        })
+        .where(eq(typefullyDrafts.id, uncertainDraft.id));
+      const operation =
+        kind === "create_draft"
+          ? leaseStore.syncDraft({
+              draftId: uncertainDraft.id,
+              actorId: ownerId,
+            })
+          : leaseStore.beginMediaAttempt({
+              draftId: uncertainDraft.id,
+              actorId: ownerId,
+              toolName: "upload_media",
+              expectedVersion: uncertainDraft.version,
+              expectedHash: uncertainDraft.contentHash,
+            });
+      await expect(operation).rejects.toMatchObject({
+        code: "reconciliation_required",
+        draftId: uncertainDraft.id,
+      });
+      expect(
+        await leaseStore.readDraft(uncertainDraft.id, ownerId),
+      ).toMatchObject({
+        attemptId: expiredAttemptId,
+        attemptKind: kind,
+        attemptState: "outcome_uncertain",
+        syncStatus: "remote_error",
+      });
+    }
+    expect(remoteCalls).toEqual(["typefully/update_draft"]);
+  });
+
+  test("an active lease blocks and an old attempt result cannot overwrite its replacement", async () => {
+    const current = await createOwnedDraft();
+    const activeStore = createTypefullyStore({
+      database,
+      auditStore: createAuditStore(database),
+      plugin: () => ({
+        decide: async () => ({ allowed: true }) as const,
+        dispatchVendor: async () => ({ text: '{"id":"802"}', isError: false }),
+      }),
+      vendor: "typefully",
+      now: () => new Date("2026-08-27T12:00:00.000Z"),
+      attemptLeaseMs: 60_000,
+    });
+    const old = await activeStore.beginMediaAttempt({
+      draftId: current.id,
+      actorId: ownerId,
+      toolName: "remove_media",
+      expectedVersion: current.version,
+      expectedHash: current.contentHash,
+    });
+    await expect(
+      activeStore.syncDraft({ draftId: current.id, actorId: ownerId }),
+    ).rejects.toMatchObject({ code: "sync_in_progress" });
+
+    const replacementAttemptId = randomUUID();
+    await database
+      .update(typefullyDrafts)
+      .set({ attemptId: replacementAttemptId, attemptKind: "update_draft" })
+      .where(eq(typefullyDrafts.id, current.id));
+    await expect(
+      activeStore.recordRemoteConfirmation({
+        draftId: current.id,
+        actorId: ownerId,
+        expectedVersion: current.version,
+        expectedHash: current.contentHash,
+        remoteDraftId: "802",
+        attemptId: old.attemptId,
+      }),
+    ).rejects.toBeInstanceOf(Error);
+    expect(await activeStore.readDraft(current.id, ownerId)).toMatchObject({
+      attemptId: replacementAttemptId,
+      remoteDraftId: null,
+    });
+  });
+
+  test("only the owner can attach a valid id to an uncertain create", async () => {
+    const current = await createOwnedDraft();
+    await database
+      .update(typefullyDrafts)
+      .set({
+        attemptId: randomUUID(),
+        attemptKind: "create_draft",
+        attemptState: "outcome_uncertain",
+        attemptVersion: current.version,
+        attemptHash: current.contentHash,
+        attemptLeaseExpiresAt: new Date(),
+        syncStatus: "remote_error",
+      })
+      .where(eq(typefullyDrafts.id, current.id));
+
+    await expect(
+      store.reconcileUncertainCreate({
+        draftId: current.id,
+        actorId: otherId,
+        expectedVersion: 1,
+        remoteDraftId: "803",
+      }),
+    ).rejects.toMatchObject({ code: "draft_not_found", status: 404 });
+    for (const remoteDraftId of ["0", "9007199254740992", "../803"]) {
+      await expect(
+        store.reconcileUncertainCreate({
+          draftId: current.id,
+          actorId: ownerId,
+          expectedVersion: 1,
+          remoteDraftId,
+        }),
+      ).rejects.toMatchObject({
+        code: "invalid_remote_draft_id",
+        status: 400,
+      });
+    }
+    expect(await store.readDraft(current.id, ownerId)).toMatchObject({
+      remoteDraftId: null,
+      attemptState: "outcome_uncertain",
+    });
+  });
+
+  test("a create completed during authorization becomes a confirmed no-op instead of a duplicate", async () => {
+    const current = await store.createDraft({
+      ownerUserId: ownerId,
+      channelId,
+      botId,
+      document: { ...document(), socialSetId: "12" },
+    });
+    draftIds.push(current.id);
+    const winnerCalls: string[] = [];
+    const winner = createTypefullyStore({
+      database,
+      auditStore: createAuditStore(database),
+      plugin: () => ({
+        decide: async () => ({ allowed: true }) as const,
+        dispatchVendor: async ({ ref }) => {
+          winnerCalls.push(ref);
+          return { text: '{"id":"804"}', isError: false };
+        },
+      }),
+      vendor: "typefully",
+    });
+    const contenderCalls: string[] = [];
+    let raced = false;
+    const contender = createTypefullyStore({
+      database,
+      auditStore: createAuditStore(database),
+      plugin: () => ({
+        decide: async () => {
+          if (!raced) {
+            raced = true;
+            await winner.syncDraft({
+              draftId: current.id,
+              actorId: ownerId,
+            });
+          }
+          return { allowed: true } as const;
+        },
+        dispatchVendor: async ({ ref }) => {
+          contenderCalls.push(ref);
+          return { text: '{"id":"805"}', isError: false };
+        },
+      }),
+      vendor: "typefully",
+    });
+
+    const racedResult = await contender.syncDraft({
+      draftId: current.id,
+      actorId: ownerId,
+    });
+    expect(racedResult.draft).toMatchObject({
+      remoteDraftId: "804",
+      remoteVersion: 1,
+      syncStatus: "synced",
+    });
+    expect(winnerCalls).toEqual(["typefully/create_draft"]);
+    expect(contenderCalls).toEqual([]);
+
+    const confirmedNoop = await contender.syncDraft({
+      draftId: current.id,
+      actorId: ownerId,
+    });
+    expect(confirmedNoop.draft.remoteDraftId).toBe("804");
+    expect(contenderCalls).toEqual([]);
+  });
 });

@@ -524,6 +524,7 @@ export function createTypefullyStore(options: {
   ): Promise<
     | { kind: "noop"; draft: TypefullyDraft }
     | { kind: "claimed"; draft: TypefullyDraft; attemptId: string }
+    | { kind: "uncertain"; draft: TypefullyDraft }
   > {
     return database.transaction(async (transaction) => {
       let current = await lockedOwnedDraft(transaction, authorized.id, actorId);
@@ -559,7 +560,9 @@ export function createTypefullyStore(options: {
             )
             .returning(draftSelection);
           if (uncertain) current = asDraft(uncertain);
-          throw new ReconciliationRequiredError(current.id);
+          // Surface reconciliation only after this transaction commits; throwing here would roll
+          // the quarantine write back and make the unsafe create look retryable again.
+          return { kind: "uncertain", draft: current };
         }
         const [reclaimed] = await transaction
           .update(typefullyDrafts)
@@ -968,6 +971,7 @@ export function createTypefullyStore(options: {
       let claim:
         | { kind: "noop"; draft: TypefullyDraft }
         | { kind: "claimed"; draft: TypefullyDraft; attemptId: string }
+        | { kind: "uncertain"; draft: TypefullyDraft }
         | null = null;
       for (let pass = 0; pass < 2; pass += 1) {
         authorized = await store.authorizeRemoteOperation(input);
@@ -1001,6 +1005,9 @@ export function createTypefullyStore(options: {
         }
       }
       if (!authorized || !claim) throw new SyncInProgressError();
+      if (claim.kind === "uncertain") {
+        throw new ReconciliationRequiredError(claim.draft.id);
+      }
       if (claim.kind === "noop") {
         return {
           draft: claim.draft,
@@ -1185,12 +1192,13 @@ export function createTypefullyStore(options: {
       expectedHash: string;
     }): Promise<{ draft: TypefullyDraft; attemptId: string }> {
       await store.authorizeTool(input);
-      return database.transaction(async (transaction) => {
+      const outcome = await database.transaction(async (transaction) => {
         const current = await lockedOwnedDraft(
           transaction,
           input.draftId,
           input.actorId,
         );
+        const instant = now();
         if (
           current.version !== input.expectedVersion ||
           current.contentHash !== input.expectedHash
@@ -1198,12 +1206,45 @@ export function createTypefullyStore(options: {
           throw new VersionConflictError(current.version, current.contentHash);
         }
         if (current.attemptId !== null) {
-          if (
-            input.toolName !== "remove_media" ||
-            current.attemptKind !== "upload_media" ||
-            current.attemptState !== "outcome_uncertain"
-          )
-            throw new SyncInProgressError();
+          const reconcilesUncertainUpload =
+            input.toolName === "remove_media" &&
+            current.attemptKind === "upload_media" &&
+            current.attemptState === "outcome_uncertain";
+          if (!reconcilesUncertainUpload) {
+            if (current.attemptState === "outcome_uncertain") {
+              throw new ReconciliationRequiredError(current.id);
+            }
+            if (
+              current.attemptLeaseExpiresAt !== null &&
+              current.attemptLeaseExpiresAt.getTime() > instant.getTime()
+            ) {
+              throw new SyncInProgressError();
+            }
+            if (
+              current.attemptKind === "create_draft" ||
+              current.attemptKind === "upload_media"
+            ) {
+              const [uncertain] = await transaction
+                .update(typefullyDrafts)
+                .set({
+                  attemptState: "outcome_uncertain",
+                  syncStatus: "remote_error",
+                  lastError:
+                    "The previous remote operation may have completed and must be reconciled before retrying.",
+                  updatedAt: instant,
+                })
+                .where(
+                  and(
+                    eq(typefullyDrafts.id, current.id),
+                    eq(typefullyDrafts.attemptId, current.attemptId),
+                  ),
+                )
+                .returning(draftSelection);
+              if (!uncertain) throw new SyncInProgressError();
+              // As in draft sync, commit the quarantine before surfacing reconciliation.
+              return { kind: "uncertain" as const, draft: asDraft(uncertain) };
+            }
+          }
           await transaction
             .update(typefullyDrafts)
             .set(clearedAttempt)
@@ -1215,7 +1256,6 @@ export function createTypefullyStore(options: {
             );
         }
         const attemptId = randomUUID();
-        const instant = now();
         const [row] = await transaction
           .update(typefullyDrafts)
           .set({
@@ -1240,8 +1280,12 @@ export function createTypefullyStore(options: {
           )
           .returning(draftSelection);
         if (!row) throw new SyncInProgressError();
-        return { draft: asDraft(row), attemptId };
+        return { kind: "claimed" as const, draft: asDraft(row), attemptId };
       });
+      if (outcome.kind === "uncertain") {
+        throw new ReconciliationRequiredError(outcome.draft.id);
+      }
+      return { draft: outcome.draft, attemptId: outcome.attemptId };
     },
 
     async markMediaOutcomeUncertain(input: {

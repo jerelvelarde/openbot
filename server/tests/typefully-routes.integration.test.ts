@@ -4,7 +4,7 @@ import { and, eq, inArray } from "drizzle-orm";
 import { Hono, type MiddlewareHandler } from "hono";
 import { mintRunAssertion } from "../src/agents/callback-token";
 import { createApp } from "../src/app";
-import { createAuditStore } from "../src/audit";
+import { createAuditStore, type TransactionalAuditStore } from "../src/audit";
 import type { AppVariables } from "../src/auth/guards";
 import { loadConfig } from "../src/config";
 import { createDatabase } from "../src/db/client";
@@ -337,6 +337,139 @@ describe("Typefully draft routes", () => {
       id: createdSummary.id,
       version: 2,
     });
+  });
+
+  test("outcome-audit failure cannot turn completed local or vendor work into a retryable failure", async () => {
+    const baseAudit = createAuditStore(database);
+    const failingOutcomeAudit: TransactionalAuditStore = {
+      insert: async () => {
+        throw new Error("audit storage unavailable");
+      },
+      inTransaction: baseAudit.inTransaction,
+    };
+    const remoteServerId = `audit-outcome-${suffix}`;
+    const remoteRef = `${remoteServerId}/mutate`;
+    await database.insert(mcpServers).values({
+      id: remoteServerId,
+      title: "Outcome audit fixture",
+      vendor: "test",
+      url: "https://vendor.invalid/mcp",
+      provenance: "custom",
+    });
+    await database.insert(mcpTools).values({
+      serverId: remoteServerId,
+      name: "mutate",
+      description: "Completes one remote mutation.",
+      inputSchema: { type: "object", additionalProperties: false },
+    });
+    await database.insert(pluginGrants).values({
+      kind: "mcp",
+      ref: remoteRef,
+      agentId: botId,
+    });
+    let vendorCalls = 0;
+    let privateVendorDispatch:
+      | ((input: {
+          ref: string;
+          args: Record<string, unknown>;
+          botId: string;
+          actorId: string;
+        }) => Promise<{ text: string; isError: boolean }>)
+      | undefined;
+    const hardened = createPluginStore({
+      database,
+      auditStore: failingOutcomeAudit,
+      credentials: {
+        readSecret: async () => null,
+        create: async () => {
+          throw new Error("not used");
+        },
+        updateSecret: async () => {
+          throw new Error("not used");
+        },
+        revoke: async () => new Date(),
+      },
+      encryptionKey: "x".repeat(44),
+      policy: () => ({ mode: "enforce", allow: ["true"], deny: [] }),
+      firstPartyTool: store.callBotTool,
+      callVendor: async () => {
+        vendorCalls += 1;
+        return {
+          text: JSON.stringify({ completed: vendorCalls }),
+          isError: false,
+        };
+      },
+      vendorDispatcherReady: (dispatch) => {
+        privateVendorDispatch = dispatch;
+      },
+    });
+    const originalConsoleError = console.error;
+    const operationalErrors: string[] = [];
+    console.error = (message?: unknown) => {
+      operationalErrors.push(String(message));
+    };
+    try {
+      const local = await hardened.callTool({
+        ref: "typefully/create_draft",
+        args: { channelId, document: document("Audit write failed locally") },
+        botId,
+        actorId: ownerId,
+        // Public, string-keyed flags are data only. They cannot select the private vendor path.
+        vendorDispatch: true,
+        __vendorDispatch: true,
+      } as Parameters<typeof hardened.callTool>[0]);
+      expect(local.isError).toBe(false);
+      const localId = JSON.parse(local.text).id as string;
+      draftIds.push(localId);
+      expect((await store.readDraft(localId, ownerId)).version).toBe(1);
+      expect(vendorCalls).toBe(0);
+
+      const remote = await hardened.callTool({
+        ref: remoteRef,
+        args: {},
+        botId,
+        actorId: ownerId,
+      });
+      expect(remote).toEqual({ text: '{"completed":1}', isError: false });
+      expect(vendorCalls).toBe(1);
+      expect(privateVendorDispatch).toBeDefined();
+      const closureResult = await privateVendorDispatch?.({
+        ref: remoteRef,
+        args: {},
+        botId,
+        actorId: ownerId,
+      });
+      expect(closureResult).toEqual({
+        text: '{"completed":2}',
+        isError: false,
+      });
+      expect(vendorCalls).toBe(2);
+
+      const auditRows = await database
+        .select({ eventType: auditEvents.eventType })
+        .from(auditEvents)
+        .where(eq(auditEvents.targetId, remoteRef));
+      expect(auditRows).toEqual([]);
+      expect(operationalErrors).toHaveLength(3);
+      for (const error of operationalErrors) {
+        expect(JSON.parse(error)).toMatchObject({
+          type: "mcp-outcome-audit-write-failed",
+          eventType: "mcp.call_succeeded",
+          failureClass: "Error",
+        });
+      }
+    } finally {
+      console.error = originalConsoleError;
+      await database
+        .delete(pluginGrants)
+        .where(eq(pluginGrants.ref, remoteRef));
+      await database
+        .delete(mcpTools)
+        .where(eq(mcpTools.serverId, remoteServerId));
+      await database
+        .delete(mcpServers)
+        .where(eq(mcpServers.id, remoteServerId));
+    }
   });
 
   test("the signed agent callback preserves actor and Bot identity for local drafts", async () => {
