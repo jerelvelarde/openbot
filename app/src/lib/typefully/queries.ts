@@ -479,7 +479,7 @@ export function draftQueryOptions(draftId: string) {
         },
       );
       const parsed = authoritativeDraftResponseSchema.safeParse(payload);
-      if (!parsed.success) {
+      if (!parsed.success || parsed.data.draft.id !== draftId) {
         throw new TypefullyClientError("remote_invalid_response");
       }
       return parsed.data;

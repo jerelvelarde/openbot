@@ -701,3 +701,38 @@ test("draft canvas refuses malformed successful payloads without rendering their
   );
   expect(view.container.textContent).not.toContain("must never render");
 });
+
+test("draft canvas refuses a different valid draft returned for the requested id", async () => {
+  const { DraftCanvas } = await import(
+    "../src/components/typefully/draft-canvas"
+  );
+  const { queryClient } = queryView(
+    (async () =>
+      new Response(
+        JSON.stringify({
+          draft: {
+            ...authoritativeDraft(),
+            id: "a2847b7f-1371-4fa7-88c8-aa80c610e50e",
+            document: {
+              ...authoritativeDraft().document,
+              posts: [{ id: "p1", x: "another owner's body", linkedin: "" }],
+            },
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )) as typeof fetch,
+  );
+  const view = render(
+    <QueryClientProvider client={queryClient}>
+      <DraftCanvas draftId={draftId} />
+    </QueryClientProvider>,
+  );
+
+  expect((await view.findByRole("alert")).textContent).toContain(
+    "could not load",
+  );
+  expect(view.container.textContent).not.toContain("another owner's body");
+  expect(queryClient.getQueryData(typefullyKeys.draft(draftId))).toBe(
+    undefined,
+  );
+});

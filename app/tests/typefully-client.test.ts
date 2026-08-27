@@ -97,9 +97,10 @@ async function mutate<TVariables>(
 
 describe("Typefully query contracts", () => {
   test("uses stable, secret-free keys and exact load routes", async () => {
+    const draftId = "8b1c61f1-2154-4a5d-8c9a-7c8df8f9ae53";
     const calls = capture({
       draft: authoritativeDraft(1, {
-        id: "8b1c61f1-2154-4a5d-8c9a-7c8df8f9ae53",
+        id: draftId,
       }),
     });
     expect(typefullyKeys.all).toEqual(["typefully"]);
@@ -116,13 +117,13 @@ describe("Typefully query contracts", () => {
     expect(typefullyKeys.lists()).toEqual(["typefully", "list"]);
 
     const abort = new AbortController();
-    await draftQueryOptions("draft/one").queryFn?.({
+    await draftQueryOptions(draftId).queryFn?.({
       signal: abort.signal,
     } as never);
     await proposalQueryOptions("proposal/one").queryFn?.({} as never);
 
     expect(calls.map(({ url, init }) => [url, init?.method ?? "GET"])).toEqual([
-      ["/api/typefully/drafts/draft%2Fone", "GET"],
+      [`/api/typefully/drafts/${draftId}`, "GET"],
       ["/api/typefully/proposals/proposal%2Fone", "GET"],
     ]);
     expect(calls[0]?.init?.signal).toBe(abort.signal);
@@ -179,6 +180,39 @@ describe("Typefully query contracts", () => {
     expect(await draftQueryOptions(valid.id).queryFn?.({} as never)).toEqual({
       draft: valid,
     });
+  });
+
+  test("rejects a valid-shaped draft returned for a different requested id without caching or leaking ids", async () => {
+    const requestedId = "8b1c61f1-2154-4a5d-8c9a-7c8df8f9ae53";
+    const returnedId = "a2847b7f-1371-4fa7-88c8-aa80c610e50e";
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    capture({
+      draft: authoritativeDraft(1, {
+        id: returnedId,
+        document: {
+          ...document,
+          posts: [{ id: "p1", x: "private", linkedin: "" }],
+        },
+      }),
+    });
+
+    const error = await queryClient
+      .fetchQuery(draftQueryOptions(requestedId))
+      .then(() => null)
+      .catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(TypefullyClientError);
+    expect((error as TypefullyClientError).code).toBe(
+      "remote_invalid_response",
+    );
+    expect((error as Error).message).not.toContain(requestedId);
+    expect((error as Error).message).not.toContain(returnedId);
+    expect((error as Error).message).not.toContain("private");
+    expect(queryClient.getQueryData(typefullyKeys.draft(requestedId))).toBe(
+      undefined,
+    );
   });
 });
 
@@ -1273,15 +1307,16 @@ describe("Typefully mutation contracts", () => {
 
   test("invalidates and refetches media errors without a draft summary", async () => {
     for (const operation of ["upload", "delete"] as const) {
+      const draftId = "8b1c61f1-2154-4a5d-8c9a-7c8df8f9ae53";
       const queryClient = new QueryClient({
         defaultOptions: {
           mutations: { retry: false },
           queries: { retry: false },
         },
       });
-      queryClient.setQueryData(typefullyKeys.draft("draft-1"), {
+      queryClient.setQueryData(typefullyKeys.draft(draftId), {
         draft: {
-          id: "draft-1",
+          id: draftId,
           document,
           version: 1,
           contentHash: "old",
@@ -1313,7 +1348,7 @@ describe("Typefully mutation contracts", () => {
         );
         await expect(
           observer.mutate({
-            draftId: "draft-1",
+            draftId,
             expectedVersion: 1,
             kind: "image",
             altText: "Launch",
@@ -1327,33 +1362,32 @@ describe("Typefully mutation contracts", () => {
         );
         await expect(
           observer.mutate({
-            draftId: "draft-1",
+            draftId,
             mediaId: "media-1",
             expectedVersion: 1,
           }),
         ).rejects.toBeInstanceOf(TypefullyClientError);
       }
       expect(
-        queryClient.getQueryState(typefullyKeys.draft("draft-1"))
-          ?.isInvalidated,
+        queryClient.getQueryState(typefullyKeys.draft(draftId))?.isInvalidated,
       ).toBe(true);
 
       globalThis.fetch = (async () =>
         json({
           draft: {
             ...(
-              queryClient.getQueryData(typefullyKeys.draft("draft-1")) as {
+              queryClient.getQueryData(typefullyKeys.draft(draftId)) as {
                 draft: Record<string, unknown>;
               }
             ).draft,
-            id: "8b1c61f1-2154-4a5d-8c9a-7c8df8f9ae53",
+            id: draftId,
             version: 7,
             syncStatus: "connection_required",
           },
         })) as typeof fetch;
-      await queryClient.fetchQuery(draftQueryOptions("draft-1"));
+      await queryClient.fetchQuery(draftQueryOptions(draftId));
       expect(
-        queryClient.getQueryData(typefullyKeys.draft("draft-1")),
+        queryClient.getQueryData(typefullyKeys.draft(draftId)),
       ).toMatchObject({ draft: { version: 7 } });
     }
   });
