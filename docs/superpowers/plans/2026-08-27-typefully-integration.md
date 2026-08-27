@@ -27,6 +27,7 @@
 - Modify: `server/src/db/schema/plugins.ts`
 - Create: `server/src/db/schema/typefully.ts`
 - Modify: `server/src/db/schema/index.ts`
+- Modify: `server/drizzle.config.ts`
 - Create via Drizzle: `server/drizzle/0021_*.sql`
 - Create via Drizzle: `server/drizzle/meta/0021_snapshot.json`
 - Modify via Drizzle: `server/drizzle/meta/_journal.json`
@@ -142,7 +143,7 @@ Define `typefullyPublicationProposals` with UUID id, draft/owner/bot/channel ide
 - a `CHECK` limiting status to `pending|declined|expired|published|failed|unknown`;
 - positive draft versions.
 
-Export the schema from `server/src/db/schema/index.ts`.
+Export the schema from `server/src/db/schema/index.ts` and add `./src/db/schema/typefully.ts` to the explicit schema list in `server/drizzle.config.ts` so Drizzle generation sees it.
 
 - [ ] **Step 5: Generate and inspect migration 0021**
 
@@ -159,7 +160,7 @@ Expected: PASS.
 - [ ] **Step 7: Commit the schema slice**
 
 ```bash
-git add server/src/db/schema/core.ts server/src/db/schema/plugins.ts server/src/db/schema/typefully.ts server/src/db/schema/index.ts server/drizzle server/tests/typefully-schema.integration.test.ts server/tests/migration-journal.test.ts
+git add server/src/db/schema/core.ts server/src/db/schema/plugins.ts server/src/db/schema/typefully.ts server/src/db/schema/index.ts server/drizzle.config.ts server/drizzle server/tests/typefully-schema.integration.test.ts server/tests/migration-journal.test.ts
 git commit -m "feat: add Typefully persistence schema"
 ```
 
