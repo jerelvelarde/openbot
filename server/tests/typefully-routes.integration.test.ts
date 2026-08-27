@@ -24,8 +24,8 @@ import {
   ConnectionRequiredError,
   createPluginStore,
 } from "../src/plugins/store";
-import { createTypefullyRoutes } from "../src/typefully/routes";
 import { PublicationVerificationError } from "../src/typefully/publication";
+import { createTypefullyRoutes } from "../src/typefully/routes";
 import { createTypefullyStore } from "../src/typefully/store";
 import { TEST_POOL } from "./support/database";
 import { testEnvironment } from "./support/environment";
@@ -200,6 +200,57 @@ async function createDraft() {
 }
 
 describe("Typefully draft routes", () => {
+  test("copies an owned draft with server-held provenance and current authorization", async () => {
+    const { body } = await createDraft();
+    const copiedDocument = document("Unsaved conflict copy");
+    const copy = async () =>
+      app.request(`/api/typefully/drafts/${body.draft.id}/copy`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ document: copiedDocument }),
+      });
+
+    actorId = outsiderId;
+    const hidden = await copy();
+    actorId = ownerId;
+    expect(hidden.status).toBe(404);
+
+    granted = false;
+    const blocked = await copy();
+    granted = true;
+    expect(blocked.status).toBe(403);
+    expect(await blocked.json()).toMatchObject({ code: "grant_required" });
+
+    await database
+      .delete(channelAgents)
+      .where(
+        and(
+          eq(channelAgents.channelId, channelId),
+          eq(channelAgents.agentId, botId),
+        ),
+      );
+    const detached = await copy();
+    await database.insert(channelAgents).values({ channelId, agentId: botId });
+    expect(detached.status).toBe(409);
+    expect(await detached.json()).toMatchObject({ code: "bot_not_attached" });
+
+    const response = await copy();
+    expect(response.status).toBe(201);
+    const result = (await response.json()) as {
+      draft: { id: string; version: number; syncStatus: string };
+    };
+    draftIds.push(result.draft.id);
+    expect(result.draft).toMatchObject({ version: 1, syncStatus: "local" });
+    const source = await store.readDraft(body.draft.id, ownerId);
+    const copied = await store.readDraft(result.draft.id, ownerId);
+    expect(copied).toMatchObject({
+      ownerUserId: ownerId,
+      channelId: source.channelId,
+      botId: source.botId,
+      document: copiedDocument,
+    });
+  });
+
   test("proposal routes prepare, privately load, and publish only after the human endpoint", async () => {
     const { body } = await createDraft();
     const local = await store.readDraft(body.draft.id, ownerId);

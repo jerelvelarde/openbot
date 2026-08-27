@@ -1,11 +1,14 @@
 import { type KeyboardEvent, useId, useRef, useState } from "react";
+import { type AutosaveSnapshot, canPublish } from "@/lib/typefully/autosave";
 import type {
   AuthoritativeDraft,
+  CanonicalDraftDocument,
   DraftSyncStatus,
   TypefullyDestination,
 } from "@/lib/typefully/queries";
-
-type Viewport = "desktop" | "mobile";
+import { DraftEditor } from "./draft-editor";
+import { MediaEditor, type MediaItemState } from "./media-editor";
+import { PlatformPreview, type PreviewViewport } from "./platform-preview";
 
 const SYNC_LABELS: Record<DraftSyncStatus, string> = {
   local: "Saved in OpenBot",
@@ -15,15 +18,6 @@ const SYNC_LABELS: Record<DraftSyncStatus, string> = {
   remote_error: "Not saved to Typefully",
   grant_blocked: "Typefully access unavailable",
 };
-
-const READINESS_LABELS: Record<Exclude<DraftSyncStatus, "synced">, string> = {
-  local: "Sync to Typefully before requesting approval",
-  syncing: "Wait for saving to finish",
-  connection_required: "Connect Typefully before requesting approval",
-  remote_error: "Resolve the Typefully sync error before requesting approval",
-  grant_blocked: "Typefully access is required before requesting approval",
-};
-
 const PLATFORM_LABELS: Record<TypefullyDestination, string> = {
   x: "X",
   linkedin: "LinkedIn",
@@ -76,7 +70,6 @@ function Tabs<T extends string>({
     event.preventDefault();
     choose(next);
   };
-
   return (
     <div
       aria-label={label}
@@ -89,11 +82,7 @@ function Tabs<T extends string>({
           <button
             aria-controls={panelId(option.id)}
             aria-selected={active}
-            className={`h-8 flex-1 rounded-[8px] px-3 text-sm font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 motion-reduce:transition-none ${
-              active
-                ? "bg-card text-card-foreground shadow-sm"
-                : "bg-transparent"
-            }`}
+            className={`h-8 flex-1 rounded-[8px] px-3 text-sm font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 motion-reduce:transition-none ${active ? "bg-card text-card-foreground shadow-sm" : "bg-transparent"}`}
             id={`${idBase}-tab-${option.id}`}
             key={option.id}
             onClick={() => onSelect(option.id)}
@@ -121,62 +110,22 @@ function EmptyDestination() {
   );
 }
 
-function PostContent({
-  draft,
+function ReadOnlyPosts({
+  document,
   platform,
 }: {
-  draft: AuthoritativeDraft;
+  document: CanonicalDraftDocument;
   platform: TypefullyDestination;
 }) {
-  return draft.document.posts.length === 0 ? (
-    <p className="text-sm text-muted-foreground">No posts yet.</p>
-  ) : (
-    draft.document.posts.map((post, index) => (
-      <article
-        className="whitespace-pre-wrap rounded-[4px] bg-muted/65 px-3 py-2 text-sm leading-[22px]"
-        key={post.id}
-      >
-        <span className="sr-only">Post {index + 1}: </span>
-        {post[platform] || "No content for this destination."}
-      </article>
-    ))
-  );
-}
-
-function PreviewContent({
-  draft,
-  platform,
-}: {
-  draft: AuthoritativeDraft;
-  platform: TypefullyDestination | undefined;
-}) {
-  if (!platform) return <EmptyDestination />;
-  return (
-    <div className="rounded-[8px] border border-border bg-card p-4 text-card-foreground">
-      <div className="mb-3 flex items-center justify-between gap-2">
-        <strong className="text-sm font-medium">
-          {draft.document.accountLabel || "Typefully account"}
-        </strong>
-        <span className="rounded-full bg-muted/65 px-1.5 py-0.5 text-xs">
-          {PLATFORM_LABELS[platform]}
-        </span>
-      </div>
-      <div className="space-y-3">
-        {draft.document.posts.length === 0 ? (
-          <p className="text-sm text-muted-foreground">No posts to preview.</p>
-        ) : (
-          draft.document.posts.map((post) => (
-            <p
-              className="whitespace-pre-wrap text-sm leading-[22px]"
-              key={post.id}
-            >
-              {post[platform] || "No content for this destination."}
-            </p>
-          ))
-        )}
-      </div>
-    </div>
-  );
+  return document.posts.map((post, index) => (
+    <article
+      className="whitespace-pre-wrap rounded-[4px] bg-muted/65 px-3 py-2 text-sm leading-[22px]"
+      key={post.id}
+    >
+      <span className="sr-only">Post {index + 1}: </span>
+      {post[platform] || "No content for this destination."}
+    </article>
+  ));
 }
 
 /** Last-error display is bounded again at the browser boundary and removes credential-shaped data. */
@@ -185,15 +134,70 @@ export function safeDraftError(value: string): string {
     const point = character.codePointAt(0) ?? 0;
     return point < 32 || point === 127 ? " " : character;
   }).join("");
-  const redacted = withoutControls
-    .replace(/\bBearer\s+\S+/giu, "Bearer [redacted]")
-    .replace(/\b(api[ _-]?key|token|secret)\s*[:=]\s*\S+/giu, "$1: [redacted]")
-    .replace(/\b[A-Za-z0-9_-]{32,}\b/gu, "[redacted]");
-  return Array.from(redacted).slice(0, 240).join("");
+  return Array.from(
+    withoutControls
+      .replace(/\bBearer\s+\S+/giu, "Bearer [redacted]")
+      .replace(
+        /\b(api[ _-]?key|token|secret)\s*[:=]\s*\S+/giu,
+        "$1: [redacted]",
+      )
+      .replace(/\b[A-Za-z0-9_-]{32,}\b/gu, "[redacted]"),
+  )
+    .slice(0, 240)
+    .join("");
 }
 
-function publishReadiness(draft: AuthoritativeDraft): string {
-  if (draft.syncStatus !== "synced") return READINESS_LABELS[draft.syncStatus];
+function autosaveLabel(
+  snapshot: AutosaveSnapshot | undefined,
+  draft: AuthoritativeDraft,
+  mediaBusy: boolean,
+) {
+  if (mediaBusy) return "Saving…";
+  if (!snapshot) return SYNC_LABELS[draft.syncStatus];
+  if (snapshot.state.kind === "dirty" || snapshot.state.kind === "saving")
+    return "Saving…";
+  if (snapshot.state.kind === "conflict") return "Save conflict";
+  if (snapshot.state.kind === "error") return "Not saved to Typefully";
+  return snapshot.state.remote === "confirmed"
+    ? "Saved to Typefully"
+    : "Saved in OpenBot";
+}
+
+function readiness(
+  draft: AuthoritativeDraft,
+  document: CanonicalDraftDocument,
+  snapshot: AutosaveSnapshot | undefined,
+  mediaStates: Readonly<Record<string, MediaItemState>>,
+  mediaBusy: boolean,
+) {
+  if (
+    mediaBusy ||
+    document.media.some((item) => item.remoteId === null) ||
+    Object.values(mediaStates).some((state) => state.kind !== "ready")
+  )
+    return "Resolve media uploads before requesting approval";
+  if (snapshot) {
+    if (snapshot.state.kind === "dirty" || snapshot.state.kind === "saving")
+      return "Wait for saving to finish";
+    if (snapshot.state.kind === "conflict")
+      return "Resolve the save conflict before requesting approval";
+    if (snapshot.state.kind === "error")
+      return "Retry saving before requesting approval";
+    return canPublish(snapshot.state)
+      ? "Ready for approval"
+      : "Sync to Typefully before requesting approval";
+  }
+  if (draft.syncStatus !== "synced") {
+    const messages: Record<Exclude<DraftSyncStatus, "synced">, string> = {
+      local: "Sync to Typefully before requesting approval",
+      syncing: "Wait for saving to finish",
+      connection_required: "Connect Typefully before requesting approval",
+      remote_error:
+        "Resolve the Typefully sync error before requesting approval",
+      grant_blocked: "Typefully access is required before requesting approval",
+    };
+    return messages[draft.syncStatus];
+  }
   return draft.remoteDraftId !== null &&
     draft.remoteVersion === draft.version &&
     draft.remoteHash === draft.contentHash
@@ -201,11 +205,43 @@ function publishReadiness(draft: AuthoritativeDraft): string {
     : "Wait for Typefully confirmation before requesting approval";
 }
 
-export function CanvasShell({ draft }: { draft: AuthoritativeDraft }) {
-  const destinations = draft.document.destinations;
+export type CanvasShellProps = {
+  draft: AuthoritativeDraft;
+  document?: CanonicalDraftDocument;
+  autosave?: AutosaveSnapshot;
+  mediaStates?: Readonly<Record<string, MediaItemState>>;
+  localMediaUrls?: Readonly<Record<string, string>>;
+  mediaBusy?: boolean;
+  onTextChange?: (next: CanonicalDraftDocument) => void;
+  onMediaChange?: (next: CanonicalDraftDocument) => void;
+  onSelectMedia?: (files: File[]) => void;
+  onRetryMedia?: (mediaId: string) => void;
+  onRemoveMedia?: (mediaId: string) => void;
+  onReload?: () => void;
+  onSaveAsNew?: () => void;
+  onRetrySave?: () => void;
+};
+
+export function CanvasShell({
+  draft,
+  document = draft.document,
+  autosave,
+  mediaStates = {},
+  localMediaUrls = {},
+  mediaBusy = false,
+  onTextChange,
+  onMediaChange,
+  onSelectMedia,
+  onRetryMedia,
+  onRemoveMedia,
+  onReload,
+  onSaveAsNew,
+  onRetrySave,
+}: CanvasShellProps) {
+  const destinations = document.destinations;
   const [requestedPlatform, setRequestedPlatform] =
     useState<TypefullyDestination>(destinations[0] ?? "x");
-  const [viewport, setViewport] = useState<Viewport>("desktop");
+  const [viewport, setViewport] = useState<PreviewViewport>("desktop");
   const platform = destinations.includes(requestedPlatform)
     ? requestedPlatform
     : destinations[0];
@@ -221,7 +257,29 @@ export function CanvasShell({ draft }: { draft: AuthoritativeDraft }) {
   ] as const;
   const platformPanelId = (value: TypefullyDestination) =>
     `${platformBase}-panel-${value}`;
-  const viewportPanelId = (value: Viewport) => `${viewportBase}-panel-${value}`;
+  const viewportPanelId = (value: PreviewViewport) =>
+    `${viewportBase}-panel-${value}`;
+  const interactive = Boolean(
+    onTextChange &&
+      onMediaChange &&
+      onSelectMedia &&
+      onRetryMedia &&
+      onRemoveMedia,
+  );
+  const saveMessage =
+    autosave?.state.kind === "error"
+      ? autosave.state.message
+      : draft.syncStatus === "remote_error"
+        ? draft.lastError
+        : null;
+  const mediaDisabled =
+    mediaBusy ||
+    Boolean(
+      autosave &&
+        autosave.state.kind !== "idle" &&
+        autosave.state.kind !== "saved" &&
+        autosave.state.kind !== "error",
+    );
 
   return (
     <div
@@ -235,28 +293,61 @@ export function CanvasShell({ draft }: { draft: AuthoritativeDraft }) {
         >
           <div className="min-w-0">
             <p className="truncate text-sm font-medium">
-              {draft.document.title || "Untitled draft"}
+              {document.title || "Untitled draft"}
             </p>
-            <p className="text-xs text-muted-foreground" role="status">
-              {SYNC_LABELS[draft.syncStatus]} · Version {draft.version}
+            <p
+              aria-live="polite"
+              className="text-xs text-muted-foreground"
+              role="status"
+            >
+              {autosaveLabel(autosave, draft, mediaBusy)} · Version{" "}
+              {autosave?.target.version ?? draft.version}
             </p>
           </div>
           <span
             className="rounded-full bg-muted/65 px-1.5 py-0.5 text-xs"
             data-testid="publish-readiness"
           >
-            {publishReadiness(draft)} · Publishing approval is required
+            {readiness(draft, document, autosave, mediaStates, mediaBusy)} ·
+            Publishing approval is required
           </span>
-          {draft.syncStatus === "remote_error" && draft.lastError ? (
+          {saveMessage ? (
             <p
               className="w-full rounded-[4px] bg-destructive/10 px-3 py-2 text-xs text-destructive"
               role="alert"
             >
-              {safeDraftError(draft.lastError)}
+              {safeDraftError(saveMessage)}
             </p>
           ) : null}
+          {autosave?.state.kind === "conflict" ? (
+            <div className="flex w-full flex-wrap gap-2">
+              <button
+                className="rounded-[8px] border border-border bg-card px-3 py-2 text-sm"
+                onClick={onReload}
+                type="button"
+              >
+                Reload
+              </button>
+              <button
+                className="rounded-[8px] border border-border bg-card px-3 py-2 text-sm"
+                disabled={!onSaveAsNew}
+                onClick={onSaveAsNew}
+                type="button"
+              >
+                Save as new
+              </button>
+            </div>
+          ) : null}
+          {autosave?.state.kind === "error" ? (
+            <button
+              className="rounded-[8px] border border-border bg-card px-3 py-2 text-sm"
+              onClick={onRetrySave}
+              type="button"
+            >
+              Retry save
+            </button>
+          ) : null}
         </header>
-
         <div className="grid flex-1 gap-2 md:grid-cols-2">
           <section
             aria-label="Editing"
@@ -274,45 +365,68 @@ export function CanvasShell({ draft }: { draft: AuthoritativeDraft }) {
                 selected={platform}
               />
             ) : null}
-
             <div className="mt-4 space-y-4">
               <div>
                 <p className="text-[10px] uppercase tracking-[0.05em] text-muted-foreground">
                   Account
                 </p>
                 <p className="mt-1 text-sm">
-                  {draft.document.accountLabel || "No social set selected"}
+                  {document.accountLabel || "No social set selected"}
                 </p>
               </div>
               {platform ? (
-                <div className="space-y-2">
-                  {platformOptions.map((option) => (
-                    <div
-                      aria-labelledby={`${platformBase}-tab-${option.id}`}
-                      hidden={platform !== option.id}
-                      id={platformPanelId(option.id)}
-                      key={option.id}
-                      role="tabpanel"
-                    >
-                      <PostContent draft={draft} platform={option.id} />
-                    </div>
-                  ))}
-                </div>
+                platformOptions.map((option) => (
+                  <div
+                    aria-labelledby={`${platformBase}-tab-${option.id}`}
+                    hidden={platform !== option.id}
+                    id={platformPanelId(option.id)}
+                    key={option.id}
+                    role="tabpanel"
+                  >
+                    {interactive ? (
+                      <DraftEditor
+                        disabled={mediaBusy}
+                        document={document}
+                        onChange={onTextChange ?? (() => {})}
+                        platform={option.id}
+                      />
+                    ) : (
+                      <div className="space-y-2">
+                        <ReadOnlyPosts
+                          document={document}
+                          platform={option.id}
+                        />
+                      </div>
+                    )}
+                  </div>
+                ))
               ) : (
                 <EmptyDestination />
               )}
-              <p className="text-xs text-muted-foreground">
-                {draft.document.media.length} media attachment
-                {draft.document.media.length === 1 ? "" : "s"}
-              </p>
+              {interactive ? (
+                <div>
+                  <SectionTitle>Media</SectionTitle>
+                  <MediaEditor
+                    disabled={mediaDisabled}
+                    document={document}
+                    onChange={onMediaChange ?? (() => {})}
+                    onRemove={onRemoveMedia ?? (() => {})}
+                    onRetry={onRetryMedia ?? (() => {})}
+                    onSelect={onSelectMedia ?? (() => {})}
+                    states={mediaStates}
+                  />
+                </div>
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  {document.media.length} media attachment
+                  {document.media.length === 1 ? "" : "s"}
+                </p>
+              )}
             </div>
           </section>
-
           <section
             aria-label="Preview"
-            className={`w-full justify-self-center rounded-[8px] border-2 border-border bg-card/50 p-4 transition-[max-width] motion-reduce:transition-none ${
-              viewport === "mobile" ? "max-w-[360px]" : "max-w-none"
-            }`}
+            className={`w-full justify-self-center rounded-[8px] border-2 border-border bg-card/50 p-4 transition-[max-width] motion-reduce:transition-none ${viewport === "mobile" ? "max-w-[360px]" : "max-w-none"}`}
             data-testid="canvas-card"
           >
             <SectionTitle>Preview</SectionTitle>
@@ -324,7 +438,6 @@ export function CanvasShell({ draft }: { draft: AuthoritativeDraft }) {
               panelId={viewportPanelId}
               selected={viewport}
             />
-
             {viewportOptions.map((option) => (
               <div
                 aria-labelledby={`${viewportBase}-tab-${option.id}`}
@@ -334,7 +447,16 @@ export function CanvasShell({ draft }: { draft: AuthoritativeDraft }) {
                 key={option.id}
                 role="tabpanel"
               >
-                <PreviewContent draft={draft} platform={platform} />
+                {platform ? (
+                  <PlatformPreview
+                    document={document}
+                    localMediaUrls={localMediaUrls}
+                    platform={platform}
+                    viewport={option.id}
+                  />
+                ) : (
+                  <EmptyDestination />
+                )}
               </div>
             ))}
           </section>

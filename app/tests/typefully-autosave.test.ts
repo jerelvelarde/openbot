@@ -87,6 +87,54 @@ const newDraftResult = {
 };
 
 describe("Typefully autosave controller", () => {
+  test("rebinds an authoritative external media version without losing its remote confirmation", () => {
+    const controller = createAutosaveController({
+      initialDraftId: "draft-current",
+      initialDocument: base,
+      initialVersion: 1,
+      save: async () => saved(2),
+    });
+
+    controller.reload(
+      edited("media authority"),
+      3,
+      "draft-current",
+      "confirmed",
+    );
+
+    expect(controller.getSnapshot()).toMatchObject({
+      document: edited("media authority"),
+      target: { draftId: "draft-current", version: 3 },
+      state: { kind: "idle", version: 3, remote: "confirmed" },
+    });
+  });
+
+  test("retains a server-committed media document as retryable when remote confirmation fails", () => {
+    const controller = createAutosaveController({
+      initialDraftId: "draft-current",
+      initialDocument: base,
+      initialVersion: 1,
+      save: async () => saved(2),
+    });
+
+    controller.remoteFailed(
+      edited("committed locally"),
+      2,
+      new TypefullyClientError("remote_unavailable"),
+    );
+
+    expect(controller.getSnapshot()).toMatchObject({
+      document: edited("committed locally"),
+      target: { draftId: "draft-current", version: 2 },
+      state: {
+        kind: "error",
+        local: edited("committed locally"),
+        message: "Typefully is temporarily unavailable. Try again.",
+      },
+      actions: ["retry"],
+    });
+  });
+
   test("keeps snapshots stable between subscribed state transitions", () => {
     const timer = clock();
     const controller = createAutosaveController({

@@ -1,8 +1,10 @@
 import { mutationOptions, type QueryClient } from "@tanstack/react-query";
+import { ALLOWED_MEDIA_TYPES, MAX_MEDIA_BYTES } from "./preview";
 import {
   type AuthoritativeDraft,
   type CanonicalDraftDocument,
   type DraftSummary,
+  draftSummary,
   type ProposalStatus,
   type ProposalSummary,
   type PublicationProposal,
@@ -129,6 +131,31 @@ export function createDraftMutationOptions() {
   });
 }
 
+export function copyDraftMutationOptions() {
+  return mutationOptions({
+    mutationFn: async (input: {
+      sourceDraftId: string;
+      document: CanonicalDraftDocument;
+      signal?: AbortSignal;
+    }): Promise<{ draft: DraftSummary }> => {
+      const payload = await typefullyRequest<unknown>(
+        `/api/typefully/drafts/${encodeURIComponent(input.sourceDraftId)}/copy`,
+        {
+          method: "POST",
+          body: { document: input.document },
+          signal: input.signal,
+        },
+      );
+      const value =
+        payload && typeof payload === "object" && !Array.isArray(payload)
+          ? draftSummary((payload as Record<string, unknown>).draft)
+          : undefined;
+      if (!value) throw new TypefullyClientError("remote_invalid_response");
+      return { draft: value };
+    },
+  });
+}
+
 export function saveDraftMutationOptions(queryClient?: QueryClient) {
   return mutationOptions({
     mutationFn: (input: {
@@ -223,16 +250,6 @@ export function reconcileDraftMutationOptions(queryClient?: QueryClient) {
     },
   });
 }
-
-const MAX_MEDIA_BYTES = 25_000_000;
-const ALLOWED_MEDIA_TYPES = new Set([
-  "image/jpeg",
-  "image/png",
-  "image/webp",
-  "image/gif",
-  "video/mp4",
-  "video/quicktime",
-]);
 
 export function uploadMediaMutationOptions(queryClient?: QueryClient) {
   return mutationOptions({

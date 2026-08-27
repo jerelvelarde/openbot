@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { MutationObserver, QueryClient } from "@tanstack/react-query";
 import {
   connectTypefully,
+  copyDraftMutationOptions,
   createDraftMutationOptions,
   declineProposalMutationOptions,
   deleteMediaMutationOptions,
@@ -217,6 +218,28 @@ describe("Typefully query contracts", () => {
 });
 
 describe("Typefully mutation contracts", () => {
+  test("copies a conflict document through server-owned source provenance and validates the summary", async () => {
+    const calls = capture({ draft: draftSummary(1, "local") });
+    const result = await mutate(copyDraftMutationOptions(), {
+      sourceDraftId: "source/1",
+      document,
+    });
+
+    expect(result).toEqual({ draft: draftSummary(1, "local") });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toBe("/api/typefully/drafts/source%2F1/copy");
+    expect(calls[0]?.init?.method).toBe("POST");
+    expect(JSON.parse(String(calls[0]?.init?.body))).toEqual({ document });
+
+    capture({ draft: { ...draftSummary(1, "local"), id: "x".repeat(121) } });
+    await expect(
+      mutate(copyDraftMutationOptions(), {
+        sourceDraftId: "source-1",
+        document,
+      }),
+    ).rejects.toMatchObject({ code: "remote_invalid_response" });
+  });
+
   test("sends exact JSON routes and bodies", async () => {
     const calls = capture({
       proposal: {

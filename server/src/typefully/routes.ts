@@ -393,6 +393,24 @@ export function createTypefullyRoutes(
     }
   });
 
+  routes.post("/drafts/:id/copy", async (context) => {
+    const sourceDraftId = context.req.param("id");
+    try {
+      const body = await jsonBody(context);
+      const source = await store.readDraft(sourceDraftId, context.var.actor.id);
+      const copied = await store.createDraft({
+        ownerUserId: context.var.actor.id,
+        channelId: source.channelId,
+        botId: source.botId,
+        document: body.document,
+        requireGrant: true,
+      });
+      return context.json({ draft: summary(copied) }, 201);
+    } catch (error) {
+      return errorResponse(context, error, sourceDraftId);
+    }
+  });
+
   routes.get("/drafts/:id", async (context) => {
     try {
       const draft = await store.readDraft(

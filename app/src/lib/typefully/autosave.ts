@@ -316,9 +316,10 @@ export function createAutosaveController(options: AutosaveOptions) {
       pendingImmediate = true;
       runSave();
     },
-    reload(
+    remoteFailed(
       authoritative: CanonicalDraftDocument,
       currentVersion: number,
+      error: unknown,
       draftId = targetDraftId,
     ) {
       if (disposed) return;
@@ -336,7 +337,35 @@ export function createAutosaveController(options: AutosaveOptions) {
       document = authoritative;
       targetDraftId = draftId;
       version = currentVersion;
-      state = { kind: "idle", version, remote: "local" };
+      state = {
+        kind: "error",
+        local: authoritative,
+        message: safeSaveMessage(error),
+      };
+      emit();
+    },
+    reload(
+      authoritative: CanonicalDraftDocument,
+      currentVersion: number,
+      draftId = targetDraftId,
+      remote: "local" | "confirmed" = "local",
+    ) {
+      if (disposed) return;
+      clearTimer();
+      activeSave?.abort();
+      activeSave = undefined;
+      recoveryAbort?.abort();
+      recoveryAbort = undefined;
+      recoveryPromise = undefined;
+      recoveryToken = undefined;
+      recoveryFailed = false;
+      pending = false;
+      ready = false;
+      pendingImmediate = false;
+      document = authoritative;
+      targetDraftId = draftId;
+      version = currentVersion;
+      state = { kind: "idle", version, remote };
       emit();
     },
     saveAsNewDraft(): Promise<SaveAsNewDraftResult | undefined> | undefined {

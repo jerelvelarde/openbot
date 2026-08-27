@@ -277,7 +277,7 @@ const PROPOSAL_STATUSES = new Set<ProposalStatus>([
   "unknown",
 ]);
 
-function draftSummary(value: unknown): DraftSummary | undefined {
+export function draftSummary(value: unknown): DraftSummary | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value))
     return undefined;
   const item = value as Record<string, unknown>;

@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import { cleanup, render } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import type { AutosaveSnapshot } from "../src/lib/typefully/autosave";
 import type { AuthoritativeDraft } from "../src/lib/typefully/queries";
 
 beforeAll(() => GlobalRegistrator.register());
@@ -210,4 +211,81 @@ test("remote errors surface a bounded redacted authoritative detail", async () =
   expect(alert.textContent).toContain("[redacted]");
   expect(alert.textContent).not.toContain("s".repeat(80));
   expect(Array.from(alert.textContent ?? "").length).toBeLessThanOrEqual(240);
+});
+
+test("interactive canvas renders optimistic autosave and conflict recovery without enabling approval", async () => {
+  const { CanvasShell } = await import(
+    "../src/components/typefully/canvas-shell"
+  );
+  const originalPost = draft.document.posts[0];
+  if (!originalPost) throw new Error("Expected the canonical post fixture.");
+  const optimistic = {
+    ...draft.document,
+    posts: [{ ...originalPost, x: "Unsaved local text" }],
+  };
+  const snapshot: AutosaveSnapshot = {
+    document: optimistic,
+    state: { kind: "dirty", baseVersion: draft.version },
+    target: { draftId: draft.id, version: draft.version },
+    createdDraft: null,
+    actions: [],
+  };
+  const callbacks = {
+    onTextChange: () => {},
+    onMediaChange: () => {},
+    onSelectMedia: () => {},
+    onRetryMedia: () => {},
+    onRemoveMedia: () => {},
+  };
+  const view = render(
+    <CanvasShell
+      autosave={snapshot}
+      document={optimistic}
+      draft={draft}
+      {...callbacks}
+    />,
+  );
+
+  expect(
+    (view.getByRole("textbox", { name: "X post 1" }) as HTMLTextAreaElement)
+      .value,
+  ).toBe("Unsaved local text");
+  expect(view.getByRole("status").textContent).toContain("Saving…");
+  expect(view.getByTestId("publish-readiness").textContent).toContain(
+    "Wait for saving",
+  );
+
+  view.rerender(
+    <CanvasShell
+      autosave={{
+        ...snapshot,
+        state: {
+          kind: "conflict",
+          local: optimistic,
+          currentVersion: draft.version + 1,
+        },
+        actions: ["reload", "saveAsNewDraft"],
+      }}
+      document={optimistic}
+      draft={draft}
+      onReload={() => {}}
+      onSaveAsNew={() => {}}
+      {...callbacks}
+    />,
+  );
+  expect(
+    (view.getByRole("textbox", { name: "X post 1" }) as HTMLTextAreaElement)
+      .value,
+  ).toBe("Unsaved local text");
+  expect(
+    (view.getByRole("button", { name: "Reload" }) as HTMLButtonElement)
+      .disabled,
+  ).toBe(false);
+  expect(
+    (view.getByRole("button", { name: "Save as new" }) as HTMLButtonElement)
+      .disabled,
+  ).toBe(false);
+  expect(view.getByTestId("publish-readiness").textContent).toContain(
+    "Resolve the save conflict",
+  );
 });
