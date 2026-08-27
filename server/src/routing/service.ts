@@ -103,16 +103,10 @@ function displayName(name: string): string {
   return name.normalize("NFKC").trim().replace(/\s+/gu, " ");
 }
 
-function base64UrlUtf8(value: string): string {
-  const bytes = new TextEncoder().encode(value);
-  let binary = "";
-  for (let start = 0; start < bytes.length; start += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(start, start + 0x8000));
-  }
-  return btoa(binary)
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/g, "");
+function utf8Hex(value: string): string {
+  return [...new TextEncoder().encode(value)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 function codePointCompare(left: string, right: string): number {
@@ -160,7 +154,7 @@ function buildAliasIndex(roster: readonly AgentProfile[]): AliasIndex {
     const duplicates = byNormalizedName.get(normalized) ?? [];
     const label =
       duplicates.length > 1
-        ? `${displayName(profile.name)} (id ${base64UrlUtf8(profile.id)})`
+        ? `${displayName(profile.name)} (id ${utf8Hex(profile.id)})`
         : profile.name;
     labels.set(profile.id, label);
     addAlias(aliases, normalized, profile);
