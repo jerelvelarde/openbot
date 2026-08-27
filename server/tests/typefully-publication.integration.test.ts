@@ -1,7 +1,9 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { createAuditStore } from "../src/audit";
+import type { ActionPolicy } from "../src/computer/policy";
+import { createCredentialStore } from "../src/credentials";
 import { createDatabase } from "../src/db/client";
 import {
   agents,
@@ -9,10 +11,15 @@ import {
   channelAgents,
   channelMemberships,
   channels,
+  credentials,
+  mcpServers,
+  mcpTools,
+  mcpUserCredentials,
   typefullyDrafts,
   typefullyPublicationProposals,
   users,
 } from "../src/db/schema";
+import { createPluginStore } from "../src/plugins/store";
 import {
   createTypefullyStore,
   DraftNotFoundError,
@@ -340,6 +347,135 @@ describe("immutable Typefully publication proposals", () => {
     expect(publishCalls).toBe(1);
   });
 
+  test("expires and audits a proposal when its originating Bot detaches at claim time", async () => {
+    const draft = await syncedDraft();
+    const detachingStore = createTypefullyStore({
+      database,
+      auditStore: createAuditStore(database),
+      plugin: () => plugin,
+      publicationVendor: {
+        fetchDraft: async () => {
+          await database
+            .delete(channelAgents)
+            .where(
+              and(
+                eq(channelAgents.channelId, channelId),
+                eq(channelAgents.agentId, botId),
+              ),
+            );
+          return { document: remoteDocument };
+        },
+        publishDraft: async () => {
+          publishCalls += 1;
+          return { outcome: "published" as const };
+        },
+        reconcileDraft: async () => ({ outcome: "unknown" as const }),
+      },
+    });
+    const proposal = await detachingStore.prepareProposal({
+      draftId: draft.id,
+      actorId: ownerId,
+      expectedVersion: draft.version,
+    });
+    publishCalls = 0;
+    try {
+      await expect(
+        detachingStore.approveAndPublish({
+          proposalId: proposal.id,
+          actorId: ownerId,
+        }),
+      ).rejects.toMatchObject({ code: "proposal_changed" });
+      expect(publishCalls).toBe(0);
+      expect(await store.readProposal(proposal.id, ownerId)).toMatchObject({
+        status: "expired",
+      });
+      const audit = await proposalAudits(proposal.id);
+      expect(audit.map(({ payload }) => payload)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            decision: "publication_refused",
+            stage: "claim_attachment",
+            failureClass: "bot_detached",
+            reason: "bot_detached",
+            vendorWrite: "not_attempted",
+            outcome: "expired",
+            policy: expect.objectContaining({ decision: "allowed" }),
+          }),
+        ]),
+      );
+      expectAuditIsSafe(audit);
+    } finally {
+      await database
+        .insert(channelAgents)
+        .values({ channelId, agentId: botId })
+        .onConflictDoNothing();
+    }
+  });
+
+  test("keeps remote verification failures pending and audits only safe provenance", async () => {
+    for (const [failure, failureClass] of [
+      [
+        new DOMException(
+          "personal-key Approved exact content timed out",
+          "TimeoutError",
+        ),
+        "remote_timeout",
+      ],
+      [
+        new Error("vendor personal-key Approved exact content exploded"),
+        "remote_unavailable",
+      ],
+    ] as const) {
+      const draft = await syncedDraft();
+      const failingStore = createTypefullyStore({
+        database,
+        auditStore: createAuditStore(database),
+        plugin: () => plugin,
+        publicationVendor: {
+          fetchDraft: async () => {
+            throw failure;
+          },
+          publishDraft: async () => {
+            publishCalls += 1;
+            return { outcome: "published" as const };
+          },
+          reconcileDraft: async () => ({ outcome: "unknown" as const }),
+        },
+      });
+      const proposal = await failingStore.prepareProposal({
+        draftId: draft.id,
+        actorId: ownerId,
+        expectedVersion: draft.version,
+      });
+      publishCalls = 0;
+      await expect(
+        failingStore.approveAndPublish({
+          proposalId: proposal.id,
+          actorId: ownerId,
+        }),
+      ).rejects.toMatchObject({ failureClass });
+      expect(publishCalls).toBe(0);
+      expect(await store.readProposal(proposal.id, ownerId)).toMatchObject({
+        status: "pending",
+      });
+      const audit = await proposalAudits(proposal.id);
+      expect(audit.map(({ payload }) => payload)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            decision: "publication_refused",
+            stage: "remote_verification",
+            failureClass,
+            reason: failureClass,
+            vendorWrite: "not_attempted",
+            outcome: "pending",
+            policy: expect.objectContaining({ decision: "allowed" }),
+          }),
+        ]),
+      );
+      expectAuditIsSafe(audit);
+    }
+  });
+
   test("keeps an in-progress acknowledgement unknown and reconciles published without re-execution", async () => {
     const draft = await syncedDraft();
     const proposal = await store.prepareProposal({
@@ -457,8 +593,8 @@ describe("immutable Typefully publication proposals", () => {
     publishCalls = 0;
     for (const [code, failureClass] of [
       ["connection_required", "connection_required"],
-      ["grant_required", "grant_or_policy_refused"],
-      ["policy_denied", "grant_or_policy_refused"],
+      ["grant_required", "grant_missing"],
+      ["policy_denied", "policy_denied"],
     ] as const) {
       const draft = await syncedDraft();
       const proposal = await store.prepareProposal({
@@ -502,6 +638,237 @@ describe("immutable Typefully publication proposals", () => {
       }
     }
     expect(publishCalls).toBe(0);
+  });
+
+  test("preserves real grant and policy refusal provenance before and after claim", async () => {
+    const ref = "typefully/prepare_publication";
+    await database
+      .insert(mcpServers)
+      .values({
+        id: "typefully",
+        title: "Typefully",
+        vendor: "Typefully",
+        url: "https://api.typefully.com/v2",
+        provenance: "first-party",
+      })
+      .onConflictDoNothing();
+    await database
+      .insert(mcpTools)
+      .values({
+        serverId: "typefully",
+        name: "prepare_publication",
+        description: "Prepare publication",
+      })
+      .onConflictDoNothing();
+    let policy: ActionPolicy = {
+      mode: "enforce",
+      deny: [],
+      allow: ["true"],
+    };
+    const realPlugin = createPluginStore({
+      database,
+      auditStore: createAuditStore(database),
+      credentials: createCredentialStore(database),
+      encryptionKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      policy: () => policy,
+      validateUserApiKey: async () => ({
+        accountId: "publication-test",
+        accountLabel: "Publication test",
+        keyLabel: "test",
+      }),
+    });
+    await realPlugin.connectUserApiKey({
+      serverId: "typefully",
+      userId: ownerId,
+      apiKey: `tf-real-publication-${suffix}`,
+      by: ownerId,
+    });
+    await realPlugin.grant("mcp", ref, botId, ownerId);
+    let denyAfterVerification = false;
+    const realStore = createTypefullyStore({
+      database,
+      auditStore: createAuditStore(database),
+      plugin: () => realPlugin,
+      publicationVendor: {
+        fetchDraft: async () => {
+          if (denyAfterVerification) {
+            policy = {
+              mode: "enforce",
+              deny: ['mcp.tool == "publish_now"'],
+              allow: ["true"],
+            };
+          }
+          return { document: remoteDocument };
+        },
+        publishDraft: async () => {
+          publishCalls += 1;
+          return { outcome: "published" as const };
+        },
+        reconcileDraft: async () => ({ outcome: "unknown" as const }),
+      },
+    });
+    try {
+      const grantDraft = await syncedDraft();
+      const grantProposal = await realStore.prepareProposal({
+        draftId: grantDraft.id,
+        actorId: ownerId,
+        expectedVersion: grantDraft.version,
+      });
+      await realPlugin.revoke("mcp", ref, botId, ownerId);
+      await expect(
+        realStore.approveAndPublish({
+          proposalId: grantProposal.id,
+          actorId: ownerId,
+        }),
+      ).rejects.toMatchObject({ failureClass: "grant_missing" });
+      const grantAudit = await proposalAudits(grantProposal.id);
+      expect(grantAudit.map(({ payload }) => payload)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            stage: "preclaim_authorization",
+            failureClass: "grant_missing",
+            policy: expect.objectContaining({ decision: "not_evaluated" }),
+          }),
+        ]),
+      );
+
+      await realPlugin.grant("mcp", ref, botId, ownerId);
+      const credentialDraft = await syncedDraft();
+      const credentialProposal = await realStore.prepareProposal({
+        draftId: credentialDraft.id,
+        actorId: ownerId,
+        expectedVersion: credentialDraft.version,
+      });
+      await realPlugin.disconnectUserConnection({
+        serverId: "typefully",
+        userId: ownerId,
+        by: ownerId,
+      });
+      await expect(
+        realStore.approveAndPublish({
+          proposalId: credentialProposal.id,
+          actorId: ownerId,
+        }),
+      ).rejects.toMatchObject({ code: "connection_required" });
+      const credentialAudit = await proposalAudits(credentialProposal.id);
+      expect(credentialAudit.map(({ payload }) => payload)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            stage: "preclaim_authorization",
+            failureClass: "connection_required",
+            policy: expect.objectContaining({ decision: "not_evaluated" }),
+          }),
+        ]),
+      );
+      await realPlugin.connectUserApiKey({
+        serverId: "typefully",
+        userId: ownerId,
+        apiKey: `tf-real-publication-reconnected-${suffix}`,
+        by: ownerId,
+      });
+
+      const policyDraft = await syncedDraft();
+      const policyProposal = await realStore.prepareProposal({
+        draftId: policyDraft.id,
+        actorId: ownerId,
+        expectedVersion: policyDraft.version,
+      });
+      policy = {
+        mode: "enforce",
+        deny: ['mcp.tool == "publish_now"'],
+        allow: ["true"],
+      };
+      let denied: unknown;
+      try {
+        await realStore.approveAndPublish({
+          proposalId: policyProposal.id,
+          actorId: ownerId,
+        });
+      } catch (error) {
+        denied = error;
+      }
+      expect(denied).toMatchObject({ failureClass: "policy_denied" });
+      expect((denied as Error).message).not.toContain(
+        'mcp.tool == "publish_now"',
+      );
+      const policyAudit = await proposalAudits(policyProposal.id);
+      expect(policyAudit.map(({ payload }) => payload)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            stage: "preclaim_authorization",
+            failureClass: "policy_denied",
+            policy: {
+              operation: "publish_now",
+              matchedRule: 'mcp.tool == "publish_now"',
+              matchedRuleId: null,
+              source: "deny",
+              mode: "enforce",
+              effect: "write",
+              decision: "denied",
+            },
+          }),
+        ]),
+      );
+
+      policy = { mode: "enforce", deny: [], allow: ["true"] };
+      const postclaimDraft = await syncedDraft();
+      const postclaimProposal = await realStore.prepareProposal({
+        draftId: postclaimDraft.id,
+        actorId: ownerId,
+        expectedVersion: postclaimDraft.version,
+      });
+      publishCalls = 0;
+      denyAfterVerification = true;
+      await expect(
+        realStore.approveAndPublish({
+          proposalId: postclaimProposal.id,
+          actorId: ownerId,
+        }),
+      ).rejects.toMatchObject({ failureClass: "policy_denied" });
+      expect(publishCalls).toBe(0);
+      expect(
+        await store.readProposal(postclaimProposal.id, ownerId),
+      ).toMatchObject({ status: "unknown" });
+      const postclaimAudit = await proposalAudits(postclaimProposal.id);
+      expect(postclaimAudit.map(({ payload }) => payload)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            stage: "postclaim_authorization",
+            failureClass: "policy_denied",
+            vendorWrite: "not_attempted",
+            policy: expect.objectContaining({
+              matchedRule: 'mcp.tool == "publish_now"',
+              source: "deny",
+              decision: "denied",
+            }),
+          }),
+        ]),
+      );
+      expectAuditIsSafe([
+        grantAudit,
+        credentialAudit,
+        policyAudit,
+        postclaimAudit,
+      ]);
+    } finally {
+      await realPlugin.revoke("mcp", ref, botId, ownerId);
+      await database
+        .delete(mcpUserCredentials)
+        .where(
+          and(
+            eq(mcpUserCredentials.serverId, "typefully"),
+            eq(mcpUserCredentials.userId, ownerId),
+          ),
+        );
+      await database
+        .delete(credentials)
+        .where(
+          and(
+            eq(credentials.provider, "typefully"),
+            eq(credentials.keyId, ownerId),
+          ),
+        );
+    }
   });
 
   test("expires an unspent proposal without contacting Typefully", async () => {
@@ -634,7 +1001,7 @@ describe("immutable Typefully publication proposals", () => {
           expect.objectContaining({
             decision: "publication_refused",
             stage: "postclaim_authorization",
-            failureClass: "grant_or_policy_refused",
+            failureClass: "grant_missing",
             vendorWrite: "not_attempted",
             outcome: "unknown",
             policy: expect.objectContaining({

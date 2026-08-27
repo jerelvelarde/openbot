@@ -48,6 +48,53 @@ describe("Typefully publication manifest boundary", () => {
 });
 
 describe("server-only Typefully publication transport", () => {
+  test("classifies remote verification refusal and timeout without vendor text", async () => {
+    const refused = createTypefullyPublicationVendor(async () =>
+      Response.json(
+        { detail: "personal-key Approved exact content" },
+        { status: 403 },
+      ),
+    );
+    await expect(
+      refused.fetchDraft({
+        token: "personal-key",
+        socialSetId: 1,
+        remoteDraftId: 2,
+        destinations: ["x"],
+      }),
+    ).rejects.toMatchObject({
+      failureClass: "remote_refused",
+      message: "Typefully could not verify the reviewed draft. Try again.",
+    });
+
+    const timedOut = createTypefullyPublicationVendor(async () => {
+      throw new DOMException("personal-key", "TimeoutError");
+    });
+    await expect(
+      timedOut.fetchDraft({
+        token: "personal-key",
+        socialSetId: 1,
+        remoteDraftId: 2,
+        destinations: ["x"],
+      }),
+    ).rejects.toMatchObject({ failureClass: "remote_timeout" });
+
+    const unavailable = createTypefullyPublicationVendor(async () =>
+      Response.json(
+        { detail: "personal-key Approved exact content" },
+        { status: 503 },
+      ),
+    );
+    await expect(
+      unavailable.fetchDraft({
+        token: "personal-key",
+        socialSetId: 1,
+        remoteDraftId: 2,
+        destinations: ["x"],
+      }),
+    ).rejects.toMatchObject({ failureClass: "remote_unavailable" });
+  });
+
   test("uses the pinned v2 draft route and the reserved publish-at-now body", async () => {
     const requests: { url: string; init?: RequestInit }[] = [];
     const vendor = createTypefullyPublicationVendor(async (input, init) => {

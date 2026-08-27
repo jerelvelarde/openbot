@@ -18,6 +18,10 @@ import type {
   PluginDecision,
   PluginKind,
 } from "../plugins/store";
+import {
+  ConnectionRequiredError,
+  OperationAuthorizationError,
+} from "../plugins/store";
 import { typefullyBotContracts } from "../plugins/typefully-contracts";
 import {
   type CanonicalDraftDocument,
@@ -33,6 +37,7 @@ import {
   type PublicationOutcome,
   type PublicationProposal,
   type PublicationVendor,
+  PublicationVerificationError,
   proposalSummary,
   remoteMatchesSnapshot,
   safePublicationOutcome,
@@ -461,8 +466,13 @@ function publicationAuthorizationFailureClass(
   error: unknown,
 ):
   | "connection_required"
-  | "grant_or_policy_refused"
-  | "authorization_unavailable" {
+  | "grant_missing"
+  | "policy_denied"
+  | "operational_auth_failure" {
+  if (error instanceof ConnectionRequiredError) return "connection_required";
+  if (error instanceof OperationAuthorizationError) {
+    return error.failureClass;
+  }
   const code =
     error && typeof error === "object" && "code" in error
       ? String(error.code)
@@ -474,14 +484,31 @@ function publicationAuthorizationFailureClass(
   ) {
     return "connection_required";
   }
-  if (
-    code === "grant_required" ||
-    code === "policy_denied" ||
-    code === "authorization_denied"
-  ) {
-    return "grant_or_policy_refused";
+  if (code === "grant_required") return "grant_missing";
+  if (code === "policy_denied" || code === "authorization_denied") {
+    return "policy_denied";
   }
-  return "authorization_unavailable";
+  return "operational_auth_failure";
+}
+
+function publicationFailurePolicyAudit(error: unknown): PublicationPolicyAudit {
+  return error instanceof OperationAuthorizationError &&
+    error.authorizationDecision
+    ? publicationPolicyAudit(error.authorizationDecision, "publish_now")
+    : UNEVALUATED_PUBLISH_POLICY_AUDIT;
+}
+
+function publicationVerificationFailure(error: unknown) {
+  if (error instanceof PublicationVerificationError) {
+    return error.failureClass;
+  }
+  if (
+    error instanceof Error &&
+    (error.name === "TimeoutError" || error.name === "AbortError")
+  ) {
+    return "remote_timeout" as const;
+  }
+  return "remote_unavailable" as const;
 }
 
 function validRemoteDraftId(value: unknown): string {
@@ -747,14 +774,14 @@ export function createTypefullyStore(options: {
     actorId: string;
     operation: "prepare_publication" | "publish_now";
   }): Promise<{ token: string; policy: PublicationPolicyAudit }> {
-    const authorizeOperation = plugin().authorizeOperation;
-    if (!authorizeOperation) {
+    const authorizationSurface = plugin();
+    if (!authorizationSurface.authorizeOperation) {
       throw new GrantRequiredError(
         `${serverId}/prepare_publication`,
         "Typefully publication authorization is unavailable.",
       );
     }
-    const authorized = await authorizeOperation({
+    const authorized = await authorizationSurface.authorizeOperation({
       requiredGrantRef: `${serverId}/prepare_publication`,
       ref: `${serverId}/${input.operation}`,
       botId: input.botId,
@@ -797,7 +824,9 @@ export function createTypefullyStore(options: {
         | "local_revision"
         | "remote_revision"
         | "preclaim_authorization"
-        | "postclaim_authorization";
+        | "postclaim_authorization"
+        | "claim_attachment"
+        | "remote_verification";
       failureClass: string;
       outcome: "pending" | "expired" | "unknown";
       policy: PublicationPolicyAudit;
@@ -813,6 +842,7 @@ export function createTypefullyStore(options: {
       decision: input.decision,
       stage: input.stage,
       failureClass: input.failureClass,
+      reason: input.failureClass,
       outcome: input.outcome,
       vendorWrite: "not_attempted",
       policy: input.policy,
@@ -1384,15 +1414,30 @@ export function createTypefullyStore(options: {
           stage: "preclaim_authorization",
           failureClass: publicationAuthorizationFailureClass(error),
           outcome: "pending",
-          policy: UNEVALUATED_PUBLISH_POLICY_AUDIT,
+          policy: publicationFailurePolicyAudit(error),
         });
         throw error;
       }
       const identity = remotePublicationIdentity(draft);
-      const remote = await publicationVendor.fetchDraft({
-        token: authorized.token,
-        ...identity,
-      });
+      let remote: Awaited<ReturnType<PublicationVendor["fetchDraft"]>>;
+      try {
+        remote = await publicationVendor.fetchDraft({
+          token: authorized.token,
+          ...identity,
+        });
+      } catch (error) {
+        const failureClass = publicationVerificationFailure(error);
+        await auditPublicationRefusal(auditStore, proposal, input.actorId, {
+          decision: "publication_refused",
+          stage: "remote_verification",
+          failureClass,
+          outcome: "pending",
+          policy: authorized.policy,
+        });
+        throw error instanceof PublicationVerificationError
+          ? error
+          : new PublicationVerificationError(failureClass);
+      }
       if (
         !remoteMatchesSnapshot(
           remote.document,
@@ -1494,7 +1539,30 @@ export function createTypefullyStore(options: {
             locked.botId,
           ))
         ) {
-          throw changedProposalError();
+          const instant = now();
+          await transaction
+            .update(typefullyPublicationProposals)
+            .set({
+              status: "expired",
+              decidedAt: instant,
+              completedAt: instant,
+              failureDetail: "Originating Bot detached after review.",
+              updatedAt: instant,
+            })
+            .where(eq(typefullyPublicationProposals.id, locked.id));
+          await auditPublicationRefusal(
+            auditStore.inTransaction(transaction),
+            locked,
+            input.actorId,
+            {
+              decision: "publication_refused",
+              stage: "claim_attachment",
+              failureClass: "bot_detached",
+              outcome: "expired",
+              policy: authorized.policy,
+            },
+          );
+          return { kind: "changed" as const };
         }
         const instant = now();
         const [claimed] = await transaction
@@ -1569,7 +1637,7 @@ export function createTypefullyStore(options: {
           stage: "postclaim_authorization",
           failureClass: publicationAuthorizationFailureClass(error),
           outcome: "unknown",
-          policy: UNEVALUATED_PUBLISH_POLICY_AUDIT,
+          policy: publicationFailurePolicyAudit(error),
         });
         throw error;
       }

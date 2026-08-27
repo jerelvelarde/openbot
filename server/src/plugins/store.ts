@@ -4,6 +4,7 @@ import {
   type ActionPolicy,
   evaluateActionPolicy,
   type PolicyContext,
+  type PolicyDecision,
 } from "../computer/policy";
 import {
   type CredentialExecutor,
@@ -187,6 +188,33 @@ export class PluginRefusedError extends Error {
   ) {
     super(message);
     this.name = "PluginRefusedError";
+  }
+}
+
+export type OperationAuthorizationFailureClass =
+  | "grant_missing"
+  | "policy_denied"
+  | "operational_auth_failure";
+
+export type OperationAuthorizationDecision = Pick<
+  PolicyDecision,
+  "allowed" | "forward" | "mode" | "matched" | "source"
+>;
+
+/** Internal authorization provenance. Routes expose only the inherited bounded refusal message. */
+export class OperationAuthorizationError extends PluginRefusedError {
+  constructor(
+    readonly failureClass: OperationAuthorizationFailureClass,
+    readonly authorizationDecision: OperationAuthorizationDecision | null,
+  ) {
+    super(
+      failureClass === "policy_denied"
+        ? "This server operation is not permitted by policy."
+        : failureClass === "grant_missing"
+          ? "This Bot does not have the required server permission."
+          : "The server operation could not be authorized.",
+      null,
+    );
   }
 }
 
@@ -3414,15 +3442,36 @@ export function createPluginStore(options: PluginStoreOptions) {
         input.context.mcp.effect !== "write" ||
         !input.requiredGrantRef.startsWith(`${serverId}/`)
       ) {
-        throw new PluginRefusedError("The server operation is invalid.", null);
+        throw new OperationAuthorizationError("operational_auth_failure", null);
       }
       const grant = await this.decide(
         "mcp",
         input.requiredGrantRef,
         input.botId,
       );
-      if (!grant.allowed) throw new PluginRefusedError(grant.reason, null);
-      const { row, entry } = await requireServer(serverId);
+      if (!grant.allowed) {
+        throw new OperationAuthorizationError("grant_missing", null);
+      }
+      let resolved: Awaited<ReturnType<typeof requireServer>>;
+      try {
+        resolved = await requireServer(serverId);
+      } catch {
+        throw new OperationAuthorizationError("operational_auth_failure", null);
+      }
+      const { row, entry } = resolved;
+      let token: string | undefined;
+      try {
+        ({ token } = await connectionTokenFor(row, entry, input.actorId));
+      } catch (error) {
+        if (error instanceof ConnectionRequiredError) throw error;
+        if (error instanceof PluginRefusedError) {
+          throw new ConnectionRequiredError(serverId, entry?.title ?? serverId);
+        }
+        throw new OperationAuthorizationError("operational_auth_failure", null);
+      }
+      if (!token) {
+        throw new ConnectionRequiredError(serverId, entry?.title ?? serverId);
+      }
       const context: PolicyContext = {
         tool: { name: toolNameFor(input.ref) },
         bot: { id: input.botId },
@@ -3437,11 +3486,14 @@ export function createPluginStore(options: PluginStoreOptions) {
       };
       const decision = evaluateActionPolicy(options.policy(), context);
       if (!decision.forward) {
-        throw new PluginRefusedError(decision.reason, decision.matched);
+        throw new OperationAuthorizationError("policy_denied", {
+          allowed: decision.allowed,
+          forward: decision.forward,
+          mode: decision.mode,
+          matched: decision.matched,
+          source: decision.source,
+        });
       }
-      const { token } = await connectionTokenFor(row, entry, input.actorId);
-      if (!token)
-        throw new ConnectionRequiredError(serverId, entry?.title ?? serverId);
       return { token, decision };
     },
 

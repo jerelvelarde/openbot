@@ -59,6 +59,19 @@ export type PublicationVendor = {
   }): Promise<PublicationOutcome>;
 };
 
+export type PublicationVerificationFailureClass =
+  | "remote_timeout"
+  | "remote_refused"
+  | "remote_unavailable"
+  | "remote_invalid_response";
+
+export class PublicationVerificationError extends Error {
+  constructor(readonly failureClass: PublicationVerificationFailureClass) {
+    super("Typefully could not verify the reviewed draft. Try again.");
+    this.name = "PublicationVerificationError";
+  }
+}
+
 export class ProposalStateError extends Error {
   readonly status = 409 as const;
   constructor(

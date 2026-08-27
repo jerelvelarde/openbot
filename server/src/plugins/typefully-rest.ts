@@ -2,6 +2,7 @@ import type {
   PublicationOutcome,
   PublicationVendor,
 } from "../typefully/publication";
+import { PublicationVerificationError } from "../typefully/publication";
 import { MAX_RESULT_CHARS, type McpCallResult, type McpTool } from "./mcp";
 import {
   inputSchemaFor,
@@ -1018,11 +1019,19 @@ export function createTypefullyPublicationVendor(
       { maxBytes: TYPEFULLY_REMOVE_MEDIA_MAX_DRAFT_BYTES },
     );
     const result = "response" in raw ? responseResult(raw, input.token) : raw;
-    if (result.isError) throw new Error(result.text);
+    if (result.isError) {
+      const failureClass = result.text.includes("did not answer in time")
+        ? "remote_timeout"
+        : "response" in raw &&
+            DEFINITE_REFUSAL_STATUSES.has(raw.response.status)
+          ? "remote_refused"
+          : "remote_unavailable";
+      throw new PublicationVerificationError(failureClass);
+    }
     try {
       return JSON.parse(result.text) as unknown;
     } catch {
-      throw new Error("Typefully returned an unreadable draft.");
+      throw new PublicationVerificationError("remote_invalid_response");
     }
   }
 
