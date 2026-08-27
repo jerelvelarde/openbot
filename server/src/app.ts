@@ -42,6 +42,7 @@ import type { PluginStore } from "./plugins/store";
 import { REFUSAL_MARKER } from "./plugins/tools";
 import type { IntentRouter } from "./routing/classify";
 import { createRoutingRoutes } from "./routing/routes";
+import { createCoworkerRoutingService } from "./routing/service";
 import type { PackageStatusReader } from "./tenant-package";
 
 /**
@@ -678,29 +679,31 @@ export function createApp(
       app.route(
         "/api/route",
         createRoutingRoutes(
-          agentProfileStore,
-          intentRouter,
-          requireUser,
-          auditStore,
-          /*
-           * Which vendors each coworker holds tools for, so the router weighs what a coworker can
-           * reach and not only what somebody wrote it was for. Only when there is a plugin store to
-           * ask: a deployment with no connectors routes exactly as it did.
-           */
-          pluginStore
-            ? async (agentId) => {
-                const granted = await pluginStore.listForAgent(agentId);
-                return [
-                  ...new Set(
-                    granted.tools.map(
-                      (tool) =>
-                        tool.toolName.replace(/^mcp__/, "").split("__")[0] ??
-                        tool.toolName,
+          createCoworkerRoutingService({
+            store: agentProfileStore,
+            router: intentRouter,
+            auditStore,
+            /*
+             * Which vendors each coworker holds tools for, so the router weighs what a coworker can
+             * reach and not only what somebody wrote it was for. Only when there is a plugin store to
+             * ask: a deployment with no connectors routes exactly as it did.
+             */
+            reachableSystems: pluginStore
+              ? async (agentId) => {
+                  const granted = await pluginStore.listForAgent(agentId);
+                  return [
+                    ...new Set(
+                      granted.tools.map(
+                        (tool) =>
+                          tool.toolName.replace(/^mcp__/, "").split("__")[0] ??
+                          tool.toolName,
+                      ),
                     ),
-                  ),
-                ];
-              }
-            : undefined,
+                  ];
+                }
+              : undefined,
+          }),
+          requireUser,
         ),
       );
     }
