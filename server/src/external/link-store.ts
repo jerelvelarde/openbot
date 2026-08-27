@@ -1,7 +1,12 @@
 import { and, eq, isNull, sql } from "drizzle-orm";
 import type { AuditTransaction } from "../audit";
 import type { Database } from "../db/client";
-import { externalUserLinks, revokedAccess, users } from "../db/schema";
+import {
+  externalUserLinks,
+  revokedAccess,
+  userRoles,
+  users,
+} from "../db/schema";
 import type {
   ExternalProvider,
   ExternalProviderIdentity,
@@ -25,6 +30,15 @@ export type ExternalLinkStore = {
   link: (
     input: ExternalProviderIdentity & { openbotUserId: string },
   ) => Promise<ExternalUserLink>;
+};
+
+/** Fresh OpenBot authorization state for an external identity already stored in the database. */
+export type SlackActiveUserLinkStore = {
+  resolveActiveUser: (openbotUserId: string) => Promise<{
+    id: string;
+    name: string;
+    role: "admin" | "user";
+  } | null>;
 };
 
 export type ExternalLinkCreationStore = ExternalLinkStore & {
@@ -55,7 +69,7 @@ function asLink(row: typeof externalUserLinks.$inferSelect): ExternalUserLink {
 
 export function createExternalLinkStore(
   database: Database,
-): ExternalLinkCreationStore {
+): ExternalLinkCreationStore & SlackActiveUserLinkStore {
   async function find(
     provider: ExternalProvider,
     tenantId: string,
@@ -97,6 +111,36 @@ export function createExternalLinkStore(
       .limit(2);
 
     return rows.length === 1 ? rows[0] : null;
+  }
+
+  async function resolveActiveUser(openbotUserId: string): Promise<{
+    id: string;
+    name: string;
+    role: "admin" | "user";
+  } | null> {
+    const rows = await database
+      .select({
+        id: users.id,
+        name: sql<string>`coalesce(${users.name}, '')`,
+        role: userRoles.role,
+      })
+      .from(users)
+      .leftJoin(
+        revokedAccess,
+        eq(revokedAccess.email, sql`lower(${users.email})`),
+      )
+      .leftJoin(userRoles, eq(userRoles.userId, users.id))
+      .where(and(eq(users.id, openbotUserId), isNull(revokedAccess.email)));
+
+    const user = rows[0];
+    if (!user) return null;
+    const roles = rows.map((row) => row.role);
+    const role: "admin" | "user" | null = roles.includes("admin")
+      ? "admin"
+      : roles.includes("user")
+        ? "user"
+        : null;
+    return role ? { id: user.id, name: user.name, role } : null;
   }
 
   async function linkWithStatusWithin(
@@ -183,6 +227,7 @@ export function createExternalLinkStore(
   return {
     find,
     findVerifiedUserByEmail,
+    resolveActiveUser,
     link,
     linkWithStatus,
     linkWithStatusAndAudit,

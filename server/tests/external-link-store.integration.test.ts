@@ -2,7 +2,12 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { and, eq, inArray } from "drizzle-orm";
 import { createDatabase } from "../src/db/client";
-import { externalUserLinks, revokedAccess, users } from "../src/db/schema";
+import {
+  externalUserLinks,
+  revokedAccess,
+  userRoles,
+  users,
+} from "../src/db/schema";
 import { createExternalLinkStore } from "../src/external/link-store";
 import { TEST_POOL } from "./support/database";
 
@@ -429,5 +434,43 @@ describe("external user links", () => {
     });
 
     await expect(store.findVerifiedUserByEmail(address)).resolves.toBeNull();
+  });
+
+  test("reloads an active user with its effective role and refuses revoked or roleless accounts", async () => {
+    const adminId = userId("active_admin");
+    const rolelessId = userId("active_roleless");
+    const revokedId = userId("active_revoked");
+    const revokedEmail = email("active_revoked");
+    await Promise.all([
+      createUser({
+        id: adminId,
+        email: email("active_admin"),
+        name: "Active admin",
+      }),
+      createUser({
+        id: rolelessId,
+        email: email("active_roleless"),
+        name: "Roleless",
+      }),
+      createUser({ id: revokedId, email: revokedEmail, name: "Revoked" }),
+    ]);
+    await database.insert(userRoles).values([
+      { userId: adminId, role: "user" },
+      { userId: adminId, role: "admin" },
+      { userId: revokedId, role: "user" },
+    ]);
+    const normalizedRevokedEmail = revokedEmail.toLowerCase();
+    createdRevocations.push(normalizedRevokedEmail);
+    await database
+      .insert(revokedAccess)
+      .values({ email: normalizedRevokedEmail, revokedBy: "test" });
+
+    await expect(store.resolveActiveUser(adminId)).resolves.toEqual({
+      id: adminId,
+      name: "Active admin",
+      role: "admin",
+    });
+    await expect(store.resolveActiveUser(rolelessId)).resolves.toBeNull();
+    await expect(store.resolveActiveUser(revokedId)).resolves.toBeNull();
   });
 });
