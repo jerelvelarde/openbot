@@ -35,6 +35,27 @@ The compose file also defines optional SPIRE services. `start.sh` does not start
 5. Acting browser/file/MCP calls return to the server for authorization and audit.
 6. The server streams results back to the app and Intelligence thread.
 
+### Managed Slack flow
+
+OpenBot declares one adapter-free CopilotKit Channel named `openbot`. CopilotKit Intelligence owns
+the managed runner, Slack provider attachment, delivery, subscriptions, streaming, files,
+deduplication, and continuation rendering; no Slack credential enters the OpenBot process.
+
+For each Slack event, the server resolves the provider identity to an active OpenBot user before it
+runs a coworker. Provider tenant and user ids stay in a server-private execution context rather than
+the model prompt. The first message in a Slack thread is routed across only the coworkers that user
+may access, and the selected coworker is stored as an immutable thread binding. Later replies in the
+subscribed Slack thread use that coworker. Each speaker is resolved again as their own OpenBot actor,
+so the coworker's current visibility, tool grants, connector identity, policy, and audit attribution
+apply to the person making that turn rather than to the person who started the thread.
+
+Interactive approvals are durable continuations. A click is accepted only after OpenBot rechecks
+the live Slack identity, linked OpenBot user, immutable thread binding, and current coworker access;
+the continuation resumes once. Human control and secret entry use a sealed, ten-minute OpenBot link
+instead of collecting sensitive input in Slack.
+
+See [Slack](slack.md) for setup, limits, readiness, and the deployment smoke test.
+
 ## Browser action governance
 
 The computer itself does not decide policy. The server gateway is the action boundary:
@@ -186,3 +207,9 @@ Connector credentials are stored through the credential vault and referenced by 
 - Browser navigation allows `http` and `https`; cloud metadata addresses are refused under every configuration.
 - `AGENT_COMPUTER_ALLOW_PRIVATE_HOSTS=true` is for local development only, and a deployment running with `NODE_ENV=production` refuses to start while it is set.
 - Computer tokens and supervisor tokens must be long random values outside local development.
+- Managed Slack credentials live in CopilotKit Intelligence and are never configured or persisted
+  by OpenBot. Slack provider ids are external identity metadata, not OpenBot authorization ids.
+- A Slack turn and approval recheck the linked OpenBot user and coworker access. Acting tools still
+  cross the existing grant, policy, and audit boundaries; Slack does not provide a privileged path.
+- Passwords, one-time codes, card values, model keys, and connector credentials are entered only on
+  authenticated OpenBot pages, never in Slack or in a model prompt.
