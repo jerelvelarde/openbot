@@ -39,6 +39,17 @@ const summaryTitleSchema = z
     "The draft title must be at most 160 characters.",
   );
 
+const socialSetLabelSchema = z
+  .string()
+  .trim()
+  .refine(
+    (label) => Array.from(label).length <= 160,
+    "The social set label must be at most 160 characters.",
+  )
+  .transform((label) => label || undefined)
+  .nullable()
+  .optional();
+
 export const TypefullyDraftProps = z.strictObject({
   draftId: z.string().uuid(),
   title: summaryTitleSchema,
@@ -50,7 +61,7 @@ export const TypefullyDraftProps = z.strictObject({
       (destinations) => new Set(destinations).size === destinations.length,
       "Destinations must be unique.",
     ),
-  socialSetLabel: z.string().max(160).optional(),
+  socialSetLabel: socialSetLabelSchema,
   mediaCount: z.number().int().min(0).max(20),
   version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
   status: draftDisplayStatusSchema,

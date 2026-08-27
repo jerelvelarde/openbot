@@ -33,6 +33,33 @@ export const chatSearchSchema = z.object({
   /** Opens an owned Typefully draft in the shared detail pane. */
   draft: z.string().uuid().optional(),
 });
+export type ChannelSearch = z.infer<typeof chatSearchSchema>;
+export type ChannelPane = "settings" | "watch" | { draft: string } | null;
+
+/** One shared pane means every explicit pane transition clears both alternatives. */
+export function channelPaneSearch(
+  previous: ChannelSearch,
+  next: ChannelPane,
+): ChannelSearch {
+  return {
+    ...previous,
+    settings: next === "settings" ? true : undefined,
+    watch: next === "watch" ? true : undefined,
+    draft: typeof next === "object" && next !== null ? next.draft : undefined,
+  };
+}
+
+/** Automatic screen activity never displaces a pane the person already opened. */
+export function computerActivitySearch(previous: ChannelSearch): ChannelSearch {
+  if (
+    previous.draft !== undefined ||
+    previous.settings === true ||
+    previous.watch === true
+  ) {
+    return previous;
+  }
+  return channelPaneSearch(previous, "watch");
+}
 
 const EASE_OUT = [0.23, 1, 0.32, 1] as const;
 
@@ -79,7 +106,7 @@ function ComputerViewPanel({
 
 function RouteComponent() {
   const { channelId } = Route.useParams();
-  const { settings, watch } = Route.useSearch();
+  const { draft, settings, watch } = Route.useSearch();
   const channel = useQuery(channelQueryOptions(channelId));
   const navigate = Route.useNavigate();
   const isSettingsOpen = settings === true;
@@ -125,7 +152,7 @@ function RouteComponent() {
    * screen card in that panel. Nothing about a stuck Bot is actionable until this pane is open.
    */
   useEffect(() => {
-    if (!needsYou) return;
+    if (!needsYou || draft !== undefined) return;
     show("watch");
   });
 
@@ -139,25 +166,18 @@ function RouteComponent() {
       runEpoch.current = activity.epoch;
       if (dismissedEpoch.current === activity.epoch) return;
       navigate({
-        search: (previous) =>
-          previous.watch === true || previous.settings === true
-            ? previous
-            : { ...previous, settings: undefined, watch: true },
+        search: computerActivitySearch,
       });
     });
   }, [agentId, navigate]);
 
-  // Settings and watch share one pane; opening either clears the other URL flag.
+  // Draft, settings and watch share one pane; opening either control clears both alternatives.
   const show = (next: "settings" | "watch" | null) => {
     // Dismissal applies only to the current browser-activity run.
     if (next !== "watch" && isWatching)
       dismissedEpoch.current = runEpoch.current;
     return navigate({
-      search: (previous) => ({
-        ...previous,
-        settings: next === "settings" ? true : undefined,
-        watch: next === "watch" ? true : undefined,
-      }),
+      search: (previous) => channelPaneSearch(previous, next),
     });
   };
 

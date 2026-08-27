@@ -89,12 +89,25 @@ try {
   modules = {};
 }
 
-/**
- * Stable order is required because this list drives hook registration order.
- */
-export const GALLERY_COMPONENTS: GalleryComponent[] = Object.values(modules)
-  .flatMap((module) => module.GALLERY ?? [])
-  .sort((left, right) => left.name.localeCompare(right.name));
+/** Build the exact production registry and fail before duplicate names can overwrite each other. */
+export function buildGalleryComponents(
+  discovered: Record<string, { GALLERY?: GalleryComponent[] }>,
+): GalleryComponent[] {
+  const components = Object.values(discovered)
+    .flatMap((module) => module.GALLERY ?? [])
+    .sort((left, right) => left.name.localeCompare(right.name));
+  const names = new Set<string>();
+  for (const component of components) {
+    if (names.has(component.name)) {
+      throw new Error(`Duplicate gallery component name: ${component.name}`);
+    }
+    names.add(component.name);
+  }
+  return components;
+}
+
+/** Stable order is required because this list drives hook registration order. */
+export const GALLERY_COMPONENTS = buildGalleryComponents(modules);
 
 /** What the server is told exists. Deliberately not the schema or the renderer: it cannot use either. */
 export type GalleryManifestEntry = {

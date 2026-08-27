@@ -11,7 +11,12 @@ import {
 import { cleanup, render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ComponentType } from "react";
-import { chatSearchSchema } from "@/routes/_authed/_app/channel/$channelId";
+import { buildGalleryComponents } from "@/lib/copilot/gallery-registry";
+import {
+  channelPaneSearch,
+  chatSearchSchema,
+  computerActivitySearch,
+} from "@/routes/_authed/_app/channel/$channelId";
 
 const { GALLERY, TYPEFULLY_DRAFT_STATUSES } = await import(
   "@/components/gallery/typefully-draft"
@@ -28,7 +33,7 @@ const definition = GALLERY.find(
   (component) => component.name === "showTypefullyDraft",
 );
 
-function validArgs(status: string) {
+function validArgs(status: string, overrides: Record<string, unknown> = {}) {
   return {
     draftId,
     title: "Launch notes",
@@ -37,10 +42,14 @@ function validArgs(status: string) {
     mediaCount: 2,
     version: 7,
     status,
+    ...overrides,
   };
 }
 
-async function renderDefinition(status: string) {
+async function renderDefinition(
+  status: string,
+  overrides: Record<string, unknown> = {},
+) {
   if (!definition) throw new Error("showTypefullyDraft was not registered");
   const Component = definition.Component as ComponentType<
     Record<string, unknown>
@@ -49,7 +58,7 @@ async function renderDefinition(status: string) {
   const channel = createRoute({
     getParentRoute: () => root,
     path: "/channel/$channelId",
-    component: () => <Component {...validArgs(status)} />,
+    component: () => <Component {...validArgs(status, overrides)} />,
   });
   const router = createRouter({
     routeTree: root.addChildren([channel]),
@@ -123,12 +132,95 @@ test("registers the strict bounded summary contract and rejects forbidden data",
 });
 
 test("the production channel search schema preserves panels and accepts only a draft UUID", () => {
-  expect(
-    chatSearchSchema.parse({ settings: true, watch: true, draft: draftId }),
-  ).toEqual({ settings: true, watch: true, draft: draftId });
+  expect(chatSearchSchema.parse({ settings: true })).toEqual({
+    settings: true,
+  });
+  expect(chatSearchSchema.parse({ watch: true })).toEqual({ watch: true });
+  expect(chatSearchSchema.parse({ draft: draftId })).toEqual({
+    draft: draftId,
+  });
   expect(chatSearchSchema.safeParse({ draft: "not-a-uuid" }).success).toBe(
     false,
   );
+});
+
+test("normalizes canonical social-set labels without refusing the card", async () => {
+  for (const [label, expected] of [
+    [null, null],
+    [undefined, undefined],
+    ["  Product team  ", "Product team"],
+    ["   ", undefined],
+  ] as const) {
+    const args = validArgs("local");
+    if (label === undefined) delete args.socialSetLabel;
+    else args.socialSetLabel = label;
+    const parsed = definition?.parameters.safeParse(args);
+    expect(parsed?.success).toBe(true);
+    if (parsed?.success) expect(parsed.data.socialSetLabel).toBe(expected);
+  }
+
+  const canonicalNull = await renderDefinition("local", {
+    socialSetLabel: null,
+  });
+  expect(canonicalNull.getByText("Not selected")).toBeTruthy();
+  expect(canonicalNull.queryByText(/summary is unavailable/i)).toBeNull();
+});
+
+test("the shared pane transitions exclude draft, settings, and watch", () => {
+  const draft = { draft: draftId };
+  expect(channelPaneSearch(draft, "settings")).toEqual({
+    draft: undefined,
+    settings: true,
+    watch: undefined,
+  });
+  expect(channelPaneSearch(draft, "watch")).toEqual({
+    draft: undefined,
+    settings: undefined,
+    watch: true,
+  });
+  expect(channelPaneSearch({ settings: true }, { draft: draftId })).toEqual({
+    draft: draftId,
+    settings: undefined,
+    watch: undefined,
+  });
+
+  const protectedDraft = { draft: draftId };
+  expect(computerActivitySearch(protectedDraft)).toBe(protectedDraft);
+  expect(computerActivitySearch({})).toEqual({
+    draft: undefined,
+    settings: undefined,
+    watch: true,
+  });
+});
+
+test("the production Vite registry discovers Typefully exactly once and rejects duplicates", async () => {
+  const { createServer } = await import("vite");
+  const vite = await createServer({
+    appType: "custom",
+    optimizeDeps: { noDiscovery: true },
+    root: new URL("../", import.meta.url).pathname,
+    server: { middlewareMode: true },
+  });
+  try {
+    const production = (await vite.ssrLoadModule(
+      "/src/lib/copilot/gallery-registry.ts",
+    )) as { GALLERY_COMPONENTS: Array<{ name: string }> };
+    expect(
+      production.GALLERY_COMPONENTS.filter(
+        (component) => component.name === "showTypefullyDraft",
+      ),
+    ).toHaveLength(1);
+  } finally {
+    await vite.close();
+  }
+
+  if (!definition) throw new Error("showTypefullyDraft was not registered");
+  expect(() =>
+    buildGalleryComponents({
+      first: { GALLERY: [definition] },
+      second: { GALLERY: [definition] },
+    }),
+  ).toThrow(/duplicate gallery component name.*showTypefullyDraft/i);
 });
 
 test("renders every current server status through the registered component", async () => {
@@ -188,7 +280,7 @@ test("review is keyboard accessible and preserves safe search state for the same
   const router = createRouter({
     routeTree: root.addChildren([channel]),
     history: createMemoryHistory({
-      initialEntries: ["/channel/channel-1?settings=true&watch=true"],
+      initialEntries: ["/channel/channel-1?settings=true"],
     }),
   });
   await router.load();
@@ -228,7 +320,6 @@ test("review is keyboard accessible and preserves safe search state for the same
   await waitFor(() =>
     expect(router.state.location.search).toEqual({
       settings: true,
-      watch: true,
     }),
   );
   expect(router.state.location.pathname).toBe("/channel/channel-1");
