@@ -6,6 +6,7 @@ import {
   callTool,
   createTypefullyRestTransport,
   listTools,
+  TYPEFULLY_REMOVE_MEDIA_MAX_DRAFT_BYTES,
 } from "../src/plugins/typefully-rest";
 
 const connection = {
@@ -84,6 +85,12 @@ describe("the reviewed Typefully tool surface", () => {
       "delete_draft",
     ]);
     expect(tools.some((tool) => /publish/i.test(tool.name))).toBe(false);
+    const removeMedia = tools.find((tool) => tool.name === "remove_media");
+    expect(removeMedia?.description).toContain(
+      `${TYPEFULLY_REMOVE_MEDIA_MAX_DRAFT_BYTES / 1_000_000} MB`,
+    );
+    expect(removeMedia?.description).toMatch(/refus/i);
+    expect(TYPEFULLY_REMOVE_MEDIA_MAX_DRAFT_BYTES).toBe(1_000_000);
   });
 
   test("closes every model-controlled object schema", async () => {
@@ -338,12 +345,23 @@ describe("v2 request mapping", () => {
       platforms: {
         x: {
           enabled: true,
-          vendor_setting: { preserve: true },
+          vendor_setting: { response_only: true },
+          settings: {
+            reply_to_url: "https://x.com/example/status/1",
+            community_id: "community-1",
+            share_with_followers: true,
+            response_only: "omit",
+          },
           posts: [
             {
               text: '<typ:comment-thread id="c1">Keep marker</typ:comment-thread>',
               media_ids: ["target-media", "keep-media"],
               quote_post_url: "https://example.test/post",
+              subscribers_only: false,
+              paid_partnership: true,
+              made_with_ai: false,
+              hide_link_preview: true,
+              response_only: "omit",
             },
             { text: "Untouched post", media_ids: ["other-media"] },
           ],
@@ -399,19 +417,127 @@ describe("v2 request mapping", () => {
     const patched = JSON.parse(calls[1]?.body ?? "null");
     expect(Object.keys(patched)).toEqual(["platforms"]);
     expect(patched.platforms).toEqual({
-      ...authoritative.platforms,
       x: {
-        ...authoritative.platforms.x,
+        enabled: true,
         posts: [
           {
-            ...authoritative.platforms.x.posts[0],
+            text: '<typ:comment-thread id="c1">Keep marker</typ:comment-thread>',
             media_ids: ["keep-media"],
+            quote_post_url: "https://example.test/post",
+            subscribers_only: false,
+            paid_partnership: true,
+            made_with_ai: false,
+            hide_link_preview: true,
           },
-          authoritative.platforms.x.posts[1],
+          { text: "Untouched post", media_ids: ["other-media"] },
         ],
+        settings: {
+          reply_to_url: "https://x.com/example/status/1",
+          community_id: "community-1",
+          share_with_followers: true,
+        },
       },
     });
+    expect(Object.keys(patched.platforms)).toEqual(["x"]);
+    expect(JSON.stringify(patched)).not.toContain("response_only");
+    expect(JSON.stringify(patched)).not.toContain("future_platform");
     expect(JSON.stringify(patched)).not.toContain("publish_at");
+  });
+
+  test("remove_media renames the documented LinkedIn response reshare field", async () => {
+    const calls: FetchCall[] = [];
+    const fetch = (async (
+      requestInput: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      const headers = new Headers(init?.headers);
+      calls.push({
+        url: String(requestInput),
+        method: init?.method ?? "GET",
+        authorization: headers.get("authorization"),
+        contentType: headers.get("content-type"),
+        body: typeof init?.body === "string" ? init.body : null,
+        signal: init?.signal ?? null,
+      });
+      return calls.length === 1
+        ? new Response(
+            JSON.stringify({
+              platforms: {
+                linkedin: {
+                  enabled: true,
+                  response_only: "omit",
+                  settings: { response_only: "omit" },
+                  posts: [
+                    {
+                      text: "Keep LinkedIn text",
+                      media_ids: ["target-media", "keep-media"],
+                      linkedin_reshare_urn: "urn:li:share:123",
+                      hide_link_preview: false,
+                      response_only: "omit",
+                    },
+                  ],
+                },
+                x: { enabled: false },
+              },
+            }),
+          )
+        : new Response(JSON.stringify({ ok: true }));
+    }) as typeof globalThis.fetch;
+    const transport = createTypefullyRestTransport(fetch);
+
+    const result = await transport.callTool(connection, "remove_media", {
+      socialSetId: 12,
+      draftId: 34,
+      platform: "linkedin",
+      postIndex: 0,
+      mediaId: "target-media",
+    });
+
+    expect(result.isError).toBe(false);
+    expect(calls).toHaveLength(2);
+    expect(JSON.parse(calls[1]?.body ?? "null")).toEqual({
+      platforms: {
+        linkedin: {
+          enabled: true,
+          posts: [
+            {
+              text: "Keep LinkedIn text",
+              media_ids: ["keep-media"],
+              linkedin_reshare_target: "urn:li:share:123",
+              hide_link_preview: false,
+            },
+          ],
+        },
+      },
+    });
+  });
+
+  test("remove_media refuses malformed selected-platform responses without PATCHing", async () => {
+    const { fetch, calls } = recordingFetch({
+      body: {
+        platforms: {
+          x: {
+            enabled: true,
+            posts: [{ text: 42, media_ids: ["target-media", "keep-media"] }],
+          },
+        },
+      },
+    });
+    const transport = createTypefullyRestTransport(fetch);
+
+    const result = await transport.callTool(connection, "remove_media", {
+      socialSetId: 12,
+      draftId: 34,
+      platform: "x",
+      postIndex: 0,
+      mediaId: "target-media",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.text).toMatch(/could not be updated safely/i);
+    expect(result.text.length).toBeLessThan(500);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.method).toBe("GET");
   });
 
   test("remove_media refuses a missing target after the authoritative GET", async () => {
@@ -928,5 +1054,38 @@ describe("bounded and redacted failures", () => {
     expect(result.text).toContain("keep this");
     expect(result.text).toContain("[redacted]");
     expect(result.text).not.toContain(connection.token);
+  });
+
+  test("redacts a chunk-split token beyond the character cap in UTF-8 bytes", async () => {
+    const token = connection.token;
+    const reflected = `${"😀".repeat(19_970)}${token} safe-tail`;
+    const json = JSON.stringify({ reflected });
+    const encoder = new TextEncoder();
+    const bytes = encoder.encode(json);
+    const tokenStart = encoder.encode(
+      json.slice(0, json.indexOf(token)),
+    ).length;
+    const split = tokenStart + Math.floor(encoder.encode(token).length / 2);
+    const fetch = (async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(bytes.slice(0, split));
+            controller.enqueue(bytes.slice(split));
+            controller.close();
+          },
+        }),
+      )) as typeof globalThis.fetch;
+    const transport = createTypefullyRestTransport(fetch);
+
+    const result = await transport.callTool(connection, "list_social_sets", {});
+
+    expect(tokenStart).toBeGreaterThan(MAX_RESULT_CHARS);
+    expect(result.isError).toBe(false);
+    expect(result.truncated).toBe(true);
+    expect(result.text).toContain("[redacted]");
+    expect(result.text).not.toContain(token);
+    expect(result.text).not.toContain(token.slice(0, 6));
+    expect(result.text).not.toContain(token.slice(6));
   });
 });

@@ -10,9 +10,10 @@ import {
 const TYPEFULLY_API_URL = "https://api.typefully.com/v2";
 const REQUEST_TIMEOUT_MS = 30_000;
 const SAFE_MESSAGE_CHARS = 400;
-const SAFE_ERROR_BODY_BYTES = 8_192;
+const SAFE_ERROR_BODY_CHARS = 2_048;
 const RETRY_AFTER_CHARS = 120;
-const AUTHORITATIVE_DRAFT_BYTES = 1_000_000;
+const MAX_REDACTABLE_TOKEN_BYTES = 4_096;
+export const TYPEFULLY_REMOVE_MEDIA_MAX_DRAFT_BYTES = 1_000_000;
 
 type Connection = { url: string; token?: string };
 type FetchImplementation = typeof globalThis.fetch;
@@ -28,8 +29,7 @@ const TOOL_DESCRIPTIONS: Record<TypefullyToolName, string> = {
     "Update reviewed fields on a Typefully draft. This tool cannot publish immediately.",
   upload_media:
     "Request a presigned Typefully media-upload URL. This only initiates the upload and never accepts file bytes.",
-  remove_media:
-    "Remove one named media reference from an authoritative Typefully draft while preserving its other platform content.",
+  remove_media: `Remove one named media reference from an authoritative Typefully draft. For safety, this refuses draft responses larger than the ${TYPEFULLY_REMOVE_MEDIA_MAX_DRAFT_BYTES / 1_000_000} MB limit.`,
   schedule_draft:
     'Schedule a draft for a future ISO 8601 datetime or the next free slot. "now" is always refused.',
   delete_draft: "Delete one Typefully draft.",
@@ -66,15 +66,30 @@ function safeFailure(message: string): McpCallResult {
     .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ")
     .replace(/\s+/g, " ")
     .trim();
-  if (oneLine.length <= SAFE_MESSAGE_CHARS) return failure(oneLine);
+  const bounded = boundedCharacters(oneLine, SAFE_MESSAGE_CHARS);
+  if (!bounded.truncated) return failure(bounded.text);
   const suffix = " [truncated]";
   return failure(
-    `${oneLine.slice(0, SAFE_MESSAGE_CHARS - suffix.length)}${suffix}`,
+    `${boundedCharacters(oneLine, SAFE_MESSAGE_CHARS - suffix.length).text}${suffix}`,
     true,
   );
 }
 
 type SanitizedText = { text: string; truncated: boolean };
+
+function boundedCharacters(
+  value: string,
+  maxCharacters: number,
+): SanitizedText {
+  const characters = Array.from(value);
+  if (characters.length <= maxCharacters) {
+    return { text: value, truncated: false };
+  }
+  return {
+    text: characters.slice(0, maxCharacters).join(""),
+    truncated: true,
+  };
+}
 
 function sanitizeVendorText(
   value: string,
@@ -89,8 +104,7 @@ function sanitizeVendorText(
       .replace(/\s+/g, " ")
       .trim();
   }
-  if (text.length <= maxChars) return { text, truncated: false };
-  return { text: text.slice(0, maxChars), truncated: true };
+  return boundedCharacters(text, maxChars);
 }
 
 function truncationNotice(oneLine = false): string {
@@ -276,14 +290,21 @@ function decodeBody(
 }
 
 type RawResponse = { response: Response; body: BoundedBody };
+type SuccessBodyLimit = { maxCharacters: number } | { maxBytes: number };
 
 async function requestTypefully(
   fetchImplementation: FetchImplementation,
   timeoutMs: number,
   token: string,
   request: RequestSpec,
-  successBodyBytes = MAX_RESULT_CHARS,
+  successBodyLimit: SuccessBodyLimit = { maxCharacters: MAX_RESULT_CHARS },
 ): Promise<RawResponse | McpCallResult> {
+  const tokenBytes = new TextEncoder().encode(token).byteLength;
+  if (tokenBytes > MAX_REDACTABLE_TOKEN_BYTES) {
+    return failure(
+      "The personal Typefully credential is too large to handle safely. Reconnect the account with a valid API key.",
+    );
+  }
   const url = new URL(`${TYPEFULLY_API_URL}${request.path}`);
   for (const [key, value] of Object.entries(request.query ?? {})) {
     url.searchParams.set(key, value);
@@ -303,8 +324,10 @@ async function requestTypefully(
     });
     receivedHeaders = true;
     const bodyLimit = response.ok
-      ? successBodyBytes + token.length
-      : SAFE_ERROR_BODY_BYTES + token.length;
+      ? "maxBytes" in successBodyLimit
+        ? successBodyLimit.maxBytes
+        : successBodyLimit.maxCharacters * 4 + tokenBytes
+      : SAFE_ERROR_BODY_CHARS * 4 + tokenBytes;
     return {
       response,
       body: await readBoundedBody(response, bodyLimit),
@@ -377,6 +400,171 @@ function responseResult(raw: RawResponse, token: string): McpCallResult {
   return successfulBody(body, token);
 }
 
+type NormalizedPlatform = {
+  enabled: boolean;
+  posts?: Record<string, unknown>[];
+  settings?: Record<string, unknown>;
+};
+
+type NormalizedPlatformResult =
+  | { ok: true; platform: NormalizedPlatform }
+  | { ok: false };
+
+function copyOptionalString(
+  source: Record<string, unknown>,
+  sourceKey: string,
+  target: Record<string, unknown>,
+  targetKey = sourceKey,
+  maxCharacters = 2_048,
+): boolean {
+  if (!Object.hasOwn(source, sourceKey)) return true;
+  const value = source[sourceKey];
+  if (typeof value !== "string" || Array.from(value).length > maxCharacters) {
+    return false;
+  }
+  target[targetKey] = value;
+  return true;
+}
+
+function copyOptionalBoolean(
+  source: Record<string, unknown>,
+  key: string,
+  target: Record<string, unknown>,
+): boolean {
+  if (!Object.hasOwn(source, key)) return true;
+  const value = source[key];
+  if (typeof value !== "boolean") return false;
+  target[key] = value;
+  return true;
+}
+
+function normalizeResponsePost(
+  platformName: Extract<
+    TypefullyCall,
+    { toolName: "remove_media" }
+  >["args"]["platform"],
+  rawPost: unknown,
+): { ok: true; post: Record<string, unknown> } | { ok: false } {
+  if (!isRecord(rawPost)) return { ok: false };
+  if (
+    typeof rawPost.text !== "string" ||
+    Array.from(rawPost.text).length > 50_000
+  ) {
+    return { ok: false };
+  }
+  const post: Record<string, unknown> = { text: rawPost.text };
+  if (Object.hasOwn(rawPost, "media_ids")) {
+    if (
+      !Array.isArray(rawPost.media_ids) ||
+      rawPost.media_ids.length > 10 ||
+      rawPost.media_ids.some(
+        (mediaId) =>
+          typeof mediaId !== "string" ||
+          mediaId.length < 1 ||
+          Array.from(mediaId).length > 240,
+      )
+    ) {
+      return { ok: false };
+    }
+    post.media_ids = [...rawPost.media_ids];
+  }
+  if (!copyOptionalBoolean(rawPost, "hide_link_preview", post)) {
+    return { ok: false };
+  }
+
+  if (platformName === "x") {
+    if (
+      !copyOptionalString(rawPost, "quote_post_url", post) ||
+      !copyOptionalBoolean(rawPost, "subscribers_only", post) ||
+      !copyOptionalBoolean(rawPost, "paid_partnership", post) ||
+      !copyOptionalBoolean(rawPost, "made_with_ai", post)
+    ) {
+      return { ok: false };
+    }
+  }
+  if (
+    platformName === "linkedin" &&
+    !copyOptionalString(
+      rawPost,
+      "linkedin_reshare_urn",
+      post,
+      "linkedin_reshare_target",
+      1_024,
+    )
+  ) {
+    return { ok: false };
+  }
+  return { ok: true, post };
+}
+
+function normalizeResponseSettings(
+  platformName: Extract<
+    TypefullyCall,
+    { toolName: "remove_media" }
+  >["args"]["platform"],
+  rawSettings: unknown,
+): { ok: true; settings: Record<string, unknown> } | { ok: false } {
+  if (!isRecord(rawSettings)) return { ok: false };
+  const settings: Record<string, unknown> = {};
+  if (
+    platformName === "x" &&
+    (!copyOptionalString(rawSettings, "reply_to_url", settings) ||
+      !copyOptionalString(
+        rawSettings,
+        "community_id",
+        settings,
+        "community_id",
+        512,
+      ) ||
+      !copyOptionalBoolean(rawSettings, "share_with_followers", settings))
+  ) {
+    return { ok: false };
+  }
+  return { ok: true, settings };
+}
+
+function normalizeSelectedPlatform(
+  platformName: Extract<
+    TypefullyCall,
+    { toolName: "remove_media" }
+  >["args"]["platform"],
+  rawPlatform: unknown,
+): NormalizedPlatformResult {
+  if (!isRecord(rawPlatform) || typeof rawPlatform.enabled !== "boolean") {
+    return { ok: false };
+  }
+  const platform: NormalizedPlatform = { enabled: rawPlatform.enabled };
+  if (Object.hasOwn(rawPlatform, "posts")) {
+    if (
+      !Array.isArray(rawPlatform.posts) ||
+      rawPlatform.posts.length < 1 ||
+      rawPlatform.posts.length > 50
+    ) {
+      return { ok: false };
+    }
+    const posts: Record<string, unknown>[] = [];
+    for (const rawPost of rawPlatform.posts) {
+      const normalized = normalizeResponsePost(platformName, rawPost);
+      if (!normalized.ok) return normalized;
+      posts.push(normalized.post);
+    }
+    platform.posts = posts;
+  } else if (rawPlatform.enabled) {
+    return { ok: false };
+  }
+  if (Object.hasOwn(rawPlatform, "settings")) {
+    const normalized = normalizeResponseSettings(
+      platformName,
+      rawPlatform.settings,
+    );
+    if (!normalized.ok) return normalized;
+    if (Object.keys(normalized.settings).length > 0) {
+      platform.settings = normalized.settings;
+    }
+  }
+  return { ok: true, platform };
+}
+
 async function removeMedia(
   fetchImplementation: FetchImplementation,
   timeoutMs: number,
@@ -389,7 +577,7 @@ async function removeMedia(
     timeoutMs,
     token,
     { method: "GET", path },
-    AUTHORITATIVE_DRAFT_BYTES,
+    { maxBytes: TYPEFULLY_REMOVE_MEDIA_MAX_DRAFT_BYTES },
   );
   if (!("response" in fetched)) return fetched;
   if (!fetched.response.ok) return responseResult(fetched, token);
@@ -409,11 +597,19 @@ async function removeMedia(
   if (!isRecord(draft) || !isRecord(draft.platforms)) {
     return failure("Typefully returned a draft without a platforms object.");
   }
-  const platform = draft.platforms[call.args.platform];
-  if (!isRecord(platform) || !Array.isArray(platform.posts)) {
-    return failure("The selected platform has no posts in this draft.");
+  const normalized = normalizeSelectedPlatform(
+    call.args.platform,
+    draft.platforms[call.args.platform],
+  );
+  if (!normalized.ok) {
+    return failure(
+      "Typefully returned a selected platform that could not be updated safely.",
+    );
   }
-  const post = platform.posts[call.args.postIndex];
+  const posts = normalized.platform.posts;
+  if (!posts)
+    return failure("The selected platform has no posts in this draft.");
+  const post = posts[call.args.postIndex];
   if (!isRecord(post) || !Array.isArray(post.media_ids)) {
     return failure("The selected post has no attached media.");
   }
@@ -422,20 +618,7 @@ async function removeMedia(
     return failure("The named media is not attached to the selected post.");
   }
 
-  const preservedPlatforms = structuredClone(draft.platforms);
-  const preservedPlatform = preservedPlatforms[call.args.platform];
-  if (!isRecord(preservedPlatform) || !Array.isArray(preservedPlatform.posts)) {
-    return failure(
-      "Typefully returned a draft that could not be updated safely.",
-    );
-  }
-  const preservedPost = preservedPlatform.posts[call.args.postIndex];
-  if (!isRecord(preservedPost) || !Array.isArray(preservedPost.media_ids)) {
-    return failure(
-      "Typefully returned a draft that could not be updated safely.",
-    );
-  }
-  preservedPost.media_ids.splice(targetIndex, 1);
+  post.media_ids.splice(targetIndex, 1);
 
   const patched = await requestTypefully(
     fetchImplementation,
@@ -444,7 +627,9 @@ async function removeMedia(
     {
       method: "PATCH",
       path,
-      body: { platforms: preservedPlatforms },
+      body: {
+        platforms: { [call.args.platform]: normalized.platform },
+      },
     },
   );
   return "response" in patched ? responseResult(patched, token) : patched;
