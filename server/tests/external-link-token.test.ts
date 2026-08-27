@@ -15,11 +15,26 @@ const identity = {
   providerUserId: "U1",
   providerEmail: "person@example.com",
 };
+const VALID_NONCE = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
 
 async function expectInvalid(token: string, key = KEY, now = NOW) {
   await expect(readExternalLinkToken(token, key, now)).rejects.toThrow(INVALID);
   await expect(readExternalLinkToken(token, key, now)).rejects.toThrowError(
     new Error(INVALID),
+  );
+}
+
+async function sealForgedClaim(overrides: Record<string, unknown>) {
+  return seal(
+    JSON.stringify({
+      ...identity,
+      issuedAt: NOW,
+      expiresAt: NOW + EXTERNAL_LINK_TTL_MS,
+      nonce: VALID_NONCE,
+      ...overrides,
+    }),
+    KEY,
+    "external-link:v1",
   );
 }
 
@@ -136,12 +151,43 @@ describe("external Slack link tokens", () => {
         ...identity,
         issuedAt: NOW,
         expiresAt: NOW - 1,
-        nonce: "nonce",
+        nonce: VALID_NONCE,
       }),
       KEY,
       "external-link:v1",
     );
 
     await expectInvalid(token);
+  });
+
+  test.each([
+    ["a non-UUID nonce", { nonce: "nonce" }, NOW],
+    [
+      "an issued time after the reader clock",
+      { issuedAt: NOW + 1, expiresAt: NOW + EXTERNAL_LINK_TTL_MS + 1 },
+      NOW,
+    ],
+    [
+      "a lifetime longer than ten minutes",
+      { expiresAt: NOW + EXTERNAL_LINK_TTL_MS + 1 },
+      NOW,
+    ],
+    [
+      "a lifetime shorter than ten minutes",
+      { expiresAt: NOW + EXTERNAL_LINK_TTL_MS - 1 },
+      NOW,
+    ],
+    [
+      "a fractional issued time",
+      { issuedAt: NOW + 0.5, expiresAt: NOW + EXTERNAL_LINK_TTL_MS + 0.5 },
+      NOW + 1,
+    ],
+    [
+      "a fractional expiry time",
+      { expiresAt: NOW + EXTERNAL_LINK_TTL_MS + 0.5 },
+      NOW,
+    ],
+  ])("refuses a forged claim with %s", async (_reason, overrides, readNow) => {
+    await expectInvalid(await sealForgedClaim(overrides), KEY, readNow);
   });
 });
