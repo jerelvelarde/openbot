@@ -5,6 +5,7 @@ import {
   createTypefullyRestTransport,
   listTools,
 } from "../src/plugins/typefully-rest";
+import { remoteMatchesSnapshot } from "../src/typefully/publication";
 
 describe("Typefully publication manifest boundary", () => {
   test("offers reversible preparation but never a final publish operation", async () => {
@@ -56,7 +57,9 @@ describe("server-only Typefully publication transport", () => {
       }
       return Response.json({
         id: 42,
-        published_url: "https://typefully.com/t/42",
+        publish_state: "in_progress",
+        status: "draft",
+        published_url: null,
       });
     });
 
@@ -74,9 +77,10 @@ describe("server-only Typefully publication transport", () => {
         remoteDraftId: 42,
       }),
     ).toEqual({
-      outcome: "published",
+      outcome: "unknown",
       vendorResultId: "42",
-      publishedUrl: "https://typefully.com/t/42",
+      detail:
+        "Typefully is still publishing. Reconcile before taking any further action.",
     });
     expect(requests.map(({ url, init }) => [url, init?.method])).toEqual([
       ["https://api.typefully.com/v2/social-sets/7/drafts/42", "GET"],
@@ -111,13 +115,20 @@ describe("server-only Typefully publication transport", () => {
     ).toMatchObject({ outcome: "unknown" });
 
     const methods: string[] = [];
+    let reconcileStatus: "published" | "error" = "published";
     const reconciler = createTypefullyPublicationVendor(
       async (_input, init) => {
         methods.push(String(init?.method));
         return Response.json({
           id: 2,
-          status: "published",
-          published_url: "https://typefully.com/t/2",
+          publish_state: "finished",
+          status: reconcileStatus,
+          published_url:
+            reconcileStatus === "published"
+              ? "https://typefully.com/t/2"
+              : null,
+          error:
+            reconcileStatus === "error" ? "Vendor publication failed" : null,
         });
       },
     );
@@ -128,6 +139,130 @@ describe("server-only Typefully publication transport", () => {
         remoteDraftId: 2,
       }),
     ).toMatchObject({ outcome: "published", vendorResultId: "2" });
+    reconcileStatus = "error";
+    expect(
+      await reconciler.reconcileDraft({
+        token: "key",
+        socialSetId: 1,
+        remoteDraftId: 2,
+      }),
+    ).toMatchObject({
+      outcome: "failed",
+      detail: "Vendor publication failed",
+    });
+    expect(methods).toEqual(["GET", "GET"]);
+  });
+
+  test("keeps in-progress reconciliation unknown and never issues a second publish PATCH", async () => {
+    const methods: string[] = [];
+    const vendor = createTypefullyPublicationVendor(async (_input, init) => {
+      methods.push(String(init?.method));
+      return Response.json({
+        id: 2,
+        publish_state: "in_progress",
+        status: "draft",
+        published_url: null,
+      });
+    });
+    expect(
+      await vendor.reconcileDraft({
+        token: "key",
+        socialSetId: 1,
+        remoteDraftId: 2,
+      }),
+    ).toMatchObject({ outcome: "unknown" });
     expect(methods).toEqual(["GET"]);
+  });
+
+  test("bounds and redacts the official terminal error detail", async () => {
+    const token = "secret-publication-key";
+    const vendor = createTypefullyPublicationVendor(async () =>
+      Response.json({
+        id: 2,
+        publish_state: "finished",
+        status: "error",
+        error: `${token}-${"x".repeat(1_000)}`,
+      }),
+    );
+    const outcome = await vendor.reconcileDraft({
+      token,
+      socialSetId: 1,
+      remoteDraftId: 2,
+    });
+    expect(outcome.outcome).toBe("failed");
+    expect(outcome.detail).not.toContain(token);
+    expect(Array.from(outcome.detail ?? "")).toHaveLength(400);
+  });
+});
+
+describe("official Typefully scheduling comparison", () => {
+  const scheduleAt = "2099-08-27T12:00:00Z";
+  const snapshot = (scheduled: string | null) => ({
+    title: "Launch",
+    destinations: ["x", "linkedin"] as const,
+    socialSetId: "7",
+    accountLabel: "OpenBot",
+    posts: [{ id: "post-1", x: "Exact X", linkedin: "Exact LinkedIn" }],
+    media: [],
+    scheduleAt: scheduled,
+  });
+  const remote = (status: string, scheduledDate: string | null) => ({
+    status,
+    scheduled_date: scheduledDate,
+    draft_title: "Launch",
+    platforms: {
+      x: { enabled: true, posts: [{ text: "Exact X", media_ids: [] }] },
+      linkedin: {
+        enabled: true,
+        posts: [{ text: "Exact LinkedIn", media_ids: [] }],
+      },
+    },
+  });
+
+  test("accepts matching planned/scheduled state and detects a date or status change", () => {
+    expect(
+      remoteMatchesSnapshot(
+        remote("planned", scheduleAt),
+        snapshot(scheduleAt),
+        "unused",
+      ),
+    ).toBe(true);
+    expect(
+      remoteMatchesSnapshot(
+        remote("scheduled", scheduleAt),
+        snapshot(scheduleAt),
+        "unused",
+      ),
+    ).toBe(true);
+    expect(
+      remoteMatchesSnapshot(
+        remote("planned", "2099-08-28T12:00:00Z"),
+        snapshot(scheduleAt),
+        "unused",
+      ),
+    ).toBe(false);
+    expect(
+      remoteMatchesSnapshot(
+        remote("draft", scheduleAt),
+        snapshot(scheduleAt),
+        "unused",
+      ),
+    ).toBe(false);
+  });
+
+  test("accepts the null draft control and rejects an unreviewed scheduled state", () => {
+    expect(
+      remoteMatchesSnapshot(remote("draft", null), snapshot(null), "unused"),
+    ).toBe(true);
+    expect(
+      remoteMatchesSnapshot(remote("planned", null), snapshot(null), "unused"),
+    ).toBe(false);
+    expect(
+      remoteMatchesSnapshot(
+        remote("planned", scheduleAt),
+        snapshot(null),
+        "unused",
+      ),
+    ).toBe(false);
   });
 });

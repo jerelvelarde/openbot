@@ -918,6 +918,48 @@ function publicationOutcomeFromBody(
   };
 }
 
+function publicationFailureDetail(
+  document: Record<string, unknown>,
+  token: string,
+): string {
+  const nested = isRecord(document.error) ? document.error.message : undefined;
+  const raw = [document.error, nested, document.detail, document.message].find(
+    (value): value is string => typeof value === "string" && value.length > 0,
+  );
+  return raw
+    ? sanitizeVendorText(raw, token, SAFE_MESSAGE_CHARS, true).text
+    : "Typefully reports that publication failed.";
+}
+
+function officialPublicationOutcome(
+  document: unknown,
+  token: string,
+  fallbackId: number,
+): PublicationOutcome {
+  if (!isRecord(document)) return { outcome: "unknown" };
+  const publishState = document.publish_state;
+  const status = document.status;
+  if (status === "error" || publishState === "error") {
+    return {
+      outcome: "failed",
+      ...publicationOutcomeFromBody(JSON.stringify(document), fallbackId),
+      detail: publicationFailureDetail(document, token),
+    };
+  }
+  if (publishState === "finished" && status === "published") {
+    return {
+      outcome: "published",
+      ...publicationOutcomeFromBody(JSON.stringify(document), fallbackId),
+    };
+  }
+  return {
+    outcome: "unknown",
+    ...publicationOutcomeFromBody(JSON.stringify(document), fallbackId),
+    detail:
+      "Typefully is still publishing. Reconcile before taking any further action.",
+  };
+}
+
 /** Dedicated server-only publication transport. It is deliberately absent from `listTools`. */
 export function createTypefullyPublicationVendor(
   fetchImplementation: FetchImplementation = globalThis.fetch,
@@ -972,27 +1014,29 @@ export function createTypefullyPublicationVendor(
           detail: result.text,
         };
       }
-      return {
-        outcome: "published",
-        ...publicationOutcomeFromBody(result.text, input.remoteDraftId),
-      };
+      let document: unknown;
+      try {
+        document = JSON.parse(result.text);
+      } catch {
+        return {
+          outcome: "unknown",
+          detail:
+            "Typefully accepted the publish request but returned an unreadable status. Reconcile before taking any further action.",
+        };
+      }
+      return officialPublicationOutcome(
+        document,
+        input.token,
+        input.remoteDraftId,
+      );
     },
     reconcileDraft: async (input) => {
       const document = await get(input);
-      if (!isRecord(document)) return { outcome: "unknown" };
-      const published =
-        document.status === "published" ||
-        typeof document.published_at === "string" ||
-        typeof document.published_url === "string";
-      return published
-        ? {
-            outcome: "published",
-            ...publicationOutcomeFromBody(
-              JSON.stringify(document),
-              input.remoteDraftId,
-            ),
-          }
-        : { outcome: "unknown" };
+      return officialPublicationOutcome(
+        document,
+        input.token,
+        input.remoteDraftId,
+      );
     },
   };
 }

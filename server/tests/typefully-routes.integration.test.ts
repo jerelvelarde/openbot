@@ -53,7 +53,16 @@ const plugin = {
   dispatchVendor: async () => {
     throw new ConnectionRequiredError("typefully", "Typefully");
   },
-  authorizeOperation: async () => ({ token: "route-personal-key" }),
+  authorizeOperation: async () => ({
+    token: "route-personal-key",
+    decision: {
+      allowed: true,
+      forward: true,
+      mode: "enforce",
+      matched: "true",
+      source: "allow",
+    },
+  }),
 };
 const store = createTypefullyStore({
   database,

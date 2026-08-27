@@ -67,7 +67,27 @@ type AuthorizationSurface = {
       intent: "write_tool";
       mcp: { server: string; tool: string; effect: "write" };
     };
-  }): Promise<{ token: string; decision: unknown }>;
+  }): Promise<{
+    token: string;
+    decision: {
+      allowed?: unknown;
+      forward?: unknown;
+      mode?: unknown;
+      matched?: unknown;
+      source?: unknown;
+      matchedRuleId?: unknown;
+    };
+  }>;
+};
+
+type PublicationPolicyAudit = {
+  operation: "prepare_publication" | "publish_now" | "human_decline";
+  matchedRule: string | null;
+  matchedRuleId: string | null;
+  source: "allow" | "deny" | "default" | "not_applicable" | "unknown";
+  mode: "enforce" | "dry-run" | "unknown";
+  effect: "write" | "human_decision";
+  decision: "allowed" | "dry_run_forwarded" | "denied" | "not_required";
 };
 
 type VendorIdentity =
@@ -377,6 +397,50 @@ function boundedError(error: unknown): string {
   return safe || "The remote operation failed.";
 }
 
+function boundedPolicyField(value: unknown): string | null {
+  if (typeof value !== "string" || value.trim() === "") return null;
+  return boundedError(value);
+}
+
+function publicationPolicyAudit(
+  decision: Awaited<
+    ReturnType<NonNullable<AuthorizationSurface["authorizeOperation"]>>
+  >["decision"],
+  operation: "prepare_publication" | "publish_now",
+): PublicationPolicyAudit {
+  const source = ["allow", "deny", "default"].includes(String(decision.source))
+    ? (decision.source as "allow" | "deny" | "default")
+    : "unknown";
+  const mode = ["enforce", "dry-run"].includes(String(decision.mode))
+    ? (decision.mode as "enforce" | "dry-run")
+    : "unknown";
+  const forwarded = decision.forward === true;
+  return {
+    operation,
+    matchedRule: boundedPolicyField(decision.matched),
+    matchedRuleId: boundedPolicyField(decision.matchedRuleId),
+    source,
+    mode,
+    effect: "write",
+    decision:
+      forwarded && decision.allowed === true
+        ? "allowed"
+        : forwarded
+          ? "dry_run_forwarded"
+          : "denied",
+  };
+}
+
+const DECLINE_POLICY_AUDIT: PublicationPolicyAudit = Object.freeze({
+  operation: "human_decline",
+  matchedRule: null,
+  matchedRuleId: null,
+  source: "not_applicable",
+  mode: "unknown",
+  effect: "human_decision",
+  decision: "not_required",
+});
+
 function validRemoteDraftId(value: unknown): string {
   if (
     typeof value !== "string" ||
@@ -639,7 +703,7 @@ export function createTypefullyStore(options: {
     botId: string;
     actorId: string;
     operation: "prepare_publication" | "publish_now";
-  }): Promise<{ token: string }> {
+  }): Promise<{ token: string; policy: PublicationPolicyAudit }> {
     const authorizeOperation = plugin().authorizeOperation;
     if (!authorizeOperation) {
       throw new GrantRequiredError(
@@ -647,7 +711,7 @@ export function createTypefullyStore(options: {
         "Typefully publication authorization is unavailable.",
       );
     }
-    return authorizeOperation({
+    const authorized = await authorizeOperation({
       requiredGrantRef: `${serverId}/prepare_publication`,
       ref: `${serverId}/${input.operation}`,
       botId: input.botId,
@@ -657,6 +721,10 @@ export function createTypefullyStore(options: {
         mcp: { server: serverId, tool: input.operation, effect: "write" },
       },
     });
+    return {
+      token: authorized.token,
+      policy: publicationPolicyAudit(authorized.decision, input.operation),
+    };
   }
 
   function remotePublicationIdentity(draft: TypefullyDraft) {
@@ -966,7 +1034,7 @@ export function createTypefullyStore(options: {
       ) {
         throw changedProposalError();
       }
-      await authorizePublication({
+      const authorization = await authorizePublication({
         botId: visible.botId,
         actorId: input.actorId,
         operation: "prepare_publication",
@@ -1043,6 +1111,7 @@ export function createTypefullyStore(options: {
             hash: proposal.contentHash,
             destinations: proposal.destinations,
             decision: "prepared",
+            policy: authorization.policy,
           },
         });
         return proposalSummary({
@@ -1108,6 +1177,7 @@ export function createTypefullyStore(options: {
             hash: proposal.contentHash,
             destinations: proposal.destinations,
             decision: "declined",
+            policy: DECLINE_POLICY_AUDIT,
           },
         });
         return asProposal(row as SelectedProposal);
@@ -1276,6 +1346,7 @@ export function createTypefullyStore(options: {
             destinations: locked.destinations,
             decision: "approved",
             outcome: "unknown",
+            policy: authorized.policy,
           },
         });
         return asProposal(claimed as SelectedProposal);
@@ -1351,6 +1422,7 @@ export function createTypefullyStore(options: {
             destinations: proposal.destinations,
             decision: "approved",
             outcome: status,
+            policy: finalAuthorization.policy,
           },
         });
         return asProposal(completed as SelectedProposal);
@@ -1384,7 +1456,26 @@ export function createTypefullyStore(options: {
           ...remotePublicationIdentity(draft),
         }),
       );
-      if (outcome.outcome === "unknown") return proposal;
+      if (outcome.outcome === "unknown") {
+        await recordAuditEvent(auditStore, {
+          eventType: "configuration.changed",
+          targetType: "typefully_publication_proposal",
+          targetId: proposal.id,
+          actorUserId: input.actorId,
+          payload: {
+            draftId: proposal.draftId,
+            botId: proposal.botId,
+            channelId: proposal.channelId,
+            version: proposal.version,
+            hash: proposal.contentHash,
+            destinations: proposal.destinations,
+            decision: "reconciled",
+            outcome: "unknown",
+            policy: authorized.policy,
+          },
+        });
+        return proposal;
+      }
       const instant = now();
       return database.transaction(async (transaction) => {
         const [row] = await transaction
@@ -1424,6 +1515,7 @@ export function createTypefullyStore(options: {
             destinations: proposal.destinations,
             decision: "reconciled",
             outcome: outcome.outcome,
+            policy: authorized.policy,
           },
         });
         return asProposal(row as SelectedProposal);

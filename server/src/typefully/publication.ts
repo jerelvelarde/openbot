@@ -168,11 +168,27 @@ export function remoteMatchesSnapshot(
     ) {
       return false;
     }
-    if (
-      Object.hasOwn(record, "publish_at") &&
-      (record.publish_at ?? null) !== snapshot.scheduleAt
-    ) {
-      return false;
+    const status = record.status;
+    const scheduledDate = record.scheduled_date ?? null;
+    if (typeof status !== "string") return false;
+    if (snapshot.scheduleAt === null) {
+      if (status !== "draft" || scheduledDate !== null) return false;
+    } else {
+      if (
+        (status !== "planned" && status !== "scheduled") ||
+        typeof scheduledDate !== "string"
+      ) {
+        return false;
+      }
+      const approvedTime = Date.parse(snapshot.scheduleAt);
+      const remoteTime = Date.parse(scheduledDate);
+      if (
+        !Number.isFinite(approvedTime) ||
+        !Number.isFinite(remoteTime) ||
+        approvedTime !== remoteTime
+      ) {
+        return false;
+      }
     }
     return true;
   }

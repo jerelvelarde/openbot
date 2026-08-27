@@ -58,7 +58,17 @@ const plugin = {
         });
       }
     }
-    return { token: "personal-key" };
+    return {
+      token: "personal-key",
+      decision: {
+        allowed: true,
+        forward: true,
+        mode: "enforce",
+        matched: "mcp.effect == 'write'",
+        source: "allow",
+        reason: "Permitted by policy.",
+      },
+    };
   },
 };
 
@@ -180,6 +190,39 @@ describe("immutable Typefully publication proposals", () => {
     ).rejects.toMatchObject({
       code: "proposal_not_pending",
     });
+    const lifecycle = await database
+      .select({ payload: auditEvents.payload })
+      .from(auditEvents)
+      .where(eq(auditEvents.targetId, proposal.id));
+    expect(lifecycle).toHaveLength(2);
+    expect(lifecycle.map(({ payload }) => payload)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          decision: "prepared",
+          policy: {
+            operation: "prepare_publication",
+            matchedRule: "mcp.effect == 'write'",
+            matchedRuleId: null,
+            source: "allow",
+            mode: "enforce",
+            effect: "write",
+            decision: "allowed",
+          },
+        }),
+        expect.objectContaining({
+          decision: "declined",
+          policy: {
+            operation: "human_decline",
+            matchedRule: null,
+            matchedRuleId: null,
+            source: "not_applicable",
+            mode: "unknown",
+            effect: "human_decision",
+            decision: "not_required",
+          },
+        }),
+      ]),
+    );
   });
 
   test("claims two concurrent approvals durably and calls the vendor exactly once", async () => {
@@ -247,7 +290,7 @@ describe("immutable Typefully publication proposals", () => {
     expect(publishCalls).toBe(1);
   });
 
-  test("quarantines an ambiguous outcome and reconciles without re-execution", async () => {
+  test("keeps an in-progress acknowledgement unknown and reconciles published without re-execution", async () => {
     const draft = await syncedDraft();
     const proposal = await store.prepareProposal({
       draftId: draft.id,
@@ -255,7 +298,7 @@ describe("immutable Typefully publication proposals", () => {
       expectedVersion: draft.version,
     });
     publishCalls = 0;
-    publishResult = { outcome: "unknown", detail: "Timed out" };
+    publishResult = { outcome: "unknown", detail: "Publishing in progress" };
 
     expect(
       await store.approveAndPublish({
@@ -275,6 +318,55 @@ describe("immutable Typefully publication proposals", () => {
         actorId: ownerId,
       }),
     ).toMatchObject({ status: "published", vendorResultId: "reconciled" });
+    expect(publishCalls).toBe(1);
+    const reconciliationAudit = await database
+      .select({ payload: auditEvents.payload })
+      .from(auditEvents)
+      .where(eq(auditEvents.targetId, proposal.id));
+    expect(reconciliationAudit.map(({ payload }) => payload)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          decision: "reconciled",
+          outcome: "published",
+          policy: {
+            operation: "publish_now",
+            matchedRule: "mcp.effect == 'write'",
+            matchedRuleId: null,
+            source: "allow",
+            mode: "enforce",
+            effect: "write",
+            decision: "allowed",
+          },
+        }),
+      ]),
+    );
+  });
+
+  test("reconciles an acknowledged publication to a known vendor error without re-execution", async () => {
+    const draft = await syncedDraft();
+    const proposal = await store.prepareProposal({
+      draftId: draft.id,
+      actorId: ownerId,
+      expectedVersion: draft.version,
+    });
+    publishCalls = 0;
+    publishResult = { outcome: "unknown", detail: "Publishing in progress" };
+    expect(
+      await store.approveAndPublish({
+        proposalId: proposal.id,
+        actorId: ownerId,
+      }),
+    ).toMatchObject({ status: "unknown" });
+    publishResult = { outcome: "failed", detail: "Vendor publication failed" };
+    expect(
+      await store.reconcileProposal({
+        proposalId: proposal.id,
+        actorId: ownerId,
+      }),
+    ).toMatchObject({
+      status: "failed",
+      failureDetail: "Vendor publication failed",
+    });
     expect(publishCalls).toBe(1);
   });
 
@@ -416,6 +508,19 @@ describe("immutable Typefully publication proposals", () => {
       .from(auditEvents)
       .where(eq(auditEvents.targetId, proposal.id));
     const serialized = JSON.stringify(audit);
+    expect(audit.length).toBeGreaterThanOrEqual(3);
+    for (const event of audit) {
+      expect(event.payload).toMatchObject({
+        policy: {
+          matchedRule: "mcp.effect == 'write'",
+          matchedRuleId: null,
+          source: "allow",
+          mode: "enforce",
+          effect: "write",
+          decision: "allowed",
+        },
+      });
+    }
     expect(serialized).toContain(draft.contentHash);
     expect(serialized).not.toContain("Approved exact content");
     expect(serialized).not.toContain("snapshot");
