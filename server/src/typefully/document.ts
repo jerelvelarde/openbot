@@ -19,13 +19,13 @@ const postBodySchema = z
 
 export const destinationSchema = z.enum(["x", "linkedin"]);
 
-export const postBlockSchema = z.object({
+export const postBlockSchema = z.strictObject({
   id: stableIdSchema,
   x: postBodySchema,
   linkedin: postBodySchema,
 });
 
-export const mediaDescriptorSchema = z.object({
+export const mediaDescriptorSchema = z.strictObject({
   id: stableIdSchema,
   kind: z.enum(["image", "video"]),
   order: z.number().int(),
@@ -96,7 +96,7 @@ const mediaSchema = z
     }
   });
 
-export const draftDocumentSchema = z.object({
+export const draftDocumentSchema = z.strictObject({
   title: z.string().trim().max(160).default(""),
   destinations: destinationsSchema,
   socialSetId: z.string().trim().max(120).nullable(),
@@ -129,10 +129,14 @@ function unsupportedDestination(input: unknown): string | null {
 }
 
 function platformLabel(platform: string): string {
-  if (platform.length === 0) {
+  const sanitized = platform.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, "�");
+  const [first, ...rest] = Array.from(sanitized);
+  if (first === undefined) {
     return "This platform";
   }
-  return `${platform[0]?.toUpperCase()}${platform.slice(1)}`;
+  return Array.from(`${first.toUpperCase()}${rest.join("")}`)
+    .slice(0, 80)
+    .join("");
 }
 
 function stableSerialize(value: unknown): string {
@@ -176,13 +180,36 @@ export function canonicalizeDraft(input: unknown): {
   return { document, serialized, hash };
 }
 
-export function draftSummary(input: {
-  id: string;
-  document: CanonicalDraftDocument;
-  version: number;
-  syncStatus: string;
-  proposalStatus?: string | null;
-}): {
+export const syncStatusSchema = z.enum([
+  "local",
+  "syncing",
+  "synced",
+  "connection_required",
+  "remote_error",
+  "grant_blocked",
+]);
+
+export const proposalStatusSchema = z.enum([
+  "pending",
+  "declined",
+  "expired",
+  "published",
+  "failed",
+  "unknown",
+]);
+
+export const draftSummaryInputSchema = z.strictObject({
+  id: z.string().uuid(),
+  document: draftDocumentSchema,
+  version: z.number().int().positive(),
+  syncStatus: syncStatusSchema,
+  proposalStatus: proposalStatusSchema.nullable().optional(),
+  socialSetLabel: z.string().trim().max(160).nullable().optional(),
+});
+
+export type DraftSummaryInput = z.input<typeof draftSummaryInputSchema>;
+
+export function draftSummary(input: DraftSummaryInput): {
   id: string;
   title: string;
   destinations: ("x" | "linkedin")[];
@@ -192,27 +219,30 @@ export function draftSummary(input: {
   syncStatus: string;
   proposalStatus: string | null;
 } {
-  let title = input.document.title.trim();
+  const parsed = draftSummaryInputSchema.parse(input);
+  let title = parsed.document.title.trim();
   if (title.length === 0) {
-    for (const post of input.document.posts) {
-      const body = input.document.destinations
+    for (const post of parsed.document.posts) {
+      const body = parsed.document.destinations
         .map((destination) => post[destination].trim())
         .find((candidate) => candidate.length > 0);
       if (body !== undefined) {
-        title = body.replace(/\s+/g, " ").slice(0, SUMMARY_TITLE_MAX_LENGTH);
+        title = Array.from(body.replace(/\s+/g, " "))
+          .slice(0, SUMMARY_TITLE_MAX_LENGTH)
+          .join("");
         break;
       }
     }
   }
 
   return {
-    id: input.id,
+    id: parsed.id,
     title,
-    destinations: [...input.document.destinations],
-    socialSetLabel: input.document.accountLabel,
-    mediaCount: input.document.media.length,
-    version: input.version,
-    syncStatus: input.syncStatus,
-    proposalStatus: input.proposalStatus ?? null,
+    destinations: [...parsed.document.destinations],
+    socialSetLabel: parsed.socialSetLabel ?? null,
+    mediaCount: parsed.document.media.length,
+    version: parsed.version,
+    syncStatus: parsed.syncStatus,
+    proposalStatus: parsed.proposalStatus ?? null,
   };
 }

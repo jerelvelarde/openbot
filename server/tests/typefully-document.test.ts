@@ -3,7 +3,10 @@ import {
   canonicalizeDraft,
   draftDocumentSchema,
   draftSummary,
+  syncStatusSchema,
 } from "../src/typefully/document";
+
+const DRAFT_ID = "11111111-1111-4111-8111-111111111111";
 
 const baseDraft = () => ({
   title: "Launch notes",
@@ -167,6 +170,66 @@ describe("canonicalizeDraft", () => {
     ).toThrow("Mastodon is not supported in OpenBot yet.");
   });
 
+  test("keeps unsupported-platform errors bounded and on one readable line", () => {
+    const unsafePlatform = `${"😀".repeat(100)}secret`;
+
+    let message = "";
+    try {
+      canonicalizeDraft({
+        ...baseDraft(),
+        destinations: [unsafePlatform],
+      });
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+
+    expect(message).not.toContain("\n");
+    expect(message).not.toContain("\u0000");
+    expect(message).not.toContain("secret");
+    expect(message.endsWith(" is not supported in OpenBot yet.")).toBe(true);
+    expect(
+      Array.from(message.replace(" is not supported in OpenBot yet.", "")),
+    ).toHaveLength(80);
+    expect(() =>
+      canonicalizeDraft({
+        ...baseDraft(),
+        destinations: ["threads\ncredential\u0000suffix"],
+      }),
+    ).toThrow("Threads�credential�suffix is not supported in OpenBot yet.");
+  });
+
+  test("rejects unknown top-level and nested document keys", () => {
+    expect(() =>
+      canonicalizeDraft({ ...baseDraft(), credentials: "must-not-be-hashed" }),
+    ).toThrow();
+    expect(() =>
+      canonicalizeDraft({
+        ...baseDraft(),
+        posts: [
+          {
+            ...baseDraft().posts[0],
+            threads: "must-not-be-silently-stripped",
+          },
+        ],
+      }),
+    ).toThrow();
+    expect(() =>
+      canonicalizeDraft({
+        ...baseDraft(),
+        media: [
+          {
+            id: "media-1",
+            kind: "image",
+            order: 0,
+            altText: "diagram",
+            remoteId: null,
+            credential: "must-not-be-silently-stripped",
+          },
+        ],
+      }),
+    ).toThrow();
+  });
+
   test("enforces destination minimum, maximum, and uniqueness", () => {
     expect(
       draftDocumentSchema.parse({
@@ -256,6 +319,18 @@ describe("canonicalizeDraft", () => {
     ).toThrow();
   });
 
+  test("rejects duplicate post ids", () => {
+    expect(() =>
+      canonicalizeDraft({
+        ...baseDraft(),
+        posts: [
+          { id: "post-1", x: "first", linkedin: "first" },
+          { id: "post-1", x: "second", linkedin: "second" },
+        ],
+      }),
+    ).toThrow("Duplicate post id: post-1.");
+  });
+
   test("enforces media count and descriptor boundaries", () => {
     const media = Array.from({ length: 20 }, (_, order) => ({
       id: order === 0 ? "i".repeat(120) : `media-${order}`,
@@ -326,17 +401,18 @@ describe("draftSummary", () => {
     }).document;
 
     const summary = draftSummary({
-      id: "draft-1",
+      id: DRAFT_ID,
       document,
       version: 4,
       syncStatus: "synced",
+      socialSetLabel: "Public social set",
     });
 
     expect(summary).toEqual({
-      id: "draft-1",
+      id: DRAFT_ID,
       title: "Launch notes",
       destinations: ["x", "linkedin"],
-      socialSetLabel: "OpenBot",
+      socialSetLabel: "Public social set",
       mediaCount: 1,
       version: 4,
       syncStatus: "synced",
@@ -349,6 +425,7 @@ describe("draftSummary", () => {
     expect(summary).not.toHaveProperty("accountLabel");
     expect(summary).not.toHaveProperty("remoteId");
     expect(summary).not.toHaveProperty("credentials");
+    expect(JSON.stringify(summary)).not.toContain("OpenBot");
   });
 
   test("uses a bounded excerpt from the first enabled destination when title is empty", () => {
@@ -367,7 +444,7 @@ describe("draftSummary", () => {
     }).document;
 
     const summary = draftSummary({
-      id: "draft-2",
+      id: DRAFT_ID,
       document,
       version: 1,
       syncStatus: "local",
@@ -400,12 +477,78 @@ describe("draftSummary", () => {
     }).document;
 
     const summary = draftSummary({
-      id: "draft-3",
+      id: DRAFT_ID,
       document,
       version: 2,
       syncStatus: "local",
     });
 
     expect(summary.title).toBe("earliest post LinkedIn text");
+  });
+
+  test("truncates fallback titles by Unicode code point", () => {
+    const document = canonicalizeDraft({
+      ...baseDraft(),
+      title: "",
+      destinations: ["x"],
+      posts: [
+        {
+          id: "post-1",
+          x: `${"A".repeat(159)}😀hidden tail`,
+          linkedin: "",
+        },
+      ],
+    }).document;
+
+    const summary = draftSummary({
+      id: DRAFT_ID,
+      document,
+      version: 1,
+      syncStatus: "local",
+    });
+
+    expect(Array.from(summary.title)).toHaveLength(160);
+    expect(summary.title.endsWith("😀")).toBe(true);
+    expect(summary.title).not.toContain("hidden tail");
+  });
+
+  test("validates all summary metadata at runtime", () => {
+    const document = canonicalizeDraft(baseDraft()).document;
+    const valid = {
+      id: DRAFT_ID,
+      document,
+      version: 1,
+      syncStatus: "connection_required",
+      proposalStatus: "unknown",
+      socialSetLabel: "s".repeat(160),
+    } as const;
+
+    expect(draftSummary(valid)).toMatchObject({
+      id: DRAFT_ID,
+      version: 1,
+      syncStatus: "connection_required",
+      proposalStatus: "unknown",
+      socialSetLabel: "s".repeat(160),
+    });
+    expect(syncStatusSchema.options).toEqual([
+      "local",
+      "syncing",
+      "synced",
+      "connection_required",
+      "remote_error",
+      "grant_blocked",
+    ]);
+    expect(() => draftSummary({ ...valid, id: "not-a-uuid" })).toThrow();
+    expect(() => draftSummary({ ...valid, version: 0 })).toThrow();
+    expect(() => draftSummary({ ...valid, version: 1.5 })).toThrow();
+    expect(() =>
+      draftSummary({ ...valid, syncStatus: "silently_ignored" }),
+    ).toThrow();
+    expect(() =>
+      draftSummary({ ...valid, proposalStatus: "approved" }),
+    ).toThrow();
+    expect(() =>
+      draftSummary({ ...valid, socialSetLabel: "s".repeat(161) }),
+    ).toThrow();
   });
 });
