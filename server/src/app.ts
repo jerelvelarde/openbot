@@ -30,9 +30,9 @@ import type { SandboxedStore } from "./components/sandboxed";
 import { createSandboxedRoutes } from "./components/sandboxed-routes";
 import type { ComponentStore } from "./components/store";
 import type { ComputerGateway } from "./computer/gateway";
+import type { PageFrameStore } from "./computer/page-frames";
 import type { PolicyStore } from "./computer/policy-store";
 import { createComputerRoutes } from "./computer/routes";
-import type { PageFrameStore } from "./computer/page-frames";
 import { configuredAuthProviders, type DeploymentConfig } from "./config";
 import type { CredentialAdminService, CredentialInput } from "./credentials";
 import { createIntelligenceClient } from "./intelligence-client";
@@ -167,6 +167,13 @@ export function createApp(
    * the wrong thing.
    */
   pageFrames?: PageFrameStore,
+  /**
+   * Authenticated confirmation routes for identities that arrived from an external provider.
+   *
+   * Appended last: callers build these routes with the deployment's encryption key, the shared
+   * user guard, and its audit store before handing the completed surface to the app.
+   */
+  externalLinkRoutes?: HonoApp,
 ) {
   const app = new Hono<{ Variables: AppVariables }>();
 
@@ -704,6 +711,10 @@ export function createApp(
       "/api/channels",
       createChannelRoutes(channelStore, requireUser, channelEvents, auditStore),
     );
+  }
+
+  if (externalLinkRoutes) {
+    app.route("/api/external-links", externalLinkRoutes);
   }
 
   if (componentStore) {
