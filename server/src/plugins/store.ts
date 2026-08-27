@@ -2523,14 +2523,26 @@ export function createPluginStore(options: PluginStoreOptions) {
           connectedAt: mcpUserCredentials.connectedAt,
         })
         .from(mcpUserCredentials)
-        .where(eq(mcpUserCredentials.userId, userId))
+        .where(
+          and(
+            eq(mcpUserCredentials.userId, userId),
+            eq(mcpUserCredentials.authMethod, "oauth"),
+          ),
+        )
         .orderBy(asc(mcpUserCredentials.serverId));
 
-      return rows.map((row) => ({
-        serverId: row.serverId,
-        scope: row.scope,
-        connectedAt: iso(row.connectedAt) ?? "",
-      }));
+      return rows.map((row) => {
+        if (row.scope === null) {
+          throw new Error(
+            `OAuth connection for ${row.serverId} is missing its granted scope`,
+          );
+        }
+        return {
+          serverId: row.serverId,
+          scope: row.scope,
+          connectedAt: iso(row.connectedAt) ?? "",
+        };
+      });
     },
 
     /**

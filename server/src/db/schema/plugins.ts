@@ -2,6 +2,7 @@ import {
   boolean,
   index,
   integer,
+  pgEnum,
   pgTable,
   primaryKey,
   text,
@@ -16,6 +17,11 @@ const createdAt = () =>
   timestamp("created_at", { withTimezone: true }).notNull().defaultNow();
 const updatedAt = () =>
   timestamp("updated_at", { withTimezone: true }).notNull().defaultNow();
+
+export const mcpUserAuthMethod = pgEnum("mcp_user_auth_method", [
+  "oauth",
+  "api_key",
+]);
 
 /**
  * Schema owned by Plugins: MCP servers a deployment has added, the tools they offer, packaged
@@ -151,6 +157,7 @@ export const mcpUserCredentials = pgTable(
     credentialId: uuid("credential_id")
       .notNull()
       .references(() => credentials.id),
+    authMethod: mcpUserAuthMethod("auth_method").notNull().default("oauth"),
     /**
      * What the vendor actually granted, as it said it — not what we asked for.
      *
@@ -158,7 +165,7 @@ export const mcpUserCredentials = pgTable(
      * rather than the request means a tool failing for want of a scope can be explained instead of
      * being a mystery about a permission we assumed we had.
      */
-    scope: text("scope").notNull(),
+    scope: text("scope"),
     /**
      * When this person connected.
      *
