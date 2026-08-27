@@ -58,6 +58,13 @@ import {
 
 export type PluginKind = "mcp" | "skill";
 
+const BLOCKED_TYPEFULLY_COMMITMENT_REFS = [
+  "typefully/publish_now",
+  "typefully/publish",
+  "typefully/schedule_draft",
+  "typefully/schedule",
+] as const;
+
 export type ToolRecord = {
   serverId: string;
   name: string;
@@ -2328,6 +2335,27 @@ export function createPluginStore(options: PluginStoreOptions) {
           .filter(([ref]) => !advertised.has(ref.slice(serverId.length + 1)))
           .sort(([left], [right]) => left.localeCompare(right));
 
+        const blockedCommitmentRefs =
+          serverId === "typefully"
+            ? stranded
+                .map(([ref]) => ref)
+                .filter((ref) =>
+                  BLOCKED_TYPEFULLY_COMMITMENT_REFS.some(
+                    (blocked) => blocked === ref,
+                  ),
+                )
+            : [];
+        if (blockedCommitmentRefs.length > 0) {
+          await database
+            .delete(pluginGrants)
+            .where(
+              and(
+                eq(pluginGrants.kind, "mcp"),
+                inArray(pluginGrants.ref, blockedCommitmentRefs),
+              ),
+            );
+        }
+
         if (stranded.length > 0) {
           await recordAuditEvent(auditStore, {
             eventType: "configuration.changed",
@@ -2340,7 +2368,10 @@ export function createPluginStore(options: PluginStoreOptions) {
               // The refs, because that is what a grant is keyed on and what an administrator revokes.
               refs: stranded.map(([ref]) => ref),
               bots: [...new Set(stranded.flatMap(([, agents]) => agents))],
-              note: "Held by a Bot and not offered to any model, because this server no longer advertises the tool. Offered again if it starts.",
+              note:
+                blockedCommitmentRefs.length > 0
+                  ? "Unsafe Typefully publishing or scheduling grants were removed; other withdrawn tools remain held but are not offered to models."
+                  : "Held by a Bot and not offered to any model, because this server no longer advertises the tool. Offered again if it starts.",
             },
           });
         }
@@ -3519,7 +3550,7 @@ export function createPluginStore(options: PluginStoreOptions) {
       if (
         serverId === "typefully" &&
         toolName !== "prepare_publication" &&
-        /publish|publication/i.test(toolName)
+        /publish|publication|schedule/i.test(toolName)
       ) {
         throw new PluginRefusedError(
           "Immediate Typefully publication requires an immutable proposal and explicit human approval.",

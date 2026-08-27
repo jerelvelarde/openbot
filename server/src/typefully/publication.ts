@@ -27,6 +27,9 @@ export type PublicationProposal = ProposalSummary & {
   vendorResultId: string | null;
   publishedUrl: string | null;
   failureDetail: string | null;
+  attemptId: string | null;
+  attemptLeaseExpiresAt: string | null;
+  vendorWriteStartedAt: string | null;
   createdAt: string;
   updatedAt: string;
 };
@@ -154,7 +157,7 @@ export function remoteMatchesSnapshot(
       ) {
         return false;
       }
-      if ((platform as Record<string, unknown>).enabled === false) return false;
+      if ((platform as Record<string, unknown>).enabled !== true) return false;
       const posts = (platform as Record<string, unknown>).posts;
       if (!Array.isArray(posts) || posts.length !== snapshot.posts.length) {
         return false;

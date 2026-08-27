@@ -152,7 +152,6 @@ export const TYPEFULLY_TOOL_NAMES = [
   "update_draft",
   "upload_media",
   "remove_media",
-  "schedule_draft",
   "delete_draft",
   "prepare_publication",
 ] as const;
@@ -210,11 +209,6 @@ export const typefullyVendorContracts = {
     platform: z.enum(["x", "linkedin", "threads", "bluesky", "mastodon"]),
     postIndex: z.number().int().min(0).max(49),
     mediaId,
-  }),
-  schedule_draft: z.strictObject({
-    socialSetId,
-    draftId,
-    publishAt: futureDateOrSlot,
   }),
   delete_draft: z.strictObject({ socialSetId, draftId }),
   prepare_publication: z.strictObject({

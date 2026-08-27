@@ -272,4 +272,69 @@ describe("Typefully persistence ownership", () => {
       publishedUrl: `https://typefully.test/${suite}`,
     });
   });
+
+  test("requires complete durable attempt state for in-flight and attempted unknown proposals", async () => {
+    const draft = await createDraft();
+    const [proposal] = await database
+      .insert(typefullyPublicationProposals)
+      .values(proposalValues(draft.id))
+      .returning({ id: typefullyPublicationProposals.id });
+    if (!proposal) throw new Error("proposal fixture was not stored");
+
+    await expect(
+      (async () => {
+        await database
+          .update(typefullyPublicationProposals)
+          .set({ status: "in_flight" })
+          .where(eq(typefullyPublicationProposals.id, proposal.id));
+      })(),
+    ).rejects.toThrow();
+
+    const attemptId = randomUUID();
+    const lease = new Date(Date.now() + 60_000);
+    const [claimed] = await database
+      .update(typefullyPublicationProposals)
+      .set({ status: "in_flight", attemptId, attemptLeaseExpiresAt: lease })
+      .where(eq(typefullyPublicationProposals.id, proposal.id))
+      .returning({ status: typefullyPublicationProposals.status });
+    expect(claimed?.status).toBe("in_flight");
+
+    await expect(
+      (async () => {
+        await database
+          .update(typefullyPublicationProposals)
+          .set({ status: "unknown" })
+          .where(eq(typefullyPublicationProposals.id, proposal.id));
+      })(),
+    ).rejects.toThrow();
+
+    const writeStartedAt = new Date();
+    const [unknown] = await database
+      .update(typefullyPublicationProposals)
+      .set({ status: "unknown", vendorWriteStartedAt: writeStartedAt })
+      .where(eq(typefullyPublicationProposals.id, proposal.id))
+      .returning({ status: typefullyPublicationProposals.status });
+    expect(unknown?.status).toBe("unknown");
+
+    await expect(
+      (async () => {
+        await database
+          .update(typefullyPublicationProposals)
+          .set({ status: "published" })
+          .where(eq(typefullyPublicationProposals.id, proposal.id));
+      })(),
+    ).rejects.toThrow();
+
+    const [published] = await database
+      .update(typefullyPublicationProposals)
+      .set({
+        status: "published",
+        attemptId: null,
+        attemptLeaseExpiresAt: null,
+        vendorWriteStartedAt: null,
+      })
+      .where(eq(typefullyPublicationProposals.id, proposal.id))
+      .returning({ status: typefullyPublicationProposals.status });
+    expect(published?.status).toBe("published");
+  });
 });

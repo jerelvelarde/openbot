@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, isNull, ne, or } from "drizzle-orm";
+import { and, eq, inArray, isNull, ne, or } from "drizzle-orm";
 import {
   type AuditStore,
   type AuditTransaction,
@@ -261,6 +261,9 @@ const proposalSelection = {
   vendorResultId: typefullyPublicationProposals.vendorResultId,
   publishedUrl: typefullyPublicationProposals.publishedUrl,
   failureDetail: typefullyPublicationProposals.failureDetail,
+  attemptId: typefullyPublicationProposals.attemptId,
+  attemptLeaseExpiresAt: typefullyPublicationProposals.attemptLeaseExpiresAt,
+  vendorWriteStartedAt: typefullyPublicationProposals.vendorWriteStartedAt,
   createdAt: typefullyPublicationProposals.createdAt,
   updatedAt: typefullyPublicationProposals.updatedAt,
 };
@@ -288,6 +291,9 @@ function asProposal(row: SelectedProposal): PublicationProposal {
     vendorResultId: row.vendorResultId,
     publishedUrl: row.publishedUrl,
     failureDetail: row.failureDetail,
+    attemptId: row.attemptId,
+    attemptLeaseExpiresAt: row.attemptLeaseExpiresAt?.toISOString() ?? null,
+    vendorWriteStartedAt: row.vendorWriteStartedAt?.toISOString() ?? null,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   };
@@ -760,6 +766,11 @@ export function createTypefullyStore(options: {
     attemptRemoteDraftId: null,
     attemptLeaseExpiresAt: null,
   } as const;
+  const clearedPublicationAttempt = {
+    attemptId: null,
+    attemptLeaseExpiresAt: null,
+    vendorWriteStartedAt: null,
+  } as const;
 
   async function isGranted(
     operation: RemoteDraftOperation,
@@ -826,10 +837,14 @@ export function createTypefullyStore(options: {
         | "preclaim_authorization"
         | "postclaim_authorization"
         | "claim_attachment"
+        | "postclaim_attachment"
+        | "postclaim_remote_revision"
+        | "postclaim_remote_verification"
         | "remote_verification";
       failureClass: string;
       outcome: "pending" | "expired" | "unknown";
       policy: PublicationPolicyAudit;
+      vendorWrite?: "not_attempted" | "started";
     },
   ) {
     return {
@@ -844,7 +859,7 @@ export function createTypefullyStore(options: {
       failureClass: input.failureClass,
       reason: input.failureClass,
       outcome: input.outcome,
-      vendorWrite: "not_attempted",
+      vendorWrite: input.vendorWrite ?? "not_attempted",
       policy: input.policy,
     };
   }
@@ -904,6 +919,139 @@ export function createTypefullyStore(options: {
         },
       );
       return true;
+    });
+  }
+
+  async function releasePublicationClaim(input: {
+    proposal: PublicationProposal;
+    attemptId: string;
+    actorId: string;
+    stage:
+      | "postclaim_authorization"
+      | "postclaim_attachment"
+      | "postclaim_remote_verification";
+    failureClass: string;
+    policy: PublicationPolicyAudit;
+  }): Promise<PublicationProposal> {
+    return database.transaction(async (transaction) => {
+      await lockedOwnedDraft(
+        transaction,
+        input.proposal.draftId,
+        input.actorId,
+      );
+      const locked = await lockedOwnedProposal(
+        transaction,
+        input.proposal.id,
+        input.actorId,
+      );
+      if (
+        locked.status !== "in_flight" ||
+        locked.attemptId !== input.attemptId ||
+        locked.vendorWriteStartedAt !== null
+      ) {
+        return locked;
+      }
+      const instant = now();
+      const [row] = await transaction
+        .update(typefullyPublicationProposals)
+        .set({
+          status: "pending",
+          decidedAt: null,
+          completedAt: null,
+          failureDetail: null,
+          ...clearedPublicationAttempt,
+          updatedAt: instant,
+        })
+        .where(
+          and(
+            eq(typefullyPublicationProposals.id, locked.id),
+            eq(typefullyPublicationProposals.status, "in_flight"),
+            eq(typefullyPublicationProposals.attemptId, input.attemptId),
+            isNull(typefullyPublicationProposals.vendorWriteStartedAt),
+          ),
+        )
+        .returning(proposalSelection);
+      if (!row) return locked;
+      await auditPublicationRefusal(
+        auditStore.inTransaction(transaction),
+        locked,
+        input.actorId,
+        {
+          decision: "publication_refused",
+          stage: input.stage,
+          failureClass: input.failureClass,
+          outcome: "pending",
+          policy: input.policy,
+        },
+      );
+      return asProposal(row as SelectedProposal);
+    });
+  }
+
+  async function recoverExpiredPublicationClaim(
+    visible: PublicationProposal,
+    actorId: string,
+  ): Promise<PublicationProposal> {
+    if (visible.status !== "in_flight") return visible;
+    return database.transaction(async (transaction) => {
+      await lockedOwnedDraft(transaction, visible.draftId, actorId);
+      const locked = await lockedOwnedProposal(
+        transaction,
+        visible.id,
+        actorId,
+      );
+      if (
+        locked.status !== "in_flight" ||
+        locked.attemptLeaseExpiresAt === null ||
+        Date.parse(locked.attemptLeaseExpiresAt) > now().getTime()
+      ) {
+        return locked;
+      }
+      const writeStarted = locked.vendorWriteStartedAt !== null;
+      const instant = now();
+      const [row] = await transaction
+        .update(typefullyPublicationProposals)
+        .set({
+          status: writeStarted ? "unknown" : "pending",
+          decidedAt:
+            writeStarted && locked.decidedAt
+              ? new Date(locked.decidedAt)
+              : null,
+          completedAt: writeStarted ? instant : null,
+          failureDetail: writeStarted
+            ? "Publishing status unknown after the attempt lease expired."
+            : null,
+          ...(writeStarted ? {} : clearedPublicationAttempt),
+          updatedAt: instant,
+        })
+        .where(
+          and(
+            eq(typefullyPublicationProposals.id, locked.id),
+            eq(typefullyPublicationProposals.status, "in_flight"),
+            eq(typefullyPublicationProposals.attemptId, locked.attemptId ?? ""),
+          ),
+        )
+        .returning(proposalSelection);
+      if (!row) return locked;
+      await recordAuditEvent(auditStore.inTransaction(transaction), {
+        eventType: "configuration.changed",
+        targetType: "typefully_publication_proposal",
+        targetId: locked.id,
+        actorUserId: actorId,
+        payload: {
+          draftId: locked.draftId,
+          botId: locked.botId,
+          channelId: locked.channelId,
+          version: locked.version,
+          hash: locked.contentHash,
+          destinations: locked.destinations,
+          decision: "attempt_lease_expired",
+          outcome: writeStarted ? "unknown" : "pending",
+          vendorWrite: writeStarted ? "started" : "not_attempted",
+          policy: UNEVALUATED_PUBLISH_POLICY_AUDIT,
+        },
+      });
+      return asProposal(row as SelectedProposal);
     });
   }
 
@@ -1206,7 +1354,7 @@ export function createTypefullyStore(options: {
         operation: "prepare_publication",
       });
 
-      return database.transaction(async (transaction) => {
+      const prepared = await database.transaction(async (transaction) => {
         const draft = await lockedOwnedDraft(
           transaction,
           input.draftId,
@@ -1233,7 +1381,98 @@ export function createTypefullyStore(options: {
           throw new DraftNotFoundError();
         }
         const instant = now();
-        await transaction
+        const unresolvedRows = await transaction
+          .select(proposalSelection)
+          .from(typefullyPublicationProposals)
+          .where(
+            and(
+              eq(typefullyPublicationProposals.draftId, draft.id),
+              inArray(typefullyPublicationProposals.status, [
+                "in_flight",
+                "unknown",
+              ]),
+            ),
+          )
+          .for("update");
+        for (const unresolvedRow of unresolvedRows) {
+          const unresolved = asProposal(unresolvedRow as SelectedProposal);
+          if (unresolved.status === "unknown") {
+            throw new ProposalStateError(
+              "proposal_not_reconcilable",
+              "Resolve the unknown publication before preparing another proposal.",
+            );
+          }
+          if (
+            unresolved.attemptLeaseExpiresAt === null ||
+            Date.parse(unresolved.attemptLeaseExpiresAt) > instant.getTime()
+          ) {
+            throw new ProposalStateError(
+              "proposal_not_pending",
+              "A publication is already in progress.",
+            );
+          }
+          if (unresolved.vendorWriteStartedAt !== null) {
+            await transaction
+              .update(typefullyPublicationProposals)
+              .set({
+                status: "unknown",
+                completedAt: instant,
+                failureDetail:
+                  "Publishing status unknown after the attempt lease expired.",
+                updatedAt: instant,
+              })
+              .where(eq(typefullyPublicationProposals.id, unresolved.id));
+            await recordAuditEvent(auditStore.inTransaction(transaction), {
+              eventType: "configuration.changed",
+              targetType: "typefully_publication_proposal",
+              targetId: unresolved.id,
+              actorUserId: input.actorId,
+              payload: {
+                draftId: unresolved.draftId,
+                botId: unresolved.botId,
+                channelId: unresolved.channelId,
+                version: unresolved.version,
+                hash: unresolved.contentHash,
+                destinations: unresolved.destinations,
+                decision: "attempt_lease_expired",
+                outcome: "unknown",
+                vendorWrite: "started",
+                policy: UNEVALUATED_PUBLISH_POLICY_AUDIT,
+              },
+            });
+            return { kind: "blocked" as const };
+          }
+          await transaction
+            .update(typefullyPublicationProposals)
+            .set({
+              status: "pending",
+              decidedAt: null,
+              completedAt: null,
+              failureDetail: null,
+              ...clearedPublicationAttempt,
+              updatedAt: instant,
+            })
+            .where(eq(typefullyPublicationProposals.id, unresolved.id));
+          await recordAuditEvent(auditStore.inTransaction(transaction), {
+            eventType: "configuration.changed",
+            targetType: "typefully_publication_proposal",
+            targetId: unresolved.id,
+            actorUserId: input.actorId,
+            payload: {
+              draftId: unresolved.draftId,
+              botId: unresolved.botId,
+              channelId: unresolved.channelId,
+              version: unresolved.version,
+              hash: unresolved.contentHash,
+              destinations: unresolved.destinations,
+              decision: "attempt_lease_expired",
+              outcome: "pending",
+              vendorWrite: "not_attempted",
+              policy: UNEVALUATED_PUBLISH_POLICY_AUDIT,
+            },
+          });
+        }
+        const supersededRows = await transaction
           .update(typefullyPublicationProposals)
           .set({
             status: "expired",
@@ -1247,7 +1486,29 @@ export function createTypefullyStore(options: {
               eq(typefullyPublicationProposals.draftId, draft.id),
               eq(typefullyPublicationProposals.status, "pending"),
             ),
-          );
+          )
+          .returning(proposalSelection);
+        for (const supersededRow of supersededRows) {
+          const superseded = asProposal(supersededRow as SelectedProposal);
+          await recordAuditEvent(auditStore.inTransaction(transaction), {
+            eventType: "configuration.changed",
+            targetType: "typefully_publication_proposal",
+            targetId: superseded.id,
+            actorUserId: input.actorId,
+            payload: {
+              draftId: superseded.draftId,
+              botId: superseded.botId,
+              channelId: superseded.channelId,
+              version: superseded.version,
+              hash: superseded.contentHash,
+              destinations: superseded.destinations,
+              decision: "superseded",
+              outcome: "expired",
+              vendorWrite: "not_attempted",
+              policy: authorization.policy,
+            },
+          });
+        }
         const [row] = await transaction
           .insert(typefullyPublicationProposals)
           .values({
@@ -1280,15 +1541,25 @@ export function createTypefullyStore(options: {
             policy: authorization.policy,
           },
         });
-        return proposalSummary({
-          id: row.id,
-          draftId: row.draftId,
-          draftVersion: row.draftVersion,
-          snapshot: proposal.snapshot,
-          expiresAt: row.expiresAt,
-          status: proposal.status,
-        });
+        return {
+          kind: "prepared" as const,
+          proposal: proposalSummary({
+            id: row.id,
+            draftId: row.draftId,
+            draftVersion: row.draftVersion,
+            snapshot: proposal.snapshot,
+            expiresAt: row.expiresAt,
+            status: proposal.status,
+          }),
+        };
       });
+      if (prepared.kind === "blocked") {
+        throw new ProposalStateError(
+          "proposal_not_reconcilable",
+          "Resolve the unknown publication before preparing another proposal.",
+        );
+      }
+      return prepared.proposal;
     },
 
     async readProposal(proposalId: string, actorId: string) {
@@ -1359,6 +1630,12 @@ export function createTypefullyStore(options: {
         input.proposalId,
         input.actorId,
       );
+      if (proposal.status === "in_flight") {
+        proposal = await recoverExpiredPublicationClaim(
+          proposal,
+          input.actorId,
+        );
+      }
       if (proposal.status !== "pending") {
         if (
           proposal.status === "expired" &&
@@ -1565,15 +1842,19 @@ export function createTypefullyStore(options: {
           return { kind: "changed" as const };
         }
         const instant = now();
+        const publicationAttemptId = randomUUID();
         const [claimed] = await transaction
           .update(typefullyPublicationProposals)
           .set({
-            // `unknown` is the durable fence. A crash after this commit is never automatically
-            // retried; reconciliation must prove the vendor state first.
-            status: "unknown",
+            status: "in_flight",
             decidedAt: instant,
-            completedAt: instant,
-            failureDetail: "Publishing status unknown.",
+            completedAt: null,
+            failureDetail: null,
+            attemptId: publicationAttemptId,
+            attemptLeaseExpiresAt: new Date(
+              instant.getTime() + Math.max(1, attemptLeaseMs),
+            ),
+            vendorWriteStartedAt: null,
             updatedAt: instant,
           })
           .where(
@@ -1602,13 +1883,15 @@ export function createTypefullyStore(options: {
             hash: locked.contentHash,
             destinations: locked.destinations,
             decision: "approved",
-            outcome: "unknown",
+            outcome: "in_flight",
+            vendorWrite: "not_attempted",
             policy: authorized.policy,
           },
         });
         return {
           kind: "claimed" as const,
           proposal: asProposal(claimed as SelectedProposal),
+          attemptId: publicationAttemptId,
         };
       });
       if (claim.kind === "expired") {
@@ -1619,11 +1902,9 @@ export function createTypefullyStore(options: {
       }
       if (claim.kind === "changed") throw changedProposalError();
       proposal = claim.proposal;
+      const publicationAttemptId = claim.attemptId;
 
-      // Re-resolve the grant, policy and actor credential after the durable claim. The earlier
-      // authorization protects the remote comparison; this one is the last server-side boundary
-      // before the irreversible write. If it fails, the already-committed `unknown` fence remains
-      // and only reconciliation may move the proposal again.
+      // Re-resolve grant, policy and actor credential after the durable, still reversible claim.
       let finalAuthorization: Awaited<ReturnType<typeof authorizePublication>>;
       try {
         finalAuthorization = await authorizePublication({
@@ -1632,15 +1913,210 @@ export function createTypefullyStore(options: {
           operation: "publish_now",
         });
       } catch (error) {
-        await auditPublicationRefusal(auditStore, proposal, input.actorId, {
-          decision: "publication_refused",
+        proposal = await releasePublicationClaim({
+          proposal,
+          attemptId: publicationAttemptId,
+          actorId: input.actorId,
           stage: "postclaim_authorization",
           failureClass: publicationAuthorizationFailureClass(error),
-          outcome: "unknown",
           policy: publicationFailurePolicyAudit(error),
         });
         throw error;
       }
+
+      let confirmedRemote: Awaited<ReturnType<PublicationVendor["fetchDraft"]>>;
+      try {
+        confirmedRemote = await publicationVendor.fetchDraft({
+          token: finalAuthorization.token,
+          ...identity,
+        });
+      } catch (error) {
+        const failureClass = publicationVerificationFailure(error);
+        proposal = await releasePublicationClaim({
+          proposal,
+          attemptId: publicationAttemptId,
+          actorId: input.actorId,
+          stage: "postclaim_remote_verification",
+          failureClass,
+          policy: finalAuthorization.policy,
+        });
+        throw error instanceof PublicationVerificationError
+          ? error
+          : new PublicationVerificationError(failureClass);
+      }
+      if (
+        !remoteMatchesSnapshot(
+          confirmedRemote.document,
+          proposal.snapshot,
+          proposal.contentHash,
+        )
+      ) {
+        await database.transaction(async (transaction) => {
+          await lockedOwnedDraft(transaction, proposal.draftId, input.actorId);
+          const locked = await lockedOwnedProposal(
+            transaction,
+            proposal.id,
+            input.actorId,
+          );
+          if (
+            locked.status !== "in_flight" ||
+            locked.attemptId !== publicationAttemptId ||
+            locked.vendorWriteStartedAt !== null
+          ) {
+            return;
+          }
+          const instant = now();
+          await transaction
+            .update(typefullyPublicationProposals)
+            .set({
+              status: "expired",
+              completedAt: instant,
+              failureDetail: "The remote draft changed after review.",
+              ...clearedPublicationAttempt,
+              updatedAt: instant,
+            })
+            .where(eq(typefullyPublicationProposals.id, locked.id));
+          await auditPublicationRefusal(
+            auditStore.inTransaction(transaction),
+            locked,
+            input.actorId,
+            {
+              decision: "publication_refused",
+              stage: "postclaim_remote_revision",
+              failureClass: "remote_changed",
+              outcome: "expired",
+              policy: finalAuthorization.policy,
+            },
+          );
+        });
+        throw changedProposalError();
+      }
+
+      const marked = await database.transaction(async (transaction) => {
+        await lockedOwnedDraft(transaction, proposal.draftId, input.actorId);
+        const locked = await lockedOwnedProposal(
+          transaction,
+          proposal.id,
+          input.actorId,
+        );
+        if (
+          locked.status !== "in_flight" ||
+          locked.attemptId !== publicationAttemptId ||
+          locked.vendorWriteStartedAt !== null
+        ) {
+          return { kind: "stale" as const, proposal: locked };
+        }
+        const instant = now();
+        if (
+          locked.attemptLeaseExpiresAt === null ||
+          Date.parse(locked.attemptLeaseExpiresAt) <= instant.getTime()
+        ) {
+          const [row] = await transaction
+            .update(typefullyPublicationProposals)
+            .set({
+              status: "pending",
+              decidedAt: null,
+              completedAt: null,
+              failureDetail: null,
+              ...clearedPublicationAttempt,
+              updatedAt: instant,
+            })
+            .where(eq(typefullyPublicationProposals.id, locked.id))
+            .returning(proposalSelection);
+          if (!row) return { kind: "stale" as const, proposal: locked };
+          await recordAuditEvent(auditStore.inTransaction(transaction), {
+            eventType: "configuration.changed",
+            targetType: "typefully_publication_proposal",
+            targetId: locked.id,
+            actorUserId: input.actorId,
+            payload: {
+              draftId: locked.draftId,
+              botId: locked.botId,
+              channelId: locked.channelId,
+              version: locked.version,
+              hash: locked.contentHash,
+              destinations: locked.destinations,
+              decision: "attempt_lease_expired",
+              outcome: "pending",
+              vendorWrite: "not_attempted",
+              policy: finalAuthorization.policy,
+            },
+          });
+          return {
+            kind: "retryable" as const,
+            proposal: asProposal(row as SelectedProposal),
+          };
+        }
+        if (
+          !(await lockBotAttachment(
+            transaction,
+            locked.channelId,
+            locked.botId,
+          ))
+        ) {
+          const [row] = await transaction
+            .update(typefullyPublicationProposals)
+            .set({
+              status: "pending",
+              decidedAt: null,
+              completedAt: null,
+              failureDetail: null,
+              ...clearedPublicationAttempt,
+              updatedAt: instant,
+            })
+            .where(eq(typefullyPublicationProposals.id, locked.id))
+            .returning(proposalSelection);
+          if (!row) return { kind: "stale" as const, proposal: locked };
+          await auditPublicationRefusal(
+            auditStore.inTransaction(transaction),
+            locked,
+            input.actorId,
+            {
+              decision: "publication_refused",
+              stage: "postclaim_attachment",
+              failureClass: "bot_detached",
+              outcome: "pending",
+              policy: finalAuthorization.policy,
+            },
+          );
+          return {
+            kind: "detached" as const,
+            proposal: asProposal(row as SelectedProposal),
+          };
+        }
+        const [row] = await transaction
+          .update(typefullyPublicationProposals)
+          .set({ vendorWriteStartedAt: instant, updatedAt: instant })
+          .where(
+            and(
+              eq(typefullyPublicationProposals.id, locked.id),
+              eq(typefullyPublicationProposals.status, "in_flight"),
+              eq(typefullyPublicationProposals.attemptId, publicationAttemptId),
+              isNull(typefullyPublicationProposals.vendorWriteStartedAt),
+            ),
+          )
+          .returning(proposalSelection);
+        return row
+          ? {
+              kind: "marked" as const,
+              proposal: asProposal(row as SelectedProposal),
+            }
+          : { kind: "stale" as const, proposal: locked };
+      });
+      if (marked.kind === "retryable") {
+        throw new ProposalStateError(
+          "proposal_not_pending",
+          "The approval attempt expired before publishing. Approve again.",
+        );
+      }
+      if (marked.kind === "detached") throw new BotNotAttachedError();
+      if (marked.kind === "stale") {
+        throw new ProposalStateError(
+          "proposal_not_pending",
+          "This proposal is no longer available for this publication attempt.",
+        );
+      }
+      proposal = marked.proposal;
 
       let outcome: PublicationOutcome;
       try {
@@ -1673,20 +2149,22 @@ export function createTypefullyStore(options: {
                   (status === "unknown"
                     ? "Publishing status unknown."
                     : "Typefully refused publication.")),
+            ...(status === "unknown" ? {} : clearedPublicationAttempt),
             updatedAt: instant,
           })
           .where(
             and(
               eq(typefullyPublicationProposals.id, proposal.id),
-              eq(typefullyPublicationProposals.status, "unknown"),
+              eq(typefullyPublicationProposals.attemptId, publicationAttemptId),
+              inArray(typefullyPublicationProposals.status, [
+                "in_flight",
+                "unknown",
+              ]),
             ),
           )
           .returning(proposalSelection);
         if (!completed) {
-          throw new ProposalStateError(
-            "proposal_not_pending",
-            "This proposal is no longer pending.",
-          );
+          return ownedProposal(transaction, proposal.id, input.actorId);
         }
         await recordAuditEvent(auditStore.inTransaction(transaction), {
           eventType: "configuration.changed",
@@ -1713,11 +2191,17 @@ export function createTypefullyStore(options: {
       if (!publicationVendor) {
         throw new Error("Typefully publication is unavailable.");
       }
-      const proposal = await ownedProposal(
+      let proposal = await ownedProposal(
         database,
         input.proposalId,
         input.actorId,
       );
+      if (proposal.status === "in_flight") {
+        proposal = await recoverExpiredPublicationClaim(
+          proposal,
+          input.actorId,
+        );
+      }
       if (proposal.status !== "unknown") {
         throw new ProposalStateError(
           "proposal_not_reconcilable",
@@ -1769,6 +2253,7 @@ export function createTypefullyStore(options: {
               outcome.outcome === "published"
                 ? null
                 : (outcome.detail ?? "Typefully reports publication failed."),
+            ...clearedPublicationAttempt,
             updatedAt: instant,
           })
           .where(
@@ -1900,7 +2385,10 @@ export function createTypefullyStore(options: {
           .where(
             and(
               eq(typefullyPublicationProposals.draftId, current.id),
-              eq(typefullyPublicationProposals.status, "unknown"),
+              inArray(typefullyPublicationProposals.status, [
+                "in_flight",
+                "unknown",
+              ]),
             ),
           )
           .limit(1);

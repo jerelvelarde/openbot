@@ -280,6 +280,40 @@ describe("immutable Typefully publication proposals", () => {
     });
   });
 
+  test("supersedes pending proposals with a transactional metadata-only audit", async () => {
+    const draft = await syncedDraft();
+    const first = await store.prepareProposal({
+      draftId: draft.id,
+      actorId: ownerId,
+      expectedVersion: draft.version,
+    });
+    const second = await store.prepareProposal({
+      draftId: draft.id,
+      actorId: ownerId,
+      expectedVersion: draft.version,
+    });
+    expect(second.id).not.toBe(first.id);
+    expect(await store.readProposal(first.id, ownerId)).toMatchObject({
+      status: "expired",
+      failureDetail: "Superseded by a newer review proposal.",
+    });
+    const audit = await proposalAudits(first.id);
+    expect(audit.map(({ payload }) => payload)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          decision: "superseded",
+          outcome: "expired",
+          vendorWrite: "not_attempted",
+          policy: expect.objectContaining({
+            operation: "prepare_publication",
+            decision: "allowed",
+          }),
+        }),
+      ]),
+    );
+    expectAuditIsSafe(audit);
+  });
+
   test("marks edits and remote changes as Changed — review again", async () => {
     const draft = await syncedDraft();
     const localProposal = await store.prepareProposal({
@@ -496,6 +530,13 @@ describe("immutable Typefully publication proposals", () => {
     await expect(
       store.approveAndPublish({ proposalId: proposal.id, actorId: ownerId }),
     ).rejects.toMatchObject({ code: "proposal_not_pending" });
+    await expect(
+      store.prepareProposal({
+        draftId: draft.id,
+        actorId: ownerId,
+        expectedVersion: draft.version,
+      }),
+    ).rejects.toMatchObject({ code: "proposal_not_reconcilable" });
 
     publishResult = { outcome: "published", vendorResultId: "reconciled" };
     expect(
@@ -505,6 +546,13 @@ describe("immutable Typefully publication proposals", () => {
       }),
     ).toMatchObject({ status: "published", vendorResultId: "reconciled" });
     expect(publishCalls).toBe(1);
+    expect(
+      await store.prepareProposal({
+        draftId: draft.id,
+        actorId: ownerId,
+        expectedVersion: draft.version,
+      }),
+    ).toMatchObject({ status: "pending" });
     const reconciliationAudit = await database
       .select({ payload: auditEvents.payload })
       .from(auditEvents)
@@ -587,6 +635,276 @@ describe("immutable Typefully publication proposals", () => {
     release();
     publishBarrier = null;
     expect(await publishing).toMatchObject({ status: "published" });
+  });
+
+  test("leases a live vendor write, fences reconciliation, and recovers an expired started attempt as unknown", async () => {
+    let clock = Date.now();
+    let releaseVendor!: () => void;
+    let vendorStarted!: () => void;
+    const vendorBarrier = new Promise<void>((resolve) => {
+      releaseVendor = resolve;
+    });
+    const vendorStartedSignal = new Promise<void>((resolve) => {
+      vendorStarted = resolve;
+    });
+    let leasedPublishCalls = 0;
+    let leasedReconcileCalls = 0;
+    const leasedStore = createTypefullyStore({
+      database,
+      auditStore: createAuditStore(database),
+      plugin: () => plugin,
+      now: () => new Date(clock),
+      attemptLeaseMs: 50,
+      publicationVendor: {
+        fetchDraft: async () => ({ document: remoteDocument }),
+        publishDraft: async () => {
+          leasedPublishCalls += 1;
+          vendorStarted();
+          await vendorBarrier;
+          return { outcome: "published" as const, vendorResultId: "late" };
+        },
+        reconcileDraft: async () => {
+          leasedReconcileCalls += 1;
+          return {
+            outcome: "published" as const,
+            vendorResultId: "reconciled",
+          };
+        },
+      },
+    });
+    const draft = await syncedDraft();
+    const proposal = await leasedStore.prepareProposal({
+      draftId: draft.id,
+      actorId: ownerId,
+      expectedVersion: draft.version,
+    });
+
+    const publishing = leasedStore.approveAndPublish({
+      proposalId: proposal.id,
+      actorId: ownerId,
+    });
+    await vendorStartedSignal;
+    expect(await leasedStore.readProposal(proposal.id, ownerId)).toMatchObject({
+      status: "in_flight",
+      attemptId: expect.any(String),
+      vendorWriteStartedAt: expect.any(String),
+    });
+    await expect(
+      leasedStore.reconcileProposal({
+        proposalId: proposal.id,
+        actorId: ownerId,
+      }),
+    ).rejects.toMatchObject({ code: "proposal_not_reconcilable" });
+    expect(leasedReconcileCalls).toBe(0);
+    await expect(
+      leasedStore.prepareProposal({
+        draftId: draft.id,
+        actorId: ownerId,
+        expectedVersion: draft.version,
+      }),
+    ).rejects.toMatchObject({ code: "proposal_not_pending" });
+
+    clock += 100;
+    expect(
+      await leasedStore.reconcileProposal({
+        proposalId: proposal.id,
+        actorId: ownerId,
+      }),
+    ).toMatchObject({ status: "published", vendorResultId: "reconciled" });
+    expect(leasedPublishCalls).toBe(1);
+    expect(leasedReconcileCalls).toBe(1);
+
+    releaseVendor();
+    expect(await publishing).toMatchObject({
+      status: "published",
+      vendorResultId: "reconciled",
+    });
+    expect(leasedPublishCalls).toBe(1);
+    expect(
+      await leasedStore.prepareProposal({
+        draftId: draft.id,
+        actorId: ownerId,
+        expectedVersion: draft.version,
+      }),
+    ).toMatchObject({ status: "pending" });
+  });
+
+  test("recovers an expired pre-write claim to pending for an explicit approval retry", async () => {
+    let clock = Date.now();
+    let recoveredPublishCalls = 0;
+    const recoveringStore = createTypefullyStore({
+      database,
+      auditStore: createAuditStore(database),
+      plugin: () => plugin,
+      now: () => new Date(clock),
+      attemptLeaseMs: 50,
+      publicationVendor: {
+        fetchDraft: async () => ({ document: remoteDocument }),
+        publishDraft: async () => {
+          recoveredPublishCalls += 1;
+          return { outcome: "published" as const };
+        },
+        reconcileDraft: async () => ({ outcome: "unknown" as const }),
+      },
+    });
+    const draft = await syncedDraft();
+    const proposal = await recoveringStore.prepareProposal({
+      draftId: draft.id,
+      actorId: ownerId,
+      expectedVersion: draft.version,
+    });
+    await database
+      .update(typefullyPublicationProposals)
+      .set({
+        status: "in_flight",
+        decidedAt: new Date(clock - 100),
+        attemptId: randomUUID(),
+        attemptLeaseExpiresAt: new Date(clock - 1),
+        vendorWriteStartedAt: null,
+      })
+      .where(eq(typefullyPublicationProposals.id, proposal.id));
+
+    clock += 1;
+    expect(
+      await recoveringStore.approveAndPublish({
+        proposalId: proposal.id,
+        actorId: ownerId,
+      }),
+    ).toMatchObject({ status: "published" });
+    expect(recoveredPublishCalls).toBe(1);
+    const audit = await proposalAudits(proposal.id);
+    expect(audit.map(({ payload }) => payload)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          decision: "attempt_lease_expired",
+          outcome: "pending",
+          vendorWrite: "not_attempted",
+        }),
+      ]),
+    );
+  });
+
+  test("releases a claim when postclaim verification fails before the vendor write", async () => {
+    let fetches = 0;
+    let postclaimPublishCalls = 0;
+    const postclaimStore = createTypefullyStore({
+      database,
+      auditStore: createAuditStore(database),
+      plugin: () => plugin,
+      publicationVendor: {
+        fetchDraft: async () => {
+          fetches += 1;
+          if (fetches === 2) {
+            throw new DOMException("secret remote timeout", "TimeoutError");
+          }
+          return { document: remoteDocument };
+        },
+        publishDraft: async () => {
+          postclaimPublishCalls += 1;
+          return { outcome: "published" as const };
+        },
+        reconcileDraft: async () => ({ outcome: "unknown" as const }),
+      },
+    });
+    const draft = await syncedDraft();
+    const proposal = await postclaimStore.prepareProposal({
+      draftId: draft.id,
+      actorId: ownerId,
+      expectedVersion: draft.version,
+    });
+    await expect(
+      postclaimStore.approveAndPublish({
+        proposalId: proposal.id,
+        actorId: ownerId,
+      }),
+    ).rejects.toMatchObject({ failureClass: "remote_timeout" });
+    expect(postclaimPublishCalls).toBe(0);
+    expect(await store.readProposal(proposal.id, ownerId)).toMatchObject({
+      status: "pending",
+      attemptId: null,
+      vendorWriteStartedAt: null,
+    });
+    const audit = await proposalAudits(proposal.id);
+    expect(audit.map(({ payload }) => payload)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          stage: "postclaim_remote_verification",
+          failureClass: "remote_timeout",
+          outcome: "pending",
+          vendorWrite: "not_attempted",
+          policy: expect.objectContaining({ decision: "allowed" }),
+        }),
+      ]),
+    );
+    expectAuditIsSafe(audit);
+  });
+
+  test("releases a claimed proposal if its Bot detaches before the write marker", async () => {
+    let fetches = 0;
+    let detachedPublishCalls = 0;
+    const detachingStore = createTypefullyStore({
+      database,
+      auditStore: createAuditStore(database),
+      plugin: () => plugin,
+      publicationVendor: {
+        fetchDraft: async () => {
+          fetches += 1;
+          if (fetches === 2) {
+            await database
+              .delete(channelAgents)
+              .where(
+                and(
+                  eq(channelAgents.channelId, channelId),
+                  eq(channelAgents.agentId, botId),
+                ),
+              );
+          }
+          return { document: remoteDocument };
+        },
+        publishDraft: async () => {
+          detachedPublishCalls += 1;
+          return { outcome: "published" as const };
+        },
+        reconcileDraft: async () => ({ outcome: "unknown" as const }),
+      },
+    });
+    const draft = await syncedDraft();
+    const proposal = await detachingStore.prepareProposal({
+      draftId: draft.id,
+      actorId: ownerId,
+      expectedVersion: draft.version,
+    });
+    try {
+      await expect(
+        detachingStore.approveAndPublish({
+          proposalId: proposal.id,
+          actorId: ownerId,
+        }),
+      ).rejects.toMatchObject({ code: "bot_not_attached" });
+      expect(detachedPublishCalls).toBe(0);
+      expect(await store.readProposal(proposal.id, ownerId)).toMatchObject({
+        status: "pending",
+        attemptId: null,
+        vendorWriteStartedAt: null,
+      });
+      const audit = await proposalAudits(proposal.id);
+      expect(audit.map(({ payload }) => payload)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            stage: "postclaim_attachment",
+            failureClass: "bot_detached",
+            outcome: "pending",
+            vendorWrite: "not_attempted",
+          }),
+        ]),
+      );
+      expectAuditIsSafe(audit);
+    } finally {
+      await database
+        .insert(channelAgents)
+        .values({ channelId, agentId: botId })
+        .onConflictDoNothing();
+    }
   });
 
   test("audits credential, grant, and policy refusals before any vendor publish", async () => {
@@ -828,7 +1146,7 @@ describe("immutable Typefully publication proposals", () => {
       expect(publishCalls).toBe(0);
       expect(
         await store.readProposal(postclaimProposal.id, ownerId),
-      ).toMatchObject({ status: "unknown" });
+      ).toMatchObject({ status: "pending" });
       const postclaimAudit = await proposalAudits(postclaimProposal.id);
       expect(postclaimAudit.map(({ payload }) => payload)).toEqual(
         expect.arrayContaining([
@@ -993,7 +1311,7 @@ describe("immutable Typefully publication proposals", () => {
       expect(publishAuthorizationCalls).toBe(2);
       expect(publishCalls).toBe(0);
       expect(await store.readProposal(proposal.id, ownerId)).toMatchObject({
-        status: "unknown",
+        status: "pending",
       });
       const audit = await proposalAudits(proposal.id);
       expect(audit.map(({ payload }) => payload)).toEqual(
@@ -1003,7 +1321,7 @@ describe("immutable Typefully publication proposals", () => {
             stage: "postclaim_authorization",
             failureClass: "grant_missing",
             vendorWrite: "not_attempted",
-            outcome: "unknown",
+            outcome: "pending",
             policy: expect.objectContaining({
               operation: "publish_now",
               decision: "not_evaluated",

@@ -25,6 +25,7 @@ import {
   createPluginStore,
 } from "../src/plugins/store";
 import { createTypefullyRoutes } from "../src/typefully/routes";
+import { PublicationVerificationError } from "../src/typefully/publication";
 import { createTypefullyStore } from "../src/typefully/store";
 import { TEST_POOL } from "./support/database";
 import { testEnvironment } from "./support/environment";
@@ -44,6 +45,7 @@ let actorId = ownerId;
 let granted = true;
 let routeRemoteDocument: unknown;
 let routePublishCalls = 0;
+let routeVerificationError: PublicationVerificationError | null = null;
 
 const plugin = {
   decide: async (_kind: "mcp" | "skill", _ref: string, agentId: string) =>
@@ -69,7 +71,10 @@ const store = createTypefullyStore({
   auditStore: createAuditStore(database),
   plugin: () => plugin,
   publicationVendor: {
-    fetchDraft: async () => ({ document: routeRemoteDocument }),
+    fetchDraft: async () => {
+      if (routeVerificationError) throw routeVerificationError;
+      return { document: routeRemoteDocument };
+    },
     publishDraft: async () => {
       routePublishCalls += 1;
       return { outcome: "published", vendorResultId: "route-published" };
@@ -250,7 +255,26 @@ describe("Typefully draft routes", () => {
   });
 
   test("a stale publish grant cannot surface or cross the signed plugin boundary", async () => {
-    const staleRef = "typefully/publish_now";
+    const staleRefs = [
+      "typefully/publish_now",
+      "typefully/publish",
+      "typefully/schedule_draft",
+      "typefully/schedule",
+    ];
+    const staleNames = staleRefs.map((ref) => ref.slice("typefully/".length));
+    await database.insert(mcpTools).values(
+      staleNames.map((name) => ({
+        serverId: "typefully",
+        name,
+        description: "stale unsafe tool",
+        inputSchema: { type: "object" },
+      })),
+    );
+    await database
+      .insert(pluginGrants)
+      .values(
+        staleRefs.map((ref) => ({ kind: "mcp" as const, ref, agentId: botId })),
+      );
     await governedPluginStore.refreshTools("typefully");
     const refreshed = await database
       .select({ name: mcpTools.name })
@@ -261,31 +285,89 @@ describe("Typefully draft routes", () => {
       refreshed.some(
         (tool) =>
           tool.name !== "prepare_publication" &&
-          /publish|publication/i.test(tool.name),
+          /publish|publication|schedule/i.test(tool.name),
       ),
     ).toBe(false);
-    await database.insert(pluginGrants).values({
-      kind: "mcp",
-      ref: staleRef,
-      agentId: botId,
-    });
+    const refreshedGrants = await database
+      .select({ ref: pluginGrants.ref })
+      .from(pluginGrants)
+      .where(
+        and(
+          inArray(pluginGrants.ref, staleRefs),
+          eq(pluginGrants.agentId, botId),
+        ),
+      );
+    expect(refreshedGrants).toEqual([]);
+
+    // Even a grant written by stale code after refresh cannot cross the signed call boundary.
+    await database
+      .insert(pluginGrants)
+      .values(
+        staleRefs.map((ref) => ({ kind: "mcp" as const, ref, agentId: botId })),
+      );
     try {
       const listed = await governedPluginStore.listForAgent(botId);
-      expect(listed.tools.map((tool) => tool.ref)).not.toContain(staleRef);
-      await expect(
-        governedPluginStore.callTool({
-          ref: staleRef,
-          args: {},
-          botId,
-          actorId: ownerId,
-        }),
-      ).rejects.toMatchObject({ name: "PluginRefusedError" });
+      for (const staleRef of staleRefs) {
+        expect(listed.tools.map((tool) => tool.ref)).not.toContain(staleRef);
+        await expect(
+          governedPluginStore.callTool({
+            ref: staleRef,
+            args: {},
+            botId,
+            actorId: ownerId,
+          }),
+        ).rejects.toMatchObject({ name: "PluginRefusedError" });
+      }
     } finally {
       await database
         .delete(pluginGrants)
         .where(
-          and(eq(pluginGrants.ref, staleRef), eq(pluginGrants.agentId, botId)),
+          and(
+            inArray(pluginGrants.ref, staleRefs),
+            eq(pluginGrants.agentId, botId),
+          ),
         );
+    }
+  });
+
+  test("maps typed remote verification failures to stable retryable responses", async () => {
+    for (const [failureClass, expectedStatus] of [
+      ["remote_refused", 502],
+      ["remote_invalid", 502],
+      ["remote_unavailable", 503],
+      ["remote_timeout", 504],
+    ] as const) {
+      const { body } = await createDraft();
+      const local = await store.readDraft(body.draft.id, ownerId);
+      routeRemoteDocument = local.document;
+      const synced = await store.recordRemoteConfirmation({
+        draftId: local.id,
+        actorId: ownerId,
+        expectedVersion: local.version,
+        expectedHash: local.contentHash,
+        remoteDraftId: String(300 + expectedStatus),
+      });
+      const proposal = await store.prepareProposal({
+        draftId: local.id,
+        actorId: ownerId,
+        expectedVersion: synced.version,
+      });
+      routeVerificationError = new PublicationVerificationError(failureClass);
+      try {
+        const response = await app.request(
+          `/api/typefully/proposals/${proposal.id}/publish`,
+          { method: "POST" },
+        );
+        expect(response.status).toBe(expectedStatus);
+        const payload = (await response.json()) as Record<string, unknown>;
+        expect(payload).toMatchObject({ code: failureClass });
+        expect(JSON.stringify(payload)).not.toContain("route-personal-key");
+        expect(await store.readProposal(proposal.id, ownerId)).toMatchObject({
+          status: "pending",
+        });
+      } finally {
+        routeVerificationError = null;
+      }
     }
   });
 

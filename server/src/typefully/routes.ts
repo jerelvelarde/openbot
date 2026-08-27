@@ -10,7 +10,11 @@ import {
   type MediaUploadDependencies,
   uploadPresignedMedia,
 } from "./media-upload";
-import { ProposalStateError, type PublicationProposal } from "./publication";
+import {
+  ProposalStateError,
+  type PublicationProposal,
+  PublicationVerificationError,
+} from "./publication";
 import {
   BotNotAttachedError,
   DraftNotFoundError,
@@ -162,6 +166,18 @@ function errorResponse(
     return context.json(
       { code: error.code, message: safeError(error) },
       error.status,
+    );
+  }
+  if (error instanceof PublicationVerificationError) {
+    const status =
+      error.failureClass === "remote_timeout"
+        ? 504
+        : error.failureClass === "remote_unavailable"
+          ? 503
+          : 502;
+    return context.json(
+      { code: error.failureClass, message: safeError(error) },
+      status,
     );
   }
   if (error instanceof ConnectionRequiredError) {

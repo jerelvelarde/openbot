@@ -192,6 +192,7 @@ export type DraftSyncStatus = z.infer<typeof syncStatusSchema>;
 
 export const proposalStatusSchema = z.enum([
   "pending",
+  "in_flight",
   "declined",
   "expired",
   "published",

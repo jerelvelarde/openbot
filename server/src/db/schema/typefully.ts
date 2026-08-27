@@ -103,6 +103,15 @@ export const typefullyPublicationProposals = pgTable(
     vendorResultId: text("vendor_result_id"),
     publishedUrl: text("published_url"),
     failureDetail: text("failure_detail"),
+    /** Fences one human-approved publication attempt across process crashes and replicas. */
+    attemptId: uuid("attempt_id"),
+    attemptLeaseExpiresAt: timestamp("attempt_lease_expires_at", {
+      withTimezone: true,
+    }),
+    /** Set durably immediately before the irreversible vendor PATCH begins. */
+    vendorWriteStartedAt: timestamp("vendor_write_started_at", {
+      withTimezone: true,
+    }),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
@@ -127,7 +136,11 @@ export const typefullyPublicationProposals = pgTable(
     ),
     check(
       "typefully_proposals_status_valid",
-      sql`${table.status} IN ('pending', 'declined', 'expired', 'published', 'failed', 'unknown')`,
+      sql`${table.status} IN ('pending', 'in_flight', 'declined', 'expired', 'published', 'failed', 'unknown')`,
+    ),
+    check(
+      "typefully_proposals_attempt_complete",
+      sql`(${table.status} <> 'in_flight' AND ${table.attemptId} IS NULL AND ${table.attemptLeaseExpiresAt} IS NULL AND ${table.vendorWriteStartedAt} IS NULL) OR (${table.attemptId} IS NOT NULL AND ${table.attemptLeaseExpiresAt} IS NOT NULL AND (${table.status} = 'in_flight' OR (${table.status} = 'unknown' AND ${table.vendorWriteStartedAt} IS NOT NULL)))`,
     ),
   ],
 );

@@ -84,13 +84,12 @@ describe("the reviewed Typefully tool surface", () => {
       "update_draft",
       "upload_media",
       "remove_media",
-      "schedule_draft",
       "delete_draft",
       "prepare_publication",
     ]);
-    expect(
-      tools.some((tool) => ["publish", "publish_now"].includes(tool.name)),
-    ).toBe(false);
+    expect(tools.some((tool) => /publish|schedule/i.test(tool.name))).toBe(
+      false,
+    );
     const removeMedia = tools.find((tool) => tool.name === "remove_media");
     expect(removeMedia?.description).toContain(
       `${TYPEFULLY_REMOVE_MEDIA_MAX_DRAFT_BYTES / 1_000_000} MB`,
@@ -424,13 +423,6 @@ describe("v2 request mapping", () => {
         method: "POST",
         path: "/v2/social-sets/12/media/upload",
         body: { file_name: "launch.png" },
-      },
-      {
-        name: "schedule_draft",
-        args: { socialSetId: 12, draftId: 34, publishAt: plannedAt },
-        method: "PATCH",
-        path: "/v2/social-sets/12/drafts/34",
-        body: { publish_at: plannedAt },
       },
       {
         name: "delete_draft",
@@ -992,11 +984,6 @@ describe("fail-closed validation", () => {
         socialSetId: 1,
         platforms: { [hostileKey]: { enabled: false } },
       }),
-      await transport.callTool(connection, "schedule_draft", {
-        socialSetId: 1,
-        draftId: 2,
-        publishAt: `2099-01-01T00:00:00Z\n${"x".repeat(2_000)}`,
-      }),
       await transport.callTool(connection, "create_draft", {
         socialSetId: 1,
         platforms,
@@ -1014,50 +1001,23 @@ describe("fail-closed validation", () => {
     expect(calls).toHaveLength(0);
   });
 
-  test("rejects now, past, impossible, and timezone-less schedules before fetch", async () => {
+  test("rejects every schedule and publish alias before credential or fetch", async () => {
     const { fetch, calls } = recordingFetch();
     const transport = createTypefullyRestTransport(fetch);
-    for (const publishAt of [
-      "now",
-      "NOW",
-      "2020-01-01T00:00:00Z",
-      "2099-02-30T12:00:00Z",
-      "2099-13-01T12:00:00Z",
-      "2099-01-01T12:00:00",
-      "tomorrow",
-      "2099-01-01",
+    for (const name of [
+      "schedule_draft",
+      "schedule",
+      "publish",
+      "publish_now",
     ]) {
-      const result = await transport.callTool(connection, "schedule_draft", {
+      const result = await transport.callTool(connection, name, {
         socialSetId: 1,
         draftId: 2,
-        publishAt,
+        publishAt: plannedAt,
       });
       expect(result.isError).toBe(true);
     }
     expect(calls).toHaveLength(0);
-  });
-
-  test("accepts future Z and offset schedules", async () => {
-    const { fetch, calls } = recordingFetch();
-    const transport = createTypefullyRestTransport(fetch);
-    for (const publishAt of [
-      "2099-08-27T12:00:00Z",
-      "2099-08-27T12:00:00-07:00",
-      "2099-08-27T12:00:00.123456Z",
-      "2099-08-27T12:00:00.123456-07:00",
-      "next-free-slot",
-    ]) {
-      const result = await transport.callTool(connection, "schedule_draft", {
-        socialSetId: 1,
-        draftId: 2,
-        publishAt,
-      });
-      expect(result.isError).toBe(false);
-      expect(JSON.parse(calls.at(-1)?.body ?? "null")).toEqual({
-        publish_at: publishAt,
-      });
-    }
-    expect(calls).toHaveLength(5);
   });
 
   test("bounds pagination before fetch", async () => {

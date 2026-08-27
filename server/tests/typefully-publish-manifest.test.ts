@@ -15,14 +15,16 @@ describe("Typefully publication manifest boundary", () => {
     expect(names).toContain("prepare_publication");
     expect(names).not.toContain("publish");
     expect(names).not.toContain("publish_now");
-    expect(names.filter((name) => /publish|publication/i.test(name))).toEqual([
-      "prepare_publication",
-    ]);
+    expect(names).not.toContain("schedule_draft");
+    expect(
+      names.filter((name) => /publish|publication|schedule/i.test(name)),
+    ).toEqual(["prepare_publication"]);
 
     const typefully = CATALOGUE.find((entry) => entry.key === "typefully");
     expect(typefully?.writeTools).toContain("prepare_publication");
     expect(typefully?.writeTools).not.toContain("publish");
     expect(typefully?.writeTools).not.toContain("publish_now");
+    expect(typefully?.writeTools).not.toContain("schedule_draft");
   });
 
   test("refuses local preparation and publish aliases before vendor network access", async () => {
@@ -36,13 +38,17 @@ describe("Typefully publication manifest boundary", () => {
       "prepare_publication",
       { draftId: "00000000-0000-4000-8000-000000000001", expectedVersion: 1 },
     );
-    const published = await transport.callTool(
-      { url: "https://api.typefully.com/v2", token: "key" },
-      "publish_now",
-      {},
+    const rejected = await Promise.all(
+      ["publish_now", "publish", "schedule_draft", "schedule"].map((name) =>
+        transport.callTool(
+          { url: "https://api.typefully.com/v2", token: "key" },
+          name,
+          {},
+        ),
+      ),
     );
     expect(prepared.isError).toBe(true);
-    expect(published.isError).toBe(true);
+    expect(rejected.every((result) => result.isError)).toBe(true);
     expect(fetches).toBe(0);
   });
 });
@@ -386,5 +392,23 @@ describe("official Typefully scheduling comparison", () => {
         "unused",
       ),
     ).toBe(false);
+  });
+
+  test("requires every reviewed destination to be explicitly enabled", () => {
+    for (const destination of ["x", "linkedin"] as const) {
+      for (const enabled of [undefined, null, false, "true", 1]) {
+        const candidate = remote("draft", null) as {
+          platforms: Record<string, Record<string, unknown>>;
+        };
+        if (enabled === undefined) {
+          delete candidate.platforms[destination]?.enabled;
+        } else if (candidate.platforms[destination]) {
+          candidate.platforms[destination].enabled = enabled;
+        }
+        expect(remoteMatchesSnapshot(candidate, snapshot(null), "unused")).toBe(
+          false,
+        );
+      }
+    }
   });
 });

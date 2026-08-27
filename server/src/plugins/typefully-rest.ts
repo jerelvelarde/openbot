@@ -60,8 +60,6 @@ const TOOL_DESCRIPTIONS: Record<TypefullyToolName, string> = {
   upload_media:
     "Request a presigned Typefully media-upload URL. This only initiates the upload and never accepts file bytes.",
   remove_media: `Remove one named media reference from an authoritative Typefully draft. For safety, this refuses draft responses larger than the ${TYPEFULLY_REMOVE_MEDIA_MAX_DRAFT_BYTES / 1_000_000} MB limit.`,
-  schedule_draft:
-    'Schedule a draft for a future ISO 8601 datetime or the next free slot. "now" is always refused.',
   delete_draft: "Delete one Typefully draft.",
   prepare_publication:
     "Prepare an immutable, expiring review proposal for one fully synchronized local draft. This never publishes.",
@@ -276,12 +274,6 @@ function buildRequest(
         method: "POST",
         path: `/social-sets/${call.args.socialSetId}/media/upload`,
         body: { file_name: call.args.fileName },
-      };
-    case "schedule_draft":
-      return {
-        method: "PATCH",
-        path: `/social-sets/${call.args.socialSetId}/drafts/${call.args.draftId}`,
-        body: { publish_at: call.args.publishAt },
       };
     case "delete_draft":
       return {
