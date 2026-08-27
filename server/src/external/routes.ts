@@ -2,7 +2,7 @@ import type { Context, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import { type AuditStore, recordAuditEvent } from "../audit";
 import type { AppVariables } from "../auth/guards";
-import type { ExternalLinkStore } from "./link-store";
+import type { ExternalLinkResult, ExternalLinkStore } from "./link-store";
 import { readExternalLinkToken } from "./link-token";
 import type { ExternalProviderIdentity } from "./schema-types";
 
@@ -62,8 +62,12 @@ export function createExternalLinkRoutes({
     }
 
     const actor = context.var.actor;
+    let linked: ExternalLinkResult;
     try {
-      await store.link({ ...claim, openbotUserId: actor.id });
+      linked = await store.linkWithStatus({
+        ...claim,
+        openbotUserId: actor.id,
+      });
     } catch (error) {
       if (error instanceof Error && error.message === LINK_CONFLICT_MESSAGE) {
         return context.json({ error: LINK_CONFLICT_MESSAGE }, 409);
@@ -71,19 +75,19 @@ export function createExternalLinkRoutes({
       throw error;
     }
 
-    await recordAuditEvent(auditStore, {
-      eventType: "external_identity.linked" as Parameters<
-        typeof recordAuditEvent
-      >[1]["eventType"],
-      targetType: "user",
-      targetId: actor.id,
-      actorUserId: actor.id,
-      payload: {
-        provider: claim.provider,
-        providerTenantId: claim.providerTenantId,
-        providerUserId: claim.providerUserId,
-      },
-    });
+    if (linked.created) {
+      await recordAuditEvent(auditStore, {
+        eventType: "external_identity.linked",
+        targetType: "user",
+        targetId: actor.id,
+        actorUserId: actor.id,
+        payload: {
+          provider: claim.provider,
+          providerTenantId: claim.providerTenantId,
+          providerUserId: claim.providerUserId,
+        },
+      });
+    }
     return context.json({ linked: true });
   });
 
