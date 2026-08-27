@@ -1,12 +1,13 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray, isNull } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull } from "drizzle-orm";
 import { createAuditStore } from "../src/audit";
 import type { ActionPolicy } from "../src/computer/policy";
 import { encryptSecret } from "../src/credentials";
 import { createDatabase } from "../src/db/client";
 import {
   agents,
+  auditEvents,
   credentials,
   mcpServers,
   mcpTools,
@@ -46,6 +47,9 @@ const brokenOauthUserId = `user_oauth_no_scope_${suite}`;
 const serverId = "google-drive";
 const toolName = "search_files";
 const ref = `${serverId}/${toolName}`;
+const typefullyServerId = "typefully";
+const typefullyToolName = "list_social_sets";
+const typefullyRef = `${typefullyServerId}/${typefullyToolName}`;
 
 // 32 zero bytes in base64. A real AES-256 key length, unlike `"x".repeat(44)`, which decodes to 33
 // bytes and makes `importKey` throw — the existing plugin store test gets away with it only because
@@ -95,6 +99,9 @@ let clientBefore: string | null = null;
  * row; never deleting leaves a fixture that reads on screen as a tool the vendor offers.
  */
 let toolWasAlreadyAdvertised = false;
+let typefullyServerWasAlreadyConfigured = false;
+let typefullyToolWasAlreadyAdvertised = false;
+let typefullyCredentialBefore: string | null = null;
 const credentialIds: string[] = [];
 
 const store = createPluginStore({
@@ -307,6 +314,27 @@ beforeAll(async () => {
         )
     ).length > 0;
   clientBefore = existing?.credentialId ?? null;
+  const [existingTypefully] = await database
+    .select({
+      id: mcpServers.id,
+      credentialId: mcpServers.credentialId,
+    })
+    .from(mcpServers)
+    .where(eq(mcpServers.id, typefullyServerId));
+  typefullyServerWasAlreadyConfigured = existingTypefully !== undefined;
+  typefullyCredentialBefore = existingTypefully?.credentialId ?? null;
+  typefullyToolWasAlreadyAdvertised =
+    (
+      await database
+        .select({ name: mcpTools.name })
+        .from(mcpTools)
+        .where(
+          and(
+            eq(mcpTools.serverId, typefullyServerId),
+            eq(mcpTools.name, typefullyToolName),
+          ),
+        )
+    ).length > 0;
 
   // Written directly, so the test needs no vendor to be reachable. What is under test is which
   // credential gets chosen, not the listing.
@@ -321,14 +349,36 @@ beforeAll(async () => {
     })
     .onConflictDoNothing();
   await database
+    .insert(mcpServers)
+    .values({
+      id: typefullyServerId,
+      title: "Typefully",
+      vendor: "Typefully",
+      url: "https://api.typefully.com/v2",
+      provenance: "first-party",
+    })
+    .onConflictDoNothing();
+  await database
     .insert(mcpTools)
     .values({ serverId, name: toolName, description: "Search files." })
+    .onConflictDoNothing();
+  await database
+    .insert(mcpTools)
+    .values({
+      serverId: typefullyServerId,
+      name: typefullyToolName,
+      description: "List social sets.",
+    })
     .onConflictDoNothing();
 
   // The Bot holds the tool throughout. Everything here is about the person, not the grant.
   await database
     .insert(pluginGrants)
     .values({ kind: "mcp", ref, agentId: botId })
+    .onConflictDoNothing();
+  await database
+    .insert(pluginGrants)
+    .values({ kind: "mcp", ref: typefullyRef, agentId: botId })
     .onConflictDoNothing();
 });
 
@@ -374,6 +424,10 @@ afterAll(async () => {
     .update(mcpServers)
     .set({ credentialId: clientBefore })
     .where(eq(mcpServers.id, serverId));
+  await database
+    .update(mcpServers)
+    .set({ credentialId: typefullyCredentialBefore })
+    .where(eq(mcpServers.id, typefullyServerId));
   for (const id of credentialIds) {
     await database.delete(credentials).where(eq(credentials.id, id));
   }
@@ -385,6 +439,11 @@ afterAll(async () => {
   await database
     .delete(pluginGrants)
     .where(and(eq(pluginGrants.ref, ref), eq(pluginGrants.agentId, botId)));
+  await database
+    .delete(pluginGrants)
+    .where(
+      and(eq(pluginGrants.ref, typefullyRef), eq(pluginGrants.agentId, botId)),
+    );
   // The fixture tool goes whether or not this suite owns the server, but only if it put it there.
   if (!toolWasAlreadyAdvertised) {
     await database
@@ -395,12 +454,82 @@ afterAll(async () => {
     await database.delete(mcpTools).where(eq(mcpTools.serverId, serverId));
     await database.delete(mcpServers).where(eq(mcpServers.id, serverId));
   }
+  if (!typefullyToolWasAlreadyAdvertised) {
+    await database
+      .delete(mcpTools)
+      .where(
+        and(
+          eq(mcpTools.serverId, typefullyServerId),
+          eq(mcpTools.name, typefullyToolName),
+        ),
+      );
+  }
+  if (!typefullyServerWasAlreadyConfigured) {
+    await database
+      .delete(mcpTools)
+      .where(eq(mcpTools.serverId, typefullyServerId));
+    await database
+      .delete(mcpServers)
+      .where(eq(mcpServers.id, typefullyServerId));
+  }
   await database.delete(agents).where(eq(agents.id, botId));
   await database
     .delete(users)
     .where(
       inArray(users.id, [askerId, otherId, apiKeyUserId, brokenOauthUserId]),
     );
+});
+
+describe("a Typefully call before personal API-key setup exists", () => {
+  test("refuses before vendor access and never falls back to a deployment credential", async () => {
+    const [credential] = await database
+      .insert(credentials)
+      .values({
+        kind: "mcp_oauth_client",
+        provider: typefullyServerId,
+        keyId: `typefully-deployment-fixture-${suite}`,
+        metadata: {},
+        encryptedValue: await encryptSecret(
+          ENCRYPTION_KEY,
+          "must-never-reach-typefully",
+        ),
+      })
+      .returning({ id: credentials.id });
+    if (!credential) throw new Error("Typefully fixture was not stored");
+    credentialIds.push(credential.id);
+    await database
+      .update(mcpServers)
+      .set({ credentialId: credential.id })
+      .where(eq(mcpServers.id, typefullyServerId));
+
+    decrypted.length = 0;
+    await expect(
+      store.callTool({
+        ref: typefullyRef,
+        args: {},
+        botId,
+        actorId: askerId,
+      }),
+    ).rejects.toThrow(
+      /personal Typefully connection setup is not available yet/i,
+    );
+    expect(decrypted).toEqual([]);
+
+    const [failure] = await database
+      .select({ payload: auditEvents.payload })
+      .from(auditEvents)
+      .where(
+        and(
+          eq(auditEvents.eventType, "mcp.call_failed"),
+          eq(auditEvents.targetId, typefullyRef),
+        ),
+      )
+      .orderBy(desc(auditEvents.createdAt))
+      .limit(1);
+    expect((failure?.payload as { reachedAs?: unknown })?.reachedAs).toBe(
+      askerId,
+    );
+  });
 });
 
 describe("a person who has not connected", () => {

@@ -1,7 +1,8 @@
 import type { CatalogueEntry } from "./catalogue";
 import * as driveRest from "./google-drive-rest";
-import * as mcp from "./mcp";
 import type { McpCallResult, McpTool } from "./mcp";
+import * as mcp from "./mcp";
+import * as typefullyRest from "./typefully-rest";
 
 /**
  * How this deployment reaches one vendor: which protocol, chosen per catalogue entry.
@@ -50,11 +51,12 @@ export type VendorTransport = {
  * A closed union rather than a string, so adding one is a change to this file and to the registry
  * below together. An entry naming a transport that does not exist should not typecheck.
  */
-export type TransportKind = "mcp" | "google-drive-rest";
+export type TransportKind = "mcp" | "google-drive-rest" | "typefully-rest";
 
 const TRANSPORTS: Record<TransportKind, VendorTransport> = {
   mcp,
   "google-drive-rest": driveRest,
+  "typefully-rest": typefullyRest,
 };
 
 /**

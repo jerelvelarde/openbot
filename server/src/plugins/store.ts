@@ -293,7 +293,9 @@ const iso = (value: Date | string | null): string | null =>
  * `deployment` for a shared token; the asker's own id for a server reached as the person asking.
  */
 const reachedAsFor = (entry: CatalogueEntry | null, actorId: string): string =>
-  entry?.auth.kind === "user-oauth" ? actorId : "deployment";
+  entry?.auth.kind === "user-oauth" || entry?.auth.kind === "user-api-key"
+    ? actorId
+    : "deployment";
 
 /**
  * Where this server actually is, when the stored row and the catalogue disagree.
@@ -692,6 +694,12 @@ export function createPluginStore(options: PluginStoreOptions) {
     entry: CatalogueEntry | null,
     actorId: string,
   ): Promise<{ token?: string }> {
+    if (entry?.auth.kind === "user-api-key") {
+      throw new PluginRefusedError(
+        `Personal ${entry.title} connection setup is not available yet. An administrator must finish enabling personal API-key connections before this tool can be used.`,
+        null,
+      );
+    }
     if (entry?.auth.kind !== "user-oauth") {
       const token = row.credentialId
         ? await secretFor(

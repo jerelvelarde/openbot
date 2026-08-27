@@ -105,9 +105,12 @@ describe("whose credential a server uses", () => {
     // whose, and a reader who guessed would guess the deployment's, which for a user-oauth vendor
     // is the one answer that breaks the promise the connector exists to keep.
     for (const entry of CATALOGUE) {
-      expect(["none", "deployment-bearer", "user-oauth"]).toContain(
-        entry.auth.kind,
-      );
+      expect([
+        "none",
+        "deployment-bearer",
+        "user-oauth",
+        "user-api-key",
+      ]).toContain(entry.auth.kind);
     }
   });
 
@@ -235,6 +238,46 @@ describe("Notion", () => {
     }
     expect(classifyTool(entry, "notion-search", true)).toBe("read");
     expect(classifyTool(entry, "brand-new-tool", false)).toBe("write");
+  });
+});
+
+describe("Typefully", () => {
+  const entry = catalogueEntry("typefully");
+
+  test("pins the official v2 API and actor-owned API-key transport", () => {
+    expect(entry).not.toBeNull();
+    expect(Object.isFrozen(entry)).toBe(true);
+    expect(entry).toMatchObject({
+      key: "typefully",
+      title: "Typefully",
+      vendor: "Typefully",
+      host: "https://api.typefully.com",
+      path: "/v2",
+      transport: "typefully-rest",
+      auth: { kind: "user-api-key" },
+      docsUrl: "https://typefully.com/docs/api",
+    });
+    expect(resolveServerUrl("typefully")?.url).toBe(
+      "https://api.typefully.com/v2",
+    );
+    expect(serverCredentialKind(entry!)).toBeNull();
+  });
+
+  test("pins every write and leaves the three reads classified as reads", () => {
+    expect(entry?.writeTools).toEqual([
+      "create_draft",
+      "update_draft",
+      "upload_media",
+      "remove_media",
+      "schedule_draft",
+      "delete_draft",
+    ]);
+    for (const name of entry?.writeTools ?? []) {
+      expect(classifyTool(entry, name, true)).toBe("write");
+    }
+    for (const name of ["list_social_sets", "list_drafts", "get_draft"]) {
+      expect(classifyTool(entry, name, true)).toBe("read");
+    }
   });
 });
 

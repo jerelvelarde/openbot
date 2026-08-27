@@ -84,10 +84,10 @@ export type CatalogueItem = {
    * Whose credential reaches this server.
    *
    * `deployment-bearer` is a token an administrator holds for everybody, and the only one this page
-   * can collect. `user-oauth` is reached as whoever is asking, so each person connects their own
-   * account and there is no token to type here.
+   * can collect. `user-oauth` and `user-api-key` are reached as whoever is asking, so each person
+   * connects their own account and there is no deployment token to type here.
    */
-  auth: "none" | "deployment-bearer" | "user-oauth";
+  auth: "none" | "deployment-bearer" | "user-oauth" | "user-api-key";
   /** True for a vendor that gives every customer their own hostname. */
   perInstance: boolean;
 };
