@@ -30,6 +30,7 @@
     "@copilotkit/aimock": "1.39.0",
     "@langchain/core": "^1.2.8",
     "@types/bun": "^1.3.3",
+    "openai": "^4.104.0",
     "roughjs": "^4.6.6",
     "typescript": "^5.9.3",
     "yaml": "^2.9.0"
