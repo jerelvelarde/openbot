@@ -145,11 +145,11 @@ export const mcpUserCredentials = pgTable(
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
     /**
-     * The vault row holding this person's refresh token.
+     * The vault row holding this person's method-dependent secret: an OAuth refresh token or a
+     * static API key.
      *
-     * A real foreign key, unlike {@link mcpServers.credentialId}, which is `text` against a `uuid`
-     * primary key and so references nothing the database will check. The new table does not copy
-     * that.
+     * A real foreign key, like {@link mcpServers.credentialId}, so the database refuses a pointer to
+     * a credential that does not exist.
      *
      * Deliberately not cascading. A revoked credential row is kept for the trail, and deleting the
      * row that says whose it was would take the trail with it.

@@ -45,7 +45,12 @@ export const typefullyDrafts = pgTable(
     updatedAt: updatedAt(),
   },
   (table) => [
-    unique("typefully_drafts_id_owner_key").on(table.id, table.ownerUserId),
+    unique("typefully_drafts_identity_key").on(
+      table.id,
+      table.ownerUserId,
+      table.botId,
+      table.channelId,
+    ),
     index("typefully_drafts_owner_channel_idx").on(
       table.ownerUserId,
       table.channelId,
@@ -85,9 +90,14 @@ export const typefullyPublicationProposals = pgTable(
   },
   (table) => [
     foreignKey({
-      name: "typefully_proposals_draft_owner_fk",
-      columns: [table.draftId, table.ownerUserId],
-      foreignColumns: [typefullyDrafts.id, typefullyDrafts.ownerUserId],
+      name: "typefully_proposals_draft_identity_fk",
+      columns: [table.draftId, table.ownerUserId, table.botId, table.channelId],
+      foreignColumns: [
+        typefullyDrafts.id,
+        typefullyDrafts.ownerUserId,
+        typefullyDrafts.botId,
+        typefullyDrafts.channelId,
+      ],
     }).onDelete("cascade"),
     index("typefully_proposals_draft_status_idx").on(
       table.draftId,

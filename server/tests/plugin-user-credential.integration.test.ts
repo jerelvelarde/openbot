@@ -41,6 +41,8 @@ const suite = randomUUID().slice(0, 8);
 const botId = `agent_oauth_bot_${suite}`;
 const askerId = `user_oauth_asker_${suite}`;
 const otherId = `user_oauth_other_${suite}`;
+const apiKeyUserId = `user_api_key_${suite}`;
+const brokenOauthUserId = `user_oauth_no_scope_${suite}`;
 const serverId = "google-drive";
 const toolName = "search_files";
 const ref = `${serverId}/${toolName}`;
@@ -169,7 +171,7 @@ const store = createPluginStore({
  * second test to call either helper meets the index instead of the behaviour it came to check.
  */
 async function retireLive(
-  kind: "mcp_oauth_client" | "mcp_user_token",
+  kind: "mcp_oauth_client" | "mcp_user_token" | "mcp_user_api_key",
   keyId: string,
 ) {
   const revokedAt = new Date();
@@ -241,6 +243,37 @@ async function connect(userId: string, refreshToken: string) {
   return credential.id;
 }
 
+async function connectFixture(input: {
+  userId: string;
+  kind: "mcp_user_token" | "mcp_user_api_key";
+  authMethod: "oauth" | "api_key";
+  scope: string | null;
+}) {
+  await retireLive(input.kind, input.userId);
+  const [credential] = await database
+    .insert(credentials)
+    .values({
+      kind: input.kind,
+      provider: serverId,
+      keyId: input.userId,
+      metadata: {},
+      encryptedValue: await encryptSecret(
+        ENCRYPTION_KEY,
+        `fixture-${input.authMethod}-${suite}`,
+      ),
+    })
+    .returning({ id: credentials.id });
+  if (!credential) throw new Error("connection fixture was not stored");
+  credentialIds.push(credential.id);
+  await database.insert(mcpUserCredentials).values({
+    serverId,
+    userId: input.userId,
+    credentialId: credential.id,
+    authMethod: input.authMethod,
+    scope: input.scope,
+  });
+}
+
 beforeAll(async () => {
   await database
     .insert(agents)
@@ -250,6 +283,8 @@ beforeAll(async () => {
   for (const [id, email] of [
     [askerId, `${askerId}@openbot.test`],
     [otherId, `${otherId}@openbot.test`],
+    [apiKeyUserId, `${apiKeyUserId}@openbot.test`],
+    [brokenOauthUserId, `${brokenOauthUserId}@openbot.test`],
   ]) {
     await database
       .insert(users)
@@ -299,7 +334,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   /*
-   * The suite's own two people, never every row for this vendor.
+   * The suite's own people, never every row for this vendor.
    *
    * `serverId` here is a real catalogue key, so a deployment somebody uses has real connections
    * under it — and deleting by server id took a person's actual Drive connection with it, after
@@ -311,7 +346,12 @@ afterAll(async () => {
     .where(
       and(
         eq(mcpUserCredentials.serverId, serverId),
-        inArray(mcpUserCredentials.userId, [askerId, otherId]),
+        inArray(mcpUserCredentials.userId, [
+          askerId,
+          otherId,
+          apiKeyUserId,
+          brokenOauthUserId,
+        ]),
       ),
     );
   /*
@@ -356,8 +396,11 @@ afterAll(async () => {
     await database.delete(mcpServers).where(eq(mcpServers.id, serverId));
   }
   await database.delete(agents).where(eq(agents.id, botId));
-  await database.delete(users).where(eq(users.id, askerId));
-  await database.delete(users).where(eq(users.id, otherId));
+  await database
+    .delete(users)
+    .where(
+      inArray(users.id, [askerId, otherId, apiKeyUserId, brokenOauthUserId]),
+    );
 });
 
 describe("a person who has not connected", () => {
@@ -493,6 +536,32 @@ describe("a person who has connected", () => {
       store.callTool({ ref, args: {}, botId, actorId: askerId }),
     ).rejects.toThrow(PluginRefusedError);
     expect(decrypted).toEqual([]);
+  });
+});
+
+describe("the current OAuth-only connection listing", () => {
+  test("excludes API-key rows", async () => {
+    await connectFixture({
+      userId: apiKeyUserId,
+      kind: "mcp_user_api_key",
+      authMethod: "api_key",
+      scope: null,
+    });
+
+    expect(await store.connectionsFor(apiKeyUserId)).toEqual([]);
+  });
+
+  test("fails loudly when an OAuth row has no scope", async () => {
+    await connectFixture({
+      userId: brokenOauthUserId,
+      kind: "mcp_user_token",
+      authMethod: "oauth",
+      scope: null,
+    });
+
+    await expect(store.connectionsFor(brokenOauthUserId)).rejects.toThrow(
+      `OAuth connection for ${serverId} is missing its granted scope`,
+    );
   });
 });
 

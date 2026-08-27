@@ -1,5 +1,5 @@
 {
-  "id": "cdcb479b-a251-4fc1-9212-adda32b58ad6",
+  "id": "0c76cb03-dfea-4357-8ed9-679f804c1c61",
   "prevId": "77ac2143-c594-48d7-9a86-c16c51e0b728",
   "version": "7",
   "dialect": "postgresql",
@@ -2861,12 +2861,14 @@
       },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {
-        "typefully_drafts_id_owner_key": {
-          "name": "typefully_drafts_id_owner_key",
+        "typefully_drafts_identity_key": {
+          "name": "typefully_drafts_identity_key",
           "nullsNotDistinct": false,
           "columns": [
             "id",
-            "owner_user_id"
+            "owner_user_id",
+            "bot_id",
+            "channel_id"
           ]
         }
       },
@@ -3052,17 +3054,21 @@
           "onDelete": "cascade",
           "onUpdate": "no action"
         },
-        "typefully_proposals_draft_owner_fk": {
-          "name": "typefully_proposals_draft_owner_fk",
+        "typefully_proposals_draft_identity_fk": {
+          "name": "typefully_proposals_draft_identity_fk",
           "tableFrom": "typefully_publication_proposals",
           "tableTo": "typefully_drafts",
           "columnsFrom": [
             "draft_id",
-            "owner_user_id"
+            "owner_user_id",
+            "bot_id",
+            "channel_id"
           ],
           "columnsTo": [
             "id",
-            "owner_user_id"
+            "owner_user_id",
+            "bot_id",
+            "channel_id"
           ],
           "onDelete": "cascade",
           "onUpdate": "no action"
