@@ -11,7 +11,7 @@ import {
 import { cleanup, render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ComponentType } from "react";
-import { z } from "zod";
+import { chatSearchSchema } from "@/routes/_authed/_app/channel/$channelId";
 
 const { GALLERY, TYPEFULLY_DRAFT_STATUSES } = await import(
   "@/components/gallery/typefully-draft"
@@ -93,6 +93,18 @@ test("registers the strict bounded summary contract and rejects forbidden data",
   expect(
     definition?.parameters.safeParse({
       ...validArgs("local"),
+      title: "🪶".repeat(160),
+    }).success,
+  ).toBe(true);
+  expect(
+    definition?.parameters.safeParse({
+      ...validArgs("local"),
+      title: "🪶".repeat(161),
+    }).success,
+  ).toBe(false);
+  expect(
+    definition?.parameters.safeParse({
+      ...validArgs("local"),
       socialSetLabel: "x".repeat(161),
     }).success,
   ).toBe(false);
@@ -108,6 +120,15 @@ test("registers the strict bounded summary contract and rejects forbidden data",
       mediaCount: 21,
     }).success,
   ).toBe(false);
+});
+
+test("the production channel search schema preserves panels and accepts only a draft UUID", () => {
+  expect(
+    chatSearchSchema.parse({ settings: true, watch: true, draft: draftId }),
+  ).toEqual({ settings: true, watch: true, draft: draftId });
+  expect(chatSearchSchema.safeParse({ draft: "not-a-uuid" }).success).toBe(
+    false,
+  );
 });
 
 test("renders every current server status through the registered component", async () => {
@@ -161,20 +182,13 @@ test("review is keyboard accessible and preserves safe search state for the same
   const channel = createRoute({
     getParentRoute: () => root,
     path: "/channel/$channelId",
-    validateSearch: z.object({
-      settings: z.boolean().optional(),
-      watch: z.boolean().optional(),
-      preserved: z.string().optional(),
-      draft: z.string().optional(),
-    }),
+    validateSearch: chatSearchSchema,
     component: () => <Component {...validArgs("synced")} />,
   });
   const router = createRouter({
     routeTree: root.addChildren([channel]),
     history: createMemoryHistory({
-      initialEntries: [
-        "/channel/channel-1?settings=true&watch=true&preserved=safe",
-      ],
+      initialEntries: ["/channel/channel-1?settings=true&watch=true"],
     }),
   });
   await router.load();
@@ -188,11 +202,36 @@ test("review is keyboard accessible and preserves safe search state for the same
   await waitFor(() => expect(router.state.location.search.draft).toBe(draftId));
   expect(router.state.location.pathname).toBe("/channel/channel-1");
   expect(router.state.location.search).toEqual({
-    preserved: "safe",
     draft: draftId,
   });
   expect(router.state.location.href).not.toContain("Launch notes");
   expect(router.state.location.href).not.toContain("Acme social");
+
+  const reloadedRoot = createRootRoute({ component: Outlet });
+  const reloadedChannel = createRoute({
+    getParentRoute: () => reloadedRoot,
+    path: "/channel/$channelId",
+    validateSearch: chatSearchSchema,
+    component: () => null,
+  });
+  const reloaded = createRouter({
+    routeTree: reloadedRoot.addChildren([reloadedChannel]),
+    history: createMemoryHistory({
+      initialEntries: [router.state.location.href],
+    }),
+  });
+  await reloaded.load();
+  expect(reloaded.state.location.pathname).toBe("/channel/channel-1");
+  expect(reloaded.state.location.search).toEqual({ draft: draftId });
+
+  await router.history.back();
+  await waitFor(() =>
+    expect(router.state.location.search).toEqual({
+      settings: true,
+      watch: true,
+    }),
+  );
+  expect(router.state.location.pathname).toBe("/channel/channel-1");
 });
 
 test("shows safe actionable grant and unavailable refusals", async () => {

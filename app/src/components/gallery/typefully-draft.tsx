@@ -31,9 +31,17 @@ export const TYPEFULLY_DRAFT_STATUSES = [
 const draftDisplayStatusSchema = z.enum(TYPEFULLY_DRAFT_STATUSES);
 export type DraftDisplayStatus = z.infer<typeof draftDisplayStatusSchema>;
 
+const summaryTitleSchema = z
+  .string()
+  .trim()
+  .refine(
+    (title) => Array.from(title).length <= 160,
+    "The draft title must be at most 160 characters.",
+  );
+
 export const TypefullyDraftProps = z.strictObject({
   draftId: z.string().uuid(),
-  title: z.string().max(160),
+  title: summaryTitleSchema,
   destinations: z
     .array(destinationSchema)
     .min(1)

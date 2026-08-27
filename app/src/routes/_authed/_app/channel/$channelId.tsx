@@ -26,10 +26,12 @@ import {
 } from "@/lib/channels/queries";
 import { onComputerActivity } from "@/lib/copilot/computer-activity";
 
-const chatSearchSchema = z.object({
+export const chatSearchSchema = z.object({
   settings: z.boolean().optional(),
   /** Opens the Bot's screen in the shared detail pane. */
   watch: z.boolean().optional(),
+  /** Opens an owned Typefully draft in the shared detail pane. */
+  draft: z.string().uuid().optional(),
 });
 
 const EASE_OUT = [0.23, 1, 0.32, 1] as const;
