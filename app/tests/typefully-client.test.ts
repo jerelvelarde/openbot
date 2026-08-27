@@ -678,6 +678,62 @@ describe("Typefully mutation contracts", () => {
     });
   });
 
+  test("replaces an in-cache upload placeholder when its version plus two descriptor arrives", async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    queryClient.setQueryData(typefullyKeys.draft("draft-1"), {
+      draft: authoritativeDraft(1),
+    });
+    let finishRequest: ((response: Response) => void) | undefined;
+    globalThis.fetch = (() =>
+      new Promise<Response>((resolve) => {
+        finishRequest = resolve;
+      })) as typeof fetch;
+    const observer = new MutationObserver(
+      queryClient,
+      uploadMediaMutationOptions(queryClient),
+    );
+    const pending = observer.mutate({
+      draftId: "draft-1",
+      expectedVersion: 1,
+      kind: "image",
+      altText: "Completed upload",
+      file: new File(["x"], "x.png", { type: "image/png" }),
+      mediaId: "media-complete",
+    });
+    while (!finishRequest) await Promise.resolve();
+    const placeholder = {
+      id: "media-complete",
+      kind: "image" as const,
+      order: 0,
+      altText: "Completed upload",
+      remoteId: null,
+    };
+    queryClient.setQueryData(typefullyKeys.draft("draft-1"), {
+      draft: authoritativeDraft(2, {
+        document: { ...document, media: [placeholder] },
+      }),
+    });
+    const completed = {
+      ...placeholder,
+      remoteId: "typefully-media-22",
+    };
+    finishRequest?.(
+      json({
+        draft: { ...draftSummary(3), mediaCount: 1 },
+        media: completed,
+      }),
+    );
+    await pending;
+
+    expect(
+      queryClient.getQueryData(typefullyKeys.draft("draft-1")),
+    ).toMatchObject({
+      draft: { version: 3, document: { media: [completed] } },
+    });
+  });
+
   test("persists an uncertain completed upload descriptor returned at version plus two", async () => {
     const queryClient = new QueryClient({
       defaultOptions: { mutations: { retry: false } },

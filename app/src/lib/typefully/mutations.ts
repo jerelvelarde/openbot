@@ -71,7 +71,8 @@ async function convergeDraftCache(
       const replaceDocument =
         updateDocument !== undefined &&
         expectedVersion !== undefined &&
-        current.draft.version === expectedVersion &&
+        current.draft.version >= expectedVersion &&
+        current.draft.version < incomingVersion &&
         documentVersionOffsets.some(
           (offset) => incomingVersion === expectedVersion + offset,
         );
