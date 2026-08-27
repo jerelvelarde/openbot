@@ -68,7 +68,6 @@ function hasTokenBoundaries(text: string, start: number, end: number): boolean {
 }
 
 type AliasOccurrence = {
-  alias: string;
   start: number;
   end: number;
   profiles: ReadonlyMap<string, AgentProfile>;
@@ -84,7 +83,7 @@ function occurrencesOf(
   while (start >= 0) {
     const end = start + alias.length;
     if (hasTokenBoundaries(text, start, end)) {
-      occurrences.push({ alias, start, end, profiles });
+      occurrences.push({ start, end, profiles });
     }
     start = text.indexOf(alias, start + alias.length);
   }
@@ -102,6 +101,18 @@ function suffixes(name: string): string[] {
 
 function displayName(name: string): string {
   return name.normalize("NFKC").trim().replace(/\s+/gu, " ");
+}
+
+function base64UrlUtf8(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+  for (let start = 0; start < bytes.length; start += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(start, start + 0x8000));
+  }
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
 }
 
 function codePointCompare(left: string, right: string): number {
@@ -142,32 +153,68 @@ function buildAliasIndex(roster: readonly AgentProfile[]): AliasIndex {
     else byNormalizedName.set(normalized, [profile]);
   }
 
-  const duplicateOptions = new Map<string, number>();
-  for (const profiles of byNormalizedName.values()) {
-    if (profiles.length < 2) continue;
-    profiles
-      .toSorted((left, right) => codePointCompare(left.id, right.id))
-      .forEach((profile, index) => {
-        duplicateOptions.set(profile.id, index + 1);
-      });
-  }
   const aliases = new Map<string, Map<string, AgentProfile>>();
   const labels = new Map<string, string>();
   for (const profile of roster) {
     const normalized = normalizeCoworkerName(profile.name);
-    const option = duplicateOptions.get(profile.id);
-    const label = option
-      ? `${displayName(profile.name)} (option ${option})`
-      : profile.name;
+    const duplicates = byNormalizedName.get(normalized) ?? [];
+    const label =
+      duplicates.length > 1
+        ? `${displayName(profile.name)} (id ${base64UrlUtf8(profile.id)})`
+        : profile.name;
     labels.set(profile.id, label);
     addAlias(aliases, normalized, profile);
     for (const suffix of suffixes(normalized))
       addAlias(aliases, suffix, profile);
-    if (option) {
+    if (duplicates.length > 1) {
       addAlias(aliases, normalizeCoworkerName(label), profile);
     }
   }
   return { aliases, labels };
+}
+
+type ExplicitOccurrence = {
+  start: number;
+  end: number;
+  profiles: Map<string, AgentProfile>;
+};
+
+/**
+ * Discard only aliases that a strictly longer explicit occurrence fully contains.
+ *
+ * Intervals are ordered by start, then widest first. A running maximum end therefore proves that a
+ * prior interval starts no later and reaches at least as far as the current one, which is exactly
+ * containment. Partial overlaps extend the maximum only for later contained intervals; they never
+ * suppress each other.
+ */
+function withoutContainedOccurrences(
+  occurrences: readonly AliasOccurrence[],
+): ExplicitOccurrence[] {
+  const bySpan = new Map<string, ExplicitOccurrence>();
+  for (const occurrence of occurrences) {
+    const key = `${occurrence.start}:${occurrence.end}`;
+    const merged =
+      bySpan.get(key) ??
+      ({
+        start: occurrence.start,
+        end: occurrence.end,
+        profiles: new Map<string, AgentProfile>(),
+      } satisfies ExplicitOccurrence);
+    for (const profile of occurrence.profiles.values()) {
+      merged.profiles.set(profile.id, profile);
+    }
+    bySpan.set(key, merged);
+  }
+
+  const sorted = [...bySpan.values()].sort(
+    (left, right) => left.start - right.start || right.end - left.end,
+  );
+  let maximumEnd = -1;
+  return sorted.filter((occurrence) => {
+    const contained = maximumEnd >= occurrence.end;
+    maximumEnd = Math.max(maximumEnd, occurrence.end);
+    return !contained;
+  });
 }
 
 function labelsFor(
@@ -188,15 +235,7 @@ function explicitNameRoute(
   const occurrences = [...aliases.entries()].flatMap(([alias, profiles]) =>
     occurrencesOf(normalizedText, alias, profiles),
   );
-  const explicitOccurrences = occurrences.filter(
-    (occurrence) =>
-      !occurrences.some(
-        (other) =>
-          other.alias.length > occurrence.alias.length &&
-          other.start < occurrence.end &&
-          occurrence.start < other.end,
-      ),
-  );
+  const explicitOccurrences = withoutContainedOccurrences(occurrences);
   const profiles = new Map<string, AgentProfile>();
   for (const occurrence of explicitOccurrences) {
     for (const profile of occurrence.profiles.values()) {
