@@ -15,6 +15,7 @@ import {
 import {
   type ProposalSummary,
   type PublicationProposal,
+  proposalMatchesSummary,
   proposalQueryOptions,
   TypefullyClientError,
 } from "@/lib/typefully/queries";
@@ -35,19 +36,6 @@ export const TypefullyPublicationArgs = z.strictObject({
 });
 
 type PublicationArgs = z.infer<typeof TypefullyPublicationArgs>;
-
-function sameSummary(proposal: PublicationProposal, expected: ProposalSummary) {
-  return (
-    proposal.id === expected.id &&
-    proposal.draftId === expected.draftId &&
-    proposal.version === expected.version &&
-    proposal.expiresAt === expected.expiresAt &&
-    proposal.destinations.length === expected.destinations.length &&
-    proposal.destinations.every(
-      (destination, index) => destination === expected.destinations[index],
-    )
-  );
-}
 
 function statusFor(proposal: PublicationProposal) {
   if (
@@ -288,7 +276,7 @@ export function TypefullyProposalReviewLoader({
     [respond],
   );
   const authoritative = query.data?.proposal;
-  const bound = authoritative && sameSummary(authoritative, summary);
+  const bound = authoritative && proposalMatchesSummary(authoritative, summary);
   const effectiveStatus = bound ? statusFor(authoritative) : null;
   const refusalReason = proposalRefusalReason(query.error);
 
@@ -399,15 +387,29 @@ export function TypefullyProposalReviewLoader({
     let completed: PublicationProposal | null = null;
     try {
       const result = await (kind === "publish" ? publish : decline).mutateAsync(
-        { proposalId: summary.id },
+        {
+          proposalId: summary.id,
+          draftId: summary.draftId,
+          version: summary.version,
+          destinations: summary.destinations,
+          expiresAt: summary.expiresAt,
+          status: "pending",
+        },
       );
       completed = result.proposal;
     } catch (error) {
+      if (
+        error instanceof TypefullyClientError &&
+        error.code === "remote_invalid_response"
+      ) {
+        setActionError(error.message);
+        return;
+      }
       const refreshed = await query.refetch();
       const latest = refreshed.data?.proposal;
       if (
         latest &&
-        sameSummary(latest, summary) &&
+        proposalMatchesSummary(latest, summary) &&
         statusFor(latest) !== "pending" &&
         statusFor(latest) !== "in_flight" &&
         statusFor(latest) !== "unknown"
@@ -431,6 +433,7 @@ export function TypefullyProposalReviewLoader({
       }
     }
     if (!completed) return;
+    if (completed.status === "unknown") return;
     try {
       await answer({
         outcome: completed.status,
@@ -445,7 +448,14 @@ export function TypefullyProposalReviewLoader({
   const reconcileUnknown = async () => {
     setActionError(null);
     try {
-      const result = await reconcile.mutateAsync({ proposalId: summary.id });
+      const result = await reconcile.mutateAsync({
+        proposalId: summary.id,
+        draftId: summary.draftId,
+        version: summary.version,
+        destinations: summary.destinations,
+        expiresAt: summary.expiresAt,
+        status: "unknown",
+      });
       if (result.proposal.status === "unknown") return;
       await answer({
         outcome: result.proposal.status,

@@ -142,6 +142,16 @@ const authoritativeDraftResponseSchema = z.strictObject({
 
 const boundedDateSchema = z.string().max(64).datetime();
 const nullableDateSchema = boundedDateSchema.nullable();
+const PUBLICATION_URL_HOSTS = new Set([
+  "typefully.com",
+  "www.typefully.com",
+  "x.com",
+  "www.x.com",
+  "twitter.com",
+  "www.twitter.com",
+  "linkedin.com",
+  "www.linkedin.com",
+]);
 const safePublishedUrlSchema = z
   .string()
   .url()
@@ -151,7 +161,9 @@ const safePublishedUrlSchema = z
     return (
       parsed.protocol === "https:" &&
       parsed.username.length === 0 &&
-      parsed.password.length === 0
+      parsed.password.length === 0 &&
+      parsed.port.length === 0 &&
+      PUBLICATION_URL_HOSTS.has(parsed.hostname)
     );
   })
   .nullable();
@@ -222,6 +234,22 @@ export type ProposalSummary = Pick<
   PublicationProposal,
   "id" | "draftId" | "version" | "destinations" | "expiresAt" | "status"
 >;
+
+export function proposalMatchesSummary(
+  proposal: PublicationProposal,
+  expected: ProposalSummary,
+): boolean {
+  return (
+    proposal.id === expected.id &&
+    proposal.draftId === expected.draftId &&
+    proposal.version === expected.version &&
+    proposal.expiresAt === expected.expiresAt &&
+    proposal.destinations.length === expected.destinations.length &&
+    proposal.destinations.every(
+      (destination, index) => destination === expected.destinations[index],
+    )
+  );
+}
 
 export type TypefullyErrorCode =
   | "access_revoked"
@@ -532,6 +560,7 @@ export function proposalQueryOptions(proposalId: string) {
   return queryOptions({
     queryKey: typefullyKeys.proposal(proposalId),
     enabled: proposalId.length > 0,
+    gcTime: 0,
     queryFn: ({ signal }): Promise<{ proposal: PublicationProposal }> =>
       typefullyRequest<unknown>(
         `/api/typefully/proposals/${encodeURIComponent(proposalId)}`,

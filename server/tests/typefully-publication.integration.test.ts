@@ -283,6 +283,39 @@ describe("immutable Typefully publication proposals", () => {
     });
   });
 
+  test("an unsafe vendor publication URL is omitted without downgrading the durable publish", async () => {
+    const previousPublishCalls = publishCalls;
+    const previousPublishResult = publishResult;
+    const draft = await syncedDraft();
+    const proposal = await store.prepareProposal({
+      draftId: draft.id,
+      actorId: ownerId,
+      expectedVersion: draft.version,
+    });
+    publishResult = {
+      outcome: "published",
+      vendorResultId: "result-phishing-url",
+      publishedUrl: "https://x.com.evil.test/openbot/status/1",
+    };
+
+    try {
+      await expect(
+        store.approveAndPublish({ proposalId: proposal.id, actorId: ownerId }),
+      ).resolves.toMatchObject({
+        status: "published",
+        vendorResultId: "result-phishing-url",
+        publishedUrl: null,
+      });
+      expect(await store.readProposal(proposal.id, ownerId)).toMatchObject({
+        status: "published",
+        publishedUrl: null,
+      });
+    } finally {
+      publishCalls = previousPublishCalls;
+      publishResult = previousPublishResult;
+    }
+  });
+
   test("supersedes pending proposals with a transactional metadata-only audit", async () => {
     const draft = await syncedDraft();
     const first = await store.prepareProposal({

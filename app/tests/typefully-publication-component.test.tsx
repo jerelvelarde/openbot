@@ -237,6 +237,141 @@ test("closing a pending decision leaves it unanswered", async () => {
   expect(respond).not.toHaveBeenCalled();
 });
 
+test("unmounting evicts the immutable proposal snapshot immediately", async () => {
+  globalThis.fetch = mock(async () =>
+    Response.json({ proposal: proposal("pending") }),
+  ) as typeof fetch;
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const view = render(
+    <QueryClientProvider client={client}>
+      <TypefullyPublicationDecision
+        args={{
+          proposalId,
+          draftId,
+          destinations: ["x", "linkedin"],
+          version: 7,
+          expiresAt,
+        }}
+        status="executing"
+      />
+    </QueryClientProvider>,
+  );
+  await view.findByRole("button", { name: "Publish now" });
+  expect(
+    client.getQueryData(["typefully", "proposal", proposalId]),
+  ).toBeDefined();
+  view.unmount();
+  await waitFor(() =>
+    expect(
+      client.getQueryData(["typefully", "proposal", proposalId]),
+    ).toBeUndefined(),
+  );
+});
+
+test("mismatched publish authority cannot change cache or answer the HITL decision", async () => {
+  const calls: string[] = [];
+  globalThis.fetch = mock(async (input, init) => {
+    calls.push(`${init?.method ?? "GET"} ${String(input)}`);
+    if (init?.method === "POST") {
+      return Response.json({
+        proposal: {
+          ...proposal("published"),
+          draftId: "5bc7b8a2-3672-4c45-bcb1-5bce6ec39dd3",
+        },
+      });
+    }
+    return Response.json({ proposal: proposal("pending") });
+  }) as typeof fetch;
+  const respond = mock(async () => {});
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const view = render(
+    <QueryClientProvider client={client}>
+      <TypefullyPublicationDecision
+        args={{
+          proposalId,
+          draftId,
+          destinations: ["x", "linkedin"],
+          version: 7,
+          expiresAt,
+        }}
+        respond={respond}
+        status="executing"
+      />
+    </QueryClientProvider>,
+  );
+  const user = userEvent.setup({ document });
+  await user.click(await view.findByRole("button", { name: "Publish now" }));
+  await waitFor(() =>
+    expect(view.getByRole("alert").textContent).toContain("invalid response"),
+  );
+  expect(respond).not.toHaveBeenCalled();
+  expect(calls).toEqual([
+    `GET /api/typefully/proposals/${proposalId}`,
+    `POST /api/typefully/proposals/${proposalId}/publish`,
+  ]);
+  expect(
+    client.getQueryData<{ proposal: PublicationProposal }>([
+      "typefully",
+      "proposal",
+      proposalId,
+    ])?.proposal,
+  ).toEqual(proposal("pending"));
+});
+
+test("direct failed publish answers once while unknown waits for reconciliation", async () => {
+  for (const terminal of ["failed", "unknown"] as const) {
+    let authoritativeStatus: PublicationProposal["status"] = "pending";
+    globalThis.fetch = mock(async (_input, init) => {
+      if (init?.method === "POST") {
+        authoritativeStatus = terminal;
+      }
+      return Response.json({ proposal: proposal(authoritativeStatus) });
+    }) as typeof fetch;
+    const respond = mock(async () => {});
+    const view = render(
+      <QueryClientProvider
+        client={
+          new QueryClient({
+            defaultOptions: {
+              queries: { retry: false },
+              mutations: { retry: false },
+            },
+          })
+        }
+      >
+        <TypefullyPublicationDecision
+          args={{
+            proposalId,
+            draftId,
+            destinations: ["x", "linkedin"],
+            version: 7,
+            expiresAt,
+          }}
+          respond={respond}
+          status="executing"
+        />
+      </QueryClientProvider>,
+    );
+    const user = userEvent.setup({ document });
+    await user.click(await view.findByRole("button", { name: "Publish now" }));
+    if (terminal === "failed") {
+      await waitFor(() => expect(respond).toHaveBeenCalledTimes(1));
+      expect(respond.mock.calls[0]?.[0]).toMatchObject({ outcome: "failed" });
+    } else {
+      expect(
+        (await view.findAllByText("Publishing status unknown")).length,
+      ).toBeGreaterThan(0);
+      expect(respond).not.toHaveBeenCalled();
+    }
+    expect(view.queryByRole("button", { name: "Publish now" })).toBeNull();
+    view.unmount();
+  }
+});
+
 test("authoritative non-disclosure and grant refusals answer once without exposing a retry", async () => {
   for (const refusal of [
     { status: 404, code: "draft_not_found", reason: "unavailable" },

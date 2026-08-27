@@ -11,6 +11,7 @@ import {
   type ProposalSummary,
   type PublicationProposal,
   parsePublicationProposalResponse,
+  proposalMatchesSummary,
   type RemoteDraftState,
   remoteDraftState,
   TypefullyClientError,
@@ -743,9 +744,18 @@ function proposalAction(
   return mutationOptions({
     mutationFn: (input: {
       proposalId: string;
+      draftId: string;
+      version: number;
+      destinations: ProposalSummary["destinations"];
+      expiresAt: string;
+      status: "pending" | "unknown";
       signal?: AbortSignal;
-    }): Promise<ProposalMutationResponse> =>
-      typefullyRequest<unknown>(
+    }): Promise<ProposalMutationResponse> => {
+      const expectedStatus = action === "reconcile" ? "unknown" : "pending";
+      if (input.status !== expectedStatus) {
+        throw new TypefullyClientError("remote_invalid_response");
+      }
+      return typefullyRequest<unknown>(
         `/api/typefully/proposals/${encodeURIComponent(input.proposalId)}/${action}`,
         { method: "POST", signal: input.signal },
       ).then((value) => {
@@ -753,9 +763,23 @@ function proposalAction(
           value,
           input.proposalId,
         );
+        if (
+          !proposalMatchesSummary(parsed.proposal, {
+            id: input.proposalId,
+            draftId: input.draftId,
+            version: input.version,
+            destinations: input.destinations,
+            expiresAt: input.expiresAt,
+            status: input.status,
+          })
+        ) {
+          throw new TypefullyClientError("remote_invalid_response");
+        }
         const validStatus =
           action === "publish"
-            ? parsed.proposal.status === "published"
+            ? parsed.proposal.status === "published" ||
+              parsed.proposal.status === "failed" ||
+              parsed.proposal.status === "unknown"
             : action === "decline"
               ? parsed.proposal.status === "declined"
               : parsed.proposal.status === "published" ||
@@ -764,7 +788,8 @@ function proposalAction(
         if (!validStatus)
           throw new TypefullyClientError("remote_invalid_response");
         return parsed;
-      }),
+      });
+    },
     onSuccess: async (result, input) => {
       if (!queryClient) return;
       queryClient.setQueryData(
@@ -783,12 +808,19 @@ function proposalAction(
         }),
       ]);
     },
-    onError: (_error, input) =>
-      queryClient?.invalidateQueries({
+    onError: (error, input) => {
+      if (
+        error instanceof TypefullyClientError &&
+        error.code === "remote_invalid_response"
+      ) {
+        return;
+      }
+      return queryClient?.invalidateQueries({
         queryKey: typefullyKeys.proposal(input.proposalId),
         exact: true,
         refetchType: "all",
-      }),
+      });
+    },
   });
 }
 

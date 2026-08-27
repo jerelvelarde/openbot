@@ -30,6 +30,18 @@ const singleMediaExpectation = {
   expectedMediaCount: 1,
 };
 
+const reviewedProposal = (
+  proposalId: string,
+  status: "pending" | "unknown" = "pending",
+) => ({
+  proposalId,
+  draftId: "draft-1",
+  version: 3,
+  destinations: ["x", "linkedin"] as const,
+  expiresAt: "2026-08-28T00:00:00.000Z",
+  status,
+});
+
 afterEach(() => {
   globalThis.fetch = realFetch;
 });
@@ -152,6 +164,7 @@ describe("Typefully query contracts", () => {
     ]);
     expect(calls[0]?.init?.signal).toBe(abort.signal);
     expect(draftQueryOptions("draft/one").gcTime).toBe(0);
+    expect(proposalQueryOptions("proposal/one").gcTime).toBe(0);
   });
 
   test("strictly validates bounded authoritative draft responses", async () => {
@@ -311,13 +324,19 @@ describe("Typefully mutation contracts", () => {
       expectedVersion: 5,
     });
     await mutate(publishProposalMutationOptions(), {
-      proposalId: "proposal/1",
+      ...reviewedProposal("proposal/1"),
+      draftId: "draft/1",
+      version: 5,
     });
     await mutate(reconcileProposalMutationOptions(), {
-      proposalId: "proposal/1",
+      ...reviewedProposal("proposal/1", "unknown"),
+      draftId: "draft/1",
+      version: 5,
     });
     await mutate(declineProposalMutationOptions(), {
-      proposalId: "proposal/1",
+      ...reviewedProposal("proposal/1"),
+      draftId: "draft/1",
+      version: 5,
     });
     await mutate(disconnectTypefullyMutationOptions(), undefined);
 
@@ -675,7 +694,7 @@ describe("Typefully mutation contracts", () => {
         completedAt: status === "published" ? "2026-08-27T01:00:01.000Z" : null,
         vendorResultId: status === "published" ? "vendor-1" : null,
         publishedUrl:
-          status === "published" ? "https://example.com/post" : null,
+          status === "published" ? "https://x.com/openbot/status/1" : null,
         failureDetail: null,
       };
       queryClient.setQueryData(typefullyKeys.proposal(proposal.id), {
@@ -684,7 +703,14 @@ describe("Typefully mutation contracts", () => {
       globalThis.fetch = (async () => json({ proposal })) as typeof fetch;
       const observer = new MutationObserver(queryClient, options(queryClient));
 
-      await observer.mutate({ proposalId: proposal.id });
+      await observer.mutate({
+        proposalId: proposal.id,
+        draftId: proposal.draftId,
+        version: proposal.version,
+        destinations: proposal.destinations,
+        expiresAt: proposal.expiresAt,
+        status: action === "reconcile" ? "unknown" : "pending",
+      });
 
       expect(
         queryClient.getQueryData(typefullyKeys.proposal(proposal.id)),
@@ -718,8 +744,57 @@ describe("Typefully mutation contracts", () => {
 
     globalThis.fetch = (async () => json({ proposal: valid })) as typeof fetch;
     await expect(
-      mutate(publishProposalMutationOptions(), { proposalId: valid.id }),
+      mutate(publishProposalMutationOptions(), reviewedProposal(valid.id)),
     ).rejects.toMatchObject({ code: "remote_invalid_response" });
+  });
+
+  test("proposal actions reject response authority mismatches without touching the reviewed cache", async () => {
+    const reviewed = reviewedProposal("proposal-1");
+    const cached = {
+      proposal: {
+        id: reviewed.proposalId,
+        draftId: reviewed.draftId,
+        version: reviewed.version,
+        destinations: reviewed.destinations,
+        expiresAt: reviewed.expiresAt,
+        status: "pending" as const,
+        snapshot: document,
+        contentHash: "content-hash",
+        decidedAt: null,
+        completedAt: null,
+        vendorResultId: null,
+        publishedUrl: null,
+        failureDetail: null,
+      },
+    };
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    queryClient.setQueryData(
+      typefullyKeys.proposal(reviewed.proposalId),
+      cached,
+    );
+    globalThis.fetch = (async () =>
+      json({
+        proposal: {
+          ...cached.proposal,
+          draftId: "draft-other",
+          status: "published",
+          decidedAt: "2026-08-27T01:00:00.000Z",
+          completedAt: "2026-08-27T01:00:01.000Z",
+        },
+      })) as typeof fetch;
+    const observer = new MutationObserver(
+      queryClient,
+      publishProposalMutationOptions(queryClient),
+    );
+
+    await expect(observer.mutate(reviewed)).rejects.toMatchObject({
+      code: "remote_invalid_response",
+    });
+    expect(
+      queryClient.getQueryData(typefullyKeys.proposal(reviewed.proposalId)),
+    ).toBe(cached);
   });
 
   test("rejects an invalid or unbounded proposal summary", async () => {

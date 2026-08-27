@@ -449,11 +449,15 @@ describe("Typefully draft routes", () => {
     );
     actorId = ownerId;
     expect(hidden.status).toBe(404);
+    expect(hidden.headers.get("cache-control")).toBe("private, no-store");
+    expect(hidden.headers.get("referrer-policy")).toBe("no-referrer");
 
     const loaded = await app.request(
       `/api/typefully/proposals/${preparedBody.proposal.id}`,
     );
     expect(loaded.status).toBe(200);
+    expect(loaded.headers.get("cache-control")).toBe("private, no-store");
+    expect(loaded.headers.get("referrer-policy")).toBe("no-referrer");
     expect(await loaded.json()).toMatchObject({
       proposal: { snapshot: local.document, status: "pending" },
     });
@@ -467,6 +471,40 @@ describe("Typefully draft routes", () => {
       proposal: { status: "published", vendorResultId: "route-published" },
     });
     expect(routePublishCalls).toBe(1);
+
+    await database
+      .update(typefullyPublicationProposals)
+      .set({ publishedUrl: "https://www.linkedin.com.evil.test/phish" })
+      .where(eq(typefullyPublicationProposals.id, preparedBody.proposal.id));
+    const sanitized = await app.request(
+      `/api/typefully/proposals/${preparedBody.proposal.id}`,
+    );
+    expect(sanitized.status).toBe(200);
+    expect(sanitized.headers.get("cache-control")).toBe("private, no-store");
+    expect(sanitized.headers.get("referrer-policy")).toBe("no-referrer");
+    expect(await sanitized.json()).toMatchObject({
+      proposal: { status: "published", publishedUrl: null },
+    });
+  });
+
+  test("proposal responses are private before authentication runs", async () => {
+    let authenticationCalls = 0;
+    const denied = new Hono<{ Variables: AppVariables }>();
+    denied.route(
+      "/api/typefully",
+      createTypefullyRoutes(store, async (context) => {
+        authenticationCalls += 1;
+        return context.json({ code: "authentication_required" }, 401);
+      }),
+    );
+
+    const response = await denied.request(
+      "/api/typefully/proposals/not-disclosed",
+    );
+    expect(response.status).toBe(401);
+    expect(authenticationCalls).toBe(1);
+    expect(response.headers.get("cache-control")).toBe("private, no-store");
+    expect(response.headers.get("referrer-policy")).toBe("no-referrer");
   });
 
   test("a stale publish grant cannot surface or cross the signed plugin boundary", async () => {

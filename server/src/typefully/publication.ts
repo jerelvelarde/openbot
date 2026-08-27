@@ -214,25 +214,51 @@ const safeField = z
   .string()
   .max(SAFE_VENDOR_FIELD_CHARS)
   .refine((value) => !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value));
-const safeUrl = safeField.refine((value) => {
-  try {
-    return new URL(value).protocol === "https:";
-  } catch {
-    return false;
+const PUBLICATION_URL_HOSTS = new Set([
+  "typefully.com",
+  "www.typefully.com",
+  "x.com",
+  "www.x.com",
+  "twitter.com",
+  "www.twitter.com",
+  "linkedin.com",
+  "www.linkedin.com",
+]);
+
+export function safePublicationUrl(
+  value: string | null | undefined,
+): string | undefined {
+  if (
+    value === null ||
+    value === undefined ||
+    !safeField.safeParse(value).success
+  ) {
+    return undefined;
   }
-});
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "https:" &&
+      parsed.username.length === 0 &&
+      parsed.password.length === 0 &&
+      parsed.port.length === 0 &&
+      PUBLICATION_URL_HOSTS.has(parsed.hostname)
+      ? value
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 export function safePublicationOutcome(
   value: PublicationOutcome,
 ): PublicationOutcome {
+  const publishedUrl = safePublicationUrl(value.publishedUrl);
   return {
     outcome: value.outcome,
     ...(value.vendorResultId === undefined
       ? {}
       : { vendorResultId: safeField.parse(value.vendorResultId) }),
-    ...(value.publishedUrl === undefined
-      ? {}
-      : { publishedUrl: safeUrl.parse(value.publishedUrl) }),
+    ...(publishedUrl === undefined ? {} : { publishedUrl }),
     ...(value.detail === undefined
       ? {}
       : { detail: safeField.parse(value.detail) }),

@@ -5,7 +5,10 @@ import {
   createTypefullyRestTransport,
   listTools,
 } from "../src/plugins/typefully-rest";
-import { remoteMatchesSnapshot } from "../src/typefully/publication";
+import {
+  remoteMatchesSnapshot,
+  safePublicationOutcome,
+} from "../src/typefully/publication";
 
 describe("Typefully publication manifest boundary", () => {
   test("offers reversible preparation but never a final publish operation", async () => {
@@ -56,6 +59,33 @@ describe("Typefully publication manifest boundary", () => {
 });
 
 describe("server-only Typefully publication transport", () => {
+  test("keeps only exact public Typefully, X, Twitter, and LinkedIn URLs", () => {
+    for (const publishedUrl of [
+      "https://typefully.com/t/reviewed",
+      "https://www.typefully.com/t/reviewed",
+      "https://x.com/openbot/status/1",
+      "https://twitter.com/openbot/status/1",
+      "https://www.linkedin.com/feed/update/urn:li:share:1",
+      "https://linkedin.com/posts/openbot_1",
+    ]) {
+      expect(
+        safePublicationOutcome({ outcome: "published", publishedUrl }),
+      ).toEqual({ outcome: "published", publishedUrl });
+    }
+    for (const publishedUrl of [
+      "https://typefully.com.evil.test/t/phish",
+      "https://eviltypefully.com/t/phish",
+      "https://person@x.com/openbot/status/1",
+      "https://x.com:444/openbot/status/1",
+      "https://www.linkedin.com.evil.test/phish",
+      "https://127.0.0.1/status/1",
+    ]) {
+      expect(
+        safePublicationOutcome({ outcome: "published", publishedUrl }),
+      ).toEqual({ outcome: "published" });
+    }
+  });
+
   test("classifies remote verification refusal and timeout without vendor text", async () => {
     const refused = createTypefullyPublicationVendor(async () =>
       Response.json(

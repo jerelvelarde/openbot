@@ -19,6 +19,9 @@ test("sign-out removes all user-scoped Typefully data", async () => {
   queryClient.setQueryData(typefullyKeys.draft("shared-id"), {
     draft: { document: { posts: [{ x: "prior user's private body" }] } },
   });
+  queryClient.setQueryData(typefullyKeys.proposal("shared-proposal"), {
+    proposal: { snapshot: { posts: [{ x: "prior user's private review" }] } },
+  });
   globalThis.fetch = (async () =>
     new Response("{}", {
       status: 200,
@@ -33,6 +36,9 @@ test("sign-out removes all user-scoped Typefully data", async () => {
   expect(queryClient.getQueryData(typefullyKeys.draft("shared-id"))).toBe(
     undefined,
   );
+  expect(
+    queryClient.getQueryData(typefullyKeys.proposal("shared-proposal")),
+  ).toBe(undefined);
 });
 
 test("a session user transition drops prior Typefully bodies before an offline second login", async () => {
@@ -44,6 +50,9 @@ test("a session user transition drops prior Typefully bodies before an offline s
   });
   queryClient.setQueryData(typefullyKeys.draft("same-uuid"), {
     draft: { document: { posts: [{ x: "user one's private body" }] } },
+  });
+  queryClient.setQueryData(typefullyKeys.proposal("same-proposal"), {
+    proposal: { snapshot: { posts: [{ x: "user one's private review" }] } },
   });
   globalThis.fetch = (async () =>
     new Response(
@@ -58,6 +67,9 @@ test("a session user transition drops prior Typefully bodies before an offline s
   expect(queryClient.getQueryData(typefullyKeys.draft("same-uuid"))).toBe(
     undefined,
   );
+  expect(
+    queryClient.getQueryData(typefullyKeys.proposal("same-proposal")),
+  ).toBe(undefined);
   globalThis.fetch = (async () => {
     throw new Error("offline");
   }) as typeof fetch;

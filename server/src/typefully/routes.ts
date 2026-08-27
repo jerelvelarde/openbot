@@ -15,6 +15,7 @@ import {
   ProposalStateError,
   type PublicationProposal,
   PublicationVerificationError,
+  safePublicationUrl,
 } from "./publication";
 import {
   BotNotAttachedError,
@@ -83,7 +84,7 @@ function proposalView(proposal: PublicationProposal) {
     decidedAt: proposal.decidedAt,
     completedAt: proposal.completedAt,
     vendorResultId: proposal.vendorResultId,
-    publishedUrl: proposal.publishedUrl,
+    publishedUrl: safePublicationUrl(proposal.publishedUrl) ?? null,
     failureDetail: proposal.failureDetail,
   };
 }
@@ -456,6 +457,11 @@ export function createTypefullyRoutes(
   const routes = new Hono<{ Variables: AppVariables }>();
   const mediaPreview =
     options.mediaPreview ?? createTypefullyMediaPreviewTransport();
+  routes.use("/proposals/*", async (context, next) => {
+    context.header("cache-control", "private, no-store");
+    context.header("referrer-policy", "no-referrer");
+    await next();
+  });
   routes.use("*", requireUser);
 
   routes.post("/drafts", async (context) => {
