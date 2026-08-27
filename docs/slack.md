@@ -248,16 +248,18 @@ do not make Slack live.
 
 ### Smoke record: 2026-08-27
 
-- Workspace: not selected; no workspace id recorded.
-- OpenBot commit: `8583116` (documentation and code under review, not a deployed runtime).
+- Workspace: CopilotKit; no workspace id recorded.
+- OpenBot commit: `09dcade` (configured checkout, not a deployed runtime).
 - `@copilotkit/channels`: `0.9.0`.
-- Result: **NOT RUN**. Slack is not claimed live.
-- Blocker: `CLI_CHANNELS_PROJECT_NOT_SELECTED`; this checkout had no selected provider attachment,
-  runtime key, or running capabilities endpoint. No credential or provider identifier was recorded.
+- Provider setup: `@OpenBot` installed and the managed `openbot` Channel reports Slack attached.
+- Result: **PARTIAL — PROVIDER ONLY**. Slack is not claimed live.
+- Blocker: this checkout has no running deployment, model-provider key, licence token, database
+  configuration, or public `OPENBOT_APP_URL`, so runtime readiness, account linking, replies, tools,
+  and audit behavior have not been exercised. No credential or provider identifier is recorded.
 
 | Step | Result |
 | --- | --- |
-| 1. Install and invite `@OpenBot` | NOT RUN |
+| 1. Install and invite `@OpenBot` | PARTIAL — installed; channel invite not run |
 | 2. Link the first Slack user | NOT RUN |
 | 3. Ask Risk Analyst to review the test attachment | NOT RUN |
 | 4. Confirm a streamed threaded response | NOT RUN |
