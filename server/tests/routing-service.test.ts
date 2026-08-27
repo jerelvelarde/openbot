@@ -238,6 +238,52 @@ describe("CoworkerRoutingService", () => {
     expect(modelCalls).toEqual([]);
   });
 
+  test("keeps partially overlapping full names as independent explicit choices", async () => {
+    const { service, modelCalls } = makeService({
+      roster: [profile("ann", "Ann Marie"), profile("curie", "Marie Curie")],
+    });
+
+    expect(
+      await service.route({ actor: ACTOR, text: "ask Ann Marie Curie" }),
+    ).toEqual({
+      kind: "ambiguous",
+      names: ["Ann Marie", "Marie Curie"],
+    });
+    expect(modelCalls).toEqual([]);
+  });
+
+  test("suppresses contained prefix aliases but retains a partially overlapping suffix name", async () => {
+    const { service, modelCalls } = makeService({
+      roster: [
+        profile("ann", "Ann"),
+        profile("ann-marie", "Ann Marie"),
+        profile("curie", "Marie Curie"),
+      ],
+    });
+
+    expect(
+      await service.route({ actor: ACTOR, text: "ask Ann Marie Curie" }),
+    ).toEqual({
+      kind: "ambiguous",
+      names: ["Ann Marie", "Marie Curie"],
+    });
+    expect(modelCalls).toEqual([]);
+  });
+
+  test("handles many repeated explicit mentions without changing their selection", async () => {
+    const { service, modelCalls } = makeService();
+    const text = Array.from({ length: 1_500 }, () => "Risk Analyst").join(
+      " and ",
+    );
+
+    expect(await service.route({ actor: ACTOR, text })).toMatchObject({
+      kind: "selected",
+      agentId: "risk",
+      viaMention: true,
+    });
+    expect(modelCalls).toEqual([]);
+  });
+
   test("labels duplicate normalized names distinctly and resolves a chosen label", async () => {
     const { service, modelCalls } = makeService({
       roster: [
@@ -253,12 +299,12 @@ describe("CoworkerRoutingService", () => {
       }),
     ).toEqual({
       kind: "ambiguous",
-      names: ["Risk Analyst (option 1)", "Risk Analyst (option 2)"],
+      names: ["Risk Analyst (id cmlzay1jb3B5)", "Risk Analyst (id cmlzay1pZA)"],
     });
     expect(
       await service.route({
         actor: ACTOR,
-        text: "ask Risk Analyst (option 1) to review this",
+        text: "ask Risk Analyst (id cmlzay1jb3B5) to review this",
       }),
     ).toMatchObject({
       kind: "selected",
@@ -268,7 +314,7 @@ describe("CoworkerRoutingService", () => {
     expect(modelCalls).toEqual([]);
   });
 
-  test("uses stable option labels when duplicate ids differ only by case", async () => {
+  test("uses stable id labels when duplicate ids differ only by case", async () => {
     const roster = [
       profile("risk", "Risk Analyst"),
       profile("Risk", "Risk Analyst"),
@@ -281,7 +327,7 @@ describe("CoworkerRoutingService", () => {
     });
     expect(result).toEqual({
       kind: "ambiguous",
-      names: ["Risk Analyst (option 1)", "Risk Analyst (option 2)"],
+      names: ["Risk Analyst (id Umlzaw)", "Risk Analyst (id cmlzaw)"],
     });
     expect(new Set(result.names.map(normalizeCoworkerName)).size).toBe(
       result.names.length,
@@ -289,13 +335,13 @@ describe("CoworkerRoutingService", () => {
     expect(
       await service.route({
         actor: ACTOR,
-        text: "ask Risk Analyst (option 1) to review this",
+        text: "ask Risk Analyst (id Umlzaw) to review this",
       }),
     ).toMatchObject({ kind: "selected", agentId: "Risk" });
     expect(modelCalls).toEqual([]);
   });
 
-  test("uses NFKC-distinct option labels with an order-independent mapping", async () => {
+  test("uses NFKC-distinct id labels with an order-independent mapping", async () => {
     const optionA = profile("A", "Risk Analyst");
     const optionFullWidthA = profile("Ａ", "Risk Analyst");
     const forward = makeService({ roster: [optionFullWidthA, optionA] });
@@ -312,21 +358,55 @@ describe("CoworkerRoutingService", () => {
 
     expect(forwardResult).toEqual({
       kind: "ambiguous",
-      names: ["Risk Analyst (option 1)", "Risk Analyst (option 2)"],
+      names: ["Risk Analyst (id 77yh)", "Risk Analyst (id QQ)"],
     });
     expect(reverseResult).toEqual(forwardResult);
     expect(
       await forward.service.route({
         actor: ACTOR,
-        text: "ask Risk Analyst (option 1) to review this",
+        text: "ask Risk Analyst (id QQ) to review this",
       }),
     ).toMatchObject({ kind: "selected", agentId: "A" });
     expect(
       await forward.service.route({
         actor: ACTOR,
-        text: "ask Risk Analyst (option 2) to review this",
+        text: "ask Risk Analyst (id 77yh) to review this",
       }),
     ).toMatchObject({ kind: "selected", agentId: "Ａ" });
+  });
+
+  test("keeps a duplicate label bound to its id when new duplicates are added or reordered", async () => {
+    const idA = profile("a", "Risk Analyst");
+    const idB = profile("b", "Risk Analyst");
+    const addedEarlier = profile("A", "Risk Analyst");
+    const original = makeService({ roster: [idB, idA] });
+    const expanded = makeService({ roster: [idB, addedEarlier, idA] });
+    const stableLabel = "Risk Analyst (id Yg)";
+
+    expect(
+      await original.service.route({
+        actor: ACTOR,
+        text: "ask risk analyst to review this",
+      }),
+    ).toEqual({
+      kind: "ambiguous",
+      names: ["Risk Analyst (id YQ)", stableLabel],
+    });
+    expect(
+      await expanded.service.route({
+        actor: ACTOR,
+        text: "ask risk analyst to review this",
+      }),
+    ).toEqual({
+      kind: "ambiguous",
+      names: ["Risk Analyst (id QQ)", "Risk Analyst (id YQ)", stableLabel],
+    });
+    expect(
+      await expanded.service.route({
+        actor: ACTOR,
+        text: `ask ${stableLabel}`,
+      }),
+    ).toMatchObject({ kind: "selected", agentId: "b" });
   });
 
   test("returns none for an absent or empty visible roster", async () => {
