@@ -299,12 +299,15 @@ describe("CoworkerRoutingService", () => {
       }),
     ).toEqual({
       kind: "ambiguous",
-      names: ["Risk Analyst (id cmlzay1jb3B5)", "Risk Analyst (id cmlzay1pZA)"],
+      names: [
+        "Risk Analyst (id 7269736b2d636f7079)",
+        "Risk Analyst (id 7269736b2d6964)",
+      ],
     });
     expect(
       await service.route({
         actor: ACTOR,
-        text: "ask Risk Analyst (id cmlzay1jb3B5) to review this",
+        text: "ask Risk Analyst (id 7269736b2d636f7079) to review this",
       }),
     ).toMatchObject({
       kind: "selected",
@@ -327,7 +330,7 @@ describe("CoworkerRoutingService", () => {
     });
     expect(result).toEqual({
       kind: "ambiguous",
-      names: ["Risk Analyst (id Umlzaw)", "Risk Analyst (id cmlzaw)"],
+      names: ["Risk Analyst (id 5269736b)", "Risk Analyst (id 7269736b)"],
     });
     expect(new Set(result.names.map(normalizeCoworkerName)).size).toBe(
       result.names.length,
@@ -335,7 +338,7 @@ describe("CoworkerRoutingService", () => {
     expect(
       await service.route({
         actor: ACTOR,
-        text: "ask Risk Analyst (id Umlzaw) to review this",
+        text: "ask Risk Analyst (id 5269736b) to review this",
       }),
     ).toMatchObject({ kind: "selected", agentId: "Risk" });
     expect(modelCalls).toEqual([]);
@@ -358,19 +361,19 @@ describe("CoworkerRoutingService", () => {
 
     expect(forwardResult).toEqual({
       kind: "ambiguous",
-      names: ["Risk Analyst (id 77yh)", "Risk Analyst (id QQ)"],
+      names: ["Risk Analyst (id 41)", "Risk Analyst (id efbca1)"],
     });
     expect(reverseResult).toEqual(forwardResult);
     expect(
       await forward.service.route({
         actor: ACTOR,
-        text: "ask Risk Analyst (id QQ) to review this",
+        text: "ask Risk Analyst (id 41) to review this",
       }),
     ).toMatchObject({ kind: "selected", agentId: "A" });
     expect(
       await forward.service.route({
         actor: ACTOR,
-        text: "ask Risk Analyst (id 77yh) to review this",
+        text: "ask Risk Analyst (id efbca1) to review this",
       }),
     ).toMatchObject({ kind: "selected", agentId: "Ａ" });
   });
@@ -381,7 +384,7 @@ describe("CoworkerRoutingService", () => {
     const addedEarlier = profile("A", "Risk Analyst");
     const original = makeService({ roster: [idB, idA] });
     const expanded = makeService({ roster: [idB, addedEarlier, idA] });
-    const stableLabel = "Risk Analyst (id Yg)";
+    const stableLabel = "Risk Analyst (id 62)";
 
     expect(
       await original.service.route({
@@ -390,7 +393,7 @@ describe("CoworkerRoutingService", () => {
       }),
     ).toEqual({
       kind: "ambiguous",
-      names: ["Risk Analyst (id YQ)", stableLabel],
+      names: ["Risk Analyst (id 61)", stableLabel],
     });
     expect(
       await expanded.service.route({
@@ -399,7 +402,7 @@ describe("CoworkerRoutingService", () => {
       }),
     ).toEqual({
       kind: "ambiguous",
-      names: ["Risk Analyst (id QQ)", "Risk Analyst (id YQ)", stableLabel],
+      names: ["Risk Analyst (id 41)", "Risk Analyst (id 61)", stableLabel],
     });
     expect(
       await expanded.service.route({
@@ -407,6 +410,37 @@ describe("CoworkerRoutingService", () => {
         text: `ask ${stableLabel}`,
       }),
     ).toMatchObject({ kind: "selected", agentId: "b" });
+  });
+
+  test("uses normalization-safe labels for base64url case collisions", async () => {
+    const first = profile("\u0800", "Risk Analyst");
+    const second = profile("\u081A", "Risk Analyst");
+    const { service } = makeService({ roster: [second, first] });
+
+    const result = await service.route({
+      actor: ACTOR,
+      text: "ask risk analyst to review this",
+    });
+
+    expect(result).toEqual({
+      kind: "ambiguous",
+      names: ["Risk Analyst (id e0a080)", "Risk Analyst (id e0a09a)"],
+    });
+    expect(new Set(result.names.map(normalizeCoworkerName)).size).toBe(
+      result.names.length,
+    );
+    expect(
+      await service.route({
+        actor: ACTOR,
+        text: "ask Risk Analyst (id e0a080) to review this",
+      }),
+    ).toMatchObject({ kind: "selected", agentId: "\u0800" });
+    expect(
+      await service.route({
+        actor: ACTOR,
+        text: "ask Risk Analyst (id e0a09a) to review this",
+      }),
+    ).toMatchObject({ kind: "selected", agentId: "\u081A" });
   });
 
   test("returns none for an absent or empty visible roster", async () => {
