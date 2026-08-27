@@ -103,11 +103,30 @@ async function mutate<TVariables>(
 describe("Typefully query contracts", () => {
   test("uses stable, secret-free keys and exact load routes", async () => {
     const draftId = "8b1c61f1-2154-4a5d-8c9a-7c8df8f9ae53";
-    const calls = capture({
-      draft: authoritativeDraft(1, {
-        id: draftId,
-      }),
-    });
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = (async (input, init) => {
+      const url = String(input);
+      calls.push({ url, init });
+      return url.includes("/proposals/")
+        ? json({
+            proposal: {
+              id: "proposal/one",
+              draftId,
+              version: 1,
+              destinations: ["x", "linkedin"],
+              expiresAt: "2026-08-28T00:00:00.000Z",
+              status: "pending",
+              snapshot: document,
+              contentHash: "hash-1",
+              decidedAt: null,
+              completedAt: null,
+              vendorResultId: null,
+              publishedUrl: null,
+              failureDetail: null,
+            },
+          })
+        : json({ draft: authoritativeDraft(1, { id: draftId }) });
+    }) as typeof fetch;
     expect(typefullyKeys.all).toEqual(["typefully"]);
     expect(typefullyKeys.draft("draft/one")).toEqual([
       "typefully",
@@ -245,16 +264,28 @@ describe("Typefully mutation contracts", () => {
   });
 
   test("sends exact JSON routes and bodies", async () => {
-    const calls = capture({
-      proposal: {
-        id: "proposal-1",
-        draftId: "draft/1",
-        version: 5,
-        destinations: ["x"],
-        expiresAt: "2026-08-28T00:00:00.000Z",
-        status: "pending",
-      },
-    });
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = (async (input, init) => {
+      const url = String(input);
+      calls.push({ url, init });
+      return json({
+        proposal: {
+          id: "proposal/1",
+          draftId: "draft/1",
+          version: 5,
+          destinations: ["x", "linkedin"],
+          expiresAt: "2026-08-28T00:00:00.000Z",
+          status: url.endsWith("/decline") ? "declined" : "published",
+          snapshot: document,
+          contentHash: "hash-5",
+          decidedAt: null,
+          completedAt: null,
+          vendorResultId: null,
+          publishedUrl: null,
+          failureDetail: null,
+        },
+      });
+    }) as typeof fetch;
     await mutate(createDraftMutationOptions(), {
       channelId: "channel-1",
       botId: "bot-1",
@@ -635,7 +666,7 @@ describe("Typefully mutation contracts", () => {
         id: `proposal-${action}`,
         draftId: "draft-1",
         version: 3,
-        destinations: ["x"] as const,
+        destinations: ["x", "linkedin"] as const,
         expiresAt: "2026-08-28T00:00:00.000Z",
         status,
         snapshot: document,
@@ -661,6 +692,34 @@ describe("Typefully mutation contracts", () => {
         proposal,
       });
     }
+  });
+
+  test("proposal authority rejects mismatched identities and impossible action status", async () => {
+    const valid = {
+      id: "proposal-1",
+      draftId: "draft-1",
+      version: 3,
+      destinations: ["x", "linkedin"] as const,
+      expiresAt: "2026-08-28T00:00:00.000Z",
+      status: "pending" as const,
+      snapshot: document,
+      contentHash: "content-hash",
+      decidedAt: null,
+      completedAt: null,
+      vendorResultId: null,
+      publishedUrl: null,
+      failureDetail: null,
+    };
+    globalThis.fetch = (async () =>
+      json({ proposal: { ...valid, id: "proposal-other" } })) as typeof fetch;
+    await expect(
+      proposalQueryOptions(valid.id).queryFn?.({} as never),
+    ).rejects.toMatchObject({ code: "remote_invalid_response" });
+
+    globalThis.fetch = (async () => json({ proposal: valid })) as typeof fetch;
+    await expect(
+      mutate(publishProposalMutationOptions(), { proposalId: valid.id }),
+    ).rejects.toMatchObject({ code: "remote_invalid_response" });
   });
 
   test("rejects an invalid or unbounded proposal summary", async () => {

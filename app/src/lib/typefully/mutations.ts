@@ -10,6 +10,7 @@ import {
   type ProposalStatus,
   type ProposalSummary,
   type PublicationProposal,
+  parsePublicationProposalResponse,
   type RemoteDraftState,
   remoteDraftState,
   TypefullyClientError,
@@ -744,10 +745,26 @@ function proposalAction(
       proposalId: string;
       signal?: AbortSignal;
     }): Promise<ProposalMutationResponse> =>
-      typefullyRequest(
+      typefullyRequest<unknown>(
         `/api/typefully/proposals/${encodeURIComponent(input.proposalId)}/${action}`,
         { method: "POST", signal: input.signal },
-      ),
+      ).then((value) => {
+        const parsed = parsePublicationProposalResponse(
+          value,
+          input.proposalId,
+        );
+        const validStatus =
+          action === "publish"
+            ? parsed.proposal.status === "published"
+            : action === "decline"
+              ? parsed.proposal.status === "declined"
+              : parsed.proposal.status === "published" ||
+                parsed.proposal.status === "failed" ||
+                parsed.proposal.status === "unknown";
+        if (!validStatus)
+          throw new TypefullyClientError("remote_invalid_response");
+        return parsed;
+      }),
     onSuccess: async (result, input) => {
       if (!queryClient) return;
       queryClient.setQueryData(

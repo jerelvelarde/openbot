@@ -8,6 +8,7 @@ import type {
   ProposalSummary,
   TypefullyDestination,
 } from "@/lib/typefully/queries";
+import { TypefullyProposalReviewLoader } from "../gallery/typefully-publication";
 import { DraftEditor } from "./draft-editor";
 import { MediaEditor, type MediaItemState } from "./media-editor";
 import { PlatformPreview, type PreviewViewport } from "./platform-preview";
@@ -367,7 +368,7 @@ export function CanvasShell({
               className="w-full rounded-[4px] bg-muted/65 px-3 py-2 text-xs"
               role="status"
             >
-              Review required. This preparation does not publish the draft.
+              An immutable publication review is shown below.
             </p>
           ) : null}
           {proposalError ? (
@@ -412,6 +413,33 @@ export function CanvasShell({
             </button>
           ) : null}
         </header>
+        {proposal ? (
+          proposal.draftId !== (autosave?.target.draftId ?? draft.id) ||
+          proposal.version !== (autosave?.target.version ?? draft.version) ? (
+            <section
+              aria-label="Typefully publication review"
+              className="rounded-[8px] border-2 border-border bg-card/50 p-4 text-sm"
+              role="alert"
+            >
+              <p>The draft changed. This approval cannot be reused.</p>
+              <button
+                className="mt-3 rounded-[8px] border border-border bg-card px-3 py-2"
+                disabled={proposalPreparing || !onPreparePublication}
+                onClick={onPreparePublication}
+                type="button"
+              >
+                Review again
+              </button>
+            </section>
+          ) : (
+            <TypefullyProposalReviewLoader
+              onReviewAgain={
+                proposalPreparing ? undefined : onPreparePublication
+              }
+              summary={proposal}
+            />
+          )
+        ) : null}
         <div className="grid flex-1 gap-2 md:grid-cols-2">
           <section
             aria-label="Editing"

@@ -140,6 +140,68 @@ const authoritativeDraftResponseSchema = z.strictObject({
   }),
 });
 
+const boundedDateSchema = z.string().max(64).datetime();
+const nullableDateSchema = boundedDateSchema.nullable();
+const safePublishedUrlSchema = z
+  .string()
+  .url()
+  .max(2_048)
+  .refine((value) => {
+    const parsed = new URL(value);
+    return (
+      parsed.protocol === "https:" &&
+      parsed.username.length === 0 &&
+      parsed.password.length === 0
+    );
+  })
+  .nullable();
+const publicationProposalSchema = z.strictObject({
+  id: stableIdSchema,
+  draftId: stableIdSchema,
+  version: positiveSafeInteger,
+  destinations: uniqueDestinationsSchema,
+  expiresAt: boundedDateSchema,
+  status: z.enum([
+    "pending",
+    "in_flight",
+    "declined",
+    "expired",
+    "published",
+    "failed",
+    "unknown",
+  ]),
+  snapshot: canonicalDraftDocumentSchema,
+  contentHash: z.string().min(1).max(128),
+  decidedAt: nullableDateSchema,
+  completedAt: nullableDateSchema,
+  vendorResultId: z.string().trim().min(1).max(240).nullable(),
+  publishedUrl: safePublishedUrlSchema,
+  failureDetail: z.string().max(500).nullable(),
+});
+const publicationProposalResponseSchema = z.strictObject({
+  proposal: publicationProposalSchema,
+});
+
+export function parsePublicationProposalResponse(
+  value: unknown,
+  proposalId: string,
+): { proposal: PublicationProposal } {
+  const parsed = publicationProposalResponseSchema.safeParse(value);
+  if (
+    !parsed.success ||
+    parsed.data.proposal.id !== proposalId ||
+    parsed.data.proposal.snapshot.destinations.length !==
+      parsed.data.proposal.destinations.length ||
+    parsed.data.proposal.destinations.some(
+      (destination, index) =>
+        parsed.data.proposal.snapshot.destinations[index] !== destination,
+    )
+  ) {
+    throw new TypefullyClientError("remote_invalid_response");
+  }
+  return parsed.data;
+}
+
 export type PublicationProposal = {
   id: string;
   draftId: string;
@@ -471,9 +533,9 @@ export function proposalQueryOptions(proposalId: string) {
     queryKey: typefullyKeys.proposal(proposalId),
     enabled: proposalId.length > 0,
     queryFn: ({ signal }): Promise<{ proposal: PublicationProposal }> =>
-      typefullyRequest(
+      typefullyRequest<unknown>(
         `/api/typefully/proposals/${encodeURIComponent(proposalId)}`,
         { signal },
-      ),
+      ).then((value) => parsePublicationProposalResponse(value, proposalId)),
   });
 }

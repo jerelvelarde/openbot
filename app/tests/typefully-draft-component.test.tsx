@@ -314,6 +314,11 @@ test("the production Vite registry discovers Typefully exactly once and rejects 
     expect(
       production
         .galleryManifest()
+        .find((component) => component.name === "approveTypefullyPublication"),
+    ).toMatchObject({ defaultPublished: false, grantMode: "explicit" });
+    expect(
+      production
+        .galleryManifest()
         .find((component) => component.name === "showTypefullyDraft"),
     ).toMatchObject({ defaultPublished: true, grantMode: "open" });
   } finally {

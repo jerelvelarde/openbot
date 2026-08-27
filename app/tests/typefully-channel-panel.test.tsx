@@ -1680,7 +1680,9 @@ test("production review control prepares a proposal without publishing", async (
   await userEvent
     .setup({ document })
     .click(view.getByRole("button", { name: "Review & publish" }));
-  expect(await view.findByText(/Review required/)).toBeTruthy();
+  expect(
+    await view.findByText(/An immutable publication review is shown below/),
+  ).toBeTruthy();
   expect(calls).toContainEqual({
     url: `/api/typefully/drafts/${draftId}/proposals`,
     method: "POST",
@@ -1689,7 +1691,11 @@ test("production review control prepares a proposal without publishing", async (
   expect(calls.some((call) => call.url.includes("/publish"))).toBe(false);
   const user = userEvent.setup({ document });
   await user.type(view.getByRole("textbox", { name: "X post 1" }), "!");
-  await waitFor(() => expect(view.queryByText(/Review required/)).toBeNull());
+  await waitFor(() =>
+    expect(
+      view.queryByText(/An immutable publication review is shown below/),
+    ).toBeNull(),
+  );
   await waitFor(
     () =>
       expect(view.getByRole("status").textContent).toContain(
@@ -1698,7 +1704,9 @@ test("production review control prepares a proposal without publishing", async (
     { timeout: 1_500 },
   );
   await user.click(view.getByRole("button", { name: "Review & publish" }));
-  expect(await view.findByText(/Review required/)).toBeTruthy();
+  expect(
+    await view.findByText(/An immutable publication review is shown below/),
+  ).toBeTruthy();
   expect(
     calls.filter(
       (call) => call.method === "POST" && call.url.endsWith("/proposals"),
