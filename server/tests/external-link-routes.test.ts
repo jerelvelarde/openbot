@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { MiddlewareHandler } from "hono";
 import { Hono } from "hono";
+import type { AgentProfileStore } from "../src/agents/profile-store";
 import { createApp } from "../src/app";
 import type { AuditEventInput, TransactionalAuditStore } from "../src/audit";
 import type { AppVariables } from "../src/auth/guards";
@@ -28,6 +29,10 @@ const actor = {
   email: "member@openbot.test",
   role: "user",
 } as const;
+
+const agentProfileStore: Pick<AgentProfileStore, "get"> = {
+  get: async () => null,
+};
 
 function authenticatedAs(
   authenticatedActor = actor,
@@ -127,6 +132,7 @@ function appFor(
       encryptionKey: KEY,
       requireUser,
       auditStore,
+      agentProfileStore,
     }),
   );
   return { app, rows, store };
@@ -344,6 +350,7 @@ describe("external Slack link confirmation routes", () => {
         insert: async () => undefined,
         inTransaction: () => ({ insert: async () => undefined }),
       },
+      agentProfileStore,
     });
     const app = createApp(
       loadConfig(testEnvironment()),
