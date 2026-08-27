@@ -1197,7 +1197,23 @@ export function createTypefullyStore(options: {
         ) {
           throw new VersionConflictError(current.version, current.contentHash);
         }
-        if (current.attemptId !== null) throw new SyncInProgressError();
+        if (current.attemptId !== null) {
+          if (
+            input.toolName !== "remove_media" ||
+            current.attemptKind !== "upload_media" ||
+            current.attemptState !== "outcome_uncertain"
+          )
+            throw new SyncInProgressError();
+          await transaction
+            .update(typefullyDrafts)
+            .set(clearedAttempt)
+            .where(
+              and(
+                eq(typefullyDrafts.id, current.id),
+                eq(typefullyDrafts.attemptId, current.attemptId),
+              ),
+            );
+        }
         const attemptId = randomUUID();
         const instant = now();
         const [row] = await transaction
@@ -1226,6 +1242,33 @@ export function createTypefullyStore(options: {
         if (!row) throw new SyncInProgressError();
         return { draft: asDraft(row), attemptId };
       });
+    },
+
+    async markMediaOutcomeUncertain(input: {
+      draftId: string;
+      actorId: string;
+      attemptId: string;
+      error: unknown;
+    }): Promise<TypefullyDraft> {
+      const [row] = await database
+        .update(typefullyDrafts)
+        .set({
+          attemptState: "outcome_uncertain",
+          syncStatus: "remote_error",
+          lastError: boundedError(input.error),
+          updatedAt: now(),
+        })
+        .where(
+          and(
+            eq(typefullyDrafts.id, input.draftId),
+            eq(typefullyDrafts.ownerUserId, input.actorId),
+            eq(typefullyDrafts.attemptId, input.attemptId),
+            eq(typefullyDrafts.attemptKind, "upload_media"),
+          ),
+        )
+        .returning(draftSelection);
+      if (!row) throw new StaleRemoteAttemptError();
+      return asDraft(row);
     },
 
     async reconcileUncertainCreate(input: {

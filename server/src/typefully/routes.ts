@@ -516,6 +516,8 @@ export function createTypefullyRoutes(
         expectedVersion: saved.version,
         expectedHash: saved.contentHash,
       });
+      let remoteInitiated = false;
+      let initiatedMedia: MediaDescriptor | null = null;
       try {
         const remote = await store.callRemoteTool({
           draftId: current.id,
@@ -546,8 +548,8 @@ export function createTypefullyRoutes(
           );
         }
         const target = remoteMediaTarget(remote.text);
-        await uploadMediaBytes(file, target.uploadUrl, options.mediaUpload);
         const confirmedMedia = { ...media, remoteId: target.id };
+        initiatedMedia = confirmedMedia;
         const confirmed = await store.saveDraft({
           draftId: saved.id,
           actorId: context.var.actor.id,
@@ -559,6 +561,8 @@ export function createTypefullyRoutes(
             ),
           },
         });
+        remoteInitiated = true;
+        await uploadMediaBytes(file, target.uploadUrl, options.mediaUpload);
         const synced = await synchronize(
           store,
           confirmed.id,
@@ -581,6 +585,25 @@ export function createTypefullyRoutes(
           201,
         );
       } catch (error) {
+        if (remoteInitiated) {
+          const uncertain = await store.markMediaOutcomeUncertain({
+            draftId: saved.id,
+            actorId: context.var.actor.id,
+            attemptId: attempt.attemptId,
+            error,
+          });
+          return context.json(
+            {
+              code: "reconciliation_required",
+              draftId: saved.id,
+              message:
+                "The media upload outcome is uncertain. Confirm it in Typefully or remove the media before retrying.",
+              draft: summary(uncertain),
+              media: initiatedMedia,
+            },
+            409,
+          );
+        }
         if (error instanceof ConnectionRequiredError) {
           await store.recordRemoteFailure({
             draftId: saved.id,

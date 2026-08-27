@@ -407,7 +407,28 @@ describe("Typefully synchronization", () => {
       method: "POST",
       body: form,
     });
-    expect(response.status).toBe(502);
+    expect(response.status).toBe(409);
+    const uncertain = await response.json();
+    expect(uncertain).toMatchObject({
+      code: "reconciliation_required",
+      draftId: id,
+      draft: { version: 3, syncStatus: "remote_error" },
+    });
+    expect(byteUploads).toHaveLength(1);
+    const retry = new FormData();
+    retry.set("expectedVersion", "3");
+    retry.set("mediaId", uncertain.media.id);
+    retry.set("kind", "image");
+    retry.set("altText", "Release image");
+    retry.set(
+      "file",
+      new File(["image"], "release.png", { type: "image/png" }),
+    );
+    const blocked = await app.request(`/api/typefully/drafts/${id}/media`, {
+      method: "POST",
+      body: retry,
+    });
+    expect(blocked.status).toBe(409);
     expect(byteUploads).toHaveLength(1);
     uploadStatus = 200;
   });
