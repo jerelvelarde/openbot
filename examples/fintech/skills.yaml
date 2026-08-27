@@ -97,3 +97,4 @@ skills:
       - typefully/get_draft
       - typefully/create_draft
       - typefully/update_draft
+      - typefully/prepare_publication

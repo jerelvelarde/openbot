@@ -7,11 +7,29 @@ import {
   callTool,
   createTypefullyMediaPreviewTransport,
   createTypefullyRestTransport,
+  createTypefullySmokeFetch,
   listTools,
   TYPEFULLY_REMOVE_MEDIA_MAX_DRAFT_BYTES,
   TypefullyApiKeyValidationError,
   validateTypefullyApiKey,
 } from "../src/plugins/typefully-rest";
+
+test("the smoke transport rewrites only the pinned Typefully origin", async () => {
+  const calls: string[] = [];
+  const smokeFetch = createTypefullySmokeFetch(
+    "http://127.0.0.1:43199/v2",
+    (async (input) => {
+      calls.push(String(input));
+      return Response.json({ ok: true });
+    }) as typeof fetch,
+  );
+
+  await smokeFetch("https://api.typefully.com/v2/me");
+  expect(calls).toEqual(["http://127.0.0.1:43199/v2/me"]);
+  await expect(smokeFetch("https://example.com/v2/me")).rejects.toThrow(
+    "refused a non-Typefully URL",
+  );
+});
 
 describe("Typefully media preview transport", () => {
   test("returns a browser redirect target without a DNS-rebindable server asset fetch", async () => {

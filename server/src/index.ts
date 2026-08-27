@@ -58,7 +58,12 @@ import { createPeopleStore } from "./people/store";
 import { redirectUriFor } from "./plugins/oauth";
 import { createPluginStore, type PluginStore } from "./plugins/store";
 import { grantedSkills, grantedTools } from "./plugins/tools";
-import { createTypefullyPublicationVendor } from "./plugins/typefully-rest";
+import {
+  createTypefullyPublicationVendor,
+  createTypefullyRestTransport,
+  createTypefullySmokeFetch,
+  validateTypefullyApiKey,
+} from "./plugins/typefully-rest";
 import { createIntentRouter } from "./routing/classify";
 import { createModelCompleter } from "./routing/model";
 import { createCoworkerRoutingService } from "./routing/service";
@@ -305,10 +310,13 @@ let pluginStore: PluginStore;
 let typefullyVendorDispatch: Parameters<
   NonNullable<Parameters<typeof createPluginStore>[0]["vendorDispatcherReady"]>
 >[0];
+const typefullyFetch = config.typefullyApiUrl
+  ? createTypefullySmokeFetch(config.typefullyApiUrl)
+  : globalThis.fetch;
 const typefullyStore = createTypefullyStore({
   database,
   auditStore: bootAuditStore,
-  publicationVendor: createTypefullyPublicationVendor(),
+  publicationVendor: createTypefullyPublicationVendor(typefullyFetch),
   plugin: () => ({
     decide: pluginStore.decide.bind(pluginStore),
     dispatchVendor: typefullyVendorDispatch,
@@ -331,6 +339,13 @@ pluginStore = createPluginStore({
    */
   redirectUri: config.publicUrl ? redirectUriFor(config.publicUrl) : undefined,
   firstPartyTool: typefullyStore.callBotTool,
+  ...(config.typefullyApiUrl
+    ? {
+        callVendor: createTypefullyRestTransport(typefullyFetch).callTool,
+        validateUserApiKey: async ({ apiKey }: { apiKey: string }) =>
+          validateTypefullyApiKey(apiKey, typefullyFetch),
+      }
+    : {}),
   vendorDispatcherReady: (dispatch) => {
     typefullyVendorDispatch = dispatch;
   },

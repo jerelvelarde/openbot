@@ -39,6 +39,7 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@copilotkit/core": "1.69.0",
     "@happy-dom/global-registrator": "^20.11.2",
     "@tailwindcss/vite": "^4.3.3",
     "@tanstack/router-plugin": "^1.168.30",

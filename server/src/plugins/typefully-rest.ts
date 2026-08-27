@@ -133,6 +133,35 @@ export function createTypefullyMediaPreviewTransport(
 type Connection = { url: string; token?: string };
 type FetchImplementation = typeof globalThis.fetch;
 
+/**
+ * Redirect the production Typefully transport to a loopback fake used by the opt-in smoke run.
+ * Configuration validates the loopback URL; this wrapper additionally refuses to carry the
+ * credential anywhere except a request that was originally pinned to Typefully's exact origin.
+ */
+export function createTypefullySmokeFetch(
+  smokeApiUrl: string,
+  fetchImplementation: FetchImplementation = globalThis.fetch,
+): FetchImplementation {
+  const smokeBase = new URL(`${smokeApiUrl.replace(/\/$/, "")}/`);
+  return (async (input, init) => {
+    const source = new URL(
+      input instanceof Request ? input.url : String(input),
+    );
+    const official = new URL(`${TYPEFULLY_API_URL}/`);
+    if (
+      source.origin !== official.origin ||
+      !source.pathname.startsWith(official.pathname)
+    ) {
+      throw new Error("Typefully smoke transport refused a non-Typefully URL.");
+    }
+    const relative = `${source.pathname.slice(official.pathname.length)}${source.search}`;
+    const target = new URL(relative, smokeBase);
+    return input instanceof Request
+      ? fetchImplementation(new Request(target, input), init)
+      : fetchImplementation(target, init);
+  }) as FetchImplementation;
+}
+
 export type TypefullyApiKeyMetadata = {
   accountId: string | null;
   accountLabel: string | null;

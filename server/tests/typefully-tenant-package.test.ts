@@ -1,7 +1,7 @@
 import { afterAll, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { createDatabase } from "../src/db/client";
 import {
   agents,
@@ -39,6 +39,7 @@ test("the fintech Typefully skill associates without creating connector authorit
     "typefully/get_draft",
     "typefully/create_draft",
     "typefully/update_draft",
+    "typefully/prepare_publication",
   ]);
   expect(socialSkill?.instructions).toContain("showTypefullyDraft");
   expect(socialSkill?.instructions).toContain("connection_required");
@@ -49,6 +50,14 @@ test("the fintech Typefully skill associates without creating connector authorit
   );
 
   const packageSuffix = randomUUID().slice(0, 8);
+  const skillIds = new Map(
+    loaded.skills.map((skill) => [
+      skill.slug,
+      `${skill.slug}-${packageSuffix}`,
+    ]),
+  );
+  const isolatedSkillId = skillIds.get("draft-social-posts");
+  if (!isolatedSkillId) throw new Error("The Typefully skill is missing.");
   const agentIds = new Map(
     loaded.agents.map((agent) => [agent.id, `${agent.id}-${packageSuffix}`]),
   );
@@ -58,14 +67,31 @@ test("the fintech Typefully skill associates without creating connector authorit
     agents: loaded.agents.map((agent) => {
       const isolatedId = agentIds.get(agent.id);
       if (!isolatedId) throw new Error(`Missing isolated id for ${agent.id}.`);
-      return { ...agent, id: isolatedId };
+      return {
+        ...agent,
+        id: isolatedId,
+        skills: agent.skills.map((skill) => {
+          const isolatedSkill = skillIds.get(skill);
+          if (!isolatedSkill) {
+            throw new Error(`Missing isolated skill id for ${skill}.`);
+          }
+          return isolatedSkill;
+        }),
+      };
+    }),
+    skills: loaded.skills.map((skill) => {
+      const isolatedSlug = skillIds.get(skill.slug);
+      if (!isolatedSlug) {
+        throw new Error(`Missing isolated skill id for ${skill.slug}.`);
+      }
+      return { ...skill, slug: isolatedSlug };
     }),
     channels: [],
     sourcePath: `${loaded.sourcePath}#${packageSuffix}`,
     checksum: randomUUID(),
   };
   const intendedBot = isolated.agents.find((agent) =>
-    agent.skills.includes("draft-social-posts"),
+    agent.skills.includes(isolatedSkillId),
   );
   if (!intendedBot) throw new Error("The package did not attach the skill.");
   expect(intendedBot?.id).toBe(`general-assistant-${packageSuffix}`);
@@ -99,7 +125,7 @@ test("the fintech Typefully skill associates without creating connector authorit
         ),
     ).toMatchObject([
       {
-        ref: "draft-social-posts",
+        ref: isolatedSkillId,
         grantedBy: "tenant-package",
       },
     ]);
@@ -107,8 +133,8 @@ test("the fintech Typefully skill associates without creating connector authorit
       await database
         .select()
         .from(skillTools)
-        .where(eq(skillTools.skillId, "draft-social-posts")),
-    ).toHaveLength(3);
+        .where(eq(skillTools.skillId, isolatedSkillId)),
+    ).toHaveLength(4);
 
     expect(
       await database
@@ -128,7 +154,10 @@ test("the fintech Typefully skill associates without creating connector authorit
         .from(pluginGrants)
         .where(
           and(
-            eq(pluginGrants.agentId, intendedBot.id),
+            inArray(
+              pluginGrants.agentId,
+              isolated.agents.map((agent) => agent.id),
+            ),
             eq(pluginGrants.kind, "mcp"),
           ),
         ),
@@ -137,7 +166,12 @@ test("the fintech Typefully skill associates without creating connector authorit
       await database
         .select()
         .from(componentExclusions)
-        .where(eq(componentExclusions.agentId, intendedBot.id)),
+        .where(
+          inArray(
+            componentExclusions.agentId,
+            isolated.agents.map((agent) => agent.id),
+          ),
+        ),
     ).toHaveLength(0);
     expect(
       await database
@@ -149,14 +183,33 @@ test("the fintech Typefully skill associates without creating connector authorit
     for (const agent of isolated.agents) {
       await database.delete(agents).where(eq(agents.id, agent.id));
     }
+    const createdSkillIds = [...skillIds.values()];
     await database
       .delete(skillTools)
-      .where(eq(skillTools.skillId, "draft-social-posts"));
-    await database.delete(skills).where(eq(skills.id, "draft-social-posts"));
+      .where(inArray(skillTools.skillId, createdSkillIds));
+    await database.delete(skills).where(inArray(skills.id, createdSkillIds));
     if (deploymentId) {
       await database
         .delete(deploymentPackages)
         .where(eq(deploymentPackages.id, deploymentId));
     }
   }
+
+  expect(
+    await database
+      .select()
+      .from(agents)
+      .where(
+        inArray(
+          agents.id,
+          isolated.agents.map((agent) => agent.id),
+        ),
+      ),
+  ).toHaveLength(0);
+  expect(
+    await database
+      .select()
+      .from(skills)
+      .where(inArray(skills.id, [...skillIds.values()])),
+  ).toHaveLength(0);
 });
