@@ -8,6 +8,7 @@ import {
   saveDraftMutationOptions,
   uploadMediaMutationOptions,
 } from "@/lib/typefully/mutations";
+import { nextMediaOrder } from "@/lib/typefully/preview";
 import {
   type AuthoritativeDraft,
   type CanonicalDraftDocument,
@@ -300,17 +301,25 @@ function EditableDraftCanvas({
     if (mediaBusyRef.current) return;
     const stable = controller.getSnapshot();
     if (stable.state.kind !== "idle" && stable.state.kind !== "saved") return;
+    const existing = existingId
+      ? stable.document.media.find((item) => item.id === existingId)
+      : undefined;
+    const allocatedOrder = existing
+      ? existing.order
+      : nextMediaOrder(stable.document.media);
+    if (allocatedOrder === undefined) {
+      setMediaOperationError(
+        "Media capacity reached. Remove an attachment before adding another.",
+      );
+      return;
+    }
     const mediaId = existingId ?? `media-${crypto.randomUUID()}`;
-    const existing = stable.document.media.find((item) => item.id === mediaId);
     const descriptor = existing ?? {
       id: mediaId,
       kind: file.type.startsWith("video/")
         ? ("video" as const)
         : ("image" as const),
-      order: stable.document.media.reduce(
-        (highest, item) => Math.max(highest, item.order + 1),
-        0,
-      ),
+      order: allocatedOrder,
       altText: "",
       remoteId: null,
     };

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import {
   ALT_TEXT_LIMIT,
+  canAppendMedia,
   MAX_MEDIA,
   orderedMedia,
   validateMediaFile,
@@ -63,7 +64,7 @@ export function MediaEditor({
       setError(validation);
       return;
     }
-    if (media.length + selected.length > MAX_MEDIA) {
+    if (!canAppendMedia(media) || media.length + selected.length > MAX_MEDIA) {
       setError(`A draft can contain at most ${MAX_MEDIA} media attachments.`);
       return;
     }
@@ -79,7 +80,7 @@ export function MediaEditor({
           accept="image/jpeg,image/png,image/webp,image/gif,video/mp4,video/quicktime"
           aria-label="Add media"
           className="sr-only"
-          disabled={remoteOperationsDisabled || media.length >= MAX_MEDIA}
+          disabled={remoteOperationsDisabled || !canAppendMedia(media)}
           multiple
           onChange={(event) => select(event.currentTarget.files)}
           type="file"

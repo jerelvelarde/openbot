@@ -1,7 +1,11 @@
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import { act, fireEvent, render, waitFor } from "@testing-library/react";
-import { platformTextMetrics } from "../src/lib/typefully/preview";
+import {
+  canAppendMedia,
+  nextMediaOrder,
+  platformTextMetrics,
+} from "../src/lib/typefully/preview";
 import type { CanonicalDraftDocument } from "../src/lib/typefully/queries";
 
 beforeAll(() => GlobalRegistrator.register());
@@ -95,6 +99,16 @@ test("platform counters follow X weighted text and LinkedIn code-point limits", 
     count: 3_001,
     valid: false,
   });
+});
+
+test("media capacity follows the bounded max-order allocation contract", () => {
+  expect(nextMediaOrder([{ order: 0 }, { order: 5 }])).toBe(6);
+  expect(canAppendMedia([{ order: 0 }, { order: 5 }])).toBe(true);
+  expect(nextMediaOrder([{ order: 19 }])).toBeUndefined();
+  expect(canAppendMedia([{ order: 19 }])).toBe(false);
+  expect(
+    canAppendMedia(Array.from({ length: 20 }, (_, order) => ({ order }))),
+  ).toBe(false);
 });
 
 test("local videos and remote media use safe native-aspect semantic previews", async () => {

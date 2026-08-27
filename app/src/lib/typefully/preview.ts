@@ -7,6 +7,7 @@ export const LINKEDIN_POST_LIMIT = 3_000;
 export const ALT_TEXT_LIMIT = 10_000;
 export const MAX_POSTS = 50;
 export const MAX_MEDIA = 20;
+export const MAX_MEDIA_ORDER = MAX_MEDIA - 1;
 export const MAX_MEDIA_BYTES = 25_000_000;
 
 export const ALLOWED_MEDIA_TYPES = new Set([
@@ -81,6 +82,24 @@ export function orderedMedia(document: CanonicalDraftDocument) {
     (left, right) =>
       left.order - right.order || left.id.localeCompare(right.id),
   );
+}
+
+export function nextMediaOrder(
+  media: readonly Pick<CanonicalDraftDocument["media"][number], "order">[],
+): number | undefined {
+  if (media.length >= MAX_MEDIA) return;
+  const order =
+    media.reduce(
+      (highest, descriptor) => Math.max(highest, descriptor.order),
+      -1,
+    ) + 1;
+  return order <= MAX_MEDIA_ORDER ? order : undefined;
+}
+
+export function canAppendMedia(
+  media: readonly Pick<CanonicalDraftDocument["media"][number], "order">[],
+): boolean {
+  return nextMediaOrder(media) !== undefined;
 }
 
 export function validateMediaFile(file: File): string | null {

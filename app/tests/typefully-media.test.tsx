@@ -58,6 +58,69 @@ test("validates MIME and 25 MB before selecting uploads", async () => {
   expect(view.getByText(/25 MB/i)).toBeTruthy();
 });
 
+test.each([
+  { name: "a gapped maximum order", orders: [19] },
+  {
+    name: "twenty contiguous attachments",
+    orders: Array.from({ length: 20 }, (_, order) => order),
+  },
+])("disables Add media for $name", async ({ orders }) => {
+  const { MediaEditor } = await import(
+    "../src/components/typefully/media-editor"
+  );
+  const view = render(
+    <MediaEditor
+      document={{
+        ...documentFixture,
+        media: orders.map((order) => ({
+          id: `media-${order}`,
+          kind: "image",
+          order,
+          altText: "",
+          remoteId: `remote-${order}`,
+        })),
+      }}
+      onReorder={() => {}}
+      onRemove={() => {}}
+      onRetry={() => {}}
+      onSelect={() => {}}
+      onTextChange={() => {}}
+      states={{}}
+    />,
+  );
+
+  expect((view.getByLabelText("Add media") as HTMLInputElement).disabled).toBe(
+    true,
+  );
+});
+
+test("keeps Add media enabled for a gapped order that can allocate six", async () => {
+  const { MediaEditor } = await import(
+    "../src/components/typefully/media-editor"
+  );
+  const view = render(
+    <MediaEditor
+      document={{
+        ...documentFixture,
+        media: documentFixture.media.map((item, index) => ({
+          ...item,
+          order: index === 0 ? 0 : 5,
+        })),
+      }}
+      onReorder={() => {}}
+      onRemove={() => {}}
+      onRetry={() => {}}
+      onSelect={() => {}}
+      onTextChange={() => {}}
+      states={{}}
+    />,
+  );
+
+  expect((view.getByLabelText("Add media") as HTMLInputElement).disabled).toBe(
+    false,
+  );
+});
+
 test("shows honest upload state and failed or uncertain Retry/Remove actions", async () => {
   const { MediaEditor } = await import(
     "../src/components/typefully/media-editor"
