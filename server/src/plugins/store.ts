@@ -3445,11 +3445,12 @@ export function createPluginStore(options: PluginStoreOptions) {
 
     /**
      * Authorize a reviewed server-only operation without advertising it as a tool. The caller must
-     * normally names a real advertised grant that gates the operation; only the reserved operation
-     * name is evaluated by policy. The one grantless exception is Typefully's exact server-only
-     * reconciliation read: it can only inspect an already-ambiguous publication and cannot create a
-     * new vendor write. Returning the actor's live token keeps the credential check and policy
-     * decision adjacent and leaves no generic HTTP or model-callable publish surface.
+     * normally name a real advertised grant that gates the operation; only the reserved operation
+     * name is evaluated by policy. Typefully has two exact server-only read contracts: publication
+     * reconciliation is grantless because it can only inspect an already-ambiguous publication,
+     * while media preview is gated by the advertised get_draft grant. Returning the actor's live
+     * token keeps the credential check and policy decision adjacent and leaves no generic HTTP or
+     * model-callable vendor surface.
      */
     async authorizeOperation(input: {
       requiredGrantRef?: string;
@@ -3472,16 +3473,22 @@ export function createPluginStore(options: PluginStoreOptions) {
         input.requiredGrantRef === undefined &&
         input.context.intent === "read_tool" &&
         input.context.mcp.effect === "read";
+      const isMediaPreviewRead =
+        serverId === "typefully" &&
+        operation === "media_preview" &&
+        input.requiredGrantRef === "typefully/get_draft" &&
+        input.context.intent === "read_tool" &&
+        input.context.mcp.effect === "read";
+      const isReservedRead = isReconciliationRead || isMediaPreviewRead;
       if (
         !serverId ||
         !operation ||
         input.context.mcp.server !== serverId ||
         input.context.mcp.tool !== operation ||
-        (!isReconciliationRead &&
+        (!isReservedRead &&
           (input.context.intent !== "write_tool" ||
             input.context.mcp.effect !== "write")) ||
-        (!isReconciliationRead &&
-          !input.requiredGrantRef?.startsWith(`${serverId}/`))
+        (!isReservedRead && !input.requiredGrantRef?.startsWith(`${serverId}/`))
       ) {
         throw new OperationAuthorizationError("operational_auth_failure", null);
       }

@@ -7,16 +7,21 @@ import { createDatabase } from "../src/db/client";
 import {
   agents,
   auditEvents,
+  channelAgents,
+  channelMemberships,
+  channels,
   credentials,
   mcpServers,
   mcpTools,
   mcpUserCredentials,
   pluginGrants,
   revokedAccess,
+  typefullyDrafts,
   users,
 } from "../src/db/schema";
 import { createPluginStore } from "../src/plugins/store";
 import { TypefullyApiKeyValidationError } from "../src/plugins/typefully-rest";
+import { createTypefullyStore } from "../src/typefully/store";
 import { TEST_POOL } from "./support/database";
 
 const database = createDatabase(
@@ -31,6 +36,7 @@ const serverId = "typefully";
 const encryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 const apiKey = `tf-personal-${suffix}`;
 const botId = `typefully-key-bot-${suffix}`;
+const channelId = `typefully-key-channel-${suffix}`;
 let serverExisted = false;
 
 const validated: string[] = [];
@@ -58,6 +64,11 @@ const store = createPluginStore({
       keyLabel: "OpenBot",
     };
   },
+});
+const typefullyStore = createTypefullyStore({
+  database,
+  auditStore: createAuditStore(database),
+  plugin: () => store,
 });
 
 beforeAll(async () => {
@@ -88,6 +99,13 @@ beforeAll(async () => {
     type: "remote_ag_ui",
     configuration: {},
   });
+  await database.insert(channels).values({
+    id: channelId,
+    name: "Typefully preview authorization",
+    description: "Production plugin-store media preview fixture",
+  });
+  await database.insert(channelMemberships).values({ channelId, userId });
+  await database.insert(channelAgents).values({ channelId, agentId: botId });
   await database
     .insert(mcpTools)
     .values({
@@ -104,6 +122,16 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  await database
+    .delete(typefullyDrafts)
+    .where(eq(typefullyDrafts.channelId, channelId));
+  await database
+    .delete(channelAgents)
+    .where(eq(channelAgents.channelId, channelId));
+  await database
+    .delete(channelMemberships)
+    .where(eq(channelMemberships.channelId, channelId));
+  await database.delete(channels).where(eq(channels.id, channelId));
   await database
     .delete(mcpUserCredentials)
     .where(inArray(mcpUserCredentials.userId, [userId, secondUserId]));
@@ -257,6 +285,43 @@ describe("personal Typefully API-key connections", () => {
         },
       }),
     ).rejects.toMatchObject({ name: "PluginRefusedError" });
+  });
+
+  test("authorizes the reserved media preview read only through a live get_draft grant", async () => {
+    const grantRef = `${serverId}/get_draft`;
+    const draft = await typefullyStore.createDraft({
+      ownerUserId: userId,
+      channelId,
+      botId,
+      document: {
+        title: "Preview authorization",
+        destinations: ["x"],
+        socialSetId: "1",
+        accountLabel: "Typefully Test Account",
+        posts: [{ id: "post-1", x: "Preview this media.", linkedin: "" }],
+        media: [],
+        scheduleAt: null,
+      },
+    });
+    const authorizePreview = () =>
+      typefullyStore.authorizeMediaPreview({
+        draftId: draft.id,
+        actorId: userId,
+      });
+
+    await expect(authorizePreview()).rejects.toMatchObject({
+      code: "grant_required",
+    });
+
+    await store.grant("mcp", grantRef, botId, userId);
+    const authorized = await authorizePreview();
+    expect(authorized.token).toBe(`${apiKey}-publication`);
+    expect(authorized.draft.id).toBe(draft.id);
+
+    await store.revoke("mcp", grantRef, botId, userId);
+    await expect(authorizePreview()).rejects.toMatchObject({
+      code: "grant_required",
+    });
   });
 
   test("rotates the exact prior key and leaves one live credential", async () => {

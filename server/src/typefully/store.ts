@@ -2485,12 +2485,12 @@ export function createTypefullyStore(options: {
         );
       const authorized = await authorizationSurface.authorizeOperation({
         requiredGrantRef: ref,
-        ref,
+        ref: `${serverId}/media_preview`,
         botId: draft.botId,
         actorId: input.actorId,
         context: {
           intent: "read_tool",
-          mcp: { server: serverId, tool: "get_draft", effect: "read" },
+          mcp: { server: serverId, tool: "media_preview", effect: "read" },
         },
       });
       draft = await ownedDraft(database, input.draftId, input.actorId);
