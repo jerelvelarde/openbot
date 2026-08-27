@@ -53,14 +53,18 @@ export function createRoutingRoutes(
         409,
       );
     }
-    return context.json({
+    const response = {
       agentId: result.agentId,
       name: result.name,
       reason: result.reason,
       fallback: result.fallback,
-      undecided: detail.undecided,
       viaMention: result.viaMention,
-    });
+    };
+    // The composer chose this coworker directly, and the legacy response did not expose a model
+    // fallback cause for that path. Keep the model-routed response shape unchanged below.
+    return context.json(
+      agentId ? response : { ...response, undecided: detail.undecided },
+    );
   });
 
   return routes;
