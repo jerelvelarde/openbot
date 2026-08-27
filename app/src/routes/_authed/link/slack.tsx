@@ -1,6 +1,6 @@
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
-import { useRef, useState } from "react";
+import { useEffect, useReducer, useRef, useState } from "react";
 import { PageSection, PageShell } from "@/components/layout/page-shell";
 import { Button } from "@/components/ui/button";
 import { tryClient } from "@/lib/client";
@@ -18,7 +18,23 @@ type SlackLinkFailure = {
 
 type SlackLinkCompletion = ReturnType<typeof slackLinkResult>;
 
-class InvalidSlackLinkError extends Error {}
+type SlackClaimState =
+  | { kind: "loading"; requestId: number }
+  | { kind: "ready"; requestId: number; claim: SlackClaim }
+  | { kind: "terminal"; requestId: number; outcome: SlackLinkCompletion }
+  | { kind: "error"; requestId: number };
+
+type SlackClaimAction =
+  | { type: "start"; requestId: number }
+  | { type: "ready"; requestId: number; claim: SlackClaim }
+  | { type: "terminal"; requestId: number; outcome: SlackLinkCompletion }
+  | { type: "error"; requestId: number };
+
+class SlackLinkTerminalError extends Error {
+  constructor(readonly outcome: SlackLinkCompletion) {
+    super(outcome.message);
+  }
+}
 
 export const Route = createFileRoute("/_authed/link/slack")({
   validateSearch: (search: Record<string, unknown>): { token?: string } => {
@@ -64,6 +80,23 @@ export function slackLinkFailure(_status?: number): SlackLinkFailure {
 }
 
 /**
+ * A response can be retried only when the server failed to serve it. Every other HTTP refusal is a
+ * terminal claim result, so an expired token is never presented as an invitation to retry forever.
+ * Omitting a status represents a network error before an HTTP response existed.
+ */
+export function slackLinkResponseOutcome(status?: number) {
+  if (status === undefined || (status >= 500 && status <= 599)) {
+    return slackLinkFailure(status);
+  }
+  return slackLinkResult(status);
+}
+
+/** Mutation state needs only an epoch to reject a response for an older page token. */
+export function slackLinkMutationVariables(version: number) {
+  return { version };
+}
+
+/**
  * Deliberately selects the three fields this page may show. In particular, a response cannot add a
  * token-shaped field and have it accidentally find its way into the UI.
  */
@@ -91,13 +124,47 @@ function nonEmptyDisplayString(value: unknown): string | null {
   return display === "" ? null : display;
 }
 
-async function loadSlackClaim(token: string): Promise<SlackClaim> {
+/** A newer claim request owns the screen; late results from an older one are ignored. */
+export function slackLinkClaimState(
+  state: SlackClaimState | null,
+  action: SlackClaimAction,
+): SlackClaimState | null {
+  if (action.type === "start") {
+    return { kind: "loading", requestId: action.requestId };
+  }
+
+  if (state?.requestId !== action.requestId) return state;
+
+  switch (action.type) {
+    case "ready":
+      return {
+        kind: "ready",
+        requestId: action.requestId,
+        claim: action.claim,
+      };
+    case "terminal":
+      return {
+        kind: "terminal",
+        requestId: action.requestId,
+        outcome: action.outcome,
+      };
+    case "error":
+      return { kind: "error", requestId: action.requestId };
+  }
+}
+
+async function loadSlackClaim(
+  token: string,
+  signal: AbortSignal,
+): Promise<SlackClaim> {
   const response = await tryClient(
     `/api/external-links/slack?token=${encodeURIComponent(token)}`,
+    { signal },
   );
 
   if (!response.ok) {
-    if (response.status === 400) throw new InvalidSlackLinkError();
+    const outcome = slackLinkResponseOutcome(response.status);
+    if (outcome.kind !== "error") throw new SlackLinkTerminalError(outcome);
     throw new Error("Could not load Slack link.");
   }
 
@@ -114,36 +181,87 @@ async function completeSlackLink(
     body: { token },
   });
 
-  if (
-    response.status === 200 ||
-    response.status === 409 ||
-    response.status === 400
-  ) {
-    return slackLinkResult(response.status);
-  }
-
-  return slackLinkFailure(response.status);
+  return slackLinkResponseOutcome(response.status);
 }
 
 function SlackLinkPage() {
   const { token } = Route.useSearch();
   const submitted = useRef(false);
+  const tokenVersion = useRef(0);
+  const visibleToken = useRef(token);
+  const requestId = useRef(0);
+  const tokenChanged = visibleToken.current !== token;
+  if (tokenChanged) {
+    visibleToken.current = token;
+    tokenVersion.current += 1;
+  }
+
   const [outcome, setOutcome] = useState<
     SlackLinkCompletion | SlackLinkFailure | null
   >(null);
-  const claim = useQuery({
-    // Do not place the secret token in a React Query cache key.
-    queryKey: ["slack-link-claim"],
-    queryFn: () => loadSlackClaim(token ?? ""),
-    enabled: token !== undefined,
-    retry: false,
-  });
+  const [claim, dispatchClaim] = useReducer(slackLinkClaimState, null);
+  const [retry, setRetry] = useState(0);
+  const [pendingVersion, setPendingVersion] = useState<number | null>(null);
+
+  useEffect(() => {
+    // The retry counter gives a retry its own generation even when the token did not change.
+    requestId.current += retry + 1;
+    const nextRequestId = requestId.current;
+    setOutcome(null);
+    submitted.current = false;
+    setPendingVersion(null);
+    dispatchClaim({ type: "start", requestId: nextRequestId });
+
+    if (!token) {
+      dispatchClaim({
+        type: "terminal",
+        requestId: nextRequestId,
+        outcome: slackLinkResult(400),
+      });
+      return;
+    }
+
+    const controller = new AbortController();
+    loadSlackClaim(token, controller.signal)
+      .then((loaded) =>
+        dispatchClaim({
+          type: "ready",
+          requestId: nextRequestId,
+          claim: loaded,
+        }),
+      )
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) return;
+        if (error instanceof SlackLinkTerminalError) {
+          dispatchClaim({
+            type: "terminal",
+            requestId: nextRequestId,
+            outcome: error.outcome,
+          });
+          return;
+        }
+        dispatchClaim({ type: "error", requestId: nextRequestId });
+      });
+
+    return () => controller.abort();
+  }, [retry, token]);
+
   const link = useMutation({
-    mutationFn: () => completeSlackLink(token ?? ""),
-    onSuccess: setOutcome,
-    onError: () => setOutcome(slackLinkFailure()),
-    onSettled: () => {
-      submitted.current = false;
+    mutationFn: (_variables: ReturnType<typeof slackLinkMutationVariables>) =>
+      completeSlackLink(token ?? ""),
+    onSuccess: (nextOutcome, variables) => {
+      if (variables.version === tokenVersion.current) setOutcome(nextOutcome);
+    },
+    onError: (_error, variables) => {
+      if (variables.version === tokenVersion.current) {
+        setOutcome(slackLinkFailure());
+      }
+    },
+    onSettled: (_data, _error, variables) => {
+      if (variables.version === tokenVersion.current) {
+        submitted.current = false;
+        setPendingVersion(null);
+      }
     },
   });
 
@@ -151,7 +269,7 @@ function SlackLinkPage() {
     return <TerminalOutcome outcome={slackLinkResult(400)} />;
   }
 
-  if (claim.isPending) {
+  if (tokenChanged || !claim || claim.kind === "loading") {
     return (
       <PageShell
         description="Checking the Slack identity that asked to be linked."
@@ -164,11 +282,11 @@ function SlackLinkPage() {
     );
   }
 
-  if (claim.isError) {
-    if (claim.error instanceof InvalidSlackLinkError) {
-      return <TerminalOutcome outcome={slackLinkResult(400)} />;
-    }
+  if (claim.kind === "terminal") {
+    return <TerminalOutcome outcome={claim.outcome} />;
+  }
 
+  if (claim.kind === "error") {
     return (
       <PageShell title="Link Slack">
         <PageSection>
@@ -177,7 +295,7 @@ function SlackLinkPage() {
           </p>
           <Button
             className="mt-4"
-            onClick={() => claim.refetch()}
+            onClick={() => setRetry((current) => current + 1)}
             type="button"
           >
             Try again
@@ -191,7 +309,9 @@ function SlackLinkPage() {
     if (submitted.current) return;
     submitted.current = true;
     setOutcome(null);
-    link.mutate();
+    const version = tokenVersion.current;
+    setPendingVersion(version);
+    link.mutate(slackLinkMutationVariables(version));
   };
 
   if (outcome && outcome.kind !== "error") {
@@ -205,13 +325,10 @@ function SlackLinkPage() {
     >
       <PageSection title="Slack identity">
         <dl className="mt-4 rounded-lg border border-border bg-card text-sm">
-          <ClaimField
-            label="Slack workspace"
-            value={claim.data?.workspace ?? ""}
-          />
-          <ClaimField label="Slack user" value={claim.data?.user ?? ""} />
-          {claim.data?.email !== undefined ? (
-            <ClaimField label="Slack email" value={claim.data.email} />
+          <ClaimField label="Slack workspace" value={claim.claim.workspace} />
+          <ClaimField label="Slack user" value={claim.claim.user} />
+          {claim.claim.email !== undefined ? (
+            <ClaimField label="Slack email" value={claim.claim.email} />
           ) : null}
         </dl>
       </PageSection>
@@ -222,8 +339,14 @@ function SlackLinkPage() {
             {outcome.message}
           </p>
         ) : null}
-        <Button disabled={link.isPending} onClick={submit} type="button">
-          {link.isPending ? "Linking Slack…" : "Link Slack"}
+        <Button
+          disabled={pendingVersion === tokenVersion.current}
+          onClick={submit}
+          type="button"
+        >
+          {pendingVersion === tokenVersion.current
+            ? "Linking Slack…"
+            : "Link Slack"}
         </Button>
       </PageSection>
     </PageShell>
