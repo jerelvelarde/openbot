@@ -254,6 +254,33 @@ export const agents = pgTable("agents", {
   updatedAt: updatedAt(),
 });
 
+/** A provider thread is permanently assigned to the Channels thread and agent that first claims it. */
+export const externalThreadBindings = pgTable(
+  "external_thread_bindings",
+  {
+    channelsThreadId: text("channels_thread_id").primaryKey(),
+    provider: text("provider").notNull(),
+    providerTenantId: text("provider_tenant_id").notNull(),
+    providerConversationId: text("provider_conversation_id").notNull(),
+    providerThreadId: text("provider_thread_id").notNull(),
+    agentId: text("agent_id")
+      .notNull()
+      .references(() => agents.id, { onDelete: "restrict" }),
+    createdByUserId: text("created_by_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "restrict" }),
+    createdAt: createdAt(),
+  },
+  (table) => [
+    uniqueIndex("external_thread_bindings_provider_thread_idx").on(
+      table.provider,
+      table.providerTenantId,
+      table.providerConversationId,
+      table.providerThreadId,
+    ),
+  ],
+);
+
 export const channels = pgTable(
   "channels",
   {
