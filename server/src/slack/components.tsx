@@ -38,31 +38,16 @@ export function configureApprovalDecisionStore(
 const approvalAction = z
   .object({
     presentationId: z.string().uuid(),
-    channelsThreadId: z.string().min(1),
-    conversationKey: z.string().min(1),
-    agentId: z.string().min(1),
-    createdByUserId: z.string().min(1),
     approved: z.boolean(),
   })
   .strict();
 
 /*
  * Channels 0.9 persists each non-undefined button actionValue in its ActionRegistry and replaces
- * the provider callback value with that stored value on hot and cold dispatch. These buttons use
- * either a complete object or null, never undefined, so provider input is never the fallback.
+ * the provider callback value with that stored value on hot and cold dispatch. Initial buttons use
+ * an opaque presentation UUID plus the decision; cold renders use null, never undefined, so the
+ * provider callback is never trusted as a fallback.
  */
-
-function sameSubject(
-  presentation: ApprovalPresentation,
-  decision: z.infer<typeof approvalAction>,
-): boolean {
-  return (
-    presentation.channelsThreadId === decision.channelsThreadId &&
-    presentation.conversationKey === decision.conversationKey &&
-    presentation.agentId === decision.agentId &&
-    presentation.createdByUserId === decision.createdByUserId
-  );
-}
 
 async function claimAndResume(
   value: unknown,
@@ -79,22 +64,10 @@ async function claimAndResume(
     throw new Error("This approval interaction could not be authorized.");
   }
   const decision = approvalAction.parse(value);
-  if (decision.conversationKey !== conversationKey) {
-    throw new Error("This approval interaction could not be authorized.");
-  }
-  const now = dependencies.now();
-  await dependencies.store.cleanup(new Date(now - dependencies.retentionMs));
-  await dependencies.store.present({
-    presentationId: decision.presentationId,
-    channelsThreadId: decision.channelsThreadId,
-    conversationKey: decision.conversationKey,
-    agentId: decision.agentId,
-    createdByUserId: decision.createdByUserId,
-  });
   const presentation = await dependencies.store.get(decision.presentationId);
   if (
     !presentation ||
-    !sameSubject(presentation, decision) ||
+    presentation.conversationKey !== conversationKey ||
     !(await dependencies.authorize({ userId, presentation }))
   ) {
     throw new Error("This approval interaction could not be authorized.");
@@ -138,6 +111,19 @@ export const ApprovalCard = defineChannelComponent({
     const presentation = subject
       ? { presentationId: crypto.randomUUID(), ...subject }
       : null;
+    if (presentation) {
+      const dependencies = approvalDependencies;
+      if (!dependencies) {
+        throw new Error(
+          "ApprovalCard requires a durable approval decision store.",
+        );
+      }
+      const now = dependencies.now();
+      await dependencies.store.cleanup(
+        new Date(now - dependencies.retentionMs),
+      );
+      await dependencies.store.present(presentation);
+    }
     return (
       <Message fallbackText={question}>
         <Section>{question}</Section>
@@ -154,7 +140,14 @@ export const ApprovalCard = defineChannelComponent({
               );
             }}
             style="primary"
-            value={presentation ? { ...presentation, approved: true } : null}
+            value={
+              presentation
+                ? {
+                    presentationId: presentation.presentationId,
+                    approved: true,
+                  }
+                : null
+            }
           >
             Approve
           </Button>
@@ -169,7 +162,14 @@ export const ApprovalCard = defineChannelComponent({
                 (decision) => thread.resume(decision),
               );
             }}
-            value={presentation ? { ...presentation, approved: false } : null}
+            value={
+              presentation
+                ? {
+                    presentationId: presentation.presentationId,
+                    approved: false,
+                  }
+                : null
+            }
           >
             Reject
           </Button>
