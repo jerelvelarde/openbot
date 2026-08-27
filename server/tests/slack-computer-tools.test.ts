@@ -16,8 +16,12 @@ import {
   ActionRefusedError,
   type ComputerGateway,
   ComputerUnavailableError,
+  ElementNotFoundError,
   HumanHasControlError,
+  NavigationRefusedError,
   StaleSnapshotError,
+  WorkspaceRefusedError,
+  WorkspaceRequestError,
 } from "../src/computer/gateway";
 import {
   createSlackComputerTools,
@@ -127,12 +131,12 @@ class FakeComputerGateway implements ComputerGateway {
   };
 
   private answer<T>(result: T): T {
+    this.afterCall?.();
     if (this.nextError !== undefined) {
       const error = this.nextError;
       this.nextError = undefined;
       throw error;
     }
-    this.afterCall?.();
     return result;
   }
 
@@ -450,7 +454,7 @@ describe("Slack computer ChannelTools", () => {
     expect(gateway.clickCalls).toHaveLength(0);
   });
 
-  test("normalizes known refusal, stale-reference, human-control, and abort conditions", async () => {
+  test("normalizes every public gateway domain error by class", async () => {
     const gateway = new FakeComputerGateway();
     const tool = toolsByName(gateway).get("computer_click")!;
     const context = channelContext(new FileAdapter());
@@ -473,11 +477,42 @@ describe("Slack computer ChannelTools", () => {
         },
       },
       {
+        error: new ElementNotFoundError("That element is gone."),
+        expected: {
+          ok: false,
+          staleRefs: true,
+          reason: "That element is gone.",
+        },
+      },
+      {
         error: new HumanHasControlError("A person is driving."),
         expected: {
           ok: false,
           humanHasControl: true,
           reason: "A person is driving.",
+        },
+      },
+      {
+        error: new NavigationRefusedError("Private hosts are not allowed."),
+        expected: {
+          ok: false,
+          refused: true,
+          reason: "Private hosts are not allowed.",
+        },
+      },
+      {
+        error: new WorkspaceRefusedError("That path leaves the workspace."),
+        expected: {
+          ok: false,
+          refused: true,
+          reason: "That path leaves the workspace.",
+        },
+      },
+      {
+        error: new WorkspaceRequestError("There is no file at notes.md."),
+        expected: {
+          ok: false,
+          reason: "There is no file at notes.md.",
         },
       },
       { error: new DOMException("cancelled", "AbortError"), expected: STOPPED },
@@ -491,6 +526,43 @@ describe("Slack computer ChannelTools", () => {
       expect(result).toEqual(item.expected);
     }
     expect(gateway.clickCalls).toHaveLength(cases.length);
+  });
+
+  test("maps an aborted transport ComputerUnavailableError to stopped", async () => {
+    const gateway = new FakeComputerGateway();
+    const controller = new AbortController();
+    gateway.afterCall = () => controller.abort();
+    gateway.nextError = new ComputerUnavailableError(
+      "The assistant's computer is not running.",
+    );
+
+    const result = await inSlack(() =>
+      invoke(
+        toolsByName(gateway).get("computer_click")!,
+        { ref: "e4", snapshotId: 9 },
+        channelContext(new FileAdapter(), controller.signal),
+      ),
+    );
+
+    expect(result).toEqual(STOPPED);
+    expect(gateway.clickCalls).toHaveLength(1);
+  });
+
+  test("does not trust an ordinary Error renamed AbortError", async () => {
+    const gateway = new FakeComputerGateway();
+    const renamed = new Error("internal detail");
+    renamed.name = "AbortError";
+    gateway.nextError = renamed;
+
+    const result = await inSlack(() =>
+      invoke(
+        toolsByName(gateway).get("computer_click")!,
+        { ref: "e4", snapshotId: 9 },
+        channelContext(new FileAdapter()),
+      ),
+    );
+
+    expect(result).toEqual(UNAVAILABLE);
   });
 
   test("hides unavailable and unknown error details and never retries", async () => {
@@ -514,32 +586,130 @@ describe("Slack computer ChannelTools", () => {
     expect(gateway.clickCalls).toHaveLength(2);
   });
 
-  test("checks abort before and after gateway methods without signal parameters", async () => {
+  test("checks abort before and after non-cancellable read-only gateway methods", async () => {
     const gateway = new FakeComputerGateway();
-    const tool = toolsByName(gateway).get("computer_navigate")!;
+    const tool = toolsByName(gateway).get("computer_read")!;
     const alreadyStopped = new AbortController();
     alreadyStopped.abort();
     const before = await inSlack(() =>
       invoke(
         tool,
-        { url: "https://example.com" },
+        {},
         channelContext(new FileAdapter(), alreadyStopped.signal),
       ),
     );
     expect(before).toEqual(STOPPED);
-    expect(gateway.navigateCalls).toHaveLength(0);
+    expect(gateway.readCalls).toHaveLength(0);
 
     const stoppedAfter = new AbortController();
     gateway.afterCall = () => stoppedAfter.abort();
     const after = await inSlack(() =>
-      invoke(
-        tool,
-        { url: "https://example.com" },
-        channelContext(new FileAdapter(), stoppedAfter.signal),
-      ),
+      invoke(tool, {}, channelContext(new FileAdapter(), stoppedAfter.signal)),
     );
     expect(after).toEqual(STOPPED);
-    expect(gateway.navigateCalls).toHaveLength(1);
+    expect(gateway.readCalls).toHaveLength(1);
+  });
+
+  test("reports successful non-cancellable mutators truthfully after their commit point", async () => {
+    const cases = [
+      {
+        name: "computer_navigate",
+        input: { url: "https://example.com" },
+        assert(result: unknown) {
+          expect(result).toMatchObject({
+            ok: true,
+            url: "https://example.com",
+          });
+        },
+      },
+      {
+        name: "computer_scroll",
+        input: { deltaY: 300 },
+        assert(result: unknown) {
+          expect(result).toMatchObject({ ok: true, action: "scroll" });
+        },
+      },
+      {
+        name: "computer_write_file",
+        input: { path: "log.txt", contents: "next\n", append: true },
+        assert(result: unknown) {
+          expect(result).toMatchObject({ ok: true, appended: true });
+        },
+      },
+    ];
+
+    for (const item of cases) {
+      const gateway = new FakeComputerGateway();
+      const controller = new AbortController();
+      gateway.afterCall = () => controller.abort();
+      const result = await inSlack(() =>
+        invoke(
+          toolsByName(gateway).get(item.name)!,
+          item.input,
+          channelContext(new FileAdapter(), controller.signal),
+        ),
+      );
+      item.assert(result);
+    }
+  });
+
+  test("reports signal-aware mutator success truthfully when abort races its return", async () => {
+    const gateway = new FakeComputerGateway();
+    const controller = new AbortController();
+    gateway.afterCall = () => controller.abort();
+
+    const result = await inSlack(() =>
+      invoke(
+        toolsByName(gateway).get("computer_click")!,
+        { ref: "e4", snapshotId: 9 },
+        channelContext(new FileAdapter(), controller.signal),
+      ),
+    );
+
+    expect(result).toMatchObject({ ok: true, action: "click", ref: "e4" });
+    expect(gateway.clickCalls).toHaveLength(1);
+  });
+
+  test("serializes an unexpected non-plain gateway value without silently collapsing it", async () => {
+    const gateway = Object.assign(new FakeComputerGateway(), {
+      async read() {
+        return new Map([["status", "ready"]]);
+      },
+    });
+
+    const result = await inSlack(() =>
+      invoke(
+        toolsByName(gateway).get("computer_read")!,
+        {},
+        channelContext(new FileAdapter()),
+      ),
+    );
+
+    expect(result).toEqual({ ok: true, result: [["status", "ready"]] });
+    expect(JSON.stringify(result)).toBe(
+      '{"ok":true,"result":[["status","ready"]]}',
+    );
+  });
+
+  test("fails safely for unsupported non-plain gateway values, including nested ones", async () => {
+    for (const value of [/private-state/u, [/private-state/u]]) {
+      const gateway = Object.assign(new FakeComputerGateway(), {
+        async read() {
+          return value;
+        },
+      });
+
+      const result = await inSlack(() =>
+        invoke(
+          toolsByName(gateway).get("computer_read")!,
+          {},
+          channelContext(new FileAdapter()),
+        ),
+      );
+
+      expect(result).toEqual(UNAVAILABLE);
+      expect(JSON.stringify(result)).not.toContain("private-state");
+    }
   });
 
   test("shares complete UTF-8 text with an explicit filename and reports adapter success", async () => {
@@ -684,6 +854,52 @@ describe("Slack computer ChannelTools", () => {
       shared: true,
       filename: "file.txt",
     });
+  });
+
+  test("removes Unicode line separators from shared filenames", async () => {
+    const gateway = new FakeComputerGateway();
+    const adapter = new FileAdapter();
+    const result = await inSlack(() =>
+      invoke(
+        toolsByName(gateway).get("computer_share_file")!,
+        { path: "reports/risk.txt", filename: "report\u2028private\u2029.txt" },
+        channelContext(adapter),
+      ),
+    );
+    expect(adapter.uploads[0]?.filename).toBe("reportprivate.txt");
+    expect(result).toMatchObject({ filename: "reportprivate.txt" });
+  });
+
+  test("limits shared filenames to 255 UTF-8 bytes without splitting code points", async () => {
+    const cases = [
+      {
+        filename: `${"a".repeat(300)}.txt`,
+        expectedSuffix: ".txt",
+      },
+      {
+        filename: `${"📊".repeat(100)}.json`,
+        expectedSuffix: ".json",
+      },
+    ];
+
+    for (const item of cases) {
+      const gateway = new FakeComputerGateway();
+      const adapter = new FileAdapter();
+      const result = await inSlack(() =>
+        invoke(
+          toolsByName(gateway).get("computer_share_file")!,
+          { path: "reports/risk.txt", filename: item.filename },
+          channelContext(adapter),
+        ),
+      );
+      const filename = adapter.uploads[0]?.filename ?? "";
+      expect(new TextEncoder().encode(filename).byteLength).toBeLessThanOrEqual(
+        255,
+      );
+      expect(filename.endsWith(item.expectedSuffix)).toBe(true);
+      expect(filename).not.toContain("�");
+      expect(result).toMatchObject({ ok: true, shared: true, filename });
+    }
   });
 
   test("ChannelTools use schemas that Channels can parse without compatibility casts", async () => {
