@@ -867,13 +867,21 @@ describe("Typefully autosave controller", () => {
         "draft-current",
         "confirmed",
       ),
-    ).toBe(true);
+    ).toBe(false);
     saving.resolve(saved(2));
     await saving.promise;
     await Promise.resolve();
+    expect(
+      controller.adoptAuthoritative(
+        edited("canonical spelling"),
+        2,
+        "draft-current",
+        "confirmed",
+      ),
+    ).toBe(true);
     expect(controller.getSnapshot()).toMatchObject({
       document: edited("canonical spelling"),
-      state: { kind: "saved", version: 2, remote: "confirmed" },
+      state: { kind: "idle", version: 2, remote: "confirmed" },
     });
   });
 
@@ -921,6 +929,56 @@ describe("Typefully autosave controller", () => {
       ),
     ).toBe(true);
     expect(controller.getSnapshot().document).toEqual(edited("canonical"));
+  });
+
+  test("adopts a genuinely newer clean authority and saves from that version", async () => {
+    const timer = clock();
+    const expectedVersions: number[] = [];
+    const controller = createAutosaveController({
+      initialDraftId: "draft-current",
+      initialDocument: base,
+      initialVersion: 1,
+      scheduler: timer.scheduler,
+      save: async ({ expectedVersion }) => {
+        expectedVersions.push(expectedVersion);
+        return saved(3);
+      },
+    });
+
+    expect(
+      controller.adoptAuthoritative(
+        edited("new remote authority"),
+        2,
+        "draft-current",
+        "confirmed",
+      ),
+    ).toBe(true);
+    expect(controller.getSnapshot()).toMatchObject({
+      document: edited("new remote authority"),
+      target: { version: 2 },
+      state: { kind: "idle", version: 2, remote: "confirmed" },
+    });
+    controller.textChanged(edited("edit after authority"));
+    timer.fire();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(expectedVersions).toEqual([2]);
+  });
+
+  test("never adopts newer authority while local content is dirty", () => {
+    const timer = clock();
+    const controller = createAutosaveController({
+      initialDraftId: "draft-current",
+      initialDocument: base,
+      initialVersion: 1,
+      scheduler: timer.scheduler,
+      save: async () => saved(2),
+    });
+    controller.textChanged(edited("unsaved local"));
+    expect(
+      controller.adoptAuthoritative(edited("remote v2"), 2, "draft-current"),
+    ).toBe(false);
+    expect(controller.getSnapshot().document).toEqual(edited("unsaved local"));
   });
 
   test("aborts in-flight work and clears timers on unmount cleanup", () => {

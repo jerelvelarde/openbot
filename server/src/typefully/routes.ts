@@ -5,6 +5,7 @@ import type { AppVariables } from "../auth/guards";
 import { checkNavigationTarget } from "../computer/target";
 import { readBoundedJson } from "../http/bounded-json";
 import { ConnectionRequiredError, PluginRefusedError } from "../plugins/store";
+import { createTypefullyMediaPreviewTransport } from "../plugins/typefully-rest";
 import { draftSummary } from "./document";
 import {
   type MediaUploadDependencies,
@@ -363,9 +364,14 @@ async function boundedFormData(request: Request): Promise<FormData> {
 export function createTypefullyRoutes(
   store: TypefullyStore,
   requireUser: MiddlewareHandler<{ Variables: AppVariables }>,
-  options: { mediaUpload?: MediaUploadDependencies } = {},
+  options: {
+    mediaUpload?: MediaUploadDependencies;
+    mediaPreview?: ReturnType<typeof createTypefullyMediaPreviewTransport>;
+  } = {},
 ) {
   const routes = new Hono<{ Variables: AppVariables }>();
+  const mediaPreview =
+    options.mediaPreview ?? createTypefullyMediaPreviewTransport();
   routes.use("*", requireUser);
 
   routes.post("/drafts", async (context) => {
@@ -420,6 +426,67 @@ export function createTypefullyRoutes(
       return context.json({ draft: authoritative(draft) });
     } catch (error) {
       return errorResponse(context, error, context.req.param("id"));
+    }
+  });
+
+  routes.get("/drafts/:id/media/:mediaId/preview", async (context) => {
+    const draftId = context.req.param("id");
+    try {
+      const authorized = await store.authorizeMediaPreview({
+        draftId,
+        actorId: context.var.actor.id,
+      });
+      const descriptor = authorized.draft.document.media.find(
+        (item) => item.id === context.req.param("mediaId"),
+      );
+      if (!descriptor?.remoteId) throw new DraftNotFoundError();
+      const socialSetId = authorized.draft.document.socialSetId;
+      if (
+        typeof socialSetId !== "string" ||
+        !/^\d+$/.test(socialSetId) ||
+        !Number.isSafeInteger(Number(socialSetId)) ||
+        Number(socialSetId) < 1
+      )
+        throw new Error("This draft has no valid Typefully social set.");
+      const status = await mediaPreview.getStatus({
+        token: authorized.token,
+        socialSetId: Number(socialSetId),
+        mediaId: descriptor.remoteId,
+      });
+      if (status.state === "processing")
+        return context.json(
+          { state: "processing", fileName: status.fileName, mime: status.mime },
+          202,
+        );
+      if (status.state === "failed")
+        return context.json(
+          {
+            state: "failed",
+            fileName: status.fileName,
+            mime: status.mime,
+            reason: safeError(status.reason),
+          },
+          422,
+        );
+      if (
+        (descriptor.kind === "image" && !status.mime.startsWith("image/")) ||
+        (descriptor.kind === "video" && !status.mime.startsWith("video/"))
+      )
+        throw new Error("Typefully returned a mismatched media preview.");
+      const asset = await mediaPreview.fetchAsset(status.url, status.mime);
+      const contentType = asset.headers.get("content-type");
+      if (!contentType)
+        throw new Error("Typefully returned an invalid media preview asset.");
+      return new Response(asset.body, {
+        status: 200,
+        headers: {
+          "cache-control": "private, no-store",
+          "content-type": contentType,
+          "x-content-type-options": "nosniff",
+        },
+      });
+    } catch (error) {
+      return errorResponse(context, error, draftId);
     }
   });
 

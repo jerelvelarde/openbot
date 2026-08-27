@@ -5,12 +5,118 @@ import { transportFor } from "../src/plugins/transport";
 import { vendorInputSchemaFor } from "../src/plugins/typefully-contracts";
 import {
   callTool,
+  createTypefullyMediaPreviewTransport,
   createTypefullyRestTransport,
   listTools,
   TYPEFULLY_REMOVE_MEDIA_MAX_DRAFT_BYTES,
   TypefullyApiKeyValidationError,
   validateTypefullyApiKey,
 } from "../src/plugins/typefully-rest";
+
+describe("Typefully media preview transport", () => {
+  test("loads official media status and proxies a safe ready asset without exposing the key", async () => {
+    const calls: Array<{ url: string; authorization: string | null }> = [];
+    const fetch = (async (input, init) => {
+      const url = String(input);
+      calls.push({
+        url,
+        authorization: new Headers(init?.headers).get("authorization"),
+      });
+      if (url.includes("/media/77"))
+        return new Response(
+          JSON.stringify({
+            file_name: "launch.png",
+            mime: "image/png",
+            status: "ready",
+            error_reason: null,
+            media_urls: {
+              original: "https://cdn.typefully.example/launch.png",
+              large: null,
+              medium: null,
+              small: null,
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      return new Response("image-bytes", {
+        status: 200,
+        headers: { "content-type": "image/png", "content-length": "11" },
+      });
+    }) as typeof globalThis.fetch;
+    const transport = createTypefullyMediaPreviewTransport(fetch);
+    const status = await transport.getStatus({
+      token: "tf-private-key",
+      socialSetId: 12,
+      mediaId: "77",
+    });
+    expect(status).toMatchObject({
+      state: "ready",
+      fileName: "launch.png",
+      mime: "image/png",
+    });
+    if (status.state !== "ready") throw new Error("Expected ready media.");
+    const asset = await transport.fetchAsset(status.url);
+    expect(await asset.text()).toBe("image-bytes");
+    expect(calls[0]).toEqual({
+      url: "https://api.typefully.com/v2/social-sets/12/media/77",
+      authorization: "Bearer tf-private-key",
+    });
+    expect(calls[1]).toEqual({
+      url: "https://cdn.typefully.example/launch.png",
+      authorization: null,
+    });
+  });
+
+  test("reports processing and failure safely and rejects SSRF media URLs", async () => {
+    for (const [body, expected] of [
+      [
+        { file_name: "x", mime: "video/mp4", status: "processing" },
+        { state: "processing" },
+      ],
+      [
+        {
+          file_name: "x",
+          mime: "video/mp4",
+          status: "failed",
+          error_reason: "secret Transcode failed",
+        },
+        { state: "failed", reason: "[redacted] Transcode failed" },
+      ],
+    ] as const) {
+      const transport = createTypefullyMediaPreviewTransport(
+        (async () =>
+          new Response(JSON.stringify(body), {
+            headers: { "content-type": "application/json" },
+          })) as typeof globalThis.fetch,
+      );
+      expect(
+        await transport.getStatus({
+          token: "secret",
+          socialSetId: 12,
+          mediaId: "77",
+        }),
+      ).toMatchObject(expected);
+    }
+    const unsafe = createTypefullyMediaPreviewTransport(
+      (async () =>
+        new Response(
+          JSON.stringify({
+            file_name: "x",
+            mime: "image/png",
+            status: "ready",
+            media_urls: { original: "http://169.254.169.254/latest/meta-data" },
+          }),
+        )) as typeof globalThis.fetch,
+    );
+    await expect(
+      unsafe.getStatus({
+        token: "must-not-leak",
+        socialSetId: 12,
+        mediaId: "77",
+      }),
+    ).rejects.toThrow("unsafe media preview response");
+  });
+});
 
 const connection = {
   url: "https://api.typefully.com/v2",

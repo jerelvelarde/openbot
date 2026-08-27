@@ -47,6 +47,20 @@ let granted = true;
 let routeRemoteDocument: unknown;
 let routePublishCalls = 0;
 let routeCredentialCalls = 0;
+let previewCredential: string | null = null;
+let previewStatus:
+  | { state: "processing"; fileName: string; mime: string }
+  | {
+      state: "ready";
+      fileName: string;
+      mime: string;
+      url: string;
+    } = {
+  state: "ready",
+  fileName: "launch.png",
+  mime: "image/png",
+  url: "https://cdn.typefully.example/launch.png",
+};
 let routeVerificationError: PublicationVerificationError | null = null;
 
 const plugin = {
@@ -119,7 +133,21 @@ const requireUser: MiddlewareHandler<{ Variables: AppVariables }> = async (
   await next();
 };
 const app = new Hono<{ Variables: AppVariables }>();
-app.route("/api/typefully", createTypefullyRoutes(store, requireUser));
+app.route(
+  "/api/typefully",
+  createTypefullyRoutes(store, requireUser, {
+    mediaPreview: {
+      getStatus: async (input) => {
+        previewCredential = input.token;
+        return previewStatus;
+      },
+      fetchAsset: async () =>
+        new Response("preview-bytes", {
+          headers: { "content-type": "image/png" },
+        }),
+    },
+  }),
+);
 
 const document = (text = "Local-first drafting") => ({
   title: "Launch",
@@ -274,6 +302,81 @@ describe("Typefully draft routes", () => {
         .from(typefullyPublicationProposals)
         .where(eq(typefullyPublicationProposals.draftId, result.draft.id)),
     ).toEqual([]);
+  });
+
+  test("proxies owned remote media without exposing credentials or crossing tenant and Bot boundaries", async () => {
+    const { body } = await createDraft();
+    const current = await store.readDraft(body.draft.id, ownerId);
+    await store.saveDraft({
+      draftId: current.id,
+      actorId: ownerId,
+      expectedVersion: current.version,
+      document: {
+        ...current.document,
+        socialSetId: "12",
+        media: [
+          {
+            id: "local-media",
+            kind: "image",
+            order: 0,
+            altText: "Launch screenshot",
+            remoteId: "77",
+          },
+        ],
+      },
+    });
+    const preview = () =>
+      app.request(
+        `/api/typefully/drafts/${current.id}/media/local-media/preview`,
+      );
+
+    actorId = outsiderId;
+    expect((await preview()).status).toBe(404);
+    actorId = ownerId;
+    expect(previewCredential).toBeNull();
+
+    granted = false;
+    const refused = await preview();
+    granted = true;
+    expect(refused.status).toBe(403);
+    expect(await refused.json()).toMatchObject({ code: "grant_required" });
+    expect(previewCredential).toBeNull();
+
+    await database
+      .delete(channelAgents)
+      .where(
+        and(
+          eq(channelAgents.channelId, channelId),
+          eq(channelAgents.agentId, botId),
+        ),
+      );
+    const detached = await preview();
+    await database.insert(channelAgents).values({ channelId, agentId: botId });
+    expect(detached.status).toBe(409);
+    expect(previewCredential).toBeNull();
+
+    const response = await preview();
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("image/png");
+    expect(response.headers.get("cache-control")).toBe("private, no-store");
+    expect(await response.text()).toBe("preview-bytes");
+    expect(previewCredential).toBe("route-personal-key");
+    expect(JSON.stringify([...response.headers])).not.toContain(
+      "route-personal-key",
+    );
+
+    previewStatus = {
+      state: "processing",
+      fileName: "launch.png",
+      mime: "image/png",
+    };
+    const processing = await preview();
+    expect(processing.status).toBe(202);
+    expect(await processing.json()).toEqual({
+      state: "processing",
+      fileName: "launch.png",
+      mime: "image/png",
+    });
   });
 
   test("proposal routes prepare, privately load, and publish only after the human endpoint", async () => {

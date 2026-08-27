@@ -2469,6 +2469,36 @@ export function createTypefullyStore(options: {
       return ownedDraft(database, draftId, actorId);
     },
 
+    async authorizeMediaPreview(input: {
+      draftId: string;
+      actorId: string;
+    }): Promise<{ draft: TypefullyDraft; token: string }> {
+      let draft = await ownedDraft(database, input.draftId, input.actorId);
+      const ref = `${serverId}/get_draft`;
+      const decision = await plugin().decide("mcp", ref, draft.botId);
+      if (!decision.allowed) throw new GrantRequiredError(ref, decision.reason);
+      const authorizationSurface = plugin();
+      if (!authorizationSurface.authorizeOperation)
+        throw new GrantRequiredError(
+          ref,
+          "Typefully media preview authorization is unavailable.",
+        );
+      const authorized = await authorizationSurface.authorizeOperation({
+        requiredGrantRef: ref,
+        ref,
+        botId: draft.botId,
+        actorId: input.actorId,
+        context: {
+          intent: "read_tool",
+          mcp: { server: serverId, tool: "get_draft", effect: "read" },
+        },
+      });
+      draft = await ownedDraft(database, input.draftId, input.actorId);
+      if (!(await isBotAttached(database, draft.channelId, draft.botId)))
+        throw new BotNotAttachedError();
+      return { draft, token: authorized.token };
+    },
+
     async saveDraft(input: {
       draftId: string;
       actorId: string;

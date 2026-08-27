@@ -872,6 +872,8 @@ test("production review control prepares a proposal without publishing", async (
   queryClient.setQueryData(typefullyKeys.draft(draftId), {
     draft: authoritativeDraft(),
   });
+  let authorityVersion = 1;
+  let authorityBody = "Route body";
   globalThis.fetch = (async (input, init) => {
     const url = typeof input === "string" ? input : input.url;
     const method = init?.method ?? "GET";
@@ -884,9 +886,9 @@ test("production review control prepares a proposal without publishing", async (
       return new Response(
         JSON.stringify({
           proposal: {
-            id: "proposal-1",
+            id: `proposal-${authorityVersion}`,
             draftId,
-            version: 1,
+            version: authorityVersion,
             destinations: ["x"],
             expiresAt: "2026-08-28T00:00:00.000Z",
             status: "pending",
@@ -894,10 +896,53 @@ test("production review control prepares a proposal without publishing", async (
         }),
         { status: 201, headers: { "content-type": "application/json" } },
       );
-    return new Response(JSON.stringify({ draft: authoritativeDraft() }), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    });
+    if (method === "PUT") {
+      const payload = JSON.parse(String(init?.body)) as {
+        document: { posts: Array<{ x: string }> };
+      };
+      authorityVersion += 1;
+      authorityBody = payload.document.posts[0]?.x ?? authorityBody;
+      return new Response(
+        JSON.stringify({
+          draft: {
+            id: draftId,
+            title: "Production route draft",
+            destinations: ["x"],
+            socialSetLabel: "Route account",
+            mediaCount: 0,
+            version: authorityVersion,
+            syncStatus: "synced",
+            proposalStatus: null,
+          },
+          remote: {
+            state: "synced",
+            remoteDraftId: "remote-1",
+            confirmedVersion: authorityVersion,
+            confirmedHash: `hash-${authorityVersion}`,
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+    return new Response(
+      JSON.stringify({
+        draft: {
+          ...authoritativeDraft(),
+          version: authorityVersion,
+          contentHash: `hash-${authorityVersion}`,
+          remoteVersion: authorityVersion,
+          remoteHash: `hash-${authorityVersion}`,
+          document: {
+            ...authoritativeDraft().document,
+            posts: [{ id: "p1", x: authorityBody, linkedin: "" }],
+          },
+        },
+      }),
+      {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      },
+    );
   }) as typeof fetch;
   const view = render(
     <QueryClientProvider client={queryClient}>
@@ -914,6 +959,23 @@ test("production review control prepares a proposal without publishing", async (
     body: { expectedVersion: 1 },
   });
   expect(calls.some((call) => call.url.includes("/publish"))).toBe(false);
+  const user = userEvent.setup({ document });
+  await user.type(view.getByRole("textbox", { name: "X post 1" }), "!");
+  await waitFor(() => expect(view.queryByText(/Review required/)).toBeNull());
+  await waitFor(
+    () =>
+      expect(view.getByRole("status").textContent).toContain(
+        "Saved to Typefully",
+      ),
+    { timeout: 1_500 },
+  );
+  await user.click(view.getByRole("button", { name: "Review & publish" }));
+  expect(await view.findByText(/Review required/)).toBeTruthy();
+  expect(
+    calls.filter(
+      (call) => call.method === "POST" && call.url.endsWith("/proposals"),
+    ),
+  ).toHaveLength(2);
 });
 
 test("save as new pushes the production route onto the authoritative copied draft", async () => {

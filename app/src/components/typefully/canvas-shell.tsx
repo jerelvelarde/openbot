@@ -504,16 +504,17 @@ export function CanvasShell({
                 key={option.id}
                 role="tabpanel"
               >
-                {platform ? (
+                {viewport === option.id && platform ? (
                   <PlatformPreview
                     document={document}
+                    draftId={autosave?.target.draftId ?? draft.id}
                     localMediaUrls={localMediaUrls}
                     platform={platform}
                     viewport={option.id}
                   />
-                ) : (
+                ) : viewport === option.id ? (
                   <EmptyDestination />
-                )}
+                ) : null}
               </div>
             ))}
           </section>

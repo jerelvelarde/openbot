@@ -3,6 +3,7 @@ import type {
   CanonicalDraftDocument,
   TypefullyDestination,
 } from "@/lib/typefully/queries";
+import { RemoteMediaPreview } from "./remote-media-preview";
 
 export type PreviewViewport = "desktop" | "mobile";
 
@@ -16,11 +17,13 @@ export function PlatformPreview({
   platform,
   viewport,
   localMediaUrls = {},
+  draftId,
 }: {
   document: CanonicalDraftDocument;
   platform: string;
   viewport: PreviewViewport;
   localMediaUrls?: Readonly<Record<string, string>>;
+  draftId?: string;
 }) {
   if (platform !== "x" && platform !== "linkedin") {
     return (
@@ -119,6 +122,16 @@ export function PlatformPreview({
                     muted
                     playsInline
                     src={localUrl}
+                  />
+                );
+              if (item.remoteId && draftId)
+                return (
+                  <RemoteMediaPreview
+                    altText={item.altText}
+                    draftId={draftId}
+                    key={item.id}
+                    kind={item.kind}
+                    mediaId={item.id}
                   />
                 );
               return (

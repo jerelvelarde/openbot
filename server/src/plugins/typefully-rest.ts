@@ -1,3 +1,4 @@
+import { checkNavigationTarget } from "../computer/target";
 import type {
   PublicationOutcome,
   PublicationVendor,
@@ -21,6 +22,171 @@ const MAX_REDACTABLE_TOKEN_BYTES = 4_096;
 const TYPEFULLY_ACCOUNT_FIELD_CHARS = 200;
 const TYPEFULLY_ME_MAX_BYTES = 16_384;
 export const TYPEFULLY_REMOVE_MEDIA_MAX_DRAFT_BYTES = 1_000_000;
+const TYPEFULLY_MEDIA_STATUS_MAX_BYTES = 32_768;
+const TYPEFULLY_MEDIA_PREVIEW_MAX_BYTES = 25_000_000;
+const TYPEFULLY_MEDIA_PREVIEW_MIMES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+  "video/mp4",
+  "video/quicktime",
+]);
+
+export type TypefullyMediaPreviewStatus =
+  | { state: "processing"; fileName: string; mime: string }
+  | { state: "failed"; fileName: string; mime: string; reason: string }
+  | {
+      state: "ready";
+      fileName: string;
+      mime: string;
+      url: string;
+    };
+
+function boundedMediaField(value: unknown, limit: number): string | null {
+  if (typeof value !== "string") return null;
+  const characters = Array.from(value);
+  return characters.length <= limit ? value : null;
+}
+
+function mediaPreviewStatus(
+  value: unknown,
+  token: string,
+): TypefullyMediaPreviewStatus {
+  if (!isRecord(value))
+    throw new Error("Typefully returned an invalid media preview response.");
+  const fileName = boundedMediaField(value.file_name, 300);
+  const mime = boundedMediaField(value.mime, 120);
+  const status = boundedMediaField(value.status, 80)?.toLowerCase();
+  if (!fileName || !mime || !status || !TYPEFULLY_MEDIA_PREVIEW_MIMES.has(mime))
+    throw new Error("Typefully returned an invalid media preview response.");
+  if (status === "failed" || status === "error") {
+    return {
+      state: "failed",
+      fileName,
+      mime,
+      reason:
+        boundedMediaField(value.error_reason, 300)?.replaceAll(
+          token,
+          "[redacted]",
+        ) ?? "Typefully could not process this media.",
+    };
+  }
+  const mediaUrls = isRecord(value.media_urls) ? value.media_urls : null;
+  const rawUrl = mediaUrls
+    ? [
+        mediaUrls.original,
+        mediaUrls.large,
+        mediaUrls.medium,
+        mediaUrls.small,
+      ].find((candidate): candidate is string => typeof candidate === "string")
+    : undefined;
+  if (!rawUrl) return { state: "processing", fileName, mime };
+  const target = checkNavigationTarget(rawUrl);
+  const parsed = target.allowed ? new URL(target.url) : null;
+  if (
+    !target.allowed ||
+    parsed?.protocol !== "https:" ||
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    target.url.includes(token)
+  )
+    throw new Error("Typefully returned an unsafe media preview response.");
+  return { state: "ready", fileName, mime, url: target.url };
+}
+
+export function createTypefullyMediaPreviewTransport(
+  fetchImplementation: FetchImplementation = globalThis.fetch,
+  options: { timeoutMs?: number } = {},
+) {
+  const timeoutMs = options.timeoutMs ?? REQUEST_TIMEOUT_MS;
+  return {
+    async getStatus(input: {
+      token: string;
+      socialSetId: number;
+      mediaId: string;
+    }): Promise<TypefullyMediaPreviewStatus> {
+      const raw = await requestTypefully(
+        fetchImplementation,
+        timeoutMs,
+        input.token,
+        {
+          method: "GET",
+          path: `/social-sets/${input.socialSetId}/media/${encodeURIComponent(input.mediaId)}`,
+        },
+        { maxBytes: TYPEFULLY_MEDIA_STATUS_MAX_BYTES },
+      );
+      if (!("response" in raw) || !raw.response.ok || raw.body.truncated)
+        throw new Error("Typefully media preview is unavailable.");
+      let value: unknown;
+      try {
+        value = JSON.parse(raw.body.text);
+      } catch {
+        throw new Error(
+          "Typefully returned an invalid media preview response.",
+        );
+      }
+      return mediaPreviewStatus(value, input.token);
+    },
+    async fetchAsset(url: string, expectedMime?: string): Promise<Response> {
+      const target = checkNavigationTarget(url);
+      const parsed = target.allowed ? new URL(target.url) : null;
+      if (
+        !target.allowed ||
+        parsed?.protocol !== "https:" ||
+        parsed.username !== "" ||
+        parsed.password !== ""
+      )
+        throw new Error("Typefully returned an unsafe media preview response.");
+      const response = await fetchImplementation(target.url, {
+        method: "GET",
+        redirect: "error",
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      const contentType = response.headers
+        .get("content-type")
+        ?.split(";", 1)[0]
+        ?.trim();
+      const contentLength = Number(response.headers.get("content-length"));
+      if (
+        !response.ok ||
+        !contentType ||
+        !TYPEFULLY_MEDIA_PREVIEW_MIMES.has(contentType) ||
+        (expectedMime !== undefined && contentType !== expectedMime) ||
+        (Number.isFinite(contentLength) &&
+          contentLength > TYPEFULLY_MEDIA_PREVIEW_MAX_BYTES)
+      ) {
+        await response.body?.cancel().catch(() => {});
+        throw new Error("Typefully returned an invalid media preview asset.");
+      }
+      const reader = response.body?.getReader();
+      const chunks: Uint8Array[] = [];
+      let total = 0;
+      if (reader) {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (!value) continue;
+          total += value.byteLength;
+          if (total > TYPEFULLY_MEDIA_PREVIEW_MAX_BYTES) {
+            await reader.cancel().catch(() => {});
+            throw new Error(
+              "Typefully returned an oversized media preview asset.",
+            );
+          }
+          chunks.push(value);
+        }
+      }
+      const bytes = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      return new Response(bytes, { headers: { "content-type": contentType } });
+    },
+  };
+}
 
 type Connection = { url: string; token?: string };
 type FetchImplementation = typeof globalThis.fetch;

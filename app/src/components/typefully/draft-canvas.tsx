@@ -173,6 +173,9 @@ function EditableDraftCanvas({
   );
 
   useEffect(() => {
+    const settled =
+      snapshot.state.kind === "idle" || snapshot.state.kind === "saved";
+    if (!settled || snapshot.target.version > draft.version) return;
     const confirmed =
       draft.syncStatus === "synced" &&
       draft.remoteVersion === draft.version &&
@@ -183,7 +186,7 @@ function EditableDraftCanvas({
       draft.id,
       confirmed ? "confirmed" : "local",
     );
-  }, [controller, draft]);
+  }, [controller, draft, snapshot.state.kind, snapshot.target.version]);
 
   useEffect(() => {
     const createdId = snapshot.createdDraft?.draftId;
@@ -199,6 +202,14 @@ function EditableDraftCanvas({
     routedDraft.current = createdId;
     onDraftCreated?.(createdId);
   }, [onDraftCreated, snapshot]);
+
+  useEffect(() => {
+    if (!proposal) return;
+    const settled =
+      snapshot.state.kind === "idle" || snapshot.state.kind === "saved";
+    if (!settled || snapshot.target.version !== proposal.version)
+      setProposal(null);
+  }, [proposal, snapshot.state.kind, snapshot.target.version]);
 
   useEffect(
     () => () => {

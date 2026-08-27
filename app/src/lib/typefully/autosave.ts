@@ -98,16 +98,6 @@ export function createAutosaveController(options: AutosaveOptions) {
   let recoveryToken: object | undefined;
   let recoveryFailed = false;
   let createdDraft: SaveAsNewDraftResult | null = null;
-  let generation = 0;
-  let pendingAuthority:
-    | {
-        draftId: string;
-        document: CanonicalDraftDocument;
-        version: number;
-        remote: "local" | "confirmed";
-        generation: number;
-      }
-    | undefined;
 
   const actions = (): AutosaveSnapshot["actions"] => {
     if (recoveryFailed) return ["retry"];
@@ -148,7 +138,6 @@ export function createAutosaveController(options: AutosaveOptions) {
     clearTimer();
     const baseVersion = version;
     const local = document;
-    const saveGeneration = generation;
     const abort = new AbortController();
     activeSave = abort;
     pending = false;
@@ -173,24 +162,13 @@ export function createAutosaveController(options: AutosaveOptions) {
         if (disposed || activeSave !== abort) return;
         activeSave = undefined;
         version = result.version;
-        let savedRemote = result.remote;
         if (pending) {
           state = { kind: "dirty", baseVersion: version };
           emit();
           runSave();
           return;
         }
-        if (
-          pendingAuthority?.draftId === targetDraftId &&
-          pendingAuthority.version === version &&
-          pendingAuthority.generation === saveGeneration &&
-          generation === saveGeneration
-        ) {
-          document = pendingAuthority.document;
-          savedRemote = pendingAuthority.remote;
-        }
-        pendingAuthority = undefined;
-        state = { kind: "saved", version, remote: savedRemote };
+        state = { kind: "saved", version, remote: result.remote };
         emit();
       })
       .catch((error: unknown) => {
@@ -306,8 +284,6 @@ export function createAutosaveController(options: AutosaveOptions) {
     },
     textChanged(next: CanonicalDraftDocument) {
       if (disposed) return;
-      generation += 1;
-      pendingAuthority = undefined;
       document = next;
       pending = true;
       state = { kind: "dirty", baseVersion: version };
@@ -323,8 +299,6 @@ export function createAutosaveController(options: AutosaveOptions) {
     },
     mediaSettled(next: CanonicalDraftDocument) {
       if (disposed) return;
-      generation += 1;
-      pendingAuthority = undefined;
       document = next;
       pending = true;
       pendingImmediate = true;
@@ -352,22 +326,14 @@ export function createAutosaveController(options: AutosaveOptions) {
       if (
         pending ||
         state.kind === "dirty" ||
+        state.kind === "saving" ||
         state.kind === "conflict" ||
         state.kind === "error"
       )
         return false;
-      if (activeSave) {
-        pendingAuthority = {
-          draftId,
-          document: authoritative,
-          version: currentVersion,
-          remote,
-          generation,
-        };
-        return true;
-      }
-      if (currentVersion !== version) return false;
+      if (activeSave || currentVersion < version) return false;
       document = authoritative;
+      version = currentVersion;
       state = { kind: "idle", version, remote };
       emit();
       return true;
@@ -390,7 +356,6 @@ export function createAutosaveController(options: AutosaveOptions) {
       pending = false;
       ready = false;
       pendingImmediate = false;
-      pendingAuthority = undefined;
       document = authoritative;
       targetDraftId = draftId;
       version = currentVersion;
@@ -419,7 +384,6 @@ export function createAutosaveController(options: AutosaveOptions) {
       pending = false;
       ready = false;
       pendingImmediate = false;
-      pendingAuthority = undefined;
       document = authoritative;
       targetDraftId = draftId;
       version = currentVersion;

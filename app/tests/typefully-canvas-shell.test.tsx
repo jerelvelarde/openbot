@@ -361,6 +361,7 @@ test("dirty autosave keeps local media metadata editable while remote operations
       autosave={snapshot}
       document={withMedia}
       draft={{ ...draft, document: withMedia }}
+      localMediaUrls={{ first: "blob:first", second: "blob:second" }}
       onMediaReorder={() => {}}
       onMediaTextChange={() => {}}
       onRemoveMedia={() => {}}
