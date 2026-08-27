@@ -36,6 +36,18 @@ function context(eventId = "Ev1"): ChannelIdentityContext {
   };
 }
 
+function selector(overrides: Record<string, string | null> = {}) {
+  return {
+    provider: "slack",
+    providerTenantId: "T1",
+    providerConversationId: "C1",
+    providerActorId: "U1",
+    applicationUserId: null,
+    conversationKey: "slack:T1:C1:root-1",
+    ...overrides,
+  };
+}
+
 const identityResult = {
   kind: "unlinked" as const,
   linkUrl: "https://openbot.test/link/slack?token=token",
@@ -54,8 +66,8 @@ describe("managed Slack ingress registry", () => {
 
     registry.remember("Ev1", ingress);
 
-    expect(registry.take("Ev1")).toBe(ingress);
-    expect(registry.take("Ev1")).toBeNull();
+    expect(registry.take("Ev1", selector())).toBe(ingress);
+    expect(registry.take("Ev1", selector())).toBeNull();
   });
 
   test("rejects a missing or blank managed event id", () => {
@@ -66,7 +78,7 @@ describe("managed Slack ingress registry", () => {
       expect(() => registry.remember(eventId, ingress)).toThrow(
         "Managed Slack ingress requires an event id.",
       );
-      expect(() => registry.take(eventId)).toThrow(
+      expect(() => registry.take(eventId, selector())).toThrow(
         "Managed Slack ingress requires an event id.",
       );
     }
@@ -85,7 +97,7 @@ describe("managed Slack ingress registry", () => {
       delay: 30_000,
       cancelled: true,
     });
-    expect(registry.take("Ev1")).toBe(latest);
+    expect(registry.take("Ev1", selector())).toBe(latest);
   });
 
   test("cancels expiry when an ingress is taken", () => {
@@ -93,7 +105,7 @@ describe("managed Slack ingress registry", () => {
     const registry = new SlackIngressRegistry(timer);
     registry.remember("Ev1", { identityContext: context(), identityResult });
 
-    registry.take("Ev1");
+    registry.take("Ev1", selector());
 
     expect(timer.scheduled[0]?.cancelled).toBe(true);
   });
@@ -106,7 +118,7 @@ describe("managed Slack ingress registry", () => {
     expect(timer.scheduled[0]?.delay).toBe(30_000);
     timer.scheduled[0]?.callback();
 
-    expect(registry.take("Ev1")).toBeNull();
+    expect(registry.take("Ev1", selector())).toBeNull();
   });
 
   test("does not let a stale expiry delete a replacement", () => {
@@ -119,7 +131,7 @@ describe("managed Slack ingress registry", () => {
 
     timer.scheduled[0]?.callback();
 
-    expect(registry.take("Ev1")).toBe(latest);
+    expect(registry.take("Ev1", selector())).toBe(latest);
   });
 
   test("uses one trimmed event key for replacement, expiry, and take", () => {
@@ -132,6 +144,40 @@ describe("managed Slack ingress registry", () => {
 
     timer.scheduled[0]?.callback();
 
-    expect(registry.take(" Ev1 ")).toBe(latest);
+    expect(registry.take(" Ev1 ", selector())).toBe(latest);
+  });
+
+  test("same event id cannot cross provider actor or conversation principals", () => {
+    const registry = new SlackIngressRegistry(clock());
+    const first = { identityContext: context(), identityResult };
+    const secondContext = {
+      ...context(),
+      actor: { id: "U2", kind: "human" as const },
+      conversation: { id: "C2" },
+    };
+    const second = {
+      identityContext: secondContext,
+      identityResult: {
+        ...identityResult,
+        identity: {
+          ...identityResult.identity,
+          providerUserId: "U2",
+        },
+      },
+    };
+    registry.remember("Ev1", first);
+    registry.remember("Ev1", second);
+
+    expect(registry.take("Ev1", selector())).toBe(first);
+    expect(
+      registry.take(
+        "Ev1",
+        selector({
+          providerActorId: "U2",
+          providerConversationId: "C2",
+          conversationKey: "slack:T1:C2:root-2",
+        }),
+      ),
+    ).toBe(second);
   });
 });
