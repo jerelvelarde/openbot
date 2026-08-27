@@ -41,6 +41,7 @@ async function convergeDraftCache(
   result?: DraftMutationResponse | TypefullyClientError,
   expectedVersion?: number,
   updateDocument?: (document: CanonicalDraftDocument) => CanonicalDraftDocument,
+  documentVersionOffsets: readonly number[] = [1],
 ) {
   if (!queryClient) return;
   const key = typefullyKeys.draft(draftId);
@@ -48,19 +49,39 @@ async function convergeDraftCache(
   if (resultDraft) {
     queryClient.setQueryData<CachedDraft>(key, (current) => {
       if (!current) return current;
+      if (resultDraft.id !== draftId) return current;
       const incomingVersion = resultDraft.version;
       if (incomingVersion < current.draft.version) return current;
       const remote = "remote" in result ? result.remote : undefined;
-      const equalVersionFailure =
-        result instanceof TypefullyClientError &&
-        incomingVersion === current.draft.version;
-      const preserveConfirmedStatus =
-        equalVersionFailure && current.draft.syncStatus === "synced";
+      const equalVersion = incomingVersion === current.draft.version;
+      const incomingRemoteVersion = remote?.confirmedVersion ?? null;
+      const currentRemoteVersion = current.draft.remoteVersion;
+      const remoteProgress =
+        equalVersion &&
+        incomingRemoteVersion !== null &&
+        (currentRemoteVersion === null ||
+          incomingRemoteVersion > currentRemoteVersion);
+      const confirmedUpgrade =
+        equalVersion &&
+        resultDraft.syncStatus === "synced" &&
+        current.draft.syncStatus !== "synced" &&
+        (incomingRemoteVersion === null ||
+          currentRemoteVersion === null ||
+          incomingRemoteVersion >= currentRemoteVersion);
       const replaceDocument =
         updateDocument !== undefined &&
         expectedVersion !== undefined &&
         current.draft.version === expectedVersion &&
-        incomingVersion === expectedVersion + 1;
+        documentVersionOffsets.some(
+          (offset) => incomingVersion === expectedVersion + offset,
+        );
+      const syncStatus = equalVersion
+        ? current.draft.syncStatus === "synced"
+          ? "synced"
+          : remoteProgress || confirmedUpgrade
+            ? resultDraft.syncStatus
+            : current.draft.syncStatus
+        : resultDraft.syncStatus;
       return {
         draft: {
           ...current.draft,
@@ -68,10 +89,8 @@ async function convergeDraftCache(
             ? updateDocument(current.draft.document)
             : current.draft.document,
           version: incomingVersion,
-          syncStatus: preserveConfirmedStatus
-            ? current.draft.syncStatus
-            : resultDraft.syncStatus,
-          ...(remote && !equalVersionFailure
+          syncStatus,
+          ...(remote && (!equalVersion || remoteProgress)
             ? {
                 remoteDraftId: remote.remoteDraftId,
                 remoteVersion: remote.confirmedVersion,
@@ -250,15 +269,18 @@ export function uploadMediaMutationOptions(queryClient?: QueryClient) {
         input.expectedVersion,
         (document) => ({
           ...document,
-          media: result.media
-            ? [
-                ...document.media.filter(
-                  (item) => item.id !== result.media?.id,
-                ),
-                result.media,
-              ].sort((left, right) => left.order - right.order)
-            : document.media,
+          media:
+            result.media &&
+            (input.mediaId === undefined || result.media.id === input.mediaId)
+              ? [
+                  ...document.media.filter(
+                    (item) => item.id !== result.media?.id,
+                  ),
+                  result.media,
+                ].sort((left, right) => left.order - right.order)
+              : document.media,
         }),
+        [1, 2],
       ),
     onError: (error, input) => {
       if (!(error instanceof TypefullyClientError))
@@ -270,13 +292,18 @@ export function uploadMediaMutationOptions(queryClient?: QueryClient) {
         input.expectedVersion,
         (document) => ({
           ...document,
-          media: error.media
-            ? [
-                ...document.media.filter((item) => item.id !== error.media?.id),
-                error.media,
-              ].sort((left, right) => left.order - right.order)
-            : document.media,
+          media:
+            error.media &&
+            (input.mediaId === undefined || error.media.id === input.mediaId)
+              ? [
+                  ...document.media.filter(
+                    (item) => item.id !== error.media?.id,
+                  ),
+                  error.media,
+                ].sort((left, right) => left.order - right.order)
+              : document.media,
         }),
+        [1, 2],
       );
     },
   });

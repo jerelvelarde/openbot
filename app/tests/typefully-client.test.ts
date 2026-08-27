@@ -620,6 +620,222 @@ describe("Typefully mutation contracts", () => {
     ).toBe(true);
   });
 
+  test("persists a completed upload descriptor returned at version plus two even when refetch fails", async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        mutations: { retry: false },
+        queries: { retry: false },
+      },
+    });
+    let failRefetch = false;
+    await queryClient.fetchQuery({
+      queryKey: typefullyKeys.draft("draft-1"),
+      queryFn: async () => {
+        if (failRefetch) throw new Error("refetch unavailable");
+        return { draft: authoritativeDraft(1) };
+      },
+    });
+    failRefetch = true;
+    const media = {
+      id: "media-complete",
+      kind: "image" as const,
+      order: 0,
+      altText: "Completed upload",
+      remoteId: "typefully-media-22",
+    };
+    globalThis.fetch = (async () =>
+      json({
+        draft: { ...draftSummary(3), mediaCount: 1 },
+        remote: {
+          state: "synced",
+          remoteDraftId: "remote-3",
+          confirmedVersion: 3,
+          confirmedHash: "remote-hash-3",
+        },
+        media,
+      })) as typeof fetch;
+    const observer = new MutationObserver(
+      queryClient,
+      uploadMediaMutationOptions(queryClient),
+    );
+
+    await observer.mutate({
+      draftId: "draft-1",
+      expectedVersion: 1,
+      kind: "image",
+      altText: media.altText,
+      file: new File(["x"], "x.png", { type: "image/png" }),
+    });
+
+    expect(
+      queryClient.getQueryData(typefullyKeys.draft("draft-1")),
+    ).toMatchObject({
+      draft: {
+        version: 3,
+        document: { media: [media] },
+        remoteVersion: 3,
+      },
+    });
+  });
+
+  test("persists an uncertain completed upload descriptor returned at version plus two", async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    queryClient.setQueryData(typefullyKeys.draft("draft-1"), {
+      draft: authoritativeDraft(1),
+    });
+    const media = {
+      id: "media-uncertain",
+      kind: "image" as const,
+      order: 0,
+      altText: "Uncertain upload",
+      remoteId: "typefully-media-uncertain",
+    };
+    globalThis.fetch = (async () =>
+      json(
+        {
+          code: "remote_error",
+          draft: { ...draftSummary(3, "remote_error"), mediaCount: 1 },
+          remote: {
+            state: "remote_error",
+            remoteDraftId: "remote-3",
+            confirmedVersion: 2,
+            confirmedHash: "remote-hash-2",
+          },
+          media,
+        },
+        502,
+      )) as typeof fetch;
+    const observer = new MutationObserver(
+      queryClient,
+      uploadMediaMutationOptions(queryClient),
+    );
+
+    await expect(
+      observer.mutate({
+        draftId: "draft-1",
+        expectedVersion: 1,
+        kind: "image",
+        altText: media.altText,
+        file: new File(["x"], "x.png", { type: "image/png" }),
+      }),
+    ).rejects.toBeInstanceOf(TypefullyClientError);
+
+    expect(
+      queryClient.getQueryData(typefullyKeys.draft("draft-1")),
+    ).toMatchObject({
+      draft: {
+        version: 3,
+        document: { media: [media] },
+        syncStatus: "remote_error",
+        remoteVersion: 2,
+      },
+    });
+  });
+
+  test("persists an initiated upload placeholder returned at version plus one", async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    queryClient.setQueryData(typefullyKeys.draft("draft-1"), {
+      draft: authoritativeDraft(1),
+    });
+    const placeholder = {
+      id: "media-placeholder",
+      kind: "image" as const,
+      order: 0,
+      altText: "Initiated upload",
+      remoteId: null,
+    };
+    globalThis.fetch = (async () =>
+      json(
+        {
+          code: "remote_error",
+          draft: { ...draftSummary(2, "remote_error"), mediaCount: 1 },
+          media: placeholder,
+        },
+        502,
+      )) as typeof fetch;
+    const observer = new MutationObserver(
+      queryClient,
+      uploadMediaMutationOptions(queryClient),
+    );
+
+    await expect(
+      observer.mutate({
+        draftId: "draft-1",
+        expectedVersion: 1,
+        kind: "image",
+        altText: placeholder.altText,
+        file: new File(["x"], "x.png", { type: "image/png" }),
+      }),
+    ).rejects.toBeInstanceOf(TypefullyClientError);
+
+    expect(
+      queryClient.getQueryData(typefullyKeys.draft("draft-1")),
+    ).toMatchObject({
+      draft: { version: 2, document: { media: [placeholder] } },
+    });
+  });
+
+  test("late completed upload cannot roll back a newer cache generation", async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    queryClient.setQueryData(typefullyKeys.draft("draft-1"), {
+      draft: authoritativeDraft(1),
+    });
+    let finishRequest: ((response: Response) => void) | undefined;
+    globalThis.fetch = (() =>
+      new Promise<Response>((resolve) => {
+        finishRequest = resolve;
+      })) as typeof fetch;
+    const observer = new MutationObserver(
+      queryClient,
+      uploadMediaMutationOptions(queryClient),
+    );
+    const late = observer.mutate({
+      draftId: "draft-1",
+      expectedVersion: 1,
+      kind: "image",
+      altText: "Late upload",
+      file: new File(["x"], "x.png", { type: "image/png" }),
+    });
+    while (!finishRequest) await Promise.resolve();
+    const newerMedia = {
+      id: "newer-media",
+      kind: "image" as const,
+      order: 0,
+      altText: "Newer media",
+      remoteId: "newer-remote",
+    };
+    queryClient.setQueryData(typefullyKeys.draft("draft-1"), {
+      draft: authoritativeDraft(4, {
+        document: { ...document, media: [newerMedia] },
+      }),
+    });
+    finishRequest?.(
+      json({
+        draft: { ...draftSummary(3), mediaCount: 1 },
+        media: {
+          id: "late-media",
+          kind: "image",
+          order: 0,
+          altText: "Late upload",
+          remoteId: "late-remote",
+        },
+      }),
+    );
+    await late;
+
+    expect(
+      queryClient.getQueryData(typefullyKeys.draft("draft-1")),
+    ).toMatchObject({
+      draft: { version: 4, document: { media: [newerMedia] } },
+    });
+  });
+
   test("late draft success cannot replace a newer authoritative cache generation", async () => {
     const queryClient = new QueryClient({
       defaultOptions: { mutations: { retry: false } },
@@ -768,6 +984,141 @@ describe("Typefully mutation contracts", () => {
       draft: {
         version: 2,
         document: confirmedDocument,
+        syncStatus: "synced",
+        remoteDraftId: "remote-2",
+        remoteVersion: 2,
+        remoteHash: "remote-hash-2",
+      },
+    });
+  });
+
+  test("late same-version success cannot downgrade a newer confirmed cache", async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    queryClient.setQueryData(typefullyKeys.draft("draft-1"), {
+      draft: authoritativeDraft(2, {
+        syncStatus: "syncing",
+        remoteVersion: 1,
+      }),
+    });
+    let finishRequest: ((response: Response) => void) | undefined;
+    globalThis.fetch = (() =>
+      new Promise<Response>((resolve) => {
+        finishRequest = resolve;
+      })) as typeof fetch;
+    const observer = new MutationObserver(
+      queryClient,
+      syncDraftMutationOptions(queryClient),
+    );
+    const late = observer.mutate({ draftId: "draft-1" });
+    while (!finishRequest) await Promise.resolve();
+    const confirmedDocument = { ...document, title: "Confirmed document" };
+    queryClient.setQueryData(typefullyKeys.draft("draft-1"), {
+      draft: authoritativeDraft(2, { document: confirmedDocument }),
+    });
+    finishRequest?.(
+      json({
+        draft: draftSummary(2, "remote_error"),
+        remote: {
+          state: "remote_error",
+          remoteDraftId: "stale-remote",
+          confirmedVersion: 1,
+          confirmedHash: "stale-hash",
+        },
+      }),
+    );
+    await late;
+
+    expect(
+      queryClient.getQueryData(typefullyKeys.draft("draft-1")),
+    ).toMatchObject({
+      draft: {
+        version: 2,
+        document: confirmedDocument,
+        syncStatus: "synced",
+        remoteDraftId: "remote-2",
+        remoteVersion: 2,
+        remoteHash: "remote-hash-2",
+      },
+    });
+  });
+
+  test("same-version confirmed success can upgrade uncertain cached remote state", async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    queryClient.setQueryData(typefullyKeys.draft("draft-1"), {
+      draft: authoritativeDraft(2, {
+        syncStatus: "remote_error",
+        remoteDraftId: "remote-1",
+        remoteVersion: 1,
+        remoteHash: "remote-hash-1",
+      }),
+    });
+    globalThis.fetch = (async () =>
+      json({
+        draft: draftSummary(2, "synced"),
+        remote: {
+          state: "synced",
+          remoteDraftId: "remote-2",
+          confirmedVersion: 2,
+          confirmedHash: "remote-hash-2",
+        },
+      })) as typeof fetch;
+    const observer = new MutationObserver(
+      queryClient,
+      syncDraftMutationOptions(queryClient),
+    );
+
+    await observer.mutate({ draftId: "draft-1" });
+
+    expect(
+      queryClient.getQueryData(typefullyKeys.draft("draft-1")),
+    ).toMatchObject({
+      draft: {
+        version: 2,
+        syncStatus: "synced",
+        remoteDraftId: "remote-2",
+        remoteVersion: 2,
+        remoteHash: "remote-hash-2",
+      },
+    });
+  });
+
+  test("same-version remote progress cannot downgrade an already synced status", async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    queryClient.setQueryData(typefullyKeys.draft("draft-1"), {
+      draft: authoritativeDraft(2, {
+        remoteDraftId: "remote-1",
+        remoteVersion: 1,
+        remoteHash: "remote-hash-1",
+      }),
+    });
+    globalThis.fetch = (async () =>
+      json({
+        draft: draftSummary(2, "remote_error"),
+        remote: {
+          state: "remote_error",
+          remoteDraftId: "remote-2",
+          confirmedVersion: 2,
+          confirmedHash: "remote-hash-2",
+        },
+      })) as typeof fetch;
+    const observer = new MutationObserver(
+      queryClient,
+      syncDraftMutationOptions(queryClient),
+    );
+
+    await observer.mutate({ draftId: "draft-1" });
+
+    expect(
+      queryClient.getQueryData(typefullyKeys.draft("draft-1")),
+    ).toMatchObject({
+      draft: {
+        version: 2,
         syncStatus: "synced",
         remoteDraftId: "remote-2",
         remoteVersion: 2,
