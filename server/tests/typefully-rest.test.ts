@@ -106,6 +106,19 @@ describe("the reviewed Typefully tool surface", () => {
     const create = tools.find((tool) => tool.name === "create_draft");
     const update = tools.find((tool) => tool.name === "update_draft");
     const schema = create?.inputSchema as {
+      allOf?: {
+        anyOf?: {
+          properties?: {
+            platforms?: {
+              required?: string[];
+              properties?: Record<
+                string,
+                { properties?: { enabled?: { const?: unknown } } }
+              >;
+            };
+          };
+        }[];
+      }[];
       properties?: {
         share?: { type?: unknown };
         platforms?: {
@@ -156,6 +169,21 @@ describe("the reviewed Typefully tool surface", () => {
         (branch) => branch.required,
       ),
     ).toEqual([["platforms"], ["draftTitle"], ["share"], ["planAt"]]);
+    expect(
+      schema.allOf?.[0]?.anyOf?.map((branch) => ({
+        platform: branch.properties?.platforms?.required?.[0],
+        enabled:
+          branch.properties?.platforms?.properties?.[
+            branch.properties.platforms.required?.[0] ?? ""
+          ]?.properties?.enabled?.const,
+      })),
+    ).toEqual([
+      { platform: "x", enabled: true },
+      { platform: "linkedin", enabled: true },
+      { platform: "threads", enabled: true },
+      { platform: "bluesky", enabled: true },
+      { platform: "mastodon", enabled: true },
+    ]);
   });
 
   test("is registered for the frozen Typefully catalogue entry", () => {
@@ -561,10 +589,10 @@ describe("fail-closed validation", () => {
     expect(calls).toHaveLength(0);
   });
 
-  test("allows disabled platforms without posts and requires posts when enabled", async () => {
+  test("requires an enabled platform on create while allowing all-disabled updates", async () => {
     const disabled = recordingFetch();
     const disabledTransport = createTypefullyRestTransport(disabled.fetch);
-    const accepted = await disabledTransport.callTool(
+    const refusedCreate = await disabledTransport.callTool(
       connection,
       "create_draft",
       {
@@ -572,8 +600,22 @@ describe("fail-closed validation", () => {
         platforms: { linkedin: { enabled: false } },
       },
     );
-    expect(accepted.isError).toBe(false);
-    expect(JSON.parse(disabled.calls[0]?.body ?? "null")).toEqual({
+    expect(refusedCreate.isError).toBe(true);
+    expect(disabled.calls).toHaveLength(0);
+
+    const update = recordingFetch();
+    const updateTransport = createTypefullyRestTransport(update.fetch);
+    const acceptedUpdate = await updateTransport.callTool(
+      connection,
+      "update_draft",
+      {
+        socialSetId: 1,
+        draftId: 2,
+        platforms: { linkedin: { enabled: false } },
+      },
+    );
+    expect(acceptedUpdate.isError).toBe(false);
+    expect(JSON.parse(update.calls[0]?.body ?? "null")).toEqual({
       platforms: { linkedin: { enabled: false } },
     });
 

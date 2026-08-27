@@ -9,6 +9,13 @@ const UPDATE_DRAFT_FIELDS = [
   "share",
   "planAt",
 ] as const;
+const PLATFORM_NAMES = [
+  "x",
+  "linkedin",
+  "threads",
+  "bluesky",
+  "mastodon",
+] as const;
 
 const positiveId = (description: string) =>
   z.number().int().positive().safe().describe(description);
@@ -154,13 +161,24 @@ export const typefullyContracts = {
   list_social_sets: z.strictObject({ limit, offset }),
   list_drafts: z.strictObject({ socialSetId, limit, offset }),
   get_draft: z.strictObject({ socialSetId, draftId }),
-  create_draft: z.strictObject({
-    socialSetId,
-    platforms,
-    draftTitle: optionalDraftFields.draftTitle,
-    share: z.boolean().optional(),
-    planAt: optionalDraftFields.planAt,
-  }),
+  create_draft: z
+    .strictObject({
+      socialSetId,
+      platforms,
+      draftTitle: optionalDraftFields.draftTitle,
+      share: z.boolean().optional(),
+      planAt: optionalDraftFields.planAt,
+    })
+    .refine(
+      ({ platforms: selectedPlatforms }) =>
+        PLATFORM_NAMES.some(
+          (platformName) => selectedPlatforms[platformName]?.enabled === true,
+        ),
+      {
+        path: ["platforms"],
+        message: "create_draft requires at least one enabled platform",
+      },
+    ),
   update_draft: z
     .strictObject({
       socialSetId,
@@ -255,6 +273,25 @@ export function inputSchemaFor(
   }
   if (toolName === "update_draft") {
     schema.anyOf = UPDATE_DRAFT_FIELDS.map((field) => ({ required: [field] }));
+  }
+  if (toolName === "create_draft") {
+    schema.allOf = [
+      {
+        anyOf: PLATFORM_NAMES.map((platformName) => ({
+          properties: {
+            platforms: {
+              required: [platformName],
+              properties: {
+                [platformName]: {
+                  required: ["enabled"],
+                  properties: { enabled: { const: true } },
+                },
+              },
+            },
+          },
+        })),
+      },
+    ];
   }
   return schema;
 }
