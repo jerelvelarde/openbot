@@ -10,7 +10,10 @@ import {
   TypefullyPublicationArgs,
   TypefullyPublicationDecision,
 } from "../src/components/gallery/typefully-publication";
-import type { PublicationProposal } from "../src/lib/typefully/queries";
+import {
+  type PublicationProposal,
+  typefullyKeys,
+} from "../src/lib/typefully/queries";
 
 const proposalId = "f36e8a5e-a3c0-4ea8-93e1-10be25ff37f1";
 const draftId = "8b1c61f1-2154-4a5d-8c9a-7c8df8f9ae53";
@@ -270,7 +273,7 @@ test("unmounting evicts the immutable proposal snapshot immediately", async () =
   );
 });
 
-test("mismatched publish authority cannot change cache or answer the HITL decision", async () => {
+test("mismatched publish authority discards pending cache and cannot repeat publication", async () => {
   const calls: string[] = [];
   globalThis.fetch = mock(async (input, init) => {
     calls.push(`${init?.method ?? "GET"} ${String(input)}`);
@@ -306,20 +309,172 @@ test("mismatched publish authority cannot change cache or answer the HITL decisi
   const user = userEvent.setup({ document });
   await user.click(await view.findByRole("button", { name: "Publish now" }));
   await waitFor(() =>
-    expect(view.getByRole("alert").textContent).toContain("invalid response"),
+    expect(
+      view.getAllByText("Publishing status unknown").length,
+    ).toBeGreaterThan(0),
   );
   expect(respond).not.toHaveBeenCalled();
   expect(calls).toEqual([
     `GET /api/typefully/proposals/${proposalId}`,
     `POST /api/typefully/proposals/${proposalId}/publish`,
+    `GET /api/typefully/proposals/${proposalId}`,
   ]);
+  expect(view.queryByRole("button", { name: "Publish now" })).toBeNull();
+  expect(view.queryByRole("button", { name: "Decline" })).toBeNull();
   expect(
-    client.getQueryData<{ proposal: PublicationProposal }>([
-      "typefully",
-      "proposal",
-      proposalId,
-    ])?.proposal,
-  ).toEqual(proposal("pending"));
+    view.getByRole("button", { name: "Check publication status" }),
+  ).toBeTruthy();
+  expect(
+    client.getQueryData(["typefully", "proposal", proposalId]),
+  ).toBeUndefined();
+});
+
+test("a malformed publish response converges through GET to committed terminal authority", async () => {
+  for (const terminal of ["published", "unknown"] as const) {
+    let publishAttempted = false;
+    const calls: string[] = [];
+    globalThis.fetch = mock(async (input, init) => {
+      calls.push(`${init?.method ?? "GET"} ${String(input)}`);
+      if (init?.method === "POST") {
+        publishAttempted = true;
+        return Response.json({ proposal: { malformed: true } });
+      }
+      return Response.json({
+        proposal: proposal(publishAttempted ? terminal : "pending"),
+      });
+    }) as typeof fetch;
+    const respond = mock(async () => {});
+    const view = render(
+      <QueryClientProvider
+        client={
+          new QueryClient({
+            defaultOptions: {
+              queries: { retry: false },
+              mutations: { retry: false },
+            },
+          })
+        }
+      >
+        <TypefullyPublicationDecision
+          args={{
+            proposalId,
+            draftId,
+            destinations: ["x", "linkedin"],
+            version: 7,
+            expiresAt,
+          }}
+          respond={respond}
+          status="executing"
+        />
+      </QueryClientProvider>,
+    );
+    const user = userEvent.setup({ document });
+    await user.click(await view.findByRole("button", { name: "Publish now" }));
+    if (terminal === "published") {
+      await waitFor(() => expect(respond).toHaveBeenCalledTimes(1));
+      expect(respond.mock.calls[0]?.[0]).toMatchObject({
+        outcome: "published",
+      });
+    } else {
+      expect(
+        (await view.findAllByText("Publishing status unknown")).length,
+      ).toBeGreaterThan(0);
+      expect(respond).not.toHaveBeenCalled();
+    }
+    expect(view.queryByRole("button", { name: "Publish now" })).toBeNull();
+    expect(calls).toEqual([
+      `GET /api/typefully/proposals/${proposalId}`,
+      `POST /api/typefully/proposals/${proposalId}/publish`,
+      `GET /api/typefully/proposals/${proposalId}`,
+    ]);
+    view.unmount();
+  }
+});
+
+test("failed authority recovery permits status checks but never repeats the action", async () => {
+  let initialLoaded = false;
+  const calls: string[] = [];
+  globalThis.fetch = mock(async (input, init) => {
+    calls.push(`${init?.method ?? "GET"} ${String(input)}`);
+    if (init?.method === "POST") {
+      return Response.json({ proposal: { malformed: true } });
+    }
+    if (!initialLoaded) {
+      initialLoaded = true;
+      return Response.json({ proposal: proposal("pending") });
+    }
+    return Response.json({ code: "remote_unavailable" }, { status: 503 });
+  }) as typeof fetch;
+  const respond = mock(async () => {});
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const view = render(
+    <QueryClientProvider client={client}>
+      <TypefullyPublicationDecision
+        args={{
+          proposalId,
+          draftId,
+          destinations: ["x", "linkedin"],
+          version: 7,
+          expiresAt,
+        }}
+        respond={respond}
+        status="executing"
+      />
+    </QueryClientProvider>,
+  );
+  const user = userEvent.setup({ document });
+  await user.click(await view.findByRole("button", { name: "Publish now" }));
+  expect(
+    (await view.findAllByText("Publishing status unknown")).length,
+  ).toBeGreaterThan(0);
+  expect(view.queryByRole("button", { name: "Publish now" })).toBeNull();
+  expect(
+    client.getQueryData(typefullyKeys.proposal(proposalId)),
+  ).toBeUndefined();
+  await user.click(
+    view.getByRole("button", { name: "Check publication status" }),
+  );
+  await waitFor(() => expect(calls).toHaveLength(4));
+  expect(calls.filter((call) => call.includes("POST"))).toHaveLength(1);
+  expect(respond).not.toHaveBeenCalled();
+});
+
+test("a malformed decline response cannot issue a duplicate decline", async () => {
+  let declined = false;
+  const calls: string[] = [];
+  globalThis.fetch = mock(async (input, init) => {
+    calls.push(`${init?.method ?? "GET"} ${String(input)}`);
+    if (init?.method === "POST") {
+      declined = true;
+      return Response.json({});
+    }
+    return Response.json({
+      proposal: proposal(declined ? "unknown" : "pending"),
+    });
+  }) as typeof fetch;
+  const view = render(
+    <QueryClientProvider client={new QueryClient()}>
+      <TypefullyPublicationDecision
+        args={{
+          proposalId,
+          draftId,
+          destinations: ["x", "linkedin"],
+          version: 7,
+          expiresAt,
+        }}
+        status="executing"
+      />
+    </QueryClientProvider>,
+  );
+  const user = userEvent.setup({ document });
+  await user.click(await view.findByRole("button", { name: "Decline" }));
+  expect(
+    (await view.findAllByText("Publishing status unknown")).length,
+  ).toBeGreaterThan(0);
+  expect(view.queryByRole("button", { name: "Decline" })).toBeNull();
+  expect(calls.filter((call) => call.includes("POST"))).toHaveLength(1);
 });
 
 test("direct failed publish answers once while unknown waits for reconciliation", async () => {

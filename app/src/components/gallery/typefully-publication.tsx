@@ -18,6 +18,7 @@ import {
   proposalMatchesSummary,
   proposalQueryOptions,
   TypefullyClientError,
+  typefullyKeys,
 } from "@/lib/typefully/queries";
 import { Badge, GalleryFrame } from "./frame";
 
@@ -261,7 +262,13 @@ export function TypefullyProposalReviewLoader({
   onReviewAgain,
 }: ReviewLoaderProps) {
   const queryClient = useQueryClient();
-  const query = useQuery(proposalQueryOptions(summary.id));
+  const [actionAuthorityUnknown, setActionAuthorityUnknown] = useState(false);
+  const [statusCheckBusy, setStatusCheckBusy] = useState(false);
+  const proposalOptions = proposalQueryOptions(summary.id);
+  const query = useQuery({
+    ...proposalOptions,
+    enabled: proposalOptions.enabled && !actionAuthorityUnknown,
+  });
   const publish = useMutation(publishProposalMutationOptions(queryClient));
   const decline = useMutation(declineProposalMutationOptions(queryClient));
   const reconcile = useMutation(reconcileProposalMutationOptions(queryClient));
@@ -279,6 +286,70 @@ export function TypefullyProposalReviewLoader({
   const bound = authoritative && proposalMatchesSummary(authoritative, summary);
   const effectiveStatus = bound ? statusFor(authoritative) : null;
   const refusalReason = proposalRefusalReason(query.error);
+
+  const recoverActionAuthority = async () => {
+    setActionAuthorityUnknown(true);
+    setStatusCheckBusy(true);
+    setActionError(null);
+    queryClient.removeQueries({
+      queryKey: typefullyKeys.proposal(summary.id),
+      exact: true,
+    });
+    const refreshed = await query.refetch();
+    setStatusCheckBusy(false);
+    const latest = refreshed.data?.proposal;
+    if (!latest) {
+      if (proposalRefusalReason(refreshed.error)) {
+        setActionAuthorityUnknown(false);
+        return;
+      }
+      queryClient.removeQueries({
+        queryKey: typefullyKeys.proposal(summary.id),
+        exact: true,
+      });
+      setActionError(
+        "Publication status could not be confirmed. Check the status again before taking any other action.",
+      );
+      return;
+    }
+    if (!proposalMatchesSummary(latest, summary)) {
+      setActionAuthorityUnknown(false);
+      try {
+        await answer({
+          outcome: "changed",
+          proposalId: summary.id,
+          draftId: summary.draftId,
+          version: summary.version,
+        });
+      } catch {
+        setActionError("The publication decision could not be sent.");
+      }
+      return;
+    }
+    const latestStatus = statusFor(latest);
+    if (latestStatus === "pending" || latestStatus === "in_flight") {
+      queryClient.removeQueries({
+        queryKey: typefullyKeys.proposal(summary.id),
+        exact: true,
+      });
+      setActionError(
+        "Publication status is not yet conclusive. Check again before taking any other action.",
+      );
+      return;
+    }
+    setActionAuthorityUnknown(false);
+    if (latestStatus === "unknown") return;
+    try {
+      await answer({
+        outcome: latestStatus,
+        proposalId: latest.id,
+        draftId: latest.draftId,
+        version: latest.version,
+      });
+    } catch {
+      setActionError("The publication decision could not be sent.");
+    }
+  };
 
   useEffect(() => {
     if (!respond) return;
@@ -334,6 +405,34 @@ export function TypefullyProposalReviewLoader({
     summary,
   ]);
 
+  if (actionAuthorityUnknown) {
+    return (
+      <section
+        aria-label="Typefully publication status"
+        className="space-y-3 rounded-[8px] border-2 border-border bg-card/50 p-4"
+      >
+        <Badge tone="neutral">Publishing status unknown</Badge>
+        <div className="space-y-2 text-sm" role="alert">
+          <strong>Publishing status unknown</strong>
+          <p className="text-muted-foreground">
+            The last action may have completed. Do not publish or decline again.
+            Check the authoritative status first.
+          </p>
+          {actionError ? (
+            <p className="text-destructive">{actionError}</p>
+          ) : null}
+        </div>
+        <button
+          className="rounded-[8px] border border-border bg-card px-3 py-2 text-sm disabled:opacity-50"
+          disabled={statusCheckBusy}
+          onClick={() => void recoverActionAuthority()}
+          type="button"
+        >
+          {statusCheckBusy ? "Checking status…" : "Check publication status"}
+        </button>
+      </section>
+    );
+  }
   if (query.isPending) {
     return (
       <p className="text-sm text-muted-foreground" role="status">
@@ -402,7 +501,7 @@ export function TypefullyProposalReviewLoader({
         error instanceof TypefullyClientError &&
         error.code === "remote_invalid_response"
       ) {
-        setActionError(error.message);
+        await recoverActionAuthority();
         return;
       }
       const refreshed = await query.refetch();

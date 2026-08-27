@@ -813,7 +813,11 @@ function proposalAction(
         error instanceof TypefullyClientError &&
         error.code === "remote_invalid_response"
       ) {
-        return;
+        return queryClient?.invalidateQueries({
+          queryKey: typefullyKeys.proposal(input.proposalId),
+          exact: true,
+          refetchType: "none",
+        });
       }
       return queryClient?.invalidateQueries({
         queryKey: typefullyKeys.proposal(input.proposalId),
