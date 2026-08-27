@@ -161,6 +161,68 @@ describe("CoworkerRoutingService", () => {
     expect(modelCalls).toEqual([]);
   });
 
+  test("treats a nested full name as ambiguous when its alias belongs to another coworker", async () => {
+    const { service, modelCalls } = makeService({
+      roster: [profile("analyst", "Analyst"), profile("risk", "Risk Analyst")],
+    });
+
+    expect(
+      await service.route({ actor: ACTOR, text: "ask analyst to review this" }),
+    ).toEqual({
+      kind: "ambiguous",
+      names: ["Analyst", "Risk Analyst"],
+    });
+    expect(modelCalls).toEqual([]);
+  });
+
+  test("prefers a unique longer explicit alias over a shared suffix", async () => {
+    const { service, modelCalls } = makeService({
+      roster: [profile("analyst", "Analyst"), profile("risk", "Risk Analyst")],
+    });
+
+    expect(
+      await service.route({
+        actor: ACTOR,
+        text: "ask risk analyst to review this",
+      }),
+    ).toMatchObject({
+      kind: "selected",
+      agentId: "risk",
+      viaMention: true,
+    });
+    expect(modelCalls).toEqual([]);
+  });
+
+  test("labels duplicate normalized names distinctly and resolves a chosen label", async () => {
+    const { service, modelCalls } = makeService({
+      roster: [
+        profile("risk-id", "Risk Analyst"),
+        profile("risk-copy", "Ｒｉｓｋ   Analyst"),
+      ],
+    });
+
+    expect(
+      await service.route({
+        actor: ACTOR,
+        text: "ask risk analyst to review this",
+      }),
+    ).toEqual({
+      kind: "ambiguous",
+      names: ["Risk Analyst (risk-copy)", "Risk Analyst (risk-id)"],
+    });
+    expect(
+      await service.route({
+        actor: ACTOR,
+        text: "ask Risk Analyst (risk-copy) to review this",
+      }),
+    ).toMatchObject({
+      kind: "selected",
+      agentId: "risk-copy",
+      viaMention: true,
+    });
+    expect(modelCalls).toEqual([]);
+  });
+
   test("returns none for an absent or empty visible roster", async () => {
     const { service } = makeService({ roster: [] });
 
@@ -171,7 +233,10 @@ describe("CoworkerRoutingService", () => {
 
   test("returns none when an explicit composer id is inaccessible", async () => {
     const { service, modelCalls } = makeService({
-      roster: [profile("risk", "Risk Analyst")],
+      roster: [
+        profile("risk", "Risk Analyst"),
+        profile("private", "Private Analyst", "private", "u2"),
+      ],
     });
 
     expect(
@@ -200,8 +265,12 @@ describe("CoworkerRoutingService", () => {
   test("passes only the actor-visible roster to intent routing", async () => {
     const visible = profile("mine", "My Private", "private", ACTOR.id);
     const inaccessible = profile("other", "Other Private", "private", "u2");
+    const deleted = {
+      ...profile("deleted", "Deleted", "public"),
+      deletedAt: new Date(),
+    };
     const { service, modelCalls } = makeService({
-      roster: [profile("public", "Public"), visible, inaccessible],
+      roster: [profile("public", "Public"), visible, inaccessible, deleted],
     });
 
     await service.route({ actor: ACTOR, text: "anything" });
@@ -221,7 +290,7 @@ describe("CoworkerRoutingService", () => {
     expect(audits[0]).toMatchObject({ targetId: "knowledge" });
     expect(audits[0]?.payload).toEqual({
       chosen: "knowledge",
-      reason: "matches what it is for",
+      reason: "intent match",
       fallback: false,
       viaMention: false,
       candidates: ["risk", "knowledge"],
@@ -246,5 +315,23 @@ describe("CoworkerRoutingService", () => {
       fallback: true,
       undecided: "unreachable",
     });
+  });
+
+  test("does not persist a model reason that echoes the message", async () => {
+    const text = "private payroll details for Sam";
+    const { service, audits } = makeService({
+      decision: {
+        agentId: "knowledge",
+        reason: text,
+        fallback: false,
+        undecided: null,
+      },
+    });
+
+    const result = await service.route({ actor: ACTOR, text });
+
+    expect(result).toMatchObject({ kind: "selected", reason: text });
+    expect(audits[0]?.payload.reason).toBe("intent match");
+    expect(JSON.stringify(audits[0])).not.toContain(text);
   });
 });

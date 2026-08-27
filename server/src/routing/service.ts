@@ -1,3 +1,4 @@
+import { canAccessAgent } from "../agents/profile-policy";
 import type { AgentProfileStore } from "../agents/profile-store";
 import type { AgentActor, AgentProfile } from "../agents/profile-types";
 import type { AuditStore } from "../audit";
@@ -32,7 +33,7 @@ export type CoworkerRoutingInput = {
   agentId?: string | null;
 };
 
-type CoworkerRouteDetail = {
+export type CoworkerRouteDetail = {
   result: CoworkerRouteResult;
   /** Kept for surfaces that have historically returned the model's fallback cause. */
   undecided: RoutingUndecided | null;
@@ -40,6 +41,9 @@ type CoworkerRouteDetail = {
 
 export type CoworkerRoutingService = {
   route(input: CoworkerRoutingInput): Promise<CoworkerRouteResult>;
+};
+
+export type HttpCoworkerRoutingService = CoworkerRoutingService & {
   routeDetailed(input: CoworkerRoutingInput): Promise<CoworkerRouteDetail>;
 };
 
@@ -72,15 +76,6 @@ function containsName(text: string, name: string): boolean {
   return false;
 }
 
-function visibleTo(actor: AgentActor, profile: AgentProfile): boolean {
-  return (
-    profile.deletedAt === null &&
-    (profile.visibility === "public" ||
-      profile.ownerUserId === actor.id ||
-      actor.role === "admin")
-  );
-}
-
 function actorId(actor: RoutingActor): string | undefined {
   return actor.id && actor.email !== DEV_ACTOR_EMAIL ? actor.id : undefined;
 }
@@ -90,58 +85,117 @@ function suffixes(name: string): string[] {
   return tokens.slice(1).map((_, index) => tokens.slice(index + 1).join(" "));
 }
 
+function displayName(name: string): string {
+  return name.normalize("NFKC").trim().replace(/\s+/gu, " ");
+}
+
+type AliasIndex = {
+  aliases: Map<string, Map<string, AgentProfile>>;
+  labels: Map<string, string>;
+};
+
+function addAlias(
+  aliases: AliasIndex["aliases"],
+  alias: string,
+  profile: AgentProfile,
+): void {
+  if (!alias) return;
+  const profiles = aliases.get(alias) ?? new Map<string, AgentProfile>();
+  profiles.set(profile.id, profile);
+  aliases.set(alias, profiles);
+}
+
+function buildAliasIndex(roster: readonly AgentProfile[]): AliasIndex {
+  const byNormalizedName = new Map<string, AgentProfile[]>();
+  for (const profile of roster) {
+    const normalized = normalizeCoworkerName(profile.name);
+    byNormalizedName.set(normalized, [
+      ...(byNormalizedName.get(normalized) ?? []),
+      profile,
+    ]);
+  }
+
+  const aliases = new Map<string, Map<string, AgentProfile>>();
+  const labels = new Map<string, string>();
+  for (const profile of roster) {
+    const normalized = normalizeCoworkerName(profile.name);
+    const duplicates = byNormalizedName.get(normalized) ?? [];
+    const label =
+      duplicates.length > 1
+        ? `${displayName(profile.name)} (${profile.id})`
+        : profile.name;
+    labels.set(profile.id, label);
+    addAlias(aliases, normalized, profile);
+    for (const suffix of suffixes(normalized))
+      addAlias(aliases, suffix, profile);
+    if (duplicates.length > 1) {
+      addAlias(aliases, normalizeCoworkerName(label), profile);
+    }
+  }
+  return { aliases, labels };
+}
+
+function labelsFor(
+  profiles: Iterable<AgentProfile>,
+  labels: ReadonlyMap<string, string>,
+): string[] {
+  return [...profiles]
+    .map((profile) => labels.get(profile.id) ?? profile.name)
+    .sort((left, right) => left.localeCompare(right));
+}
+
 function explicitNameRoute(
   text: string,
   roster: readonly AgentProfile[],
 ): CoworkerRouteResult | null {
   const normalizedText = normalizeCoworkerName(text);
-  const fullMatches = roster.filter((profile) =>
-    containsName(normalizedText, normalizeCoworkerName(profile.name)),
-  );
-  if (fullMatches.length === 1) {
-    const [chosen] = fullMatches;
-    if (!chosen) return null;
-    return {
-      kind: "selected",
-      agentId: chosen.id,
-      name: chosen.name,
-      reason: "named by the person asking",
-      fallback: false,
-      viaMention: true,
-    };
-  }
-  if (fullMatches.length > 1) {
-    return {
-      kind: "ambiguous",
-      names: fullMatches
-        .map(({ name }) => name)
-        .sort((a, b) => a.localeCompare(b)),
-    };
-  }
-
-  const candidatesBySuffix = new Map<string, AgentProfile[]>();
-  for (const profile of roster) {
-    for (const suffix of suffixes(normalizeCoworkerName(profile.name))) {
-      if (!containsName(normalizedText, suffix)) continue;
-      candidatesBySuffix.set(suffix, [
-        ...(candidatesBySuffix.get(suffix) ?? []),
-        profile,
-      ]);
+  const { aliases, labels } = buildAliasIndex(roster);
+  const matches = [...aliases.entries()]
+    .filter(([alias]) => containsName(normalizedText, alias))
+    .sort(([left], [right]) => right.length - left.length);
+  for (let start = 0; start < matches.length; ) {
+    const aliasLength = matches[start]?.[0].length;
+    if (aliasLength === undefined) break;
+    const sameLength = matches
+      .slice(start)
+      .filter(([alias]) => alias.length === aliasLength);
+    const profiles = new Map<string, AgentProfile>();
+    for (const [, candidates] of sameLength) {
+      for (const profile of candidates.values())
+        profiles.set(profile.id, profile);
     }
+    if (profiles.size === 1) {
+      const chosen = profiles.values().next().value as AgentProfile;
+      return {
+        kind: "selected",
+        agentId: chosen.id,
+        name: chosen.name,
+        reason: "named by the person asking",
+        fallback: false,
+        viaMention: true,
+      };
+    }
+    if (profiles.size > 1) {
+      return { kind: "ambiguous", names: labelsFor(profiles.values(), labels) };
+    }
+    start += sameLength.length;
   }
-  const ambiguous = [...candidatesBySuffix.entries()]
-    .filter(([, profiles]) => profiles.length > 1)
-    .sort(([left], [right]) => right.length - left.length)[0]?.[1];
-  if (!ambiguous) return null;
-  return {
-    kind: "ambiguous",
-    names: ambiguous.map(({ name }) => name).sort((a, b) => a.localeCompare(b)),
-  };
+  return null;
+}
+
+function auditReason(
+  selected: Extract<CoworkerRouteResult, { kind: "selected" }>,
+  undecided: RoutingUndecided | null,
+): string {
+  if (selected.viaMention) return "named by the person asking";
+  if (selected.fallback)
+    return undecided ? `fallback: ${undecided}` : "fallback";
+  return "intent match";
 }
 
 export function createCoworkerRoutingService(
   options: CreateCoworkerRoutingServiceOptions,
-): CoworkerRoutingService {
+): HttpCoworkerRoutingService {
   async function record(
     actor: RoutingActor,
     selected: Extract<CoworkerRouteResult, { kind: "selected" }>,
@@ -156,7 +210,7 @@ export function createCoworkerRoutingService(
       ...(actorId(actor) ? { actorUserId: actorId(actor) } : {}),
       payload: {
         chosen: selected.agentId,
-        reason: selected.reason,
+        reason: auditReason(selected, undecided),
         fallback: selected.fallback,
         viaMention: selected.viaMention,
         candidates,
@@ -168,10 +222,10 @@ export function createCoworkerRoutingService(
   async function routeDetailed(
     input: CoworkerRoutingInput,
   ): Promise<CoworkerRouteDetail> {
-    // The store applies this same policy in SQL. Retaining this check makes the service's boundary
-    // explicit to future store implementations and protects callers that provide a broader roster.
+    // The store applies this same policy in SQL; keep this canonical policy check at the service
+    // boundary so a broader store implementation cannot leak a coworker into routing.
     const roster = (await options.store.list(input.actor, false)).filter(
-      (profile) => visibleTo(input.actor, profile),
+      (profile) => canAccessAgent(input.actor, profile),
     );
     const namedId = input.agentId?.trim() || null;
     if (namedId) {
