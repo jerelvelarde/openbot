@@ -446,6 +446,8 @@ describe("fail-closed validation", () => {
     for (const publishAt of [
       "2099-08-27T12:00:00Z",
       "2099-08-27T12:00:00-07:00",
+      "2099-08-27T12:00:00.123456Z",
+      "2099-08-27T12:00:00.123456-07:00",
       "next-free-slot",
     ]) {
       const result = await transport.callTool(connection, "schedule_draft", {
@@ -458,7 +460,7 @@ describe("fail-closed validation", () => {
         publish_at: publishAt,
       });
     }
-    expect(calls).toHaveLength(3);
+    expect(calls).toHaveLength(5);
   });
 
   test("bounds pagination before fetch", async () => {

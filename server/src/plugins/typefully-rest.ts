@@ -378,7 +378,7 @@ function futureDateOrSlot(value: unknown): value is string {
   if (value === "next-free-slot") return true;
   if (typeof value !== "string") return false;
   const match = value.match(
-    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|([+-])(\d{2}):(\d{2}))$/,
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|([+-])(\d{2}):(\d{2}))$/,
   );
   if (!match) return false;
 
@@ -407,7 +407,9 @@ function futureDateOrSlot(value: unknown): value is string {
   const hour = Number(hourText);
   const minute = Number(minuteText);
   const second = Number(secondText);
-  const millisecond = Number(fractionText.padEnd(3, "0"));
+  // JavaScript dates retain milliseconds. RFC 3339 allows more precision, so retain the first
+  // three digits for calendar round-tripping without rejecting a valid sub-millisecond suffix.
+  const millisecond = Number(fractionText.slice(0, 3).padEnd(3, "0"));
   const local = new Date(0);
   local.setUTCFullYear(year, month - 1, day);
   local.setUTCHours(hour, minute, second, millisecond);
