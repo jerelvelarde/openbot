@@ -35,36 +35,38 @@ export type TypefullyConnection = {
 
 type CachedDraft = { draft: AuthoritativeDraft };
 
-function patchDraftCache(
+async function convergeDraftCache(
   queryClient: QueryClient | undefined,
   draftId: string,
-  result: DraftMutationResponse | TypefullyClientError,
+  result?: DraftMutationResponse | TypefullyClientError,
   updateDocument?: (document: CanonicalDraftDocument) => CanonicalDraftDocument,
 ) {
-  if (!queryClient || !result.draft) return;
+  if (!queryClient) return;
   const key = typefullyKeys.draft(draftId);
-  queryClient.setQueryData<CachedDraft>(key, (current) => {
-    if (!current) return current;
-    const remote = "remote" in result ? result.remote : undefined;
-    return {
-      draft: {
-        ...current.draft,
-        document: updateDocument
-          ? updateDocument(current.draft.document)
-          : current.draft.document,
-        version: result.draft?.version ?? current.draft.version,
-        syncStatus: result.draft?.syncStatus ?? current.draft.syncStatus,
-        ...(remote
-          ? {
-              remoteDraftId: remote.remoteDraftId,
-              remoteVersion: remote.confirmedVersion,
-              remoteHash: remote.confirmedHash,
-            }
-          : {}),
-      },
-    };
-  });
-  void queryClient.invalidateQueries({ queryKey: key, exact: true });
+  if (result?.draft) {
+    queryClient.setQueryData<CachedDraft>(key, (current) => {
+      if (!current) return current;
+      const remote = "remote" in result ? result.remote : undefined;
+      return {
+        draft: {
+          ...current.draft,
+          document: updateDocument
+            ? updateDocument(current.draft.document)
+            : current.draft.document,
+          version: result.draft?.version ?? current.draft.version,
+          syncStatus: result.draft?.syncStatus ?? current.draft.syncStatus,
+          ...(remote
+            ? {
+                remoteDraftId: remote.remoteDraftId,
+                remoteVersion: remote.confirmedVersion,
+                remoteHash: remote.confirmedHash,
+              }
+            : {}),
+        },
+      };
+    });
+  }
+  await queryClient.invalidateQueries({ queryKey: key, exact: true });
 }
 
 export function createDraftMutationOptions() {
@@ -107,10 +109,15 @@ export function saveDraftMutationOptions(queryClient?: QueryClient) {
         },
       ),
     onSuccess: (result, input) =>
-      patchDraftCache(queryClient, input.draftId, result, () => input.document),
+      convergeDraftCache(
+        queryClient,
+        input.draftId,
+        result,
+        () => input.document,
+      ),
     onError: (error, input) => {
       if (error instanceof TypefullyClientError) {
-        patchDraftCache(
+        return convergeDraftCache(
           queryClient,
           input.draftId,
           error,
@@ -129,10 +136,10 @@ export function syncDraftMutationOptions(queryClient?: QueryClient) {
         { method: "POST", signal: input.signal },
       ),
     onSuccess: (result, input) =>
-      patchDraftCache(queryClient, input.draftId, result),
+      convergeDraftCache(queryClient, input.draftId, result),
     onError: (error, input) => {
       if (error instanceof TypefullyClientError)
-        patchDraftCache(queryClient, input.draftId, error);
+        return convergeDraftCache(queryClient, input.draftId, error);
     },
   });
 }
@@ -157,10 +164,10 @@ export function reconcileDraftMutationOptions(queryClient?: QueryClient) {
         },
       ),
     onSuccess: (result, input) =>
-      patchDraftCache(queryClient, input.draftId, result),
+      convergeDraftCache(queryClient, input.draftId, result),
     onError: (error, input) => {
       if (error instanceof TypefullyClientError)
-        patchDraftCache(queryClient, input.draftId, error);
+        return convergeDraftCache(queryClient, input.draftId, error);
     },
   });
 }
@@ -204,7 +211,7 @@ export function uploadMediaMutationOptions(queryClient?: QueryClient) {
       );
     },
     onSuccess: (result, input) =>
-      patchDraftCache(queryClient, input.draftId, result, (document) => ({
+      convergeDraftCache(queryClient, input.draftId, result, (document) => ({
         ...document,
         media: result.media
           ? [
@@ -214,16 +221,22 @@ export function uploadMediaMutationOptions(queryClient?: QueryClient) {
           : document.media,
       })),
     onError: (error, input) => {
-      if (!(error instanceof TypefullyClientError)) return;
-      patchDraftCache(queryClient, input.draftId, error, (document) => ({
-        ...document,
-        media: error.media
-          ? [
-              ...document.media.filter((item) => item.id !== error.media?.id),
-              error.media,
-            ].sort((left, right) => left.order - right.order)
-          : document.media,
-      }));
+      if (!(error instanceof TypefullyClientError))
+        return convergeDraftCache(queryClient, input.draftId);
+      return convergeDraftCache(
+        queryClient,
+        input.draftId,
+        error,
+        (document) => ({
+          ...document,
+          media: error.media
+            ? [
+                ...document.media.filter((item) => item.id !== error.media?.id),
+                error.media,
+              ].sort((left, right) => left.order - right.order)
+            : document.media,
+        }),
+      );
     },
   });
 }
@@ -245,13 +258,14 @@ export function deleteMediaMutationOptions(queryClient?: QueryClient) {
         },
       ),
     onSuccess: (result, input) =>
-      patchDraftCache(queryClient, input.draftId, result, (document) => ({
+      convergeDraftCache(queryClient, input.draftId, result, (document) => ({
         ...document,
         media: document.media.filter((item) => item.id !== input.mediaId),
       })),
     onError: (error, input) => {
       if (error instanceof TypefullyClientError)
-        patchDraftCache(queryClient, input.draftId, error);
+        return convergeDraftCache(queryClient, input.draftId, error);
+      return convergeDraftCache(queryClient, input.draftId);
     },
   });
 }

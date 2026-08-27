@@ -29,6 +29,8 @@ export type SaveAsNewDraftResult = SaveDraftResult & {
 export type AutosaveSnapshot = {
   document: CanonicalDraftDocument;
   state: AutosaveState;
+  target: { draftId: string; version: number };
+  createdDraft: SaveAsNewDraftResult | null;
   actions: Array<"reload" | "saveAsNewDraft" | "retry">;
 };
 
@@ -38,12 +40,14 @@ type Scheduler = {
 };
 
 type AutosaveOptions = {
+  initialDraftId: string;
   initialDocument: CanonicalDraftDocument;
   initialVersion: number;
   initialRemote?: "local" | "confirmed";
   debounceMs?: number;
   scheduler?: Scheduler;
   save(input: {
+    draftId: string;
     document: CanonicalDraftDocument;
     expectedVersion: number;
     signal: AbortSignal;
@@ -75,6 +79,7 @@ function safeSaveMessage(error: unknown): string {
 export function createAutosaveController(options: AutosaveOptions) {
   const scheduler = options.scheduler ?? browserScheduler;
   const listeners = new Set<(snapshot: AutosaveSnapshot) => void>();
+  let targetDraftId = options.initialDraftId;
   let document = options.initialDocument;
   let version = options.initialVersion;
   let state: AutosaveState = {
@@ -91,8 +96,11 @@ export function createAutosaveController(options: AutosaveOptions) {
   let recoveryAbort: AbortController | undefined;
   let recoveryPromise: Promise<SaveAsNewDraftResult | undefined> | undefined;
   let recoveryToken: object | undefined;
+  let recoveryFailed = false;
+  let createdDraft: SaveAsNewDraftResult | null = null;
 
   const actions = (): AutosaveSnapshot["actions"] => {
+    if (recoveryFailed) return ["retry"];
     if (state.kind === "conflict") return ["reload", "saveAsNewDraft"];
     if (state.kind === "error") return ["retry"];
     return [];
@@ -100,6 +108,8 @@ export function createAutosaveController(options: AutosaveOptions) {
   const snapshot = (): AutosaveSnapshot => ({
     document,
     state,
+    target: { draftId: targetDraftId, version },
+    createdDraft,
     actions: actions(),
   });
   const emit = () => {
@@ -111,7 +121,15 @@ export function createAutosaveController(options: AutosaveOptions) {
     timer = undefined;
   };
   const runSave = () => {
-    if (disposed || activeSave || !pending || !ready) return;
+    if (
+      disposed ||
+      activeSave ||
+      recoveryPromise ||
+      recoveryFailed ||
+      !pending ||
+      !ready
+    )
+      return;
     clearTimer();
     const baseVersion = version;
     const local = document;
@@ -125,6 +143,7 @@ export function createAutosaveController(options: AutosaveOptions) {
     let operation: Promise<SaveDraftResult>;
     try {
       operation = options.save({
+        draftId: targetDraftId,
         document: local,
         expectedVersion: baseVersion,
         signal: abort.signal,
@@ -158,12 +177,14 @@ export function createAutosaveController(options: AutosaveOptions) {
           error.code === "version_conflict" &&
           error.currentVersion !== undefined
         ) {
+          recoveryFailed = false;
           state = {
             kind: "conflict",
             local: document,
             currentVersion: error.currentVersion,
           };
         } else {
+          recoveryFailed = false;
           if (error instanceof TypefullyClientError && error.draft) {
             version = error.draft.version;
           }
@@ -175,6 +196,73 @@ export function createAutosaveController(options: AutosaveOptions) {
         }
         emit();
       });
+  };
+
+  const startRecovery = ():
+    | Promise<SaveAsNewDraftResult | undefined>
+    | undefined => {
+    if (recoveryPromise) return recoveryPromise;
+    if (
+      disposed ||
+      (!recoveryFailed && state.kind !== "conflict") ||
+      !options.saveAsNewDraft
+    )
+      return undefined;
+    const local = document;
+    const abort = new AbortController();
+    const token = {};
+    clearTimer();
+    pending = false;
+    ready = false;
+    pendingImmediate = false;
+    recoveryFailed = false;
+    recoveryAbort = abort;
+    recoveryToken = token;
+    state = { kind: "saving", baseVersion: version };
+    emit();
+    let shouldDrain = false;
+    const operation = (async () => {
+      try {
+        const result = await options.saveAsNewDraft?.(local, abort.signal);
+        if (!result || disposed || abort.signal.aborted) return undefined;
+        targetDraftId = result.draftId;
+        version = result.version;
+        createdDraft = result;
+        const hasQueuedChanges = document !== local || pending;
+        if (hasQueuedChanges) {
+          state = { kind: "dirty", baseVersion: version };
+          emit();
+          shouldDrain = true;
+        } else {
+          state = { kind: "saved", version, remote: result.remote };
+          emit();
+        }
+        return result;
+      } catch (error) {
+        if (disposed || abort.signal.aborted) return undefined;
+        clearTimer();
+        pending = false;
+        ready = false;
+        pendingImmediate = false;
+        recoveryFailed = true;
+        state = {
+          kind: "error",
+          local: document,
+          message: safeSaveMessage(error),
+        };
+        emit();
+        return undefined;
+      } finally {
+        if (recoveryToken === token) {
+          recoveryPromise = undefined;
+          recoveryToken = undefined;
+        }
+        if (recoveryAbort === abort) recoveryAbort = undefined;
+        if (shouldDrain) runSave();
+      }
+    })();
+    recoveryPromise = operation;
+    return operation;
   };
 
   return {
@@ -210,13 +298,18 @@ export function createAutosaveController(options: AutosaveOptions) {
       runSave();
     },
     retry() {
+      if (recoveryFailed) return startRecovery();
       if (disposed || state.kind !== "error") return;
       pending = true;
       ready = true;
       pendingImmediate = true;
       runSave();
     },
-    reload(authoritative: CanonicalDraftDocument, currentVersion: number) {
+    reload(
+      authoritative: CanonicalDraftDocument,
+      currentVersion: number,
+      draftId = targetDraftId,
+    ) {
       if (disposed) return;
       clearTimer();
       activeSave?.abort();
@@ -225,50 +318,18 @@ export function createAutosaveController(options: AutosaveOptions) {
       recoveryAbort = undefined;
       recoveryPromise = undefined;
       recoveryToken = undefined;
+      recoveryFailed = false;
       pending = false;
       ready = false;
       pendingImmediate = false;
       document = authoritative;
+      targetDraftId = draftId;
       version = currentVersion;
       state = { kind: "idle", version, remote: "local" };
       emit();
     },
     saveAsNewDraft(): Promise<SaveAsNewDraftResult | undefined> | undefined {
-      if (recoveryPromise) return recoveryPromise;
-      if (disposed || state.kind !== "conflict" || !options.saveAsNewDraft)
-        return undefined;
-      const local = document;
-      const abort = new AbortController();
-      const token = {};
-      recoveryAbort = abort;
-      recoveryToken = token;
-      state = { kind: "saving", baseVersion: version };
-      emit();
-      const operation = (async () => {
-        try {
-          const result = await options.saveAsNewDraft?.(local, abort.signal);
-          if (!result || disposed || document !== local || abort.signal.aborted)
-            return undefined;
-          version = result.version;
-          state = { kind: "saved", version, remote: result.remote };
-          emit();
-          return result;
-        } catch (error) {
-          if (disposed || document !== local || abort.signal.aborted)
-            return undefined;
-          state = { kind: "error", local, message: safeSaveMessage(error) };
-          emit();
-          return undefined;
-        } finally {
-          if (recoveryToken === token) {
-            recoveryPromise = undefined;
-            recoveryToken = undefined;
-          }
-          if (recoveryAbort === abort) recoveryAbort = undefined;
-        }
-      })();
-      recoveryPromise = operation;
-      return operation;
+      return startRecovery();
     },
     dispose() {
       if (disposed) return;
@@ -279,6 +340,8 @@ export function createAutosaveController(options: AutosaveOptions) {
       recoveryAbort?.abort();
       recoveryAbort = undefined;
       recoveryToken = undefined;
+      pending = false;
+      ready = false;
       listeners.clear();
     },
   };

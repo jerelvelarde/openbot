@@ -496,6 +496,95 @@ describe("Typefully mutation contracts", () => {
         document: { media: [media] },
       },
     });
+    expect(
+      queryClient.getQueryState(typefullyKeys.draft("draft-1"))?.isInvalidated,
+    ).toBe(true);
+  });
+
+  test("invalidates and refetches media errors without a draft summary", async () => {
+    for (const operation of ["upload", "delete"] as const) {
+      const queryClient = new QueryClient({
+        defaultOptions: {
+          mutations: { retry: false },
+          queries: { retry: false },
+        },
+      });
+      queryClient.setQueryData(typefullyKeys.draft("draft-1"), {
+        draft: {
+          id: "draft-1",
+          document,
+          version: 1,
+          contentHash: "old",
+          remoteDraftId: "22",
+          remoteVersion: 1,
+          remoteHash: "old",
+          syncStatus: "synced",
+          lastError: null,
+          createdAt: "2026-08-27T00:00:00.000Z",
+          updatedAt: "2026-08-27T00:00:00.000Z",
+        },
+      });
+      globalThis.fetch = (async () =>
+        json(
+          operation === "upload"
+            ? { code: "grant_required", ref: "typefully/upload_media" }
+            : {
+                code: "connection_required",
+                serverId: "typefully",
+                draftId: "draft-1",
+                connectPath: "/settings/connected-accounts/typefully",
+              },
+          operation === "upload" ? 403 : 409,
+        )) as typeof fetch;
+      if (operation === "upload") {
+        const observer = new MutationObserver(
+          queryClient,
+          uploadMediaMutationOptions(queryClient),
+        );
+        await expect(
+          observer.mutate({
+            draftId: "draft-1",
+            expectedVersion: 1,
+            kind: "image",
+            altText: "Launch",
+            file: new File(["x"], "x.png", { type: "image/png" }),
+          }),
+        ).rejects.toBeInstanceOf(TypefullyClientError);
+      } else {
+        const observer = new MutationObserver(
+          queryClient,
+          deleteMediaMutationOptions(queryClient),
+        );
+        await expect(
+          observer.mutate({
+            draftId: "draft-1",
+            mediaId: "media-1",
+            expectedVersion: 1,
+          }),
+        ).rejects.toBeInstanceOf(TypefullyClientError);
+      }
+      expect(
+        queryClient.getQueryState(typefullyKeys.draft("draft-1"))
+          ?.isInvalidated,
+      ).toBe(true);
+
+      globalThis.fetch = (async () =>
+        json({
+          draft: {
+            ...(
+              queryClient.getQueryData(typefullyKeys.draft("draft-1")) as {
+                draft: Record<string, unknown>;
+              }
+            ).draft,
+            version: 7,
+            syncStatus: "connection_required",
+          },
+        })) as typeof fetch;
+      await queryClient.fetchQuery(draftQueryOptions("draft-1"));
+      expect(
+        queryClient.getQueryData(typefullyKeys.draft("draft-1")),
+      ).toMatchObject({ draft: { version: 7 } });
+    }
   });
 
   test("carries remote-error media identity into explicit retry and remove calls", async () => {

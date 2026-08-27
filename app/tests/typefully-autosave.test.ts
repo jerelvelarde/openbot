@@ -91,6 +91,7 @@ describe("Typefully autosave controller", () => {
     const timer = clock();
     const calls: unknown[] = [];
     const controller = createAutosaveController({
+      initialDraftId: "draft-current",
       initialDocument: base,
       initialVersion: 3,
       scheduler: timer.scheduler,
@@ -115,6 +116,7 @@ describe("Typefully autosave controller", () => {
     await Promise.resolve();
     expect(calls).toEqual([
       {
+        draftId: "draft-current",
         document: edited("third"),
         expectedVersion: 3,
         signal: expect.any(AbortSignal),
@@ -143,6 +145,7 @@ describe("Typefully autosave controller", () => {
       ],
     };
     const controller = createAutosaveController({
+      initialDraftId: "draft-current",
       initialDocument: base,
       initialVersion: 1,
       scheduler: timer.scheduler,
@@ -173,6 +176,7 @@ describe("Typefully autosave controller", () => {
       signal: AbortSignal;
     }> = [];
     const controller = createAutosaveController({
+      initialDraftId: "draft-current",
       initialDocument: base,
       initialVersion: 1,
       scheduler: timer.scheduler,
@@ -214,6 +218,7 @@ describe("Typefully autosave controller", () => {
     const first = deferred<SaveDraftResult>();
     const calls: Array<{ expectedVersion: number; signal: AbortSignal }> = [];
     const controller = createAutosaveController({
+      initialDraftId: "draft-current",
       initialDocument: base,
       initialVersion: 1,
       scheduler: timer.scheduler,
@@ -243,6 +248,7 @@ describe("Typefully autosave controller", () => {
     const first = deferred<SaveDraftResult>();
     let calls = 0;
     const controller = createAutosaveController({
+      initialDraftId: "draft-current",
       initialDocument: base,
       initialVersion: 1,
       scheduler: timer.scheduler,
@@ -274,6 +280,7 @@ describe("Typefully autosave controller", () => {
     const local = edited("do not lose me");
     let savedAsNew: CanonicalDraftDocument | undefined;
     const controller = createAutosaveController({
+      initialDraftId: "draft-current",
       initialDocument: base,
       initialVersion: 7,
       scheduler: timer.scheduler,
@@ -317,6 +324,7 @@ describe("Typefully autosave controller", () => {
     const timer = clock();
     const local = edited("preserved");
     const controller = createAutosaveController({
+      initialDraftId: "draft-current",
       initialDocument: base,
       initialVersion: 2,
       scheduler: timer.scheduler,
@@ -352,11 +360,14 @@ describe("Typefully autosave controller", () => {
     }>();
     let recoverySignal: AbortSignal | undefined;
     let calls = 0;
+    let normalSaves = 0;
     const controller = createAutosaveController({
+      initialDraftId: "draft-current",
       initialDocument: base,
       initialVersion: 2,
       scheduler: timer.scheduler,
       save: async () => {
+        normalSaves += 1;
         throw new TypefullyClientError("version_conflict", {
           currentVersion: 3,
         });
@@ -375,16 +386,142 @@ describe("Typefully autosave controller", () => {
     const second = controller.saveAsNewDraft();
     expect(first).toBe(second);
     expect(calls).toBe(1);
+    controller.mediaSettled(edited("queued before dispose"));
+    expect(normalSaves).toBe(1);
     controller.dispose();
     expect(recoverySignal?.aborted).toBe(true);
     recovery.reject(new DOMException("Aborted", "AbortError"));
     expect(await first).toBeUndefined();
+    expect(normalSaves).toBe(1);
+  });
+
+  test("rebinding recovery queues in-flight edits onto the new draft target", async () => {
+    const timer = clock();
+    const recovery = deferred<typeof newDraftResult>();
+    const followup = deferred<SaveDraftResult>();
+    const saves: Array<{
+      draftId?: string;
+      document: CanonicalDraftDocument;
+      expectedVersion: number;
+    }> = [];
+    const controller = createAutosaveController({
+      initialDraftId: "old-draft",
+      initialDocument: base,
+      initialVersion: 4,
+      scheduler: timer.scheduler,
+      save: async (input) => {
+        saves.push(input);
+        if (saves.length === 1) {
+          throw new TypefullyClientError("version_conflict", {
+            currentVersion: 5,
+          });
+        }
+        return followup.promise;
+      },
+      saveAsNewDraft: () => recovery.promise,
+    });
+    controller.textChanged(edited("conflicted"));
+    timer.fire();
+    await Promise.resolve();
+    await Promise.resolve();
+    const creating = controller.saveAsNewDraft();
+    controller.textChanged(edited("during create"));
+    controller.mediaSettled({
+      ...edited("latest on new draft"),
+      media: [
+        {
+          id: "media-new",
+          kind: "image",
+          order: 0,
+          altText: "new",
+          remoteId: null,
+        },
+      ],
+    });
+    expect(saves).toHaveLength(1);
+
+    recovery.resolve(newDraftResult);
+    expect((await creating)?.draftId).toBe("new-draft");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(saves).toHaveLength(2);
+    expect(saves[1]).toMatchObject({
+      draftId: "new-draft",
+      expectedVersion: 1,
+      document: {
+        posts: [{ x: "latest on new draft" }],
+        media: [{ id: "media-new" }],
+      },
+    });
+    expect(controller.getSnapshot()).toMatchObject({
+      target: { draftId: "new-draft", version: 1 },
+      createdDraft: newDraftResult,
+    });
+    followup.resolve(saved(2));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(controller.getSnapshot().target).toEqual({
+      draftId: "new-draft",
+      version: 2,
+    });
+  });
+
+  test("retries failed recovery as create, then retries normal saves on the rebound target", async () => {
+    const timer = clock();
+    const saveTargets: Array<string | undefined> = [];
+    let createAttempts = 0;
+    const controller = createAutosaveController({
+      initialDraftId: "old-draft",
+      initialDocument: base,
+      initialVersion: 1,
+      scheduler: timer.scheduler,
+      save: async (input) => {
+        saveTargets.push(input.draftId);
+        if (saveTargets.length === 1) {
+          throw new TypefullyClientError("version_conflict", {
+            currentVersion: 2,
+          });
+        }
+        if (saveTargets.length === 2) throw new Error("temporary");
+        return saved(3);
+      },
+      saveAsNewDraft: async () => {
+        createAttempts += 1;
+        if (createAttempts === 1) throw new Error("temporary create failure");
+        return newDraftResult;
+      },
+    });
+    controller.textChanged(edited("conflict"));
+    timer.fire();
+    await Promise.resolve();
+    await Promise.resolve();
+    await controller.saveAsNewDraft();
+    expect(createAttempts).toBe(1);
+
+    const recovered = await controller.retry();
+    expect(recovered?.draftId).toBe("new-draft");
+    expect(createAttempts).toBe(2);
+    expect(saveTargets).toEqual(["old-draft"]);
+
+    controller.mediaSettled(edited("new target edit"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(controller.getSnapshot().state.kind).toBe("error");
+    controller.retry();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(saveTargets).toEqual(["old-draft", "new-draft", "new-draft"]);
+    expect(controller.getSnapshot().target).toEqual({
+      draftId: "new-draft",
+      version: 3,
+    });
   });
 
   test("uses safe errors and disables publish for every unsettled state", async () => {
     const timer = clock();
     const pending = deferred<SaveDraftResult>();
     const controller = createAutosaveController({
+      initialDraftId: "draft-current",
       initialDocument: base,
       initialVersion: 1,
       scheduler: timer.scheduler,
@@ -412,6 +549,7 @@ describe("Typefully autosave controller", () => {
     const timer = clock();
     const local = edited("still safe");
     const controller = createAutosaveController({
+      initialDraftId: "draft-current",
       initialDocument: base,
       initialVersion: 1,
       scheduler: timer.scheduler,
@@ -437,6 +575,7 @@ describe("Typefully autosave controller", () => {
     const versions: number[] = [];
     let attempt = 0;
     const controller = createAutosaveController({
+      initialDraftId: "draft-current",
       initialDocument: base,
       initialVersion: 1,
       scheduler: timer.scheduler,
@@ -481,6 +620,7 @@ describe("Typefully autosave controller", () => {
     const timer = clock();
     let signal: AbortSignal | undefined;
     const controller = createAutosaveController({
+      initialDraftId: "draft-current",
       initialDocument: base,
       initialVersion: 1,
       scheduler: timer.scheduler,
