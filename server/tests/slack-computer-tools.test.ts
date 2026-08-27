@@ -47,6 +47,14 @@ class FileAdapter extends FakeAdapter {
   readonly uploads: UploadArgs[] = [];
   result: UploadResult = { ok: true, fileId: "slack-file-1" };
   afterUpload?: () => void;
+  beforePost?: () => void;
+  postError?: unknown;
+
+  override async post(...args: Parameters<PlatformAdapter["post"]>) {
+    this.beforePost?.();
+    if (this.postError !== undefined) throw this.postError;
+    return super.post(...args);
+  }
 
   async postFile(
     _target: Parameters<NonNullable<PlatformAdapter["postFile"]>>[0],
@@ -125,8 +133,13 @@ class FakeComputerGateway implements ComputerGateway {
   readonly requestHelpCalls: Parameters<ComputerGateway["requestHelp"]>[] = [];
   readonly requestSecretCalls: Parameters<ComputerGateway["requestSecret"]>[] =
     [];
+  readonly releaseControlCalls: Parameters<
+    ComputerGateway["releaseControl"]
+  >[] = [];
   nextError?: unknown;
   afterCall?: () => void;
+  afterRequest?: () => void;
+  releaseError?: unknown;
   readFileResult: Awaited<ReturnType<ComputerGateway["readFile"]>> = {
     path: "reports/risk.txt",
     text: "Résumé 📊",
@@ -263,6 +276,7 @@ class FakeComputerGateway implements ComputerGateway {
   }
   async requestHelp(...args: Parameters<ComputerGateway["requestHelp"]>) {
     this.requestHelpCalls.push(args);
+    this.afterRequest?.();
     return {
       holder: "bot" as const,
       since: "2026-08-27T00:00:00.000Z",
@@ -272,11 +286,18 @@ class FakeComputerGateway implements ComputerGateway {
   async takeControl(): Promise<never> {
     throw new Error("unused");
   }
-  async releaseControl(): Promise<never> {
-    throw new Error("unused");
+  async releaseControl(...args: Parameters<ComputerGateway["releaseControl"]>) {
+    this.releaseControlCalls.push(args);
+    if (this.releaseError !== undefined) throw this.releaseError;
+    return {
+      holder: "bot" as const,
+      since: "2026-08-27T00:00:00.000Z",
+      requested: false,
+    };
   }
   async requestSecret(...args: Parameters<ComputerGateway["requestSecret"]>) {
     this.requestSecretCalls.push(args);
+    this.afterRequest?.();
     return {
       holder: "bot" as const,
       since: "2026-08-27T00:00:00.000Z",
@@ -426,6 +447,123 @@ describe("Slack computer ChannelTools", () => {
 
     expect(gateway.requestHelpCalls).toEqual([]);
     expect(result).toEqual(UNAVAILABLE);
+  });
+
+  for (const toolName of [
+    "computer_request_help",
+    "computer_request_secret",
+  ] as const) {
+    const args =
+      toolName === "computer_request_help"
+        ? { reason: "Please sign in." }
+        : { label: "one-time code", ref: "e9", snapshotId: 9 };
+
+    test(`${toolName} stops before committing when already aborted`, async () => {
+      const gateway = new FakeComputerGateway();
+      const controller = new AbortController();
+      controller.abort();
+      const result = await inSlack(
+        () =>
+          invoke(
+            toolsWithAssistance(gateway).get(toolName)!,
+            args,
+            channelContext(new FileAdapter(), controller.signal),
+          ),
+        { channelsThreadId: "channels-thread-private" },
+      );
+
+      expect(result).toEqual(STOPPED);
+      expect(gateway.requestHelpCalls).toEqual([]);
+      expect(gateway.requestSecretCalls).toEqual([]);
+      expect(gateway.releaseControlCalls).toEqual([]);
+    });
+
+    test(`${toolName} clears its committed request when Slack delivery fails`, async () => {
+      const gateway = new FakeComputerGateway();
+      const adapter = new FileAdapter();
+      adapter.postError = new Error("Slack unavailable");
+      const result = await inSlack(
+        () =>
+          invoke(
+            toolsWithAssistance(gateway).get(toolName)!,
+            args,
+            channelContext(adapter),
+          ),
+        { channelsThreadId: "channels-thread-private" },
+      );
+
+      expect(gateway.releaseControlCalls).toEqual([
+        ["risk", { id: "u1", userId: "u1" }],
+      ]);
+      expect(result).toEqual({
+        ok: false,
+        reason:
+          "The Slack handoff could not be delivered. Its OpenBot assistance request was cleared; ask again if help is still needed.",
+      });
+    });
+
+    test(`${toolName} compensates when Stop races immediately after request commit`, async () => {
+      const gateway = new FakeComputerGateway();
+      const controller = new AbortController();
+      gateway.afterRequest = () => controller.abort();
+      const adapter = new FileAdapter();
+      const result = await inSlack(
+        () =>
+          invoke(
+            toolsWithAssistance(gateway).get(toolName)!,
+            args,
+            channelContext(adapter, controller.signal),
+          ),
+        { channelsThreadId: "channels-thread-private" },
+      );
+
+      expect(adapter.posted).toEqual([]);
+      expect(gateway.releaseControlCalls).toHaveLength(1);
+      expect(result).toEqual(STOPPED);
+    });
+
+    test(`${toolName} compensates when Stop races Slack post commit`, async () => {
+      const gateway = new FakeComputerGateway();
+      const controller = new AbortController();
+      const adapter = new FileAdapter();
+      adapter.beforePost = () => controller.abort();
+      const result = await inSlack(
+        () =>
+          invoke(
+            toolsWithAssistance(gateway).get(toolName)!,
+            args,
+            channelContext(adapter, controller.signal),
+          ),
+        { channelsThreadId: "channels-thread-private" },
+      );
+
+      expect(gateway.releaseControlCalls).toHaveLength(1);
+      expect(result).toEqual(STOPPED);
+    });
+  }
+
+  test("reports a possibly-live request when Slack delivery and compensation both fail", async () => {
+    const gateway = new FakeComputerGateway();
+    gateway.releaseError = new Error("computer unavailable");
+    const adapter = new FileAdapter();
+    adapter.postError = new Error("Slack unavailable");
+
+    const result = await inSlack(
+      () =>
+        invoke(
+          toolsWithAssistance(gateway).get("computer_request_help")!,
+          { reason: "Please sign in." },
+          channelContext(adapter),
+        ),
+      { channelsThreadId: "channels-thread-private" },
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      assistanceMayBePending: true,
+      reason:
+        "The Slack assistance flow could not be completed, and its OpenBot assistance request may still be pending. Open the coworker directly to clear it before asking again.",
+    });
   });
 
   test("passes the pinned coworker, linked actor, parsed click input, and signal", async () => {
