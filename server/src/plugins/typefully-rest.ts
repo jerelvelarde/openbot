@@ -899,6 +899,8 @@ export async function callTool(
 function publicationOutcomeFromBody(
   body: string,
   fallbackId: number,
+  destinations: ("x" | "linkedin")[],
+  includePublishedUrl = false,
 ): Pick<PublicationOutcome, "vendorResultId" | "publishedUrl"> {
   let parsed: unknown;
   try {
@@ -908,7 +910,25 @@ function publicationOutcomeFromBody(
   }
   if (!isRecord(parsed)) return { vendorResultId: String(fallbackId) };
   const rawId = parsed.id ?? parsed.draft_id;
-  const rawUrl = parsed.published_url ?? parsed.url ?? parsed.share_url;
+  const platformFields = {
+    x: "x_published_url",
+    linkedin: "linkedin_published_url",
+  } as const;
+  const rawUrl = includePublishedUrl
+    ? (["x", "linkedin"] as const)
+        .filter((destination) => destinations.includes(destination))
+        .map((destination) => parsed[platformFields[destination]])
+        .find((value): value is string => {
+          if (typeof value !== "string" || Array.from(value).length > 500) {
+            return false;
+          }
+          try {
+            return new URL(value).protocol === "https:";
+          } catch {
+            return false;
+          }
+        })
+    : undefined;
   return {
     vendorResultId:
       typeof rawId === "string" || typeof rawId === "number"
@@ -935,6 +955,7 @@ function officialPublicationOutcome(
   document: unknown,
   token: string,
   fallbackId: number,
+  destinations: ("x" | "linkedin")[],
 ): PublicationOutcome {
   if (!isRecord(document)) return { outcome: "unknown" };
   const publishState = document.publish_state;
@@ -942,19 +963,32 @@ function officialPublicationOutcome(
   if (status === "error" || publishState === "error") {
     return {
       outcome: "failed",
-      ...publicationOutcomeFromBody(JSON.stringify(document), fallbackId),
+      ...publicationOutcomeFromBody(
+        JSON.stringify(document),
+        fallbackId,
+        destinations,
+      ),
       detail: publicationFailureDetail(document, token),
     };
   }
   if (publishState === "finished" && status === "published") {
     return {
       outcome: "published",
-      ...publicationOutcomeFromBody(JSON.stringify(document), fallbackId),
+      ...publicationOutcomeFromBody(
+        JSON.stringify(document),
+        fallbackId,
+        destinations,
+        true,
+      ),
     };
   }
   return {
     outcome: "unknown",
-    ...publicationOutcomeFromBody(JSON.stringify(document), fallbackId),
+    ...publicationOutcomeFromBody(
+      JSON.stringify(document),
+      fallbackId,
+      destinations,
+    ),
     detail:
       "Typefully is still publishing. Reconcile before taking any further action.",
   };
@@ -971,6 +1005,7 @@ export function createTypefullyPublicationVendor(
     token: string;
     socialSetId: number;
     remoteDraftId: number;
+    destinations: ("x" | "linkedin")[];
   }) {
     const raw = await requestTypefully(
       fetchImplementation,
@@ -1028,6 +1063,7 @@ export function createTypefullyPublicationVendor(
         document,
         input.token,
         input.remoteDraftId,
+        input.destinations,
       );
     },
     reconcileDraft: async (input) => {
@@ -1036,6 +1072,7 @@ export function createTypefullyPublicationVendor(
         document,
         input.token,
         input.remoteDraftId,
+        input.destinations,
       );
     },
   };

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, isNull, ne, or } from "drizzle-orm";
 import {
+  type AuditStore,
   type AuditTransaction,
   recordAuditEvent,
   type TransactionalAuditStore,
@@ -87,7 +88,12 @@ type PublicationPolicyAudit = {
   source: "allow" | "deny" | "default" | "not_applicable" | "unknown";
   mode: "enforce" | "dry-run" | "unknown";
   effect: "write" | "human_decision";
-  decision: "allowed" | "dry_run_forwarded" | "denied" | "not_required";
+  decision:
+    | "allowed"
+    | "dry_run_forwarded"
+    | "denied"
+    | "not_required"
+    | "not_evaluated";
 };
 
 type VendorIdentity =
@@ -441,6 +447,43 @@ const DECLINE_POLICY_AUDIT: PublicationPolicyAudit = Object.freeze({
   decision: "not_required",
 });
 
+const UNEVALUATED_PUBLISH_POLICY_AUDIT: PublicationPolicyAudit = Object.freeze({
+  operation: "publish_now",
+  matchedRule: null,
+  matchedRuleId: null,
+  source: "unknown",
+  mode: "unknown",
+  effect: "write",
+  decision: "not_evaluated",
+});
+
+function publicationAuthorizationFailureClass(
+  error: unknown,
+):
+  | "connection_required"
+  | "grant_or_policy_refused"
+  | "authorization_unavailable" {
+  const code =
+    error && typeof error === "object" && "code" in error
+      ? String(error.code)
+      : "";
+  if (
+    code === "connection_required" ||
+    code === "credential_required" ||
+    code === "credential_unavailable"
+  ) {
+    return "connection_required";
+  }
+  if (
+    code === "grant_required" ||
+    code === "policy_denied" ||
+    code === "authorization_denied"
+  ) {
+    return "grant_or_policy_refused";
+  }
+  return "authorization_unavailable";
+}
+
 function validRemoteDraftId(value: unknown): string {
   if (
     typeof value !== "string" ||
@@ -738,7 +781,100 @@ export function createTypefullyStore(options: {
     ) {
       throw changedProposalError();
     }
-    return { socialSetId, remoteDraftId };
+    return {
+      socialSetId,
+      remoteDraftId,
+      destinations: [...draft.document.destinations],
+    };
+  }
+
+  function publicationLifecyclePayload(
+    proposal: PublicationProposal,
+    input: {
+      decision: "publication_refused";
+      stage:
+        | "ttl_expiry"
+        | "local_revision"
+        | "remote_revision"
+        | "preclaim_authorization"
+        | "postclaim_authorization";
+      failureClass: string;
+      outcome: "pending" | "expired" | "unknown";
+      policy: PublicationPolicyAudit;
+    },
+  ) {
+    return {
+      draftId: proposal.draftId,
+      botId: proposal.botId,
+      channelId: proposal.channelId,
+      version: proposal.version,
+      hash: proposal.contentHash,
+      destinations: proposal.destinations,
+      decision: input.decision,
+      stage: input.stage,
+      failureClass: input.failureClass,
+      outcome: input.outcome,
+      vendorWrite: "not_attempted",
+      policy: input.policy,
+    };
+  }
+
+  async function auditPublicationRefusal(
+    targetAuditStore: AuditStore,
+    proposal: PublicationProposal,
+    actorId: string,
+    input: Parameters<typeof publicationLifecyclePayload>[1],
+  ) {
+    await recordAuditEvent(targetAuditStore, {
+      eventType: "configuration.changed",
+      targetType: "typefully_publication_proposal",
+      targetId: proposal.id,
+      actorUserId: actorId,
+      payload: publicationLifecyclePayload(proposal, input),
+    });
+  }
+
+  async function expirePendingProposal(input: {
+    proposal: PublicationProposal;
+    actorId: string;
+    failureDetail: string;
+    stage: "ttl_expiry" | "local_revision" | "remote_revision";
+    failureClass: "proposal_expired" | "draft_changed" | "remote_changed";
+    policy: PublicationPolicyAudit;
+  }): Promise<boolean> {
+    return database.transaction(async (transaction) => {
+      const instant = now();
+      const [row] = await transaction
+        .update(typefullyPublicationProposals)
+        .set({
+          status: "expired",
+          decidedAt: instant,
+          completedAt: instant,
+          failureDetail: input.failureDetail,
+          updatedAt: instant,
+        })
+        .where(
+          and(
+            eq(typefullyPublicationProposals.id, input.proposal.id),
+            eq(typefullyPublicationProposals.status, "pending"),
+          ),
+        )
+        .returning(proposalSelection);
+      if (!row) return false;
+      await auditPublicationRefusal(
+        auditStore.inTransaction(transaction),
+        input.proposal,
+        input.actorId,
+        {
+          decision: "publication_refused",
+          stage: input.stage,
+          failureClass: input.failureClass,
+          outcome: "expired",
+          policy: input.policy,
+        },
+      );
+      return true;
+    });
   }
 
   function remoteArgs(draft: TypefullyDraft): Record<string, unknown> {
@@ -1206,21 +1342,14 @@ export function createTypefullyStore(options: {
         );
       }
       if (new Date(proposal.expiresAt).getTime() <= now().getTime()) {
-        await database
-          .update(typefullyPublicationProposals)
-          .set({
-            status: "expired",
-            decidedAt: now(),
-            completedAt: now(),
-            failureDetail: "The review proposal expired.",
-            updatedAt: now(),
-          })
-          .where(
-            and(
-              eq(typefullyPublicationProposals.id, proposal.id),
-              eq(typefullyPublicationProposals.status, "pending"),
-            ),
-          );
+        await expirePendingProposal({
+          proposal,
+          actorId: input.actorId,
+          failureDetail: "The review proposal expired.",
+          stage: "ttl_expiry",
+          failureClass: "proposal_expired",
+          policy: UNEVALUATED_PUBLISH_POLICY_AUDIT,
+        });
         throw new ProposalStateError(
           "proposal_expired",
           "This proposal expired. Review the draft again.",
@@ -1232,13 +1361,33 @@ export function createTypefullyStore(options: {
         draft.contentHash !== proposal.contentHash ||
         !isCurrentRevisionConfirmed(draft)
       ) {
+        await expirePendingProposal({
+          proposal,
+          actorId: input.actorId,
+          failureDetail: "Draft changed after proposal creation.",
+          stage: "local_revision",
+          failureClass: "draft_changed",
+          policy: UNEVALUATED_PUBLISH_POLICY_AUDIT,
+        });
         throw changedProposalError();
       }
-      const authorized = await authorizePublication({
-        botId: proposal.botId,
-        actorId: input.actorId,
-        operation: "publish_now",
-      });
+      let authorized: Awaited<ReturnType<typeof authorizePublication>>;
+      try {
+        authorized = await authorizePublication({
+          botId: proposal.botId,
+          actorId: input.actorId,
+          operation: "publish_now",
+        });
+      } catch (error) {
+        await auditPublicationRefusal(auditStore, proposal, input.actorId, {
+          decision: "publication_refused",
+          stage: "preclaim_authorization",
+          failureClass: publicationAuthorizationFailureClass(error),
+          outcome: "pending",
+          policy: UNEVALUATED_PUBLISH_POLICY_AUDIT,
+        });
+        throw error;
+      }
       const identity = remotePublicationIdentity(draft);
       const remote = await publicationVendor.fetchDraft({
         token: authorized.token,
@@ -1251,25 +1400,18 @@ export function createTypefullyStore(options: {
           proposal.contentHash,
         )
       ) {
-        await database
-          .update(typefullyPublicationProposals)
-          .set({
-            status: "expired",
-            decidedAt: now(),
-            completedAt: now(),
-            failureDetail: "The remote draft changed after review.",
-            updatedAt: now(),
-          })
-          .where(
-            and(
-              eq(typefullyPublicationProposals.id, proposal.id),
-              eq(typefullyPublicationProposals.status, "pending"),
-            ),
-          );
+        await expirePendingProposal({
+          proposal,
+          actorId: input.actorId,
+          failureDetail: "The remote draft changed after review.",
+          stage: "remote_revision",
+          failureClass: "remote_changed",
+          policy: authorized.policy,
+        });
         throw changedProposalError();
       }
 
-      proposal = await database.transaction(async (transaction) => {
+      const claim = await database.transaction(async (transaction) => {
         // Draft before proposal is the global mutation lock order. `saveDraft` already holds the
         // draft before it invalidates proposals; reversing that order here deadlocks an edit racing
         // the approval claim.
@@ -1290,15 +1432,62 @@ export function createTypefullyStore(options: {
           );
         }
         if (new Date(locked.expiresAt).getTime() <= now().getTime()) {
-          throw new ProposalStateError(
-            "proposal_expired",
-            "This proposal expired. Review the draft again.",
+          const instant = now();
+          await transaction
+            .update(typefullyPublicationProposals)
+            .set({
+              status: "expired",
+              decidedAt: instant,
+              completedAt: instant,
+              failureDetail: "The review proposal expired.",
+              updatedAt: instant,
+            })
+            .where(eq(typefullyPublicationProposals.id, locked.id));
+          await auditPublicationRefusal(
+            auditStore.inTransaction(transaction),
+            locked,
+            input.actorId,
+            {
+              decision: "publication_refused",
+              stage: "ttl_expiry",
+              failureClass: "proposal_expired",
+              outcome: "expired",
+              policy: authorized.policy,
+            },
           );
+          return { kind: "expired" as const };
         }
         if (
           draft.version !== locked.version ||
           draft.contentHash !== locked.contentHash ||
-          !isCurrentRevisionConfirmed(draft) ||
+          !isCurrentRevisionConfirmed(draft)
+        ) {
+          const instant = now();
+          await transaction
+            .update(typefullyPublicationProposals)
+            .set({
+              status: "expired",
+              decidedAt: instant,
+              completedAt: instant,
+              failureDetail: "Draft changed after proposal creation.",
+              updatedAt: instant,
+            })
+            .where(eq(typefullyPublicationProposals.id, locked.id));
+          await auditPublicationRefusal(
+            auditStore.inTransaction(transaction),
+            locked,
+            input.actorId,
+            {
+              decision: "publication_refused",
+              stage: "local_revision",
+              failureClass: "draft_changed",
+              outcome: "expired",
+              policy: authorized.policy,
+            },
+          );
+          return { kind: "changed" as const };
+        }
+        if (
           !(await lockBotAttachment(
             transaction,
             locked.channelId,
@@ -1349,18 +1538,41 @@ export function createTypefullyStore(options: {
             policy: authorized.policy,
           },
         });
-        return asProposal(claimed as SelectedProposal);
+        return {
+          kind: "claimed" as const,
+          proposal: asProposal(claimed as SelectedProposal),
+        };
       });
+      if (claim.kind === "expired") {
+        throw new ProposalStateError(
+          "proposal_expired",
+          "This proposal expired. Review the draft again.",
+        );
+      }
+      if (claim.kind === "changed") throw changedProposalError();
+      proposal = claim.proposal;
 
       // Re-resolve the grant, policy and actor credential after the durable claim. The earlier
       // authorization protects the remote comparison; this one is the last server-side boundary
       // before the irreversible write. If it fails, the already-committed `unknown` fence remains
       // and only reconciliation may move the proposal again.
-      const finalAuthorization = await authorizePublication({
-        botId: proposal.botId,
-        actorId: input.actorId,
-        operation: "publish_now",
-      });
+      let finalAuthorization: Awaited<ReturnType<typeof authorizePublication>>;
+      try {
+        finalAuthorization = await authorizePublication({
+          botId: proposal.botId,
+          actorId: input.actorId,
+          operation: "publish_now",
+        });
+      } catch (error) {
+        await auditPublicationRefusal(auditStore, proposal, input.actorId, {
+          decision: "publication_refused",
+          stage: "postclaim_authorization",
+          failureClass: publicationAuthorizationFailureClass(error),
+          outcome: "unknown",
+          policy: UNEVALUATED_PUBLISH_POLICY_AUDIT,
+        });
+        throw error;
+      }
 
       let outcome: PublicationOutcome;
       try {
@@ -1679,7 +1891,7 @@ export function createTypefullyStore(options: {
           throw new VersionConflictError(latest.version, latest.contentHash);
         }
 
-        await transaction
+        const expiredProposals = await transaction
           .update(typefullyPublicationProposals)
           .set({
             status: "expired",
@@ -1693,7 +1905,23 @@ export function createTypefullyStore(options: {
               eq(typefullyPublicationProposals.draftId, input.draftId),
               eq(typefullyPublicationProposals.status, "pending"),
             ),
+          )
+          .returning(proposalSelection);
+
+        for (const expiredRow of expiredProposals) {
+          await auditPublicationRefusal(
+            auditStore.inTransaction(transaction),
+            asProposal(expiredRow as SelectedProposal),
+            input.actorId,
+            {
+              decision: "publication_refused",
+              stage: "local_revision",
+              failureClass: "draft_changed",
+              outcome: "expired",
+              policy: UNEVALUATED_PUBLISH_POLICY_AUDIT,
+            },
           );
+        }
 
         const draft = asDraft(row);
         await recordAuditEvent(auditStore.inTransaction(transaction), {

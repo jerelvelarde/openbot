@@ -60,6 +60,7 @@ describe("server-only Typefully publication transport", () => {
         publish_state: "in_progress",
         status: "draft",
         published_url: null,
+        share_url: "https://typefully.com/draft/review-only",
       });
     });
 
@@ -68,20 +69,22 @@ describe("server-only Typefully publication transport", () => {
         token: "secret-key",
         socialSetId: 7,
         remoteDraftId: 42,
+        destinations: ["x", "linkedin"],
       }),
     ).toEqual({ document: { status: "draft", platforms: {} } });
-    expect(
-      await vendor.publishDraft({
-        token: "secret-key",
-        socialSetId: 7,
-        remoteDraftId: 42,
-      }),
-    ).toEqual({
+    const outcome = await vendor.publishDraft({
+      token: "secret-key",
+      socialSetId: 7,
+      remoteDraftId: 42,
+      destinations: ["x", "linkedin"],
+    });
+    expect(outcome).toEqual({
       outcome: "unknown",
       vendorResultId: "42",
       detail:
         "Typefully is still publishing. Reconcile before taking any further action.",
     });
+    expect(outcome).not.toHaveProperty("publishedUrl");
     expect(requests.map(({ url, init }) => [url, init?.method])).toEqual([
       ["https://api.typefully.com/v2/social-sets/7/drafts/42", "GET"],
       ["https://api.typefully.com/v2/social-sets/7/drafts/42", "PATCH"],
@@ -100,6 +103,7 @@ describe("server-only Typefully publication transport", () => {
         token: "key",
         socialSetId: 1,
         remoteDraftId: 2,
+        destinations: ["x"],
       }),
     ).toMatchObject({ outcome: "failed" });
 
@@ -111,6 +115,7 @@ describe("server-only Typefully publication transport", () => {
         token: "key",
         socialSetId: 1,
         remoteDraftId: 2,
+        destinations: ["x"],
       }),
     ).toMatchObject({ outcome: "unknown" });
 
@@ -123,10 +128,11 @@ describe("server-only Typefully publication transport", () => {
           id: 2,
           publish_state: "finished",
           status: reconcileStatus,
-          published_url:
+          x_published_url:
             reconcileStatus === "published"
-              ? "https://typefully.com/t/2"
-              : null,
+              ? "https://x.com/openbot/status/2"
+              : "https://x.com/openbot/status/failed-not-proof",
+          share_url: "https://typefully.com/draft/not-a-publication-url",
           error:
             reconcileStatus === "error" ? "Vendor publication failed" : null,
         });
@@ -137,19 +143,25 @@ describe("server-only Typefully publication transport", () => {
         token: "key",
         socialSetId: 1,
         remoteDraftId: 2,
-      }),
-    ).toMatchObject({ outcome: "published", vendorResultId: "2" });
-    reconcileStatus = "error";
-    expect(
-      await reconciler.reconcileDraft({
-        token: "key",
-        socialSetId: 1,
-        remoteDraftId: 2,
+        destinations: ["x"],
       }),
     ).toMatchObject({
+      outcome: "published",
+      vendorResultId: "2",
+      publishedUrl: "https://x.com/openbot/status/2",
+    });
+    reconcileStatus = "error";
+    const failed = await reconciler.reconcileDraft({
+      token: "key",
+      socialSetId: 1,
+      remoteDraftId: 2,
+      destinations: ["x"],
+    });
+    expect(failed).toMatchObject({
       outcome: "failed",
       detail: "Vendor publication failed",
     });
+    expect(failed).not.toHaveProperty("publishedUrl");
     expect(methods).toEqual(["GET", "GET"]);
   });
 
@@ -162,6 +174,8 @@ describe("server-only Typefully publication transport", () => {
         publish_state: "in_progress",
         status: "draft",
         published_url: null,
+        x_published_url: "https://x.com/openbot/status/in-progress-not-proof",
+        share_url: "https://typefully.com/draft/review-only",
       });
     });
     expect(
@@ -169,9 +183,69 @@ describe("server-only Typefully publication transport", () => {
         token: "key",
         socialSetId: 1,
         remoteDraftId: 2,
+        destinations: ["x"],
       }),
-    ).toMatchObject({ outcome: "unknown" });
+    ).toEqual({
+      outcome: "unknown",
+      vendorResultId: "2",
+      detail:
+        "Typefully is still publishing. Reconcile before taking any further action.",
+    });
     expect(methods).toEqual(["GET"]);
+  });
+
+  test("uses only a selected destination's official published URL", async () => {
+    const vendor = createTypefullyPublicationVendor(async () =>
+      Response.json({
+        id: 2,
+        publish_state: "finished",
+        status: "published",
+        x_published_url: "https://x.com/openbot/status/2",
+        linkedin_published_url:
+          "https://www.linkedin.com/feed/update/urn:li:activity:2",
+        share_url: "https://typefully.com/draft/review-only",
+        url: "https://example.test/not-proof",
+      }),
+    );
+    expect(
+      await vendor.reconcileDraft({
+        token: "key",
+        socialSetId: 1,
+        remoteDraftId: 2,
+        destinations: ["linkedin"],
+      }),
+    ).toEqual({
+      outcome: "published",
+      vendorResultId: "2",
+      publishedUrl: "https://www.linkedin.com/feed/update/urn:li:activity:2",
+    });
+    expect(
+      await vendor.reconcileDraft({
+        token: "key",
+        socialSetId: 1,
+        remoteDraftId: 2,
+        destinations: ["linkedin", "x"],
+      }),
+    ).toMatchObject({ publishedUrl: "https://x.com/openbot/status/2" });
+  });
+
+  test("does not treat a draft share URL as published proof", async () => {
+    const vendor = createTypefullyPublicationVendor(async () =>
+      Response.json({
+        id: 2,
+        publish_state: "finished",
+        status: "published",
+        share_url: "https://typefully.com/draft/review-only",
+      }),
+    );
+    expect(
+      await vendor.reconcileDraft({
+        token: "key",
+        socialSetId: 1,
+        remoteDraftId: 2,
+        destinations: ["x"],
+      }),
+    ).toEqual({ outcome: "published", vendorResultId: "2" });
   });
 
   test("bounds and redacts the official terminal error detail", async () => {
@@ -188,6 +262,7 @@ describe("server-only Typefully publication transport", () => {
       token,
       socialSetId: 1,
       remoteDraftId: 2,
+      destinations: ["x"],
     });
     expect(outcome.outcome).toBe("failed");
     expect(outcome.detail).not.toContain(token);
@@ -219,7 +294,7 @@ describe("official Typefully scheduling comparison", () => {
     },
   });
 
-  test("accepts matching planned/scheduled state and detects a date or status change", () => {
+  test("accepts only matching inert planned state and detects a date or live scheduling change", () => {
     expect(
       remoteMatchesSnapshot(
         remote("planned", scheduleAt),
@@ -233,7 +308,7 @@ describe("official Typefully scheduling comparison", () => {
         snapshot(scheduleAt),
         "unused",
       ),
-    ).toBe(true);
+    ).toBe(false);
     expect(
       remoteMatchesSnapshot(
         remote("planned", "2099-08-28T12:00:00Z"),

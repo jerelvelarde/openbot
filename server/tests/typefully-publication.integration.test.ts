@@ -53,9 +53,12 @@ const plugin = {
     if (input.ref.endsWith("/publish_now")) {
       publishAuthorizationCalls += 1;
       if (failSecondPublishAuthorization && publishAuthorizationCalls === 2) {
-        throw Object.assign(new Error("Grant changed before publication"), {
-          code: "grant_required",
-        });
+        throw Object.assign(
+          new Error(
+            "Grant changed before publication personal-key Approved exact content",
+          ),
+          { code: "grant_required" },
+        );
       }
     }
     return {
@@ -155,6 +158,22 @@ async function syncedDraft() {
     expectedHash: created.contentHash,
     remoteDraftId: "101",
   });
+}
+
+async function proposalAudits(proposalId: string) {
+  return database
+    .select({ payload: auditEvents.payload })
+    .from(auditEvents)
+    .where(eq(auditEvents.targetId, proposalId));
+}
+
+function expectAuditIsSafe(audit: unknown) {
+  const serialized = JSON.stringify(audit);
+  expect(serialized).not.toContain("Approved exact content");
+  expect(serialized).not.toContain("Edited after review");
+  expect(serialized).not.toContain("Changed in Typefully");
+  expect(serialized).not.toContain("personal-key");
+  expect(serialized).not.toContain("snapshot");
 }
 
 describe("immutable Typefully publication proposals", () => {
@@ -273,6 +292,23 @@ describe("immutable Typefully publication proposals", () => {
         actorId: ownerId,
       }),
     ).rejects.toMatchObject({ code: "proposal_changed" });
+    const localAudit = await proposalAudits(localProposal.id);
+    expect(localAudit.map(({ payload }) => payload)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          decision: "publication_refused",
+          stage: "local_revision",
+          failureClass: "draft_changed",
+          vendorWrite: "not_attempted",
+          outcome: "expired",
+          policy: expect.objectContaining({
+            operation: "publish_now",
+            decision: "not_evaluated",
+          }),
+        }),
+      ]),
+    );
+    expectAuditIsSafe(localAudit);
 
     const fresh = await syncedDraft();
     const remoteProposal = await store.prepareProposal({
@@ -287,6 +323,20 @@ describe("immutable Typefully publication proposals", () => {
         actorId: ownerId,
       }),
     ).rejects.toMatchObject({ code: "proposal_changed" });
+    const remoteAudit = await proposalAudits(remoteProposal.id);
+    expect(remoteAudit.map(({ payload }) => payload)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          decision: "publication_refused",
+          stage: "remote_revision",
+          failureClass: "remote_changed",
+          vendorWrite: "not_attempted",
+          outcome: "expired",
+          policy: expect.objectContaining({ decision: "allowed" }),
+        }),
+      ]),
+    );
+    expectAuditIsSafe(remoteAudit);
     expect(publishCalls).toBe(1);
   });
 
@@ -403,28 +453,55 @@ describe("immutable Typefully publication proposals", () => {
     expect(await publishing).toMatchObject({ status: "published" });
   });
 
-  test("refuses a disconnected or policy-blocked owner before any vendor publish", async () => {
-    const draft = await syncedDraft();
-    const proposal = await store.prepareProposal({
-      draftId: draft.id,
-      actorId: ownerId,
-      expectedVersion: draft.version,
-    });
+  test("audits credential, grant, and policy refusals before any vendor publish", async () => {
     publishCalls = 0;
-    authorizeError = Object.assign(new Error("Connection required"), {
-      code: "connection_required",
-    });
-    try {
-      await expect(
-        store.approveAndPublish({ proposalId: proposal.id, actorId: ownerId }),
-      ).rejects.toMatchObject({ code: "connection_required" });
-      expect(publishCalls).toBe(0);
-      expect(await store.readProposal(proposal.id, ownerId)).toMatchObject({
-        status: "pending",
+    for (const [code, failureClass] of [
+      ["connection_required", "connection_required"],
+      ["grant_required", "grant_or_policy_refused"],
+      ["policy_denied", "grant_or_policy_refused"],
+    ] as const) {
+      const draft = await syncedDraft();
+      const proposal = await store.prepareProposal({
+        draftId: draft.id,
+        actorId: ownerId,
+        expectedVersion: draft.version,
       });
-    } finally {
-      authorizeError = null;
+      authorizeError = Object.assign(
+        new Error(`${code} personal-key Approved exact content`),
+        { code },
+      );
+      try {
+        await expect(
+          store.approveAndPublish({
+            proposalId: proposal.id,
+            actorId: ownerId,
+          }),
+        ).rejects.toMatchObject({ code });
+        expect(await store.readProposal(proposal.id, ownerId)).toMatchObject({
+          status: "pending",
+        });
+        const audit = await proposalAudits(proposal.id);
+        expect(audit.map(({ payload }) => payload)).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              decision: "publication_refused",
+              stage: "preclaim_authorization",
+              failureClass,
+              vendorWrite: "not_attempted",
+              outcome: "pending",
+              policy: expect.objectContaining({
+                operation: "publish_now",
+                decision: "not_evaluated",
+              }),
+            }),
+          ]),
+        );
+        expectAuditIsSafe(audit);
+      } finally {
+        authorizeError = null;
+      }
     }
+    expect(publishCalls).toBe(0);
   });
 
   test("expires an unspent proposal without contacting Typefully", async () => {
@@ -460,6 +537,76 @@ describe("immutable Typefully publication proposals", () => {
     expect(await store.readProposal(proposal.id, ownerId)).toMatchObject({
       status: "expired",
     });
+    const audit = await proposalAudits(proposal.id);
+    expect(audit.map(({ payload }) => payload)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          decision: "publication_refused",
+          stage: "ttl_expiry",
+          failureClass: "proposal_expired",
+          vendorWrite: "not_attempted",
+          outcome: "expired",
+          policy: expect.objectContaining({
+            operation: "publish_now",
+            decision: "not_evaluated",
+          }),
+        }),
+      ]),
+    );
+    expectAuditIsSafe(audit);
+  });
+
+  test("commits and audits expiry if the TTL elapses while approval is being claimed", async () => {
+    const base = Date.parse("2099-08-27T12:00:00Z");
+    let clockReads = 0;
+    const racingStore = createTypefullyStore({
+      database,
+      auditStore: createAuditStore(database),
+      plugin: () => plugin,
+      proposalTtlMs: 100,
+      now: () => {
+        clockReads += 1;
+        return new Date(base + (clockReads >= 3 ? 200 : 0));
+      },
+      publicationVendor: {
+        fetchDraft: async () => ({ document: remoteDocument }),
+        publishDraft: async () => {
+          publishCalls += 1;
+          return { outcome: "published" as const };
+        },
+        reconcileDraft: async () => ({ outcome: "unknown" as const }),
+      },
+    });
+    const draft = await syncedDraft();
+    const proposal = await racingStore.prepareProposal({
+      draftId: draft.id,
+      actorId: ownerId,
+      expectedVersion: draft.version,
+    });
+    publishCalls = 0;
+
+    await expect(
+      racingStore.approveAndPublish({
+        proposalId: proposal.id,
+        actorId: ownerId,
+      }),
+    ).rejects.toMatchObject({ code: "proposal_expired" });
+    expect(publishCalls).toBe(0);
+    expect(await store.readProposal(proposal.id, ownerId)).toMatchObject({
+      status: "expired",
+    });
+    const audit = await proposalAudits(proposal.id);
+    expect(audit.map(({ payload }) => payload)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          stage: "ttl_expiry",
+          outcome: "expired",
+          vendorWrite: "not_attempted",
+          policy: expect.objectContaining({ decision: "allowed" }),
+        }),
+      ]),
+    );
+    expectAuditIsSafe(audit);
   });
 
   test("rechecks authorization after the durable claim and before the vendor write", async () => {
@@ -481,6 +628,23 @@ describe("immutable Typefully publication proposals", () => {
       expect(await store.readProposal(proposal.id, ownerId)).toMatchObject({
         status: "unknown",
       });
+      const audit = await proposalAudits(proposal.id);
+      expect(audit.map(({ payload }) => payload)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            decision: "publication_refused",
+            stage: "postclaim_authorization",
+            failureClass: "grant_or_policy_refused",
+            vendorWrite: "not_attempted",
+            outcome: "unknown",
+            policy: expect.objectContaining({
+              operation: "publish_now",
+              decision: "not_evaluated",
+            }),
+          }),
+        ]),
+      );
+      expectAuditIsSafe(audit);
     } finally {
       failSecondPublishAuthorization = false;
     }

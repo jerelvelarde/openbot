@@ -43,16 +43,19 @@ export type PublicationVendor = {
     token: string;
     socialSetId: number;
     remoteDraftId: number;
+    destinations: ("x" | "linkedin")[];
   }): Promise<{ document: unknown; outcome?: PublicationOutcome }>;
   publishDraft(input: {
     token: string;
     socialSetId: number;
     remoteDraftId: number;
+    destinations: ("x" | "linkedin")[];
   }): Promise<PublicationOutcome>;
   reconcileDraft(input: {
     token: string;
     socialSetId: number;
     remoteDraftId: number;
+    destinations: ("x" | "linkedin")[];
   }): Promise<PublicationOutcome>;
 };
 
@@ -174,10 +177,7 @@ export function remoteMatchesSnapshot(
     if (snapshot.scheduleAt === null) {
       if (status !== "draft" || scheduledDate !== null) return false;
     } else {
-      if (
-        (status !== "planned" && status !== "scheduled") ||
-        typeof scheduledDate !== "string"
-      ) {
+      if (status !== "planned" || typeof scheduledDate !== "string") {
         return false;
       }
       const approvedTime = Date.parse(snapshot.scheduleAt);
