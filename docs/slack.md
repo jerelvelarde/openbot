@@ -24,23 +24,42 @@ an existing OpenBot coworker, not another Slack app or Slack user.
 From the OpenBot checkout, run:
 
 ```sh
+npx copilotkit@latest login
+npx copilotkit@latest project select
 npx copilotkit@latest channels setup
 ```
 
-The command installs the current Channels setup guidance and prints a prompt for the guided setup.
-Follow that prompt, and choose:
+The first two commands sign the CLI in and select the existing Intelligence project whose runtime
+configuration OpenBot uses. `channels setup` installs the current Channels setup guidance and
+prints a prompt for the guided setup. Follow that prompt, and choose:
 
-1. the existing CopilotKit Intelligence project whose runtime key and licence OpenBot uses;
-2. Channel name `openbot`; and
-3. Slack as the provider.
+1. Channel name `openbot`; and
+2. Slack as the provider.
 
 The `setup` command itself does not provision a project. The guided flow reconciles the Channel and
 walks you through the provider-console steps. Follow the exact resume command it prints whenever it
 stops for an operator action. Do not create a second `openbot` Channel for the same project.
 
-CopilotKit Intelligence stores and uses the managed Slack provider credentials. OpenBot neither
-reads nor persists a Slack bot token, app token, or signing secret, so none belongs in `.env`, a
-tenant package, a deployment change record, or this repository.
+### Handle the attachment credentials
+
+The current CLI needs the Slack bot token and signing secret long enough to attach the provider. For
+Channel `openbot`, the CLI-generated environment names are:
+
+- `INTELLIGENCE_CHANNEL_OPENBOT_SLACK_BOT_TOKEN`
+- `INTELLIGENCE_CHANNEL_OPENBOT_SLACK_SIGNING_SECRET`
+
+Use the exact names and resume command printed by the current CLI. It can read them from an ignored
+local `.env`, from the shell environment, or from a credential document on standard input. Prefer a
+secret manager that emits the credential document directly into the exact CLI resume command with
+`--credentials-stdin`. The document must use the schema requested by the CLI; do not put literal
+credentials in shell history or an intermediate tracked file. No CLI flag accepts a credential
+value.
+
+After attachment, CopilotKit Intelligence stores and uses the provider credentials. The running
+OpenBot server neither requires nor reads them. However, OpenBot loads the entire `.env` into its
+process, so remove the two temporary lines from a local `.env` or unset their shell variables as
+soon as attachment succeeds and before starting OpenBot. Never put them in `.env.example`, a tenant
+package, a deployment change record, or source control.
 
 ### Review the generated Slack manifest
 
@@ -55,14 +74,19 @@ The manifest must cover only the capabilities the managed adapter needs:
 - read conversations in the supported channel, group, direct-message, and multi-person contexts;
 - post and update threaded responses and interactive continuations;
 - read attached files and upload files OpenBot intentionally shares;
-- read the human user's profile and, where the workspace exposes it to the app, verified email for
-  account linking; and
+- read the human user's profile; and
 - receive the interactions and reactions used by the managed Slack experience.
 
 Compare those categories with the CLI-generated manifest and Slack's install review. If the
 generated manifest requests a capability you cannot approve, stop instead of deleting it and
 assuming the adapter will degrade safely. Re-run the current setup flow after a Channels upgrade so
 the manifest and provider event configuration are reconciled together.
+
+The CLI 4.9.2 manifest grants profile read but does not grant Slack's separate email-read scope, and
+the Channels 0.9 actor contract has an optional email but no verification flag. Therefore the
+default generated manifest does not provide a trustworthy verified email for automatic linking.
+Do not silently add a remembered email scope by hand. Use the explicit authenticated link below and
+treat the next CLI-generated manifest as the source of truth after any upgrade.
 
 ## Verify readiness without credentials
 
@@ -106,17 +130,21 @@ whether Slack is ready.
 
 ## Link Slack people to OpenBot
 
-OpenBot attempts automatic linking when all of these are true:
+The reliable current path is the explicit authenticated link: `@OpenBot` posts a sealed link to the
+OpenBot app, valid for ten minutes. The person signs in to OpenBot, verifies the Slack tenant and
+user shown on the confirmation page, and explicitly chooses **Link Slack**. The link binds that Slack
+identity to the signed-in OpenBot account; it does not grant coworker or tool access.
+
+Automatic linking activates only when a future CLI-generated manifest approved by the operator and
+its provider contract supply a trustworthy verified email, and all of these are true:
 
 - the Slack event actor is a human;
-- Slack returns a verified email for that exact human profile;
+- the provider returns a trustworthy verified email for that exact human profile;
 - the normalized email matches exactly one verified, non-revoked OpenBot user; and
 - that OpenBot user is active and has a current role.
 
-If any condition is absent or ambiguous, `@OpenBot` posts a link to the authenticated OpenBot app.
-The sealed link is valid for ten minutes. The person signs in to OpenBot, verifies the Slack tenant
-and user shown on the confirmation page, and explicitly chooses **Link Slack**. The link binds that
-Slack identity to the signed-in OpenBot account; it does not grant coworker or tool access.
+If any condition is absent or ambiguous, OpenBot uses the explicit link. Operators must not broaden
+the generated Slack manifest merely to avoid that confirmation step.
 
 An expired or invalid link must be restarted from Slack. A Slack identity already linked to a
 different OpenBot account, or the same OpenBot account already linked to another Slack identity in
@@ -180,8 +208,9 @@ assistance request completed, expired, was cancelled, or needs operator checking
   `npx copilotkit@latest channels status`. A healthy `/health` response is not sufficient.
 - **The CLI reports setup required:** re-run `npx copilotkit@latest channels setup` and finish the
   exact provider-console and resume steps it prints.
-- **A person always receives a link:** confirm Slack exposes the verified email capability to the
-  installed app and that exactly one active, verified, non-revoked OpenBot user has that email.
+- **A person always receives a link:** this is expected with the CLI 4.9.2 generated manifest. Use
+  the explicit authenticated link. Automatic linking is only available when the provider supplies
+  trustworthy verified email and exactly one active, verified, non-revoked OpenBot user matches it.
 - **The link opens the wrong host or is refused:** set `OPENBOT_APP_URL` to the public HTTPS browser
   app origin, restart OpenBot, and request a new link. Old links expire after ten minutes.
 - **A reply names a different coworker but the old one runs:** this is expected. Coworker assignment
@@ -206,12 +235,34 @@ Run this against a test Slack workspace only after readiness reports `online` an
    apply rather than the first user's.
 7. Run one allowed browser action and one action the configured policy refuses.
 8. Request browser control and secret assistance; complete both only in authenticated OpenBot.
-9. Confirm the audit trail contains `channel.routed`, tool, policy, approval where exercised, and
-   assistance events attributed to the linked OpenBot user and pinned coworker, without Slack
-   message bodies or secret values.
+9. Confirm the audit trail contains `channel.routed`, governed tool/policy, and assistance events
+   attributed to the linked OpenBot user and pinned coworker, without Slack message bodies or secret
+   values. For a button decision, verify the one-use outcome in durable `approval_decisions` state;
+   approval decisions do not currently have a separate audit event.
 
 Record the date, test workspace label, OpenBot commit, installed `@copilotkit/channels` version, and
 pass or fail for every item in the deployment change record. Do not record a Slack workspace id,
 provider credentials, account-link token, assistance link, message transcript, or secret. A release
 must say explicitly when this real-provider smoke test was not run; local tests and a healthy server
 do not make Slack live.
+
+### Smoke record: 2026-08-27
+
+- Workspace: not selected; no workspace id recorded.
+- OpenBot commit: `8583116` (documentation and code under review, not a deployed runtime).
+- `@copilotkit/channels`: `0.9.0`.
+- Result: **NOT RUN**. Slack is not claimed live.
+- Blocker: `CLI_CHANNELS_PROJECT_NOT_SELECTED`; this checkout had no selected provider attachment,
+  runtime key, or running capabilities endpoint. No credential or provider identifier was recorded.
+
+| Step | Result |
+| --- | --- |
+| 1. Install and invite `@OpenBot` | NOT RUN |
+| 2. Link the first Slack user | NOT RUN |
+| 3. Ask Risk Analyst to review the test attachment | NOT RUN |
+| 4. Confirm a streamed threaded response | NOT RUN |
+| 5. Confirm an unmentioned thread reply uses the pinned coworker | NOT RUN |
+| 6. Confirm a second user's own access and grants | NOT RUN |
+| 7. Exercise one allowed and one policy-refused browser action | NOT RUN |
+| 8. Complete control and secret assistance only in OpenBot | NOT RUN |
+| 9. Inspect routing, governed tool/policy, assistance, and approval state | NOT RUN |
