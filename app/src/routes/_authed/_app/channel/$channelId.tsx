@@ -26,14 +26,38 @@ import {
 } from "@/lib/channels/queries";
 import { onComputerActivity } from "@/lib/copilot/computer-activity";
 
-export const chatSearchSchema = z.object({
-  settings: z.boolean().optional(),
-  /** Opens the Bot's screen in the shared detail pane. */
-  watch: z.boolean().optional(),
-  /** Opens an owned Typefully draft in the shared detail pane. */
-  draft: z.string().uuid().optional(),
-});
-export type ChannelSearch = z.infer<typeof chatSearchSchema>;
+export type ChannelSearch = {
+  settings?: true;
+  watch?: true;
+  draft?: string;
+};
+
+export const chatSearchSchema = z
+  .object({
+    settings: z.boolean().optional(),
+    /** Opens the Bot's screen in the shared detail pane. */
+    watch: z.boolean().optional(),
+    /** Opens an owned Typefully draft in the shared detail pane. */
+    draft: z.string().uuid().optional(),
+  })
+  .transform((search): ChannelSearch => {
+    // A durable draft link is most specific; the rendered pane already gives watch precedence over
+    // settings when old URLs contain both flags.
+    if (search.draft !== undefined) {
+      return { draft: search.draft, settings: undefined, watch: undefined };
+    }
+    if (search.watch === true) {
+      return { draft: undefined, settings: undefined, watch: true };
+    }
+    if (search.settings === true) {
+      return { draft: undefined, settings: true, watch: undefined };
+    }
+    return { draft: undefined, settings: undefined, watch: undefined };
+  });
+
+export function validateChannelSearch(search: unknown): ChannelSearch {
+  return chatSearchSchema.parse(search);
+}
 export type ChannelPane = "settings" | "watch" | { draft: string } | null;
 
 /** One shared pane means every explicit pane transition clears both alternatives. */
@@ -70,7 +94,7 @@ const HEADING_ENTRANCE_OFFSET = "translateY(4px)";
 const SCREEN_PANEL_WIDTH = 400;
 
 export const Route = createFileRoute("/_authed/_app/channel/$channelId")({
-  validateSearch: chatSearchSchema,
+  validateSearch: validateChannelSearch,
   component: RouteComponent,
 });
 

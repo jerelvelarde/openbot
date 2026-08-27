@@ -16,6 +16,7 @@ import {
   channelPaneSearch,
   chatSearchSchema,
   computerActivitySearch,
+  validateChannelSearch,
 } from "@/routes/_authed/_app/channel/$channelId";
 
 const { GALLERY, TYPEFULLY_DRAFT_STATUSES } = await import(
@@ -131,17 +132,105 @@ test("registers the strict bounded summary contract and rejects forbidden data",
   ).toBe(false);
 });
 
-test("the production channel search schema preserves panels and accepts only a draft UUID", () => {
-  expect(chatSearchSchema.parse({ settings: true })).toEqual({
-    settings: true,
-  });
-  expect(chatSearchSchema.parse({ watch: true })).toEqual({ watch: true });
-  expect(chatSearchSchema.parse({ draft: draftId })).toEqual({
-    draft: draftId,
-  });
+test("the production channel search schema canonicalizes every pane conflict", () => {
+  for (const [input, expected] of [
+    [{}, { draft: undefined, settings: undefined, watch: undefined }],
+    [
+      { settings: true },
+      { draft: undefined, settings: true, watch: undefined },
+    ],
+    [{ watch: true }, { draft: undefined, settings: undefined, watch: true }],
+    [
+      { draft: draftId },
+      { draft: draftId, settings: undefined, watch: undefined },
+    ],
+    [
+      { settings: true, watch: true },
+      { draft: undefined, settings: undefined, watch: true },
+    ],
+    [
+      { settings: true, draft: draftId },
+      { draft: draftId, settings: undefined, watch: undefined },
+    ],
+    [
+      { watch: true, draft: draftId },
+      { draft: draftId, settings: undefined, watch: undefined },
+    ],
+    [
+      { settings: true, watch: true, draft: draftId },
+      { draft: draftId, settings: undefined, watch: undefined },
+    ],
+    [
+      { settings: false, watch: false },
+      { draft: undefined, settings: undefined, watch: undefined },
+    ],
+  ] as const) {
+    expect(chatSearchSchema.parse(input)).toEqual(expected);
+  }
   expect(chatSearchSchema.safeParse({ draft: "not-a-uuid" }).success).toBe(
     false,
   );
+});
+
+test("reconstructed channel URLs serialize only the canonical pane", async () => {
+  for (const [query, expected] of [
+    ["", { draft: undefined, settings: undefined, watch: undefined }],
+    ["?settings=true", { draft: undefined, settings: true, watch: undefined }],
+    ["?watch=true", { draft: undefined, settings: undefined, watch: true }],
+    [
+      `?draft=${draftId}`,
+      { draft: draftId, settings: undefined, watch: undefined },
+    ],
+    [
+      "?settings=true&watch=true",
+      { draft: undefined, settings: undefined, watch: true },
+    ],
+    [
+      `?settings=true&draft=${draftId}`,
+      { draft: draftId, settings: undefined, watch: undefined },
+    ],
+    [
+      `?watch=true&draft=${draftId}`,
+      { draft: draftId, settings: undefined, watch: undefined },
+    ],
+    [
+      `?settings=true&watch=true&draft=${draftId}`,
+      { draft: draftId, settings: undefined, watch: undefined },
+    ],
+  ] as const) {
+    const root = createRootRoute({ component: Outlet });
+    const channel = createRoute({
+      getParentRoute: () => root,
+      path: "/channel/$channelId",
+      validateSearch: validateChannelSearch,
+      component: () => null,
+    });
+    const router = createRouter({
+      routeTree: root.addChildren([channel]),
+      history: createMemoryHistory({
+        initialEntries: [`/channel/channel-1${query}`],
+      }),
+    });
+    await router.load();
+    const validated = router.state.matches.at(-1)?.search;
+    expect(validated).toEqual(expected);
+    await router.navigate({
+      replace: true,
+      search: validated,
+    });
+    const serialized = new URL(
+      router.state.location.href,
+      "https://openbot.test",
+    );
+    expect(
+      ["draft", "settings", "watch"].filter((key) =>
+        serialized.searchParams.has(key),
+      ),
+    ).toHaveLength(
+      Object.values(expected).filter((value) => value !== undefined).length,
+    );
+    expect(router.state.location.pathname).toBe("/channel/channel-1");
+  }
 });
 
 test("normalizes canonical social-set labels without refusing the card", async () => {
@@ -274,7 +363,7 @@ test("review is keyboard accessible and preserves safe search state for the same
   const channel = createRoute({
     getParentRoute: () => root,
     path: "/channel/$channelId",
-    validateSearch: chatSearchSchema,
+    validateSearch: validateChannelSearch,
     component: () => <Component {...validArgs("synced")} />,
   });
   const router = createRouter({
@@ -303,7 +392,7 @@ test("review is keyboard accessible and preserves safe search state for the same
   const reloadedChannel = createRoute({
     getParentRoute: () => reloadedRoot,
     path: "/channel/$channelId",
-    validateSearch: chatSearchSchema,
+    validateSearch: validateChannelSearch,
     component: () => null,
   });
   const reloaded = createRouter({
