@@ -114,8 +114,9 @@ export function createAutosaveController(options: AutosaveOptions) {
   });
   let currentSnapshot = buildSnapshot();
   const emit = () => {
-    currentSnapshot = buildSnapshot();
-    for (const listener of listeners) listener(currentSnapshot);
+    const nextSnapshot = buildSnapshot();
+    currentSnapshot = nextSnapshot;
+    for (const listener of listeners) listener(nextSnapshot);
   };
   const clearTimer = () => {
     if (timer !== undefined) scheduler.clearTimeout(timer);
