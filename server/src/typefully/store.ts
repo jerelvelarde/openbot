@@ -593,7 +593,7 @@ export function createTypefullyStore(options: {
           current.botId,
         );
         const syncStatus: DraftSyncStatus =
-          current.syncStatus === "syncing" && current.remoteDraftId === null
+          current.syncStatus === "syncing"
             ? "syncing"
             : attached &&
                 granted &&
@@ -759,6 +759,8 @@ export function createTypefullyStore(options: {
             typeof error === "object" &&
             "code" in error &&
             error.code === "connection_required") ||
+          error instanceof GrantRequiredError ||
+          error instanceof BotNotAttachedError ||
           (error instanceof Error && error.name === "PluginRefusedError")
         ) {
           await database
@@ -776,8 +778,7 @@ export function createTypefullyStore(options: {
             .where(
               and(
                 eq(typefullyDrafts.id, authorized.draft.id),
-                eq(typefullyDrafts.version, authorized.draft.version),
-                eq(typefullyDrafts.contentHash, authorized.draft.contentHash),
+                eq(typefullyDrafts.ownerUserId, input.actorId),
                 eq(typefullyDrafts.syncStatus, "syncing"),
               ),
             );

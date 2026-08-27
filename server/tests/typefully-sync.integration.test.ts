@@ -13,8 +13,15 @@ import {
   typefullyDrafts,
   users,
 } from "../src/db/schema";
+import {
+  ConnectionRequiredError,
+  PluginRefusedError,
+} from "../src/plugins/store";
 import { createTypefullyRoutes } from "../src/typefully/routes";
-import { createTypefullyStore } from "../src/typefully/store";
+import {
+  BotNotAttachedError,
+  createTypefullyStore,
+} from "../src/typefully/store";
 import { TEST_POOL } from "./support/database";
 
 const database = createDatabase(
@@ -630,5 +637,391 @@ describe("Typefully synchronization", () => {
     release.resolve();
     vendorGate = null;
     expect((await first).status).toBe(200);
+  });
+
+  test("serializes existing-draft updates until the older snapshot settles", async () => {
+    const id = await createDraft();
+    nextRemoteId = "701";
+    expect(
+      (
+        await app.request(`/api/typefully/drafts/${id}/sync`, {
+          method: "POST",
+        })
+      ).status,
+    ).toBe(200);
+    const firstEntered = deferred();
+    const overlap = deferred();
+    const release = deferred();
+    let entries = 0;
+    vendorGate = {
+      entered: () => {
+        entries += 1;
+        if (entries === 1) firstEntered.resolve();
+        if (entries === 2) overlap.resolve();
+      },
+      wait: release.wait,
+    };
+    const before = calls.length;
+    const older = app.request(`/api/typefully/drafts/${id}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        expectedVersion: 1,
+        document: document("Older outbound update"),
+      }),
+    });
+    await firstEntered.wait;
+    const newer = app.request(`/api/typefully/drafts/${id}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        expectedVersion: 2,
+        document: document("Newer local update"),
+      }),
+    });
+    const winner = await Promise.race([
+      newer.then(() => "saved" as const),
+      overlap.wait.then(() => "overlap" as const),
+    ]);
+    const callsBeforeRelease = calls.length;
+    release.resolve();
+    vendorGate = null;
+    expect((await older).status).toBe(200);
+    expect((await newer).status).toBe(200);
+    expect(winner).toBe("saved");
+    expect(callsBeforeRelease).toBe(before + 1);
+
+    const local = await app.request(`/api/typefully/drafts/${id}`);
+    expect(await local.json()).toMatchObject({
+      draft: {
+        version: 3,
+        remoteVersion: 2,
+        syncStatus: "local",
+        document: document("Newer local update"),
+      },
+    });
+    const retry = await app.request(`/api/typefully/drafts/${id}/sync`, {
+      method: "POST",
+    });
+    expect(retry.status).toBe(200);
+    expect(calls.at(-1)).toMatchObject({
+      ref: "typefully/update_draft",
+      args: {
+        draftId: 701,
+        platforms: {
+          x: { posts: [{ text: "Newer local update" }] },
+          linkedin: { posts: [{ text: "Newer local update" }] },
+        },
+      },
+    });
+  });
+
+  test("releases a first-create claim after connection loss advances the local revision", async () => {
+    const id = await createDraft();
+    const entered = deferred();
+    const release = deferred();
+    vendorGate = { entered: entered.resolve, wait: release.wait };
+    thrownFailure = new ConnectionRequiredError("typefully", "Typefully");
+    const syncing = app.request(`/api/typefully/drafts/${id}/sync`, {
+      method: "POST",
+    });
+    await entered.wait;
+    const saved = await app.request(`/api/typefully/drafts/${id}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        expectedVersion: 1,
+        document: document("Saved while disconnected"),
+      }),
+    });
+    expect(saved.status).toBe(200);
+    release.resolve();
+    vendorGate = null;
+    const refusal = await syncing;
+    thrownFailure = null;
+    expect(refusal.status).toBe(409);
+    expect(await refusal.json()).toMatchObject({
+      code: "connection_required",
+      draftId: id,
+    });
+    const local = await app.request(`/api/typefully/drafts/${id}`);
+    expect(await local.json()).toMatchObject({
+      draft: {
+        version: 2,
+        syncStatus: "connection_required",
+        document: document("Saved while disconnected"),
+      },
+    });
+    nextRemoteId = "702";
+    expect(
+      (
+        await app.request(`/api/typefully/drafts/${id}/sync`, {
+          method: "POST",
+        })
+      ).status,
+    ).toBe(200);
+  });
+
+  test("releases a first-create claim after policy refusal advances the local revision", async () => {
+    const id = await createDraft();
+    const entered = deferred();
+    const release = deferred();
+    vendorGate = { entered: entered.resolve, wait: release.wait };
+    thrownFailure = new PluginRefusedError("Policy changed.", null);
+    const syncing = app.request(`/api/typefully/drafts/${id}/sync`, {
+      method: "POST",
+    });
+    await entered.wait;
+    const saved = await app.request(`/api/typefully/drafts/${id}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        expectedVersion: 1,
+        document: document("Saved after refusal"),
+      }),
+    });
+    expect(saved.status).toBe(200);
+    release.resolve();
+    vendorGate = null;
+    const refusal = await syncing;
+    thrownFailure = null;
+    expect(refusal.status).toBe(403);
+    const local = await app.request(`/api/typefully/drafts/${id}`);
+    expect(await local.json()).toMatchObject({
+      draft: {
+        version: 2,
+        syncStatus: "grant_blocked",
+        document: document("Saved after refusal"),
+      },
+    });
+    nextRemoteId = "703";
+    expect(
+      (
+        await app.request(`/api/typefully/drafts/${id}/sync`, {
+          method: "POST",
+        })
+      ).status,
+    ).toBe(200);
+  });
+
+  test("releases a first-create claim after attachment loss advances the local revision", async () => {
+    const id = await createDraft();
+    const entered = deferred();
+    const release = deferred();
+    vendorGate = { entered: entered.resolve, wait: release.wait };
+    thrownFailure = new BotNotAttachedError();
+    const syncing = app.request(`/api/typefully/drafts/${id}/sync`, {
+      method: "POST",
+    });
+    await entered.wait;
+    const saved = await app.request(`/api/typefully/drafts/${id}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        expectedVersion: 1,
+        document: document("Saved after attachment loss"),
+      }),
+    });
+    expect(saved.status).toBe(200);
+    release.resolve();
+    vendorGate = null;
+    const refusal = await syncing;
+    thrownFailure = null;
+    expect(refusal.status).toBe(409);
+    expect(await refusal.json()).toEqual({ code: "bot_not_attached" });
+    const local = await app.request(`/api/typefully/drafts/${id}`);
+    expect(await local.json()).toMatchObject({
+      draft: {
+        version: 2,
+        syncStatus: "grant_blocked",
+        document: document("Saved after attachment loss"),
+      },
+    });
+  });
+
+  test("media DELETE is stale-safe, local-first, exhaustive, and syncs its exact revision", async () => {
+    const id = await createDraft();
+    nextRemoteId = "704";
+    expect(
+      (
+        await app.request(`/api/typefully/drafts/${id}/sync`, {
+          method: "POST",
+        })
+      ).status,
+    ).toBe(200);
+    const current = await store.readDraft(id, ownerId);
+    const withMedia = await store.saveDraft({
+      draftId: id,
+      actorId: ownerId,
+      expectedVersion: current.version,
+      document: {
+        ...document("One"),
+        posts: [
+          { id: "post-1", x: "One", linkedin: "One" },
+          { id: "post-2", x: "Two", linkedin: "Two" },
+        ],
+        media: [
+          {
+            id: "media-all",
+            kind: "image",
+            order: 0,
+            altText: "Every post",
+            remoteId: "remote-media-all",
+          },
+        ],
+      },
+    });
+    expect(
+      (
+        await app.request(`/api/typefully/drafts/${id}/sync`, {
+          method: "POST",
+        })
+      ).status,
+    ).toBe(200);
+
+    const beforeStale = calls.length;
+    const stale = await app.request(
+      `/api/typefully/drafts/${id}/media/media-all`,
+      {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ expectedVersion: withMedia.version - 1 }),
+      },
+    );
+    expect(stale.status).toBe(409);
+    expect(calls.length).toBe(beforeStale);
+
+    const beforeDelete = calls.length;
+    const removed = await app.request(
+      `/api/typefully/drafts/${id}/media/media-all`,
+      {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ expectedVersion: withMedia.version }),
+      },
+    );
+    expect(removed.status).toBe(200);
+    expect(await removed.json()).toMatchObject({
+      draft: { version: withMedia.version + 1, mediaCount: 0 },
+      remote: { confirmedVersion: withMedia.version + 1, state: "synced" },
+    });
+    const deleteCalls = calls.slice(beforeDelete);
+    expect(
+      deleteCalls
+        .filter((call) => call.ref === "typefully/remove_media")
+        .map((call) => [call.args.platform, call.args.postIndex]),
+    ).toEqual([
+      ["x", 0],
+      ["x", 1],
+      ["linkedin", 0],
+      ["linkedin", 1],
+    ]);
+    expect(deleteCalls.at(-1)).toMatchObject({
+      ref: "typefully/update_draft",
+      args: {
+        platforms: {
+          x: { posts: [{ text: "One" }, { text: "Two" }] },
+          linkedin: { posts: [{ text: "One" }, { text: "Two" }] },
+        },
+      },
+    });
+  });
+
+  test("failed remote media removal is explicit and retryable from the saved local revision", async () => {
+    const id = await createDraft();
+    nextRemoteId = "705";
+    expect(
+      (
+        await app.request(`/api/typefully/drafts/${id}/sync`, {
+          method: "POST",
+        })
+      ).status,
+    ).toBe(200);
+    const current = await store.readDraft(id, ownerId);
+    const withMedia = await store.saveDraft({
+      draftId: id,
+      actorId: ownerId,
+      expectedVersion: current.version,
+      document: {
+        ...current.document,
+        media: [
+          {
+            id: "media-failure",
+            kind: "image",
+            order: 0,
+            altText: "Retry me",
+            remoteId: "remote-media-failure",
+          },
+        ],
+      },
+    });
+    failure = { text: "Remote remove failed." };
+    const removed = await app.request(
+      `/api/typefully/drafts/${id}/media/media-failure`,
+      {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ expectedVersion: withMedia.version }),
+      },
+    );
+    failure = null;
+    expect(removed.status).toBe(502);
+    expect(await removed.json()).toMatchObject({
+      code: "remote_error",
+      draft: { version: withMedia.version + 1, syncStatus: "remote_error" },
+    });
+    const local = await store.readDraft(id, ownerId);
+    expect(local.document.media).toEqual([]);
+    const retry = await app.request(`/api/typefully/drafts/${id}/sync`, {
+      method: "POST",
+    });
+    expect(retry.status).toBe(200);
+  });
+
+  test("media DELETE connection_required includes the saved draft id", async () => {
+    const id = await createDraft();
+    nextRemoteId = "706";
+    expect(
+      (
+        await app.request(`/api/typefully/drafts/${id}/sync`, {
+          method: "POST",
+        })
+      ).status,
+    ).toBe(200);
+    const current = await store.readDraft(id, ownerId);
+    const withMedia = await store.saveDraft({
+      draftId: id,
+      actorId: ownerId,
+      expectedVersion: current.version,
+      document: {
+        ...current.document,
+        media: [
+          {
+            id: "media-disconnected",
+            kind: "image",
+            order: 0,
+            altText: "Disconnected",
+            remoteId: "remote-media-disconnected",
+          },
+        ],
+      },
+    });
+    thrownFailure = new ConnectionRequiredError("typefully", "Typefully");
+    const removed = await app.request(
+      `/api/typefully/drafts/${id}/media/media-disconnected`,
+      {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ expectedVersion: withMedia.version }),
+      },
+    );
+    thrownFailure = null;
+    expect(removed.status).toBe(409);
+    expect(await removed.json()).toMatchObject({
+      code: "connection_required",
+      serverId: "typefully",
+      draftId: id,
+      connectPath: "/settings/connected-accounts/typefully",
+    });
   });
 });

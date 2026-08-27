@@ -100,6 +100,7 @@ function retryAt(message: string): string | undefined {
 function errorResponse(
   context: Context<{ Variables: AppVariables }>,
   error: unknown,
+  draftId?: string,
 ) {
   if (error instanceof DraftNotFoundError) {
     return context.json({ code: error.code }, 404);
@@ -128,6 +129,7 @@ function errorResponse(
       {
         code: error.code,
         serverId: error.serverId,
+        ...(draftId ? { draftId } : {}),
         connectPath: error.connectPath,
       },
       409,
@@ -316,18 +318,19 @@ export function createTypefullyRoutes(
       );
       return context.json({ draft: authoritative(draft) });
     } catch (error) {
-      return errorResponse(context, error);
+      return errorResponse(context, error, context.req.param("id"));
     }
   });
 
   routes.put("/drafts/:id", async (context) => {
+    const draftId = context.req.param("id");
     try {
       const body = await jsonBody(context);
       if (!Number.isSafeInteger(body.expectedVersion)) {
         throw new Error("expectedVersion must be an integer.");
       }
       const saved = await store.saveDraft({
-        draftId: context.req.param("id"),
+        draftId,
         actorId: context.var.actor.id,
         expectedVersion: body.expectedVersion as number,
         document: body.document,
@@ -382,7 +385,7 @@ export function createTypefullyRoutes(
         throw error;
       }
     } catch (error) {
-      return errorResponse(context, error);
+      return errorResponse(context, error, draftId);
     }
   });
 
@@ -416,7 +419,7 @@ export function createTypefullyRoutes(
           409,
         );
       }
-      return errorResponse(context, error);
+      return errorResponse(context, error, draftId);
     }
   });
 
@@ -534,21 +537,14 @@ export function createTypefullyRoutes(
         );
       } catch (error) {
         if (error instanceof ConnectionRequiredError) {
-          return context.json(
-            {
-              draft: summary(saved),
-              media,
-              remote: { state: "connection_required" },
-            },
-            201,
-          );
+          return errorResponse(context, error, saved.id);
         }
         if (
           error instanceof GrantRequiredError ||
           error instanceof BotNotAttachedError ||
           error instanceof PluginRefusedError
         ) {
-          return errorResponse(context, error);
+          return errorResponse(context, error, saved.id);
         }
         const failed = await store.recordRemoteFailure({
           draftId: saved.id,
@@ -570,20 +566,19 @@ export function createTypefullyRoutes(
       if (error instanceof MediaTooLargeError) {
         return context.json({ code: "media_too_large" }, 413);
       }
-      return errorResponse(context, error);
+      return errorResponse(context, error, context.req.param("id"));
     }
   });
 
   routes.delete("/drafts/:id/media/:mediaId", async (context) => {
+    const draftId = context.req.param("id");
+    let saved: TypefullyDraft | null = null;
     try {
       const body = await jsonBody(context);
       if (!Number.isSafeInteger(body.expectedVersion)) {
         throw new Error("expectedVersion must be an integer.");
       }
-      const current = await store.readDraft(
-        context.req.param("id"),
-        context.var.actor.id,
-      );
+      const current = await store.readDraft(draftId, context.var.actor.id);
       const descriptor = current.document.media.find(
         (item) => item.id === context.req.param("mediaId"),
       );
@@ -593,41 +588,96 @@ export function createTypefullyRoutes(
         actorId: context.var.actor.id,
         toolName: "remove_media",
       });
-      if (descriptor.remoteId !== null && current.remoteDraftId !== null) {
-        const removed = await store.callRemoteTool({
-          draftId: current.id,
-          actorId: context.var.actor.id,
-          toolName: "remove_media",
-          args: {
-            socialSetId: Number(current.document.socialSetId),
-            draftId: Number(current.remoteDraftId),
-            platform: current.document.destinations[0],
-            postIndex: 0,
-            mediaId: descriptor.remoteId,
-          },
-        });
-        if (removed.isError) {
-          return context.json(
-            { code: "remote_error", message: safeError(removed.text) },
-            502,
-          );
-        }
-      }
       const media = current.document.media.filter(
         (item) => item.id !== context.req.param("mediaId"),
       );
-      const draft = await store.saveDraft({
+      saved = await store.saveDraft({
         draftId: current.id,
         actorId: context.var.actor.id,
         expectedVersion: body.expectedVersion as number,
         document: { ...current.document, media },
       });
+      if (descriptor.remoteId !== null && current.remoteDraftId !== null) {
+        for (const platform of current.document.destinations) {
+          for (const [postIndex] of current.document.posts.entries()) {
+            const removed = await store.callRemoteTool({
+              draftId: current.id,
+              actorId: context.var.actor.id,
+              toolName: "remove_media",
+              args: {
+                socialSetId: Number(current.document.socialSetId),
+                draftId: Number(current.remoteDraftId),
+                platform,
+                postIndex,
+                mediaId: descriptor.remoteId,
+              },
+            });
+            if (removed.isError) {
+              const failed = await store.recordRemoteFailure({
+                draftId: saved.id,
+                actorId: context.var.actor.id,
+                expectedVersion: saved.version,
+                expectedHash: saved.contentHash,
+                error: removed.text,
+              });
+              return context.json(
+                {
+                  code: "remote_error",
+                  message: safeError(removed.text),
+                  draft: summary(failed),
+                  remote: remoteState(failed),
+                },
+                502,
+              );
+            }
+          }
+        }
+      }
+      const synced = await synchronize(store, saved.id, context.var.actor.id, {
+        version: saved.version,
+        hash: saved.contentHash,
+      });
+      if (!synced.ok) {
+        return context.json(
+          {
+            ...synced.error,
+            draft: summary(synced.draft),
+            remote: remoteState(synced.draft),
+          },
+          502,
+        );
+      }
       return context.json({
-        draft: summary(draft),
-        remote: remoteState(draft),
+        draft: summary(synced.draft),
+        remote: remoteState(synced.draft),
       });
     } catch (error) {
-      return errorResponse(context, error);
+      if (
+        saved &&
+        !(error instanceof ConnectionRequiredError) &&
+        !(error instanceof GrantRequiredError) &&
+        !(error instanceof BotNotAttachedError) &&
+        !(error instanceof PluginRefusedError) &&
+        !(error instanceof SyncInProgressError)
+      ) {
+        const failed = await store.recordRemoteFailure({
+          draftId: saved.id,
+          actorId: context.var.actor.id,
+          expectedVersion: saved.version,
+          expectedHash: saved.contentHash,
+          error,
+        });
+        return context.json(
+          {
+            code: "remote_error",
+            message: safeError(error),
+            draft: summary(failed),
+            remote: remoteState(failed),
+          },
+          502,
+        );
+      }
+      return errorResponse(context, error, draftId);
     }
   });
 
