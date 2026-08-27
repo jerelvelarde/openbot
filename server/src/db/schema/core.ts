@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import {
   boolean,
+  check,
   index,
   pgEnum,
   pgTable,
@@ -274,6 +275,10 @@ export const externalThreadBindings = pgTable(
     createdAt: createdAt(),
   },
   (table) => [
+    check(
+      "external_thread_bindings_provider_slack_check",
+      sql`${table.provider} = 'slack'`,
+    ),
     uniqueIndex("external_thread_bindings_provider_thread_idx").on(
       table.provider,
       table.providerTenantId,
