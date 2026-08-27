@@ -36,12 +36,18 @@ beforeAll(() => {
     window as unknown as { happyDOM: { setURL: (url: string) => void } }
   ).happyDOM.setURL("http://localhost/");
 });
-afterEach(() => {
-  cleanup();
+afterEach(async () => {
+  await act(async () => {
+    cleanup();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  });
   mock.restore();
   globalThis.fetch = originalFetch;
 });
-afterAll(() => GlobalRegistrator.unregister());
+afterAll(async () => {
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  GlobalRegistrator.unregister();
+});
 
 const draftId = "8b1c61f1-2154-4a5d-8c9a-7c8df8f9ae53";
 
@@ -114,12 +120,27 @@ function authoritativeDraft() {
 }
 
 function queryView(fetchImplementation: typeof fetch) {
-  globalThis.fetch = fetchImplementation;
+  globalThis.fetch = (async (input, init) => {
+    if (String(input) === "/api/plugins/connections") {
+      return confirmedConnectionsResponse();
+    }
+    return fetchImplementation(input, init);
+  }) as typeof fetch;
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
   confirmTypefully(queryClient);
   return { queryClient };
+}
+
+function confirmedConnectionsResponse() {
+  return new Response(
+    JSON.stringify({
+      connections: [confirmedTypefullyConnection],
+      redirectUri: null,
+    }),
+    { headers: { "content-type": "application/json" } },
+  );
 }
 
 function confirmTypefully(queryClient: QueryClient) {
@@ -600,12 +621,14 @@ test("an authoritative draft is fetched only while its canvas is mounted", async
   await waitFor(() => expect(calls).toHaveLength(2));
   expect(view.queryByText("Private body")).toBeNull();
   expect(view.getByRole("status").textContent).toContain("Loading draft");
-  resolveSecond?.(
-    new Response(JSON.stringify({ draft: authoritativeDraft() }), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    }),
-  );
+  await act(async () => {
+    resolveSecond?.(
+      new Response(JSON.stringify({ draft: authoritativeDraft() }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+  });
   expect(await view.findByText("Production route draft")).toBeTruthy();
 });
 
@@ -774,7 +797,10 @@ test("production draft canvas keeps editing during a delayed save and coalesces 
   queryClient.setQueryData(typefullyKeys.draft(draftId), {
     draft: authoritativeDraft(),
   });
-  globalThis.fetch = (async (_input, init) => {
+  globalThis.fetch = (async (input, init) => {
+    if (String(input) === "/api/plugins/connections") {
+      return confirmedConnectionsResponse();
+    }
     const method = init?.method ?? "GET";
     if (method === "PUT") {
       const payload = JSON.parse(String(init?.body)) as {
@@ -910,6 +936,9 @@ test("draft media add omits an id, then retry and remove use the server-authorit
   globalThis.fetch = (async (input, init) => {
     const url = typeof input === "string" ? input : input.url;
     const method = init?.method ?? "GET";
+    if (url === "/api/plugins/connections") {
+      return confirmedConnectionsResponse();
+    }
     const form = init?.body instanceof FormData ? init.body : null;
     calls.push({ url, method, mediaId: form?.get("mediaId") ?? null });
     if (method === "POST") {
@@ -1442,7 +1471,10 @@ for (const [label, uploadResult] of [
     queryClient.setQueryData(typefullyKeys.draft(draftId), {
       draft: authoritativeDraft(),
     });
-    globalThis.fetch = (async (_input, init) => {
+    globalThis.fetch = (async (input, init) => {
+      if (String(input) === "/api/plugins/connections") {
+        return confirmedConnectionsResponse();
+      }
       if ((init?.method ?? "GET") === "POST") return uploadResult();
       return new Response(JSON.stringify({ draft: authoritativeDraft() }), {
         headers: { "content-type": "application/json" },
@@ -1570,6 +1602,9 @@ test("production review control prepares a proposal without publishing", async (
   globalThis.fetch = (async (input, init) => {
     const url = typeof input === "string" ? input : input.url;
     const method = init?.method ?? "GET";
+    if (url === "/api/plugins/connections") {
+      return confirmedConnectionsResponse();
+    }
     calls.push({
       url,
       method,

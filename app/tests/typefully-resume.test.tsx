@@ -57,12 +57,18 @@ const typefullyConnection = {
 };
 
 beforeAll(() => GlobalRegistrator.register());
-afterEach(() => {
-  cleanup();
+afterEach(async () => {
+  await act(async () => {
+    cleanup();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  });
   mock.restore();
   globalThis.fetch = originalFetch;
 });
-afterAll(() => GlobalRegistrator.unregister());
+afterAll(async () => {
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  GlobalRegistrator.unregister();
+});
 
 test("refetches connection and authoritative draft before resuming exactly once", async () => {
   const calls: string[] = [];
@@ -384,18 +390,23 @@ test("disconnecting an active canvas clears remote authority but preserves the l
     connections: [typefullyConnection],
     redirectUri: null,
   });
+  let disconnected = false;
   globalThis.fetch = (async (input, init) => {
     if (
       String(input) === "/api/plugins/connections/typefully" &&
       init?.method === "DELETE"
     ) {
+      disconnected = true;
       return new Response(JSON.stringify({ disconnected: true }), {
         headers: { "content-type": "application/json" },
       });
     }
     if (String(input) === "/api/plugins/connections") {
       return new Response(
-        JSON.stringify({ connections: [], redirectUri: null }),
+        JSON.stringify({
+          connections: disconnected ? [] : [typefullyConnection],
+          redirectUri: null,
+        }),
         { headers: { "content-type": "application/json" } },
       );
     }
@@ -407,8 +418,10 @@ test("disconnecting an active canvas clears remote authority but preserves the l
       <ConnectTypefully connection={typefullyConnection} />
     </QueryClientProvider>,
   );
-  expect(view.getByTestId("publish-readiness").textContent).toContain(
-    "Ready for approval",
+  await waitFor(() =>
+    expect(view.getByTestId("publish-readiness").textContent).toContain(
+      "Ready for approval",
+    ),
   );
 
   await userEvent
@@ -611,6 +624,137 @@ test("an authoritative connected result restores confirmed remote readiness", as
       .getByRole("button", { name: "Review & publish" })
       .hasAttribute("disabled"),
   ).toBeFalse();
+});
+
+test("cached connected data stays fail-closed until the mount refetch settles", async () => {
+  const { DraftCanvas } = await import(
+    "../src/components/typefully/draft-canvas"
+  );
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
+    },
+  });
+  queryClient.setQueryData(typefullyKeys.draft(draftId), {
+    draft: syncedDraft(),
+  });
+  queryClient.setQueryData(pluginKeys.connections(), {
+    connections: [typefullyConnection],
+    redirectUri: null,
+  });
+  let finishConnectionCheck!: (response: Response) => void;
+  let connectionChecks = 0;
+  globalThis.fetch = (async (input) => {
+    if (String(input) === "/api/plugins/connections") {
+      connectionChecks += 1;
+      return await new Promise<Response>((resolve) => {
+        finishConnectionCheck = resolve;
+      });
+    }
+    throw new Error(`Unexpected request: ${String(input)}`);
+  }) as typeof fetch;
+  const view = render(
+    <QueryClientProvider client={queryClient}>
+      <DraftCanvas draftId={draftId} />
+    </QueryClientProvider>,
+  );
+
+  await waitFor(() => expect(connectionChecks).toBe(1));
+  expect(view.getByTestId("canvas-status").textContent).toContain(
+    "Saved in OpenBot",
+  );
+  expect(
+    view
+      .getByRole("button", { name: "Review & publish" })
+      .hasAttribute("disabled"),
+  ).toBeTrue();
+  expect(queryClient.getQueryData(typefullyKeys.draft(draftId))).toMatchObject({
+    draft: { syncStatus: "synced", remoteDraftId: "remote-draft" },
+  });
+
+  await act(async () => {
+    finishConnectionCheck(
+      new Response(JSON.stringify({ connections: [], redirectUri: null }), {
+        headers: { "content-type": "application/json" },
+      }),
+    );
+  });
+  await waitFor(() =>
+    expect(view.getByTestId("canvas-status").textContent).toContain(
+      "Saved in OpenBot",
+    ),
+  );
+  expect(queryClient.getQueryData(typefullyKeys.draft(draftId))).toMatchObject({
+    draft: { syncStatus: "local", remoteDraftId: null },
+  });
+  view.unmount();
+  queryClient.clear();
+});
+
+test("cached connected data restores remote readiness after a connected refetch", async () => {
+  const { DraftCanvas } = await import(
+    "../src/components/typefully/draft-canvas"
+  );
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
+    },
+  });
+  queryClient.setQueryData(typefullyKeys.draft(draftId), {
+    draft: syncedDraft(),
+  });
+  queryClient.setQueryData(pluginKeys.connections(), {
+    connections: [typefullyConnection],
+    redirectUri: null,
+  });
+  let finishConnectionCheck!: (response: Response) => void;
+  globalThis.fetch = (async (input) => {
+    if (String(input) === "/api/plugins/connections") {
+      return await new Promise<Response>((resolve) => {
+        finishConnectionCheck = resolve;
+      });
+    }
+    throw new Error(`Unexpected request: ${String(input)}`);
+  }) as typeof fetch;
+  const view = render(
+    <QueryClientProvider client={queryClient}>
+      <DraftCanvas draftId={draftId} />
+    </QueryClientProvider>,
+  );
+
+  await waitFor(() => expect(finishConnectionCheck).toBeTypeOf("function"));
+  expect(view.getByTestId("canvas-status").textContent).toContain(
+    "Saved in OpenBot",
+  );
+  expect(
+    view
+      .getByRole("button", { name: "Review & publish" })
+      .hasAttribute("disabled"),
+  ).toBeTrue();
+
+  await act(async () => {
+    finishConnectionCheck(
+      new Response(
+        JSON.stringify({
+          connections: [typefullyConnection],
+          redirectUri: null,
+        }),
+        { headers: { "content-type": "application/json" } },
+      ),
+    );
+  });
+  await waitFor(() =>
+    expect(view.getByTestId("canvas-status").textContent).toContain(
+      "Saved to Typefully",
+    ),
+  );
+  expect(
+    view
+      .getByRole("button", { name: "Review & publish" })
+      .hasAttribute("disabled"),
+  ).toBeFalse();
+  view.unmount();
+  queryClient.clear();
 });
 
 test("unmounting the inline canvas aborts authority revalidation before sync", async () => {

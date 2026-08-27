@@ -11,8 +11,8 @@ import {
 } from "@/lib/typefully/mutations";
 import { nextMediaOrder } from "@/lib/typefully/preview";
 import {
-  asLocalTypefullyDraft,
   type AuthoritativeDraft,
+  asLocalTypefullyDraft,
   type CanonicalDraftDocument,
   draftQueryOptions,
   type ProposalSummary,
@@ -63,14 +63,22 @@ export function DraftCanvas({
   onDraftCreated?: (draftId: string) => void;
 }) {
   const draft = useQuery(draftQueryOptions(draftId));
-  const connections = useQuery(connectionsQueryOptions());
+  const connections = useQuery({
+    ...connectionsQueryOptions(),
+    refetchOnMount: "always",
+  });
   const remoteConnected =
     connections.isSuccess &&
+    !connections.isFetching &&
     connections.data.connections.some(
       (connection) => connection.serverId === "typefully",
     );
   const connectionConfirmedDisconnected =
-    connections.isSuccess && !remoteConnected;
+    connections.isSuccess &&
+    !connections.isFetching &&
+    !connections.data.connections.some(
+      (connection) => connection.serverId === "typefully",
+    );
 
   if (draft.isPending) {
     return (

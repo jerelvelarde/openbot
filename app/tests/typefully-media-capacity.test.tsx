@@ -40,13 +40,35 @@ function confirmTypefully(queryClient: QueryClient) {
   });
 }
 
+function confirmedConnectionsResponse() {
+  return new Response(
+    JSON.stringify({
+      connections: [
+        {
+          serverId: "typefully",
+          authMethod: "api_key",
+          scope: null,
+          accountLabel: "Route account",
+          connectedAt: "2026-08-27T08:00:00.000Z",
+        },
+      ],
+      redirectUri: null,
+    }),
+    { headers: { "content-type": "application/json" } },
+  );
+}
+
 beforeAll(() => GlobalRegistrator.register());
-afterEach(() => {
-  cleanup();
+afterEach(async () => {
+  await act(async () => {
+    cleanup();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  });
   renderedShell = undefined;
   globalThis.fetch = originalFetch;
 });
-afterAll(() => {
+afterAll(async () => {
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
   mock.restore();
   GlobalRegistrator.unregister();
 });
@@ -89,10 +111,15 @@ test("a stale upload callback refuses exhausted order capacity without mutation"
   confirmTypefully(queryClient);
   const cached = { draft: authoritative };
   queryClient.setQueryData(typefullyKeys.draft(draftId), cached);
-  const fetchRequest = mock(() =>
+  const uploadRequest = mock(() =>
     Promise.reject(new Error("capacity guard must not make a request")),
   );
-  globalThis.fetch = fetchRequest as typeof fetch;
+  globalThis.fetch = (async (input, init) => {
+    if (String(input) === "/api/plugins/connections") {
+      return confirmedConnectionsResponse();
+    }
+    return uploadRequest(input, init);
+  }) as typeof fetch;
   const createObjectURL = mock(() => "blob:must-not-be-created");
   const originalCreateObjectURL = Object.getOwnPropertyDescriptor(
     URL,
@@ -125,7 +152,7 @@ test("a stale upload callback refuses exhausted order capacity without mutation"
       "Media capacity reached",
     );
     expect(createObjectURL).not.toHaveBeenCalled();
-    expect(fetchRequest).not.toHaveBeenCalled();
+    expect(uploadRequest).not.toHaveBeenCalled();
     expect(renderedShell?.document).toBe(beforeDocument);
     expect(renderedShell?.document?.media).toEqual(
       authoritative.document.media,
@@ -180,7 +207,10 @@ test("a gapped layout uploads at the exact next order six", async () => {
   });
   let submittedVersion: string | null = null;
   let uploadRequests = 0;
-  globalThis.fetch = (async (_input, init) => {
+  globalThis.fetch = (async (input, init) => {
+    if (String(input) === "/api/plugins/connections") {
+      return confirmedConnectionsResponse();
+    }
     if ((init?.method ?? "GET") !== "POST") {
       return new Response(JSON.stringify({ draft: authoritative }), {
         headers: { "content-type": "application/json" },
