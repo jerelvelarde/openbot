@@ -154,7 +154,17 @@ function serverIdFor(vendor: VendorIdentity | undefined): string {
 
 function boundedError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
-  return Array.from(message).slice(0, LAST_ERROR_MAX_LENGTH).join("");
+  const redacted = message
+    .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ")
+    .replace(/\bBearer\s+[^\s,;&]+/giu, "Bearer [redacted]")
+    .replace(
+      /\b(api[\s_-]?key|authorization|access[\s_-]?token|refresh[\s_-]?token|secret)(?:\s*[:=]\s*|\s+)(?:"[^"]*"|'[^']*'|[^\s,;&]+)/giu,
+      "$1=[redacted]",
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+  const safe = Array.from(redacted).slice(0, LAST_ERROR_MAX_LENGTH).join("");
+  return safe || "The remote operation failed.";
 }
 
 async function ownedDraft(
@@ -201,6 +211,49 @@ async function isBotAttached(
   return Boolean(attachment);
 }
 
+/**
+ * Keep an authorization row present until the transaction using it commits. A concurrent delete
+ * either wins before this read (and the mutation refuses) or waits for this transaction; it cannot
+ * disappear between the check and the write.
+ */
+async function lockMembership(
+  executor: AuditTransaction,
+  channelId: string,
+  actorId: string,
+): Promise<boolean> {
+  const [membership] = await executor
+    .select({ userId: channelMemberships.userId })
+    .from(channelMemberships)
+    .where(
+      and(
+        eq(channelMemberships.channelId, channelId),
+        eq(channelMemberships.userId, actorId),
+      ),
+    )
+    .limit(1)
+    .for("key share");
+  return Boolean(membership);
+}
+
+async function lockBotAttachment(
+  executor: AuditTransaction,
+  channelId: string,
+  botId: string,
+): Promise<boolean> {
+  const [attachment] = await executor
+    .select({ agentId: channelAgents.agentId })
+    .from(channelAgents)
+    .where(
+      and(
+        eq(channelAgents.channelId, channelId),
+        eq(channelAgents.agentId, botId),
+      ),
+    )
+    .limit(1)
+    .for("key share");
+  return Boolean(attachment);
+}
+
 function auditPayload(draft: TypefullyDraft) {
   return {
     ownerUserId: draft.ownerUserId,
@@ -232,22 +285,6 @@ export function createTypefullyStore(options: {
     return decision.allowed;
   }
 
-  async function requireRemoteAuthorization(
-    executor: Database | AuditTransaction,
-    draft: TypefullyDraft,
-    granted: boolean,
-  ) {
-    if (!(await isBotAttached(executor, draft.channelId, draft.botId))) {
-      throw new BotNotAttachedError();
-    }
-    if (!granted) {
-      throw new GrantRequiredError(
-        grantRef("update_draft"),
-        "This Bot no longer has the Typefully update grant.",
-      );
-    }
-  }
-
   return {
     async createDraft(input: {
       ownerUserId: string;
@@ -258,19 +295,16 @@ export function createTypefullyStore(options: {
       const canonical = canonicalizeDraft(input.document);
       const granted = await isGranted("create_draft", input.botId);
       return database.transaction(async (transaction) => {
-        const [membership] = await transaction
-          .select({ userId: channelMemberships.userId })
-          .from(channelMemberships)
-          .where(
-            and(
-              eq(channelMemberships.channelId, input.channelId),
-              eq(channelMemberships.userId, input.ownerUserId),
-            ),
-          )
-          .limit(1);
-        if (!membership) throw new DraftNotFoundError();
-
-        const attached = await isBotAttached(
+        if (
+          !(await lockMembership(
+            transaction,
+            input.channelId,
+            input.ownerUserId,
+          ))
+        ) {
+          throw new DraftNotFoundError();
+        }
+        const attached = await lockBotAttachment(
           transaction,
           input.channelId,
           input.botId,
@@ -314,6 +348,9 @@ export function createTypefullyStore(options: {
     }): Promise<TypefullyDraft> {
       const canonical = canonicalizeDraft(input.document);
       const visible = await ownedDraft(database, input.draftId, input.actorId);
+      // A grant is advisory for a local save. It is read immediately before the transaction so no
+      // database transaction spans a plugin call. A revocation after this decision is unavoidable;
+      // Task 6 preflights again before any vendor action, so it can never authorize remote work.
       const granted = await isGranted("update_draft", visible.botId);
       return database.transaction(async (transaction) => {
         const current = await ownedDraft(
@@ -321,7 +358,12 @@ export function createTypefullyStore(options: {
           input.draftId,
           input.actorId,
         );
-        const attached = await isBotAttached(
+        if (
+          !(await lockMembership(transaction, current.channelId, input.actorId))
+        ) {
+          throw new DraftNotFoundError();
+        }
+        const attached = await lockBotAttachment(
           transaction,
           current.channelId,
           current.botId,
@@ -384,21 +426,66 @@ export function createTypefullyStore(options: {
       });
     },
 
+    /**
+     * Authorize immediately before a vendor request. The remote id chooses the exact grant: the
+     * first synchronization creates and every later one updates. No transaction is held over the
+     * plugin decision or the following network request, so grants and attachments can change after
+     * this preflight. The record methods deliberately persist the already-observed vendor outcome
+     * even if that happens.
+     */
+    async authorizeRemoteOperation(input: {
+      draftId: string;
+      actorId: string;
+    }): Promise<{ draft: TypefullyDraft; ref: string }> {
+      let draft = await ownedDraft(database, input.draftId, input.actorId);
+      let operation: "create_draft" | "update_draft" = draft.remoteDraftId
+        ? "update_draft"
+        : "create_draft";
+      let ref = grantRef(operation);
+      let decision = await plugin().decide("mcp", ref, draft.botId);
+      if (!decision.allowed) {
+        throw new GrantRequiredError(ref, decision.reason);
+      }
+
+      // Re-read after the plugin decision. Membership or attachment retirement must win if it
+      // completed while authorization was being evaluated, and a concurrent first sync may have
+      // changed the required grant from create to update.
+      draft = await ownedDraft(database, input.draftId, input.actorId);
+      const currentOperation = draft.remoteDraftId
+        ? "update_draft"
+        : "create_draft";
+      if (currentOperation !== operation) {
+        operation = currentOperation;
+        ref = grantRef(operation);
+        decision = await plugin().decide("mcp", ref, draft.botId);
+        if (!decision.allowed) {
+          throw new GrantRequiredError(ref, decision.reason);
+        }
+        draft = await ownedDraft(database, input.draftId, input.actorId);
+      }
+      if (!(await isBotAttached(database, draft.channelId, draft.botId))) {
+        throw new BotNotAttachedError();
+      }
+      return { draft, ref };
+    },
+
     async recordRemoteConfirmation(input: {
       draftId: string;
       actorId: string;
       expectedVersion: number;
       remoteDraftId: string;
     }): Promise<TypefullyDraft> {
-      const visible = await ownedDraft(database, input.draftId, input.actorId);
-      const granted = await isGranted("update_draft", visible.botId);
       return database.transaction(async (transaction) => {
         const current = await ownedDraft(
           transaction,
           input.draftId,
           input.actorId,
         );
-        await requireRemoteAuthorization(transaction, current, granted);
+        if (
+          !(await lockMembership(transaction, current.channelId, input.actorId))
+        ) {
+          throw new DraftNotFoundError();
+        }
         const [row] = await transaction
           .update(typefullyDrafts)
           .set({
@@ -443,15 +530,17 @@ export function createTypefullyStore(options: {
       expectedVersion: number;
       error: unknown;
     }): Promise<TypefullyDraft> {
-      const visible = await ownedDraft(database, input.draftId, input.actorId);
-      const granted = await isGranted("update_draft", visible.botId);
       return database.transaction(async (transaction) => {
         const current = await ownedDraft(
           transaction,
           input.draftId,
           input.actorId,
         );
-        await requireRemoteAuthorization(transaction, current, granted);
+        if (
+          !(await lockMembership(transaction, current.channelId, input.actorId))
+        ) {
+          throw new DraftNotFoundError();
+        }
         const [row] = await transaction
           .update(typefullyDrafts)
           .set({
