@@ -12,18 +12,33 @@ import {
   runWithSlackExecution,
   type SlackExecution,
 } from "./execution-context";
+import type {
+  LinkedSlackIngress,
+  SlackIngressRegistry,
+} from "./ingress-registry";
 
 type ApprovalDependencies = {
   store: ApprovalDecisionStore;
   authorize(input: {
     userId: string;
     presentation: ApprovalPresentation;
+    liveIdentity: LinkedSlackIngress | null;
   }): Promise<boolean | SlackApprovalAuthorization>;
   now(): number;
   retentionMs: number;
 };
 
 let approvalDependencies: ApprovalDependencies | undefined;
+let approvalInteractionBridge:
+  | Pick<SlackIngressRegistry, "takeInteraction">
+  | undefined;
+
+/** Connect the channel's live identifyUser handoff to durable approval actions. */
+export function configureApprovalInteractionBridge(
+  bridge: Pick<SlackIngressRegistry, "takeInteraction">,
+): void {
+  approvalInteractionBridge = bridge;
+}
 
 /** Wire the durable decision store before registering ApprovalCard with a Channel runtime. */
 export function configureApprovalDecisionStore(
@@ -58,6 +73,8 @@ async function claimAndResume(
   value: unknown,
   actionId: string,
   userId: string | null,
+  providerActorId: string | null,
+  platform: string,
   conversationKey: string | null,
   initialExecution: SlackExecution | null,
   resume: (decision: { approved: boolean }) => Promise<unknown>,
@@ -66,7 +83,7 @@ async function claimAndResume(
   if (!dependencies) {
     throw new Error("ApprovalCard requires a durable approval decision store.");
   }
-  if (!userId || !conversationKey) {
+  if (!userId || !providerActorId || platform !== "slack" || !conversationKey) {
     throw new Error("This approval interaction could not be authorized.");
   }
   const decision = approvalAction.parse(value);
@@ -74,7 +91,17 @@ async function claimAndResume(
   if (!presentation || presentation.conversationKey !== conversationKey) {
     throw new Error("This approval interaction could not be authorized.");
   }
-  const authorization = await dependencies.authorize({ userId, presentation });
+  const liveIdentity =
+    approvalInteractionBridge?.takeInteraction({
+      provider: "slack",
+      providerActorId,
+      applicationUserId: userId,
+    }) ?? null;
+  const authorization = await dependencies.authorize({
+    userId,
+    presentation,
+    liveIdentity,
+  });
   if (!authorization) {
     throw new Error("This approval interaction could not be authorized.");
   }
@@ -169,11 +196,13 @@ export const ApprovalCard = defineChannelComponent({
         <Actions>
           <Button
             key="approval-approve"
-            onClick={async ({ action, thread, user }) => {
+            onClick={async ({ action, thread, user, actor, platform }) => {
               await claimAndResume(
                 action.value,
                 action.id,
                 user?.id ?? null,
+                actor?.kind === "human" ? actor.id : null,
+                platform ?? "",
                 threadConversationKey(thread),
                 execution,
                 (decision) => thread.resume(decision),
@@ -193,11 +222,13 @@ export const ApprovalCard = defineChannelComponent({
           </Button>
           <Button
             key="approval-reject"
-            onClick={async ({ action, thread, user }) => {
+            onClick={async ({ action, thread, user, actor, platform }) => {
               await claimAndResume(
                 action.value,
                 action.id,
                 user?.id ?? null,
+                actor?.kind === "human" ? actor.id : null,
+                platform ?? "",
                 threadConversationKey(thread),
                 execution,
                 (decision) => thread.resume(decision),

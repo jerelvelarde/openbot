@@ -39,11 +39,8 @@ function context(eventId = "Ev1"): ChannelIdentityContext {
 function selector(overrides: Record<string, string | null> = {}) {
   return {
     provider: "slack",
-    providerTenantId: "T1",
-    providerConversationId: "C1",
     providerActorId: "U1",
     applicationUserId: null,
-    conversationKey: "slack:T1:C1:root-1",
     ...overrides,
   };
 }
@@ -174,10 +171,105 @@ describe("managed Slack ingress registry", () => {
         "Ev1",
         selector({
           providerActorId: "U2",
-          providerConversationId: "C2",
-          conversationKey: "slack:T1:C2:root-2",
         }),
       ),
     ).toBe(second);
+  });
+
+  test("same event and linked principal across conversations is ambiguous in either delivery order", () => {
+    const linked = (conversationId: string) => ({
+      identityContext: {
+        ...context(),
+        conversation: { id: conversationId },
+      },
+      identityResult: {
+        kind: "linked" as const,
+        user: { id: "u1", name: "User One" },
+        actor: { id: "u1", role: "user" as const },
+        identity: {
+          provider: "slack" as const,
+          providerTenantId: "T1",
+          providerUserId: "U1",
+          providerEmail: null,
+        },
+      },
+    });
+    const linkedSelector = selector({ applicationUserId: "u1" });
+
+    for (const order of [
+      [linked("C1"), linked("C2")],
+      [linked("C2"), linked("C1")],
+    ]) {
+      const registry = new SlackIngressRegistry(clock());
+      registry.remember("Ev-shared", order[0]!);
+      registry.remember("Ev-shared", order[1]!);
+
+      expect(registry.take("Ev-shared", linkedSelector)).toBeNull();
+    }
+  });
+
+  test("same event and linked principal cannot overwrite a different provider thread", () => {
+    const registry = new SlackIngressRegistry(clock());
+    const linked = (providerThreadId: string) => ({
+      identityContext: {
+        ...context(),
+        event: { id: "Ev-shared", threadId: providerThreadId },
+      },
+      identityResult: {
+        kind: "linked" as const,
+        user: { id: "u1", name: "User One" },
+        actor: { id: "u1", role: "user" as const },
+        identity: {
+          provider: "slack" as const,
+          providerTenantId: "T1",
+          providerUserId: "U1",
+          providerEmail: null,
+        },
+      },
+    });
+    registry.remember("Ev-shared", linked("provider-thread-1"));
+    registry.remember("Ev-shared", linked("provider-thread-2"));
+
+    expect(
+      registry.take("Ev-shared", selector({ applicationUserId: "u1" })),
+    ).toBeNull();
+  });
+
+  test("consumes a live linked interaction principal once and burns ambiguity", () => {
+    const registry = new SlackIngressRegistry(clock());
+    const linked = (actorId: string, conversationId: string) => ({
+      identityContext: {
+        ...context(),
+        actor: { id: actorId, kind: "human" as const },
+        conversation: { id: conversationId },
+        trigger: "interaction",
+      },
+      identityResult: {
+        kind: "linked" as const,
+        user: { id: "u1", name: "User One" },
+        actor: { id: "u1", role: "user" as const },
+        identity: {
+          provider: "slack" as const,
+          providerTenantId: "T1",
+          providerUserId: actorId,
+          providerEmail: null,
+        },
+      },
+    });
+    const first = linked("U1", "C1");
+    registry.remember("interaction-1", first);
+    const interactionSelector = {
+      provider: "slack" as const,
+      providerActorId: "U1",
+      applicationUserId: "u1",
+    };
+
+    expect(registry.takeInteraction(interactionSelector)).toBe(first);
+    expect(registry.takeInteraction(interactionSelector)).toBeNull();
+
+    registry.remember("interaction-2", linked("U1", "C1"));
+    registry.remember("interaction-3", linked("U1", "C2"));
+    expect(registry.takeInteraction(interactionSelector)).toBeNull();
+    expect(registry.takeInteraction(interactionSelector)).toBeNull();
   });
 });

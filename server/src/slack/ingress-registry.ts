@@ -10,11 +10,13 @@ export type SlackIngress = {
 
 export type SlackIngressSelector = {
   provider: "slack";
-  providerTenantId: string;
-  providerConversationId: string;
   providerActorId: string;
   applicationUserId: string | null;
-  conversationKey: string;
+};
+
+export type SlackInteractionSelector = SlackIngressSelector;
+export type LinkedSlackIngress = SlackIngress & {
+  identityResult: Extract<SlackIdentityResult, { kind: "linked" }>;
 };
 
 export type SlackIngressTimer = {
@@ -24,9 +26,22 @@ export type SlackIngressTimer = {
 const INGRESS_TTL_MS = 30_000;
 const EVENT_ID_ERROR = "Managed Slack ingress requires an event id.";
 
+export function providerThreadIdFromIdentity(
+  context: ChannelIdentityContext,
+): string {
+  const eventThreadId = context.event.threadId;
+  return typeof eventThreadId === "string" && eventThreadId.trim()
+    ? eventThreadId
+    : context.conversation.id;
+}
+
 type RememberedIngress = {
   ingress: SlackIngress;
   timer: Timer;
+};
+
+type RememberedLinkedInteraction = RememberedIngress & {
+  ingress: LinkedSlackIngress;
 };
 
 const systemTimer: SlackIngressTimer = {
@@ -82,6 +97,31 @@ export class SlackIngressRegistry {
     return remembered.ingress;
   }
 
+  /** Consume the one live interaction principal that Channels resolved immediately before click dispatch. */
+  takeInteraction(
+    selector: SlackInteractionSelector,
+  ): LinkedSlackIngress | null {
+    const matches = [...this.entries.entries()].flatMap(([id, entries]) =>
+      entries
+        .filter(isLinkedInteraction)
+        .filter(({ ingress }) => matchesSelector(ingress, selector))
+        .map((remembered) => ({ id, remembered })),
+    );
+    // Ambiguity is itself untrusted. Burn every candidate so none can be replayed after expiry or
+    // after another overlapping interaction disappears.
+    if (matches.length !== 1) {
+      for (const { id, remembered } of matches) {
+        this.remove(id, remembered);
+        remembered.timer.cancel();
+      }
+      return null;
+    }
+    const [{ id, remembered }] = matches;
+    this.remove(id, remembered);
+    remembered.timer.cancel();
+    return remembered.ingress;
+  }
+
   private remove(id: string, remembered: RememberedIngress): void {
     const remaining = (this.entries.get(id) ?? []).filter(
       (entry) => entry !== remembered,
@@ -89,6 +129,15 @@ export class SlackIngressRegistry {
     if (remaining.length > 0) this.entries.set(id, remaining);
     else this.entries.delete(id);
   }
+}
+
+function isLinkedInteraction(
+  remembered: RememberedIngress,
+): remembered is RememberedLinkedInteraction {
+  return (
+    remembered.ingress.identityContext.trigger === "interaction" &&
+    remembered.ingress.identityResult.kind === "linked"
+  );
 }
 
 function applicationUserId(ingress: SlackIngress): string | null {
@@ -101,8 +150,12 @@ function samePrincipal(left: SlackIngress, right: SlackIngress): boolean {
   return (
     left.identityContext.provider === right.identityContext.provider &&
     left.identityContext.tenant.id === right.identityContext.tenant.id &&
+    left.identityContext.installation.id ===
+      right.identityContext.installation.id &&
     left.identityContext.conversation.id ===
       right.identityContext.conversation.id &&
+    providerThreadIdFromIdentity(left.identityContext) ===
+      providerThreadIdFromIdentity(right.identityContext) &&
     left.identityContext.actor.id === right.identityContext.actor.id &&
     applicationUserId(left) === applicationUserId(right)
   );
@@ -113,14 +166,9 @@ function matchesSelector(
   selector: SlackIngressSelector,
 ): boolean {
   const context = ingress.identityContext;
-  const expectedPrefix = `${selector.provider}:${selector.providerTenantId}:${selector.providerConversationId}:`;
   return (
     context.provider === selector.provider &&
-    context.tenant.id === selector.providerTenantId &&
-    context.conversation.id === selector.providerConversationId &&
     context.actor.id === selector.providerActorId &&
-    applicationUserId(ingress) === selector.applicationUserId &&
-    selector.conversationKey.startsWith(expectedPrefix) &&
-    selector.conversationKey.length > expectedPrefix.length
+    applicationUserId(ingress) === selector.applicationUserId
   );
 }

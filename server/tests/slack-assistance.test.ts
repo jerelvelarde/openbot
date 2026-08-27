@@ -319,6 +319,8 @@ test("approval buttons resume the originating thread with a boolean decision", a
         resume: async (decision: unknown) => void decisions.push(decision),
       },
       user: { id: "user-1", name: "User" },
+      actor: { kind: "human", id: "U1" },
+      platform: "slack",
     });
   }
 
@@ -483,6 +485,8 @@ test("approval authorization fails closed and the same winner can retry a pre-re
       action: { id: `action-${index}`, value: node.props.value },
       thread: { conversationKey: "conversation-1", resume },
       user: userId ? { id: userId, name: userId } : null,
+      actor: { kind: "human", id: "U1" },
+      platform: "slack",
     });
   };
 
