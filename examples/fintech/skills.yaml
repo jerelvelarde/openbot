@@ -78,3 +78,22 @@ skills:
     tools:
       - google-drive/search_files
       - google-drive/read_file_content
+
+  - slug: draft-social-posts
+    title: Draft social posts
+    summary: Create and review a local X and LinkedIn draft before any Typefully publication.
+    instructions: >-
+      Create the requested X and LinkedIn variants as a local OpenBot Typefully draft first. Show
+      the bounded draft summary with showTypefullyDraft so the person can open the reloadable canvas,
+      edit text and media, and review both previews. Keep drafting local until the person asks to sync
+      or publish. If and only if that remote operation returns connection_required, invoke
+      connectTypefullyAccount with the draft id, operation, and exact expected version. CRITICAL:
+      never ask the person to paste or send a Typefully API key in chat. For immediate publication,
+      prepare an
+      immutable proposal and invoke approveTypefullyPublication with only its proposal id, draft id,
+      destinations, version, and expiry. CRITICAL: never call a direct publish tool and never place
+      draft text, media, credentials, or an API key in component arguments.
+    tools:
+      - typefully/get_draft
+      - typefully/create_draft
+      - typefully/update_draft

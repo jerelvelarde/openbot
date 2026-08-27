@@ -11,6 +11,7 @@ test("includes the complete fintech deployment package example", () => {
     "channels.yaml",
     "model.yaml",
     "knowledge.yaml",
+    "skills.yaml",
   ]) {
     expect(existsSync(join(fintechDirectory, fileName))).toBe(true);
   }
