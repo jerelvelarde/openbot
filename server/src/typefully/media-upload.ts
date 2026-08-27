@@ -1,6 +1,7 @@
 import { lookup } from "node:dns/promises";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
+import { Address4, Address6 } from "ip-address";
 
 export type ResolvedAddress = { address: string; family: 4 | 6 };
 export type MediaUploadDependencies = {
@@ -13,28 +14,77 @@ export type MediaUploadDependencies = {
   }) => Promise<number>;
 };
 
+type IpRange = readonly [base: bigint, prefix: number];
+
+function inRange(value: bigint, [base, prefix]: IpRange, bits: number) {
+  const shift = BigInt(bits - prefix);
+  return value >> shift === base >> shift;
+}
+
+const NON_GLOBAL_V4: IpRange[] = [
+  [0x00000000n, 8],
+  [0x0a000000n, 8],
+  [0x64400000n, 10],
+  [0x7f000000n, 8],
+  [0xa9fe0000n, 16],
+  [0xac100000n, 12],
+  [0xc0000000n, 24],
+  [0xc0000200n, 24],
+  [0xc0586300n, 24],
+  [0xc0a80000n, 16],
+  [0xc6120000n, 15],
+  [0xc6336400n, 24],
+  [0xcb007100n, 24],
+  [0xe0000000n, 4],
+  [0xf0000000n, 4],
+];
+
+function publicIpv4(value: bigint): boolean {
+  return !NON_GLOBAL_V4.some((range) => inRange(value, range, 32));
+}
+
+const NON_GLOBAL_V6: IpRange[] = [
+  [0n, 128],
+  [1n, 128],
+  [new Address6("64:ff9b:1::").bigInt(), 48], // local-use NAT64
+  [new Address6("100::").bigInt(), 64], // discard-only
+  [new Address6("2001::").bigInt(), 23], // reserved/transition/documentation
+  [new Address6("2001:db8::").bigInt(), 32], // documentation
+  [new Address6("3fff::").bigInt(), 20], // documentation
+  [new Address6("5f00::").bigInt(), 16], // segment-routing experiments
+  [new Address6("fc00::").bigInt(), 7],
+  [new Address6("fe80::").bigInt(), 10],
+  [new Address6("fec0::").bigInt(), 10],
+  [new Address6("ff00::").bigInt(), 8],
+];
+
 function publicAddress(address: string): boolean {
   if (isIP(address) === 4) {
-    const [a, b] = address.split(".").map(Number);
-    return !(
-      a === 0 ||
-      a === 10 ||
-      a === 127 ||
-      (a === 169 && b === 254) ||
-      (a === 172 && b >= 16 && b <= 31) ||
-      (a === 192 && b === 168) ||
-      a >= 224
-    );
+    return publicIpv4(new Address4(address).bigInt());
   }
-  const value = address.toLowerCase();
-  if (value.startsWith("::ffff:")) return publicAddress(value.slice(7));
-  return !(
-    value === "::" ||
-    value === "::1" ||
-    value.startsWith("fc") ||
-    value.startsWith("fd") ||
-    /^fe[89ab]/.test(value)
-  );
+  if (isIP(address) !== 6) return false;
+  const value = new Address6(address).bigInt();
+  if (NON_GLOBAL_V6.some((range) => inRange(value, range, 128))) return false;
+
+  const high96 = value >> 32n;
+  const embeddedV4 = value & 0xffffffffn;
+  // IPv4-compatible, IPv4-mapped, and well-known NAT64 addresses inherit the embedded address's
+  // classification. The local-use NAT64 prefix is rejected wholesale above.
+  if (
+    high96 === 0n ||
+    high96 === 0xffffn ||
+    high96 === 0x0064ff9b0000000000000000n
+  ) {
+    return publicIpv4(embeddedV4);
+  }
+  // 6to4 and ISATAP can route to their embedded IPv4 destination.
+  if (value >> 112n === 0x2002n) {
+    return publicIpv4((value >> 80n) & 0xffffffffn);
+  }
+  if (((value >> 32n) & 0xffffffffn) === 0x00005efen) {
+    return publicIpv4(embeddedV4);
+  }
+  return true;
 }
 
 async function defaultPut(input: {

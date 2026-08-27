@@ -12,7 +12,11 @@ import {
   typefullyDrafts,
   typefullyPublicationProposals,
 } from "../db/schema";
-import type { PluginDecision, PluginKind } from "../plugins/store";
+import type {
+  PluginCallResult,
+  PluginDecision,
+  PluginKind,
+} from "../plugins/store";
 import { typefullyBotContracts } from "../plugins/typefully-contracts";
 import {
   type CanonicalDraftDocument,
@@ -42,7 +46,7 @@ type AuthorizationSurface = {
     args: Record<string, unknown>;
     botId: string;
     actorId: string;
-  }): Promise<{ text: string; isError: boolean }>;
+  }): Promise<PluginCallResult>;
 };
 
 type VendorIdentity =
@@ -312,6 +316,18 @@ function validRemoteDraftId(value: unknown): string {
     BigInt(value) > MAX_TYPEFULLY_DRAFT_ID
   ) {
     throw new InvalidRemoteDraftIdError();
+  }
+  return value;
+}
+
+function validRemoteMediaId(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    Array.from(value).length > 240 ||
+    /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value)
+  ) {
+    throw new Error("Typefully returned an invalid media id.");
   }
   return value;
 }
@@ -965,7 +981,7 @@ export function createTypefullyStore(options: {
       attemptId?: string;
     }): Promise<{
       draft: TypefullyDraft;
-      result: { text: string; isError: boolean };
+      result: PluginCallResult;
     }> {
       let authorized: { draft: TypefullyDraft; ref: string } | null = null;
       let claim:
@@ -1020,7 +1036,7 @@ export function createTypefullyStore(options: {
       authorized.draft = claim.draft;
       const attemptId = claim.attemptId;
       const dispatchVendor = plugin().dispatchVendor;
-      let result: { text: string; isError: boolean };
+      let result: PluginCallResult;
       try {
         if (!dispatchVendor) {
           throw new Error("Typefully remote calls are unavailable.");
@@ -1076,6 +1092,17 @@ export function createTypefullyStore(options: {
         };
       }
       if (result.isError) {
+        if (
+          result.sideEffectOutcome === "uncertain" &&
+          authorized.draft.remoteDraftId === null
+        ) {
+          return await markCreateOutcomeUncertain(
+            input.draftId,
+            input.actorId,
+            attemptId,
+            result.text,
+          );
+        }
         const draft = await store.recordRemoteFailure({
           draftId: input.draftId,
           actorId: input.actorId,
@@ -1145,7 +1172,7 @@ export function createTypefullyStore(options: {
       toolName: "upload_media" | "remove_media";
       args: Record<string, unknown>;
       attemptId?: string;
-    }): Promise<{ draft: TypefullyDraft; text: string; isError: boolean }> {
+    }): Promise<{ draft: TypefullyDraft } & PluginCallResult> {
       const draft = await store.authorizeTool({
         draftId: input.draftId,
         actorId: input.actorId,
@@ -1308,6 +1335,70 @@ export function createTypefullyStore(options: {
             eq(typefullyDrafts.ownerUserId, input.actorId),
             eq(typefullyDrafts.attemptId, input.attemptId),
             eq(typefullyDrafts.attemptKind, "upload_media"),
+          ),
+        )
+        .returning(draftSelection);
+      if (!row) throw new StaleRemoteAttemptError();
+      return asDraft(row);
+    },
+
+    async renewMediaAttempt(input: {
+      draftId: string;
+      actorId: string;
+      attemptId: string;
+    }): Promise<{ draft: TypefullyDraft; renewAfterMs: number }> {
+      const instant = now();
+      const [row] = await database
+        .update(typefullyDrafts)
+        .set({
+          attemptLeaseExpiresAt: new Date(
+            instant.getTime() + Math.max(1, attemptLeaseMs),
+          ),
+          updatedAt: instant,
+        })
+        .where(
+          and(
+            eq(typefullyDrafts.id, input.draftId),
+            eq(typefullyDrafts.ownerUserId, input.actorId),
+            eq(typefullyDrafts.attemptId, input.attemptId),
+            eq(typefullyDrafts.attemptState, "in_flight"),
+            or(
+              eq(typefullyDrafts.attemptKind, "upload_media"),
+              eq(typefullyDrafts.attemptKind, "remove_media"),
+            ),
+          ),
+        )
+        .returning(draftSelection);
+      if (!row) throw new StaleRemoteAttemptError();
+      return {
+        draft: asDraft(row),
+        renewAfterMs: Math.max(1, Math.floor(attemptLeaseMs / 3)),
+      };
+    },
+
+    async recordMediaInitiation(input: {
+      draftId: string;
+      actorId: string;
+      attemptId: string;
+      remoteMediaId: string;
+    }): Promise<TypefullyDraft> {
+      const instant = now();
+      const [row] = await database
+        .update(typefullyDrafts)
+        .set({
+          attemptRemoteDraftId: validRemoteMediaId(input.remoteMediaId),
+          attemptLeaseExpiresAt: new Date(
+            instant.getTime() + Math.max(1, attemptLeaseMs),
+          ),
+          updatedAt: instant,
+        })
+        .where(
+          and(
+            eq(typefullyDrafts.id, input.draftId),
+            eq(typefullyDrafts.ownerUserId, input.actorId),
+            eq(typefullyDrafts.attemptId, input.attemptId),
+            eq(typefullyDrafts.attemptKind, "upload_media"),
+            eq(typefullyDrafts.attemptState, "in_flight"),
           ),
         )
         .returning(draftSelection);

@@ -38,7 +38,14 @@ const calls: { ref: string; args: Record<string, unknown> }[] = [];
 let nextRemoteId = "501";
 let failure: { text: string } | null = null;
 let thrownFailure: Error | null = null;
-const queuedResults: { text: string; isError: boolean }[] = [];
+const queuedResults: Array<
+  | {
+      text: string;
+      isError: boolean;
+      sideEffectOutcome?: "definitely_not_applied" | "uncertain";
+    }
+  | Error
+> = [];
 const deniedRefs = new Set<string>();
 let vendorGate: { entered: () => void; wait: Promise<void> } | null = null;
 
@@ -57,6 +64,7 @@ const plugin = {
       await vendorGate.wait;
     }
     const queued = queuedResults.shift();
+    if (queued instanceof Error) throw queued;
     if (queued) return queued;
     if (thrownFailure) throw thrownFailure;
     if (failure) return { text: failure.text, isError: true };
@@ -86,7 +94,7 @@ app.route(
   "/api/typefully",
   createTypefullyRoutes(store, requireUser, {
     mediaUpload: {
-      resolve: async () => [{ address: "203.0.113.10", family: 4 }],
+      resolve: async () => [{ address: "8.8.8.8", family: 4 }],
       put: async ({ url, address, bytes }) => {
         byteUploads.push({
           url: url.toString(),
@@ -289,11 +297,14 @@ describe("Typefully synchronization", () => {
 
   test("an ambiguous create transport failure cannot be blindly retried", async () => {
     const id = await createDraft();
-    thrownFailure = new Error("socket closed before Typefully answered");
+    queuedResults.push({
+      text: "Typefully could not be reached.",
+      isError: true,
+      sideEffectOutcome: "uncertain",
+    });
     const response = await app.request(`/api/typefully/drafts/${id}/sync`, {
       method: "POST",
     });
-    thrownFailure = null;
     expect(response.status).toBe(409);
     expect(await response.json()).toMatchObject({
       code: "reconciliation_required",
@@ -304,13 +315,14 @@ describe("Typefully synchronization", () => {
   test("reconciles one uncertain create without a second POST and updates that attached id thereafter", async () => {
     const id = await createDraft();
     const before = calls.length;
-    thrownFailure = new Error(
-      "socket closed after Typefully accepted the create",
-    );
+    queuedResults.push({
+      text: "Typefully could not be reached.",
+      isError: true,
+      sideEffectOutcome: "uncertain",
+    });
     const uncertain = await app.request(`/api/typefully/drafts/${id}/sync`, {
       method: "POST",
     });
-    thrownFailure = null;
     expect(uncertain.status).toBe(409);
     expect(calls.length).toBe(before + 1);
 
@@ -480,6 +492,64 @@ describe("Typefully synchronization", () => {
     expect(blocked.status).toBe(409);
     expect(byteUploads).toHaveLength(1);
     uploadStatus = 200;
+  });
+
+  test("quarantines ambiguous and malformed media initiation without a second allocation", async () => {
+    for (const result of [
+      {
+        text: "Typefully could not be reached.",
+        isError: true,
+        sideEffectOutcome: "uncertain" as const,
+      },
+      { text: '{"unexpected":true}', isError: false },
+    ]) {
+      const id = await createDraft();
+      queuedResults.push(result);
+      byteUploads.length = 0;
+      const before = calls.filter(
+        (call) => call.ref === "typefully/upload_media",
+      ).length;
+      const form = new FormData();
+      form.set("expectedVersion", "1");
+      form.set("kind", "image");
+      form.set("altText", "Uncertain allocation");
+      form.set(
+        "file",
+        new File(["image"], "uncertain.png", { type: "image/png" }),
+      );
+      const first = await app.request(`/api/typefully/drafts/${id}/media`, {
+        method: "POST",
+        body: form,
+      });
+      expect(first.status).toBe(409);
+      const body = await first.json();
+      expect(body).toMatchObject({
+        code: "reconciliation_required",
+        draft: { version: 2, syncStatus: "remote_error" },
+      });
+      const quarantined = await store.readDraft(id, ownerId);
+      const mediaId = quarantined.document.media[0]?.id;
+      expect(mediaId).toBeString();
+
+      const retry = new FormData();
+      retry.set("expectedVersion", "2");
+      retry.set("mediaId", mediaId as string);
+      retry.set("kind", "image");
+      retry.set("altText", "Uncertain allocation");
+      retry.set(
+        "file",
+        new File(["image"], "uncertain.png", { type: "image/png" }),
+      );
+      const repeated = await app.request(`/api/typefully/drafts/${id}/media`, {
+        method: "POST",
+        body: retry,
+      });
+      expect(repeated.status).toBe(409);
+      expect(
+        calls.filter((call) => call.ref === "typefully/upload_media"),
+      ).toHaveLength(before + 1);
+      expect(byteUploads).toHaveLength(0);
+    }
   });
 
   test("uses upload and remove grants independently from draft update", async () => {
@@ -833,13 +903,38 @@ describe("Typefully synchronization", () => {
 
     release.resolve();
     vendorGate = null;
-    expect((await uploading).status).toBe(502);
+    const quarantined = await uploading;
+    expect(quarantined.status).toBe(409);
+    expect(await quarantined.json()).toMatchObject({
+      code: "reconciliation_required",
+    });
     const local = await store.readDraft(id, ownerId);
-    expect(local).toMatchObject({ version: 3, syncStatus: "local" });
+    expect(local).toMatchObject({
+      version: 3,
+      syncStatus: "remote_error",
+      attemptKind: "upload_media",
+      attemptState: "outcome_uncertain",
+      attemptRemoteDraftId: "remote-overlap-first",
+    });
     expect(local.document.media).toHaveLength(2);
     expect(local.document.media.every((media) => media.remoteId === null)).toBe(
       true,
     );
+    const firstMediaId = local.document.media[0]?.id;
+    expect(firstMediaId).toBeString();
+    const recovered = await app.request(
+      `/api/typefully/drafts/${id}/media/${firstMediaId}`,
+      {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ expectedVersion: local.version }),
+      },
+    );
+    expect(recovered.status).toBe(200);
+    expect(await store.readDraft(id, ownerId)).toMatchObject({
+      attemptId: null,
+      syncStatus: "synced",
+    });
   });
 
   test("releases a first-create claim after connection loss advances the local revision", async () => {
@@ -1104,7 +1199,7 @@ describe("Typefully synchronization", () => {
     expect(retry.status).toBe(200);
   });
 
-  test("a partial remote removal stays recoverable through one exact-state sync", async () => {
+  test("a partial remote removal exception releases its claim and remains recoverable", async () => {
     const id = await createDraft();
     nextRemoteId = "911";
     expect(
@@ -1134,7 +1229,7 @@ describe("Typefully synchronization", () => {
     });
     queuedResults.push(
       { text: '{"removed":true}', isError: false },
-      { text: "Second platform removal failed.", isError: true },
+      new ConnectionRequiredError("typefully", "Typefully"),
     );
     const before = calls.length;
     const removed = await app.request(
@@ -1145,12 +1240,17 @@ describe("Typefully synchronization", () => {
         body: JSON.stringify({ expectedVersion: withMedia.version }),
       },
     );
-    expect(removed.status).toBe(502);
+    expect(removed.status).toBe(409);
+    expect(await removed.json()).toMatchObject({
+      code: "connection_required",
+      draftId: id,
+    });
     const local = await store.readDraft(id, ownerId);
     expect(local).toMatchObject({
       version: withMedia.version + 1,
       syncStatus: "remote_error",
       attemptId: null,
+      lastError: expect.stringContaining("partial remote media removal"),
     });
     expect(local.document.media).toEqual([]);
     expect(
@@ -1219,5 +1319,15 @@ describe("Typefully synchronization", () => {
       draftId: id,
       connectPath: "/settings/connected-accounts/typefully",
     });
+    const released = await store.readDraft(id, ownerId);
+    expect(released).toMatchObject({
+      syncStatus: "remote_error",
+      attemptId: null,
+    });
+    nextRemoteId = "706";
+    const immediate = await app.request(`/api/typefully/drafts/${id}/sync`, {
+      method: "POST",
+    });
+    expect(immediate.status).toBe(200);
   });
 });

@@ -36,7 +36,7 @@ import {
   resolveServerUrl,
   serverCredentialKind,
 } from "./catalogue";
-import { McpServerError } from "./mcp";
+import { McpServerError, type SideEffectOutcome } from "./mcp";
 import { registerDynamicClient } from "./oauth";
 import { transportFor } from "./transport";
 import {
@@ -173,6 +173,12 @@ export type GrantedPlugins = {
 export type PluginDecision =
   | { allowed: true }
   | { allowed: false; reason: string };
+
+export type PluginCallResult = {
+  text: string;
+  isError: boolean;
+  sideEffectOutcome?: SideEffectOutcome;
+};
 
 export class PluginRefusedError extends Error {
   constructor(
@@ -557,7 +563,7 @@ export type PluginStoreOptions = {
     connection: { url: string; token?: string },
     toolName: string,
     args: Record<string, unknown>,
-  ) => Promise<{ text: string; isError: boolean }>;
+  ) => Promise<PluginCallResult>;
   /**
    * A reviewed local implementation for a first-party tool. It runs only after the normal grant and
    * policy decisions. Returning null keeps the actor-scoped credential and vendor path unchanged.
@@ -568,7 +574,7 @@ export type PluginStoreOptions = {
     args: Record<string, unknown>;
     botId: string;
     actorId: string;
-  }) => Promise<{ text: string; isError: boolean } | null>;
+  }) => Promise<PluginCallResult | null>;
   /** Receives a closure that can bypass local dispatch; it is never exposed on PluginStore. */
   vendorDispatcherReady?: (
     dispatch: (input: {
@@ -576,7 +582,7 @@ export type PluginStoreOptions = {
       args: Record<string, unknown>;
       botId: string;
       actorId: string;
-    }) => Promise<{ text: string; isError: boolean }>,
+    }) => Promise<PluginCallResult>,
   ) => void;
   /** Trading a refresh token for a short-lived access token. Defaults to a real HTTP exchange. */
   exchangeRefreshToken?: (input: {
@@ -3391,7 +3397,7 @@ export function createPluginStore(options: PluginStoreOptions) {
       args: Record<string, unknown>;
       botId: string;
       actorId: string;
-    }): Promise<{ text: string; isError: boolean }> {
+    }): Promise<PluginCallResult> {
       const [serverId, ...rest] = input.ref.split("/");
       const toolName = rest.join("/");
       if (!serverId || !toolName) {
@@ -3568,7 +3574,13 @@ export function createPluginStore(options: PluginStoreOptions) {
             ? { ...decided, failureClass: "tool_reported_error" }
             : decided,
         });
-        return { text: result.text, isError: result.isError };
+        return {
+          text: result.text,
+          isError: result.isError,
+          ...(result.sideEffectOutcome
+            ? { sideEffectOutcome: result.sideEffectOutcome }
+            : {}),
+        };
       } catch (error) {
         /*
          * Recorded, then rethrown unchanged. The caller's behaviour is unaffected — what changes is

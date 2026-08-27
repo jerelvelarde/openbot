@@ -82,8 +82,17 @@ export async function listTools(_connection: Connection): Promise<McpTool[]> {
   return structuredClone(TOOLS) as McpTool[];
 }
 
-function failure(text: string, truncated = false): McpCallResult {
-  return { text, isError: true, truncated };
+function failure(
+  text: string,
+  truncated = false,
+  sideEffectOutcome?: McpCallResult["sideEffectOutcome"],
+): McpCallResult {
+  return {
+    text,
+    isError: true,
+    truncated,
+    ...(sideEffectOutcome ? { sideEffectOutcome } : {}),
+  };
 }
 
 function safeFailure(message: string): McpCallResult {
@@ -471,15 +480,14 @@ async function requestTypefully(
     request.body === undefined ? undefined : JSON.stringify(request.body);
   if (body !== undefined) headers.set("content-type", "application/json");
 
-  let receivedHeaders = false;
+  let response: Response | null = null;
   try {
-    const response = await fetchImplementation(url, {
+    response = await fetchImplementation(url, {
       method: request.method,
       headers,
       body,
       signal: AbortSignal.timeout(timeoutMs),
     });
-    receivedHeaders = true;
     const bodyLimit = response.ok
       ? "maxBytes" in successBodyLimit
         ? successBodyLimit.maxBytes
@@ -490,16 +498,27 @@ async function requestTypefully(
       body: await readBoundedBody(response, bodyLimit),
     };
   } catch (error) {
+    const mutates = request.method !== "GET";
+    const sideEffectOutcome =
+      !mutates || (response !== null && !response.ok)
+        ? "definitely_not_applied"
+        : "uncertain";
     if (
       error instanceof Error &&
       (error.name === "TimeoutError" || error.name === "AbortError")
     ) {
-      return failure("Typefully did not answer in time.");
+      return failure(
+        "Typefully did not answer in time.",
+        false,
+        sideEffectOutcome,
+      );
     }
     return failure(
-      receivedHeaders
+      response
         ? "Typefully response could not be read."
         : "Typefully could not be reached.",
+      false,
+      sideEffectOutcome,
     );
   }
 }
@@ -527,6 +546,8 @@ function responseResult(raw: RawResponse, token: string): McpCallResult {
   if (response.status === 401) {
     return failure(
       "Typefully authentication failed (401). Reconnect your personal Typefully account and try again.",
+      false,
+      "definitely_not_applied",
     );
   }
   if (response.status === 429) {
@@ -541,6 +562,7 @@ function responseResult(raw: RawResponse, token: string): McpCallResult {
     return failure(
       `${base}${truncated ? truncationNotice(true) : ""}`,
       truncated,
+      "definitely_not_applied",
     );
   }
   if (!response.ok) {
@@ -552,6 +574,7 @@ function responseResult(raw: RawResponse, token: string): McpCallResult {
     return failure(
       `${base}${truncated ? truncationNotice(true) : ""}`,
       truncated,
+      "definitely_not_applied",
     );
   }
   return successfulBody(body, token);

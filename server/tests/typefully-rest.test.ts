@@ -1139,13 +1139,73 @@ describe("bounded and redacted failures", () => {
         "list_social_sets",
         {},
       );
-      expect(result).toEqual({
+      const resultText = result.text;
+      expect(result).toMatchObject({
         text: expect.stringContaining("could not be read"),
         isError: true,
         truncated: false,
+        sideEffectOutcome: "definitely_not_applied",
       });
-      expect(result.text).not.toContain(connection.token);
+      expect(resultText.includes(connection.token)).toBe(false);
     }
+  });
+
+  test("preserves whether a failed request may already have applied a write", async () => {
+    const unreachable = (async () => {
+      throw new Error("socket closed");
+    }) as typeof globalThis.fetch;
+    const transport = createTypefullyRestTransport(unreachable);
+    const read = await transport.callTool(connection, "list_social_sets", {});
+    expect(read).toMatchObject({
+      isError: true,
+      sideEffectOutcome: "definitely_not_applied",
+    });
+    const create = await transport.callTool(connection, "create_draft", {
+      socialSetId: 12,
+      platforms: { x: { enabled: true, posts: [{ text: "Ambiguous" }] } },
+    });
+    expect(create).toMatchObject({
+      isError: true,
+      sideEffectOutcome: "uncertain",
+    });
+
+    const refused = createTypefullyRestTransport(
+      (async () => new Response("refused", { status: 422 })) as typeof fetch,
+    );
+    expect(
+      await refused.callTool(connection, "create_draft", {
+        socialSetId: 12,
+        platforms: { x: { enabled: true, posts: [{ text: "Refused" }] } },
+      }),
+    ).toMatchObject({
+      isError: true,
+      sideEffectOutcome: "definitely_not_applied",
+    });
+  });
+
+  test("treats a successful write whose body cannot be read as uncertain", async () => {
+    const encoder = new TextEncoder();
+    const unreadable = (async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode('{"id":'));
+          },
+          pull(controller) {
+            controller.error(new Error("response stream reset"));
+          },
+        }),
+        { status: 200 },
+      )) as typeof fetch;
+    const result = await createTypefullyRestTransport(unreadable).callTool(
+      connection,
+      "upload_media",
+      { socialSetId: 12, fileName: "release.png" },
+    );
+    expect(result).toMatchObject({
+      isError: true,
+      sideEffectOutcome: "uncertain",
+    });
   });
 
   test("uses an abort timeout and reports it canonically", async () => {
@@ -1174,10 +1234,11 @@ describe("bounded and redacted failures", () => {
 
     const result = await transport.callTool(connection, "list_social_sets", {});
     expect(calls[0]?.signal).toBeInstanceOf(AbortSignal);
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       text: expect.stringContaining("in time"),
       isError: true,
       truncated: false,
+      sideEffectOutcome: "definitely_not_applied",
     });
   });
 
@@ -1191,7 +1252,7 @@ describe("bounded and redacted failures", () => {
     expect(result.isError).toBe(true);
     expect(result.text).toContain("could not be reached");
     expect(result.text).not.toContain("10.0.0.7");
-    expect(result.text).not.toContain(connection.token);
+    expect(result.text.includes(connection.token)).toBe(false);
   });
 
   test("never includes the token or an untrusted 401 body", async () => {
@@ -1200,13 +1261,15 @@ describe("bounded and redacted failures", () => {
     const transport = createTypefullyRestTransport(fetch);
 
     const result = await transport.callTool(connection, "list_social_sets", {});
-    expect(result).toEqual({
+    const resultText = result.text;
+    expect(result).toMatchObject({
       text: expect.stringContaining("authentication"),
       isError: true,
       truncated: false,
+      sideEffectOutcome: "definitely_not_applied",
     });
-    expect(result.text).not.toContain(connection.token);
-    expect(result.text).not.toContain("internal-auth-host");
+    expect(resultText).not.toContain(connection.token);
+    expect(resultText).not.toContain("internal-auth-host");
   });
 
   test("reports a bounded Retry-After on 429 and does not retry", async () => {

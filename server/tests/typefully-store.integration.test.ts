@@ -1203,6 +1203,7 @@ describe("owned local Typefully drafts", () => {
 
   test("an active lease blocks and an old attempt result cannot overwrite its replacement", async () => {
     const current = await createOwnedDraft();
+    let instant = new Date("2026-08-27T12:00:00.000Z");
     const activeStore = createTypefullyStore({
       database,
       auditStore: createAuditStore(database),
@@ -1211,8 +1212,8 @@ describe("owned local Typefully drafts", () => {
         dispatchVendor: async () => ({ text: '{"id":"802"}', isError: false }),
       }),
       vendor: "typefully",
-      now: () => new Date("2026-08-27T12:00:00.000Z"),
-      attemptLeaseMs: 60_000,
+      now: () => instant,
+      attemptLeaseMs: 1_000,
     });
     const old = await activeStore.beginMediaAttempt({
       draftId: current.id,
@@ -1225,11 +1226,38 @@ describe("owned local Typefully drafts", () => {
       activeStore.syncDraft({ draftId: current.id, actorId: ownerId }),
     ).rejects.toMatchObject({ code: "sync_in_progress" });
 
-    const replacementAttemptId = randomUUID();
-    await database
-      .update(typefullyDrafts)
-      .set({ attemptId: replacementAttemptId, attemptKind: "update_draft" })
-      .where(eq(typefullyDrafts.id, current.id));
+    instant = new Date(instant.getTime() + 900);
+    await activeStore.renewMediaAttempt({
+      draftId: current.id,
+      actorId: ownerId,
+      attemptId: old.attemptId,
+    });
+    instant = new Date(instant.getTime() + 600);
+    await expect(
+      activeStore.beginMediaAttempt({
+        draftId: current.id,
+        actorId: ownerId,
+        toolName: "remove_media",
+        expectedVersion: current.version,
+        expectedHash: current.contentHash,
+      }),
+    ).rejects.toMatchObject({ code: "sync_in_progress" });
+
+    instant = new Date(instant.getTime() + 501);
+    const replacement = await activeStore.beginMediaAttempt({
+      draftId: current.id,
+      actorId: ownerId,
+      toolName: "remove_media",
+      expectedVersion: current.version,
+      expectedHash: current.contentHash,
+    });
+    await expect(
+      activeStore.renewMediaAttempt({
+        draftId: current.id,
+        actorId: ownerId,
+        attemptId: old.attemptId,
+      }),
+    ).rejects.toBeInstanceOf(Error);
     await expect(
       activeStore.recordRemoteConfirmation({
         draftId: current.id,
@@ -1241,7 +1269,7 @@ describe("owned local Typefully drafts", () => {
       }),
     ).rejects.toBeInstanceOf(Error);
     expect(await activeStore.readDraft(current.id, ownerId)).toMatchObject({
-      attemptId: replacementAttemptId,
+      attemptId: replacement.attemptId,
       remoteDraftId: null,
     });
   });

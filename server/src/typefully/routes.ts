@@ -246,6 +246,38 @@ async function uploadMediaBytes(
   await uploadPresignedMedia(file, uploadUrl, dependencies);
 }
 
+async function withMediaHeartbeat<T>(
+  store: TypefullyStore,
+  input: { draftId: string; actorId: string; attemptId: string },
+  operation: () => Promise<T>,
+): Promise<T> {
+  const first = await store.renewMediaAttempt(input);
+  let heartbeatError: unknown;
+  let inFlight: Promise<void> | null = null;
+  const timer = setInterval(() => {
+    if (inFlight || heartbeatError) return;
+    inFlight = store
+      .renewMediaAttempt(input)
+      .then(() => {})
+      .catch((error) => {
+        heartbeatError = error;
+      })
+      .finally(() => {
+        inFlight = null;
+      });
+  }, first.renewAfterMs);
+  timer.unref?.();
+  try {
+    const result = await operation();
+    if (inFlight) await inFlight;
+    if (heartbeatError) throw heartbeatError;
+    await store.renewMediaAttempt(input);
+    return result;
+  } finally {
+    clearInterval(timer);
+  }
+}
+
 async function boundedFormData(request: Request): Promise<FormData> {
   const declared = request.headers.get("content-length");
   if (
@@ -519,17 +551,28 @@ export function createTypefullyRoutes(
       let remoteInitiated = false;
       let initiatedMedia: MediaDescriptor | null = null;
       try {
-        const remote = await store.callRemoteTool({
+        const heartbeat = {
           draftId: current.id,
           actorId: context.var.actor.id,
-          toolName: "upload_media",
           attemptId: attempt.attemptId,
-          args: {
-            socialSetId: Number(saved.document.socialSetId),
-            fileName: file.name,
-          },
-        });
+        };
+        const remote = await withMediaHeartbeat(store, heartbeat, () =>
+          store.callRemoteTool({
+            draftId: current.id,
+            actorId: context.var.actor.id,
+            toolName: "upload_media",
+            attemptId: attempt.attemptId,
+            args: {
+              socialSetId: Number(saved.document.socialSetId),
+              fileName: file.name,
+            },
+          }),
+        );
         if (remote.isError) {
+          if (remote.sideEffectOutcome === "uncertain") {
+            remoteInitiated = true;
+            throw new Error(remote.text);
+          }
           const failed = await store.recordRemoteFailure({
             draftId: saved.id,
             actorId: context.var.actor.id,
@@ -547,7 +590,12 @@ export function createTypefullyRoutes(
             502,
           );
         }
+        remoteInitiated = true;
         const target = remoteMediaTarget(remote.text);
+        await store.recordMediaInitiation({
+          ...heartbeat,
+          remoteMediaId: target.id,
+        });
         const confirmedMedia = { ...media, remoteId: target.id };
         initiatedMedia = confirmedMedia;
         const confirmed = await store.saveDraft({
@@ -561,8 +609,9 @@ export function createTypefullyRoutes(
             ),
           },
         });
-        remoteInitiated = true;
-        await uploadMediaBytes(file, target.uploadUrl, options.mediaUpload);
+        await withMediaHeartbeat(store, heartbeat, () =>
+          uploadMediaBytes(file, target.uploadUrl, options.mediaUpload),
+        );
         const synced = await synchronize(
           store,
           confirmed.id,
@@ -657,6 +706,7 @@ export function createTypefullyRoutes(
     const draftId = context.req.param("id");
     let saved: TypefullyDraft | null = null;
     let mediaAttemptId: string | null = null;
+    let remoteRemovalsSucceeded = 0;
     try {
       const body = await jsonBody(context);
       if (!Number.isSafeInteger(body.expectedVersion)) {
@@ -692,19 +742,28 @@ export function createTypefullyRoutes(
       if (descriptor.remoteId !== null && current.remoteDraftId !== null) {
         for (const platform of current.document.destinations) {
           for (const [postIndex] of current.document.posts.entries()) {
-            const removed = await store.callRemoteTool({
-              draftId: current.id,
-              actorId: context.var.actor.id,
-              toolName: "remove_media",
-              attemptId: attempt.attemptId,
-              args: {
-                socialSetId: Number(current.document.socialSetId),
-                draftId: Number(current.remoteDraftId),
-                platform,
-                postIndex,
-                mediaId: descriptor.remoteId,
+            const removed = await withMediaHeartbeat(
+              store,
+              {
+                draftId: current.id,
+                actorId: context.var.actor.id,
+                attemptId: attempt.attemptId,
               },
-            });
+              () =>
+                store.callRemoteTool({
+                  draftId: current.id,
+                  actorId: context.var.actor.id,
+                  toolName: "remove_media",
+                  attemptId: attempt.attemptId,
+                  args: {
+                    socialSetId: Number(current.document.socialSetId),
+                    draftId: Number(current.remoteDraftId),
+                    platform,
+                    postIndex,
+                    mediaId: descriptor.remoteId,
+                  },
+                }),
+            );
             if (removed.isError) {
               const failed = await store.recordRemoteFailure({
                 draftId: saved.id,
@@ -712,7 +771,10 @@ export function createTypefullyRoutes(
                 expectedVersion: saved.version,
                 expectedHash: saved.contentHash,
                 attemptId: attempt.attemptId,
-                error: removed.text,
+                error:
+                  remoteRemovalsSucceeded > 0
+                    ? `A partial remote media removal completed before the remaining operation failed: ${safeError(removed.text)}`
+                    : removed.text,
               });
               return context.json(
                 {
@@ -724,9 +786,15 @@ export function createTypefullyRoutes(
                 502,
               );
             }
+            remoteRemovalsSucceeded += 1;
           }
         }
       }
+      await store.renewMediaAttempt({
+        draftId: saved.id,
+        actorId: context.var.actor.id,
+        attemptId: attempt.attemptId,
+      });
       const synced = await synchronize(
         store,
         saved.id,
@@ -752,22 +820,26 @@ export function createTypefullyRoutes(
         remote: remoteState(synced.draft),
       });
     } catch (error) {
-      if (
-        saved &&
-        !(error instanceof ConnectionRequiredError) &&
-        !(error instanceof GrantRequiredError) &&
-        !(error instanceof BotNotAttachedError) &&
-        !(error instanceof PluginRefusedError) &&
-        !(error instanceof SyncInProgressError)
-      ) {
+      if (saved && mediaAttemptId && !(error instanceof SyncInProgressError)) {
         const failed = await store.recordRemoteFailure({
           draftId: saved.id,
           actorId: context.var.actor.id,
           expectedVersion: saved.version,
           expectedHash: saved.contentHash,
           ...(mediaAttemptId ? { attemptId: mediaAttemptId } : {}),
-          error,
+          error:
+            remoteRemovalsSucceeded > 0
+              ? `A partial remote media removal completed before the remaining operation failed: ${safeError(error)}`
+              : error,
         });
+        if (
+          error instanceof ConnectionRequiredError ||
+          error instanceof GrantRequiredError ||
+          error instanceof BotNotAttachedError ||
+          error instanceof PluginRefusedError
+        ) {
+          return errorResponse(context, error, draftId);
+        }
         return context.json(
           {
             code: "remote_error",
