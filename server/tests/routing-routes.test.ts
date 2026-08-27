@@ -6,6 +6,7 @@ import type { AuditStore } from "../src/audit";
 import type { AppVariables } from "../src/auth/guards";
 import type { IntentRouter, RoutingUndecided } from "../src/routing/classify";
 import { createRoutingRoutes } from "../src/routing/routes";
+import { createCoworkerRoutingService } from "../src/routing/service";
 
 /**
  * Why a conversation went where it went, for every conversation.
@@ -32,12 +33,16 @@ const ROSTER = [
     name: "Risk Analyst",
     roleDescription: "regulatory and compliance questions",
     visibility: "public",
+    ownerUserId: null,
+    deletedAt: null,
   },
   {
     id: "knowledge",
     name: "Knowledge",
     roleDescription: "company knowledge",
     visibility: "public",
+    ownerUserId: null,
+    deletedAt: null,
   },
 ];
 
@@ -87,7 +92,10 @@ function app(options: { routed?: string; undecided?: RoutingUndecided } = {}) {
   const server = new Hono<{ Variables: AppVariables }>();
   server.route(
     "/api/route",
-    createRoutingRoutes(store, router, asActor, auditStore),
+    createRoutingRoutes(
+      createCoworkerRoutingService({ store, router, auditStore }),
+      asActor,
+    ),
   );
   return { server, written, asked };
 }
