@@ -8,7 +8,7 @@ import {
 } from "@copilotkit/runtime/v2";
 import { createCopilotHonoHandler } from "@copilotkit/runtime/v2/hono";
 import type { Observable } from "rxjs";
-import { defer, from, switchMap } from "rxjs";
+import { defer, finalize, from, switchMap } from "rxjs";
 import { z } from "zod";
 import { PROVENANCE_GUIDANCE } from "../../shared/bot-prompt";
 import type { ActorAgentResolver } from "./agents/agent-resolver";
@@ -378,13 +378,8 @@ async function buildAgent(
   };
 
   if (agent.type === "remote_ag_ui") {
-    /*
-     * The remote path narrows inside its own middleware rather than by being wrapped.
-     *
-     * `.use()` middleware is applied by `runAgent`, not by `run`, so an outer agent delegating to
-     * `remote.run(input)` skips it: the endpoint would get a run with no standing role, no holdings
-     * message, no tools and no signed assertion, and every one of those failures is silent.
-     */
+    // The remote wrapper composes every direct `run(input)`, which is the path channel delegation
+    // uses. Its ordinary `runAgent()` path reaches the same composition once through the wrapper.
     return remoteAgentWithStandingRole(
       agent,
       stallGuard,
@@ -475,22 +470,14 @@ function remoteAgentWithStandingRole(
   /** As for the built-in path: what this deployment connects to, held or not. */
   connectedVendors: readonly string[] = [],
   /**
-   * Which of those tools this run is about, decided once the message is known.
-   *
-   * NARROWED HERE RATHER THAN BY WRAPPING THE AGENT, and the difference is not cosmetic. Middleware
-   * registered with `.use()` is applied by `runAgent`, not by `run`: an outer agent that delegated
-   * to `remote.run(input)` would skip this whole function's work, and the endpoint would receive a
-   * run with no standing role, no holdings message, no tools and no signed assertion. Every one of
-   * those is silent — the Bot simply answers worse — so the narrowing goes inside the middleware
-   * that is already here.
-   *
-   * Absent means no narrowing, which is the behaviour every deployment had before this existed.
+   * Which of those tools this run is about, decided once the message is known. The composed wrapper
+   * invokes it on subscription for both web `runAgent()` and direct delegated `run()` calls.
    */
   narrow?: (input: RunAgentInput) => Promise<GrantedTool[]>,
   /** The fetch this agent is dialled with. See {@link buildAgents}. */
   agentFetch?: AgentFetch,
 ) {
-  const remote = new HttpAgent({
+  const raw = new HttpAgent({
     url: agent.endpoint,
     agentId: agent.id,
     // The customer's own key, if their agent sits behind one. `HttpAgentConfig` is
@@ -535,13 +522,9 @@ function remoteAgentWithStandingRole(
       : null;
   };
 
-  const runWith = (
-    tools: GrantedTool[],
-    input: RunAgentInput,
-    next: AbstractAgent,
-  ) => {
+  const compose = (tools: GrantedTool[], input: RunAgentInput) => {
     const holdingsMessage = holdingsMessageFor(tools);
-    return next.run({
+    return {
       ...input,
       messages: [
         agent.standingMessage,
@@ -602,23 +585,66 @@ function remoteAgentWithStandingRole(
              */
             {}),
       },
-    } as never);
+    } as RunAgentInput;
   };
 
-  /*
-   * Deferred, because choosing the tools is a model call and middleware has to answer with a stream
-   * straight away. `defer` puts the work on the subscription, which is where the run actually
-   * begins, so nothing happens until somebody is listening and a retried run chooses again.
-   */
-  remote.use((input, next) =>
-    defer(() =>
-      from(narrow ? narrow(input) : Promise.resolve(tools)).pipe(
-        switchMap((offered) => runWith(offered, input, next)),
-      ),
-    ),
+  return new ComposedRemoteAgent(
+    { agentId: agent.id, description: agent.name },
+    raw,
+    async (input) =>
+      compose(await (narrow ? narrow(input) : Promise.resolve(tools)), input),
   );
+}
 
-  return remote;
+/**
+ * A remote AG-UI agent whose direct `run` path is the full OpenBot composition boundary.
+ *
+ * `AbstractAgent` only applies `.use()` middleware in `runAgent()`, while channel delegation calls
+ * `run(input)` to forward AG-UI events unchanged. Keeping composition here makes both entrances
+ * equivalent without trying to reconstruct a run from `runAgent()` output.
+ */
+class ComposedRemoteAgent extends AbstractAgent {
+  private raw: HttpAgent;
+  private compose: (input: RunAgentInput) => Promise<RunAgentInput>;
+  private active?: HttpAgent;
+
+  constructor(
+    identity: { agentId: string; description: string },
+    raw: HttpAgent,
+    compose: (input: RunAgentInput) => Promise<RunAgentInput>,
+  ) {
+    super(identity);
+    this.raw = raw;
+    this.compose = compose;
+  }
+
+  run(input: RunAgentInput): Observable<BaseEvent> {
+    return defer(() => {
+      // `HttpAgent.abortRun()` aborts its current controller permanently. A fresh raw clone per
+      // wrapper run gives a cancelled turn its own controller and leaves the next turn runnable.
+      const raw = this.raw.clone() as HttpAgent;
+      this.active = raw;
+      return from(this.compose(input)).pipe(
+        switchMap((composed) => raw.run(composed)),
+        finalize(() => {
+          if (this.active === raw) this.active = undefined;
+        }),
+      );
+    });
+  }
+
+  clone(): ComposedRemoteAgent {
+    const cloned = super.clone() as ComposedRemoteAgent;
+    cloned.raw = this.raw.clone() as HttpAgent;
+    cloned.compose = this.compose;
+    cloned.active = undefined;
+    return cloned;
+  }
+
+  abortRun(): void {
+    this.active?.abortRun();
+    super.abortRun();
+  }
 }
 
 /**
