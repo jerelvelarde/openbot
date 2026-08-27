@@ -1,8 +1,8 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { inArray } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { createDatabase } from "../src/db/client";
-import { revokedAccess, users } from "../src/db/schema";
+import { externalUserLinks, revokedAccess, users } from "../src/db/schema";
 import { createExternalLinkStore } from "../src/external/link-store";
 import { TEST_POOL } from "./support/database";
 
@@ -18,6 +18,7 @@ const store = createExternalLinkStore(database);
 const suite = randomUUID().slice(0, 8);
 const createdUsers: string[] = [];
 const createdRevocations: string[] = [];
+const LINK_CONFLICT_MESSAGE = "That Slack identity is already linked.";
 
 function userId(label: string): string {
   const id = `external_link_${label}_${suite}`;
@@ -39,6 +40,13 @@ async function createUser(input: {
     ...input,
     emailVerified: input.emailVerified ?? true,
   });
+}
+
+function expectLinkConflict(error: unknown): void {
+  expect(error).toBeInstanceOf(Error);
+  if (error instanceof Error) {
+    expect(error.message).toBe(LINK_CONFLICT_MESSAGE);
+  }
 }
 
 afterAll(async () => {
@@ -124,19 +132,161 @@ describe("external user links", () => {
       providerEmail: "first@example.com",
     });
 
-    await expect(
-      store.link({
+    const error = await store
+      .link({
         provider: "slack",
         providerTenantId: teamId,
         providerUserId: "U789",
         openbotUserId: secondUserId,
         providerEmail: "second@example.com",
-      }),
-    ).rejects.toThrow("That Slack identity is already linked.");
+      })
+      .catch((reason: unknown) => reason);
+    expectLinkConflict(error);
     expect(await store.find("slack", teamId, "U789")).toMatchObject({
       openbotUserId: firstUserId,
       providerEmail: "first@example.com",
     });
+  });
+
+  test("rejects a second Slack identity claiming an OpenBot user in the same workspace", async () => {
+    const openbotUserId = userId("one_identity");
+    const teamId = `T${suite}`;
+    await createUser({
+      id: openbotUserId,
+      email: email("one_identity"),
+      name: "One identity person",
+    });
+    await store.link({
+      provider: "slack",
+      providerTenantId: teamId,
+      providerUserId: "U901",
+      openbotUserId,
+      providerEmail: "first@example.com",
+    });
+
+    const error = await store
+      .link({
+        provider: "slack",
+        providerTenantId: teamId,
+        providerUserId: "U902",
+        openbotUserId,
+        providerEmail: "second@example.com",
+      })
+      .catch((reason: unknown) => reason);
+
+    expectLinkConflict(error);
+    const links = await database
+      .select()
+      .from(externalUserLinks)
+      .where(
+        and(
+          eq(externalUserLinks.provider, "slack"),
+          eq(externalUserLinks.providerTenantId, teamId),
+          eq(externalUserLinks.openbotUserId, openbotUserId),
+        ),
+      );
+    expect(links).toHaveLength(1);
+    expect(links[0]?.providerUserId).toBe("U901");
+  });
+
+  test("returns one public conflict when Slack identities race for one OpenBot user", async () => {
+    const openbotUserId = userId("racing_identities");
+    const teamId = `T${suite}`;
+    await createUser({
+      id: openbotUserId,
+      email: email("racing_identities"),
+      name: "Racing identity person",
+    });
+
+    const results = await Promise.allSettled([
+      store.link({
+        provider: "slack",
+        providerTenantId: teamId,
+        providerUserId: "U903",
+        openbotUserId,
+        providerEmail: "first@example.com",
+      }),
+      store.link({
+        provider: "slack",
+        providerTenantId: teamId,
+        providerUserId: "U904",
+        openbotUserId,
+        providerEmail: "second@example.com",
+      }),
+    ]);
+
+    const successes = results.filter((result) => result.status === "fulfilled");
+    const failures = results.filter(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+    expect(successes).toHaveLength(1);
+    expect(failures).toHaveLength(1);
+    expectLinkConflict(failures[0]?.reason);
+
+    const links = await database
+      .select()
+      .from(externalUserLinks)
+      .where(
+        and(
+          eq(externalUserLinks.provider, "slack"),
+          eq(externalUserLinks.providerTenantId, teamId),
+          eq(externalUserLinks.openbotUserId, openbotUserId),
+        ),
+      );
+    expect(links).toHaveLength(1);
+  });
+
+  test("returns one public conflict when OpenBot users race for one Slack identity", async () => {
+    const firstUserId = userId("racing_identity_first");
+    const secondUserId = userId("racing_identity_second");
+    const teamId = `T${suite}`;
+    await createUser({
+      id: firstUserId,
+      email: email("racing_identity_first"),
+      name: "First racing identity person",
+    });
+    await createUser({
+      id: secondUserId,
+      email: email("racing_identity_second"),
+      name: "Second racing identity person",
+    });
+
+    const results = await Promise.allSettled([
+      store.link({
+        provider: "slack",
+        providerTenantId: teamId,
+        providerUserId: "U905",
+        openbotUserId: firstUserId,
+        providerEmail: "first@example.com",
+      }),
+      store.link({
+        provider: "slack",
+        providerTenantId: teamId,
+        providerUserId: "U905",
+        openbotUserId: secondUserId,
+        providerEmail: "second@example.com",
+      }),
+    ]);
+
+    const successes = results.filter((result) => result.status === "fulfilled");
+    const failures = results.filter(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+    expect(successes).toHaveLength(1);
+    expect(failures).toHaveLength(1);
+    expectLinkConflict(failures[0]?.reason);
+
+    const links = await database
+      .select()
+      .from(externalUserLinks)
+      .where(
+        and(
+          eq(externalUserLinks.provider, "slack"),
+          eq(externalUserLinks.providerTenantId, teamId),
+          eq(externalUserLinks.providerUserId, "U905"),
+        ),
+      );
+    expect(links).toHaveLength(1);
   });
 
   test("finds exactly one active verified OpenBot user by a normalized email", async () => {
