@@ -7,8 +7,8 @@ import {
 import {
   and,
   eq,
+  gte,
   inArray,
-  notInArray,
 } from "../../server/node_modules/drizzle-orm/index.js";
 import { createDatabase } from "../../server/src/db/client";
 import {
@@ -27,7 +27,9 @@ import {
 } from "../../server/src/db/schema";
 import { TEST_POOL } from "../../server/tests/support/database";
 import { startFakeTypefullyVendor } from "../../server/tests/support/fake-typefully-vendor";
-import { ownedSmokeTypefullyAssociation } from "../../server/tests/support/typefully-smoke-isolation";
+import { settleSmokeCleanup } from "../../server/tests/support/typefully-smoke-cleanup";
+import { confirmedSmokeTypefullyAssociation } from "../../server/tests/support/typefully-smoke-isolation";
+import { correlatedRuntimeToolResult } from "../../server/tests/support/typefully-smoke-protocol";
 
 /**
  * The Typefully journey through a deployment that is really running.
@@ -228,58 +230,81 @@ describe.skipIf(!asked)("the running Typefully deployment journey", () => {
     if (!fakeApi) throw new Error("Missing fake Typefully URL.");
     const suffix = randomUUID().slice(0, 8);
     const apiKey = `tf_smoke_${suffix}_secret`;
-    const firstBody = `SMOKE_FULL_DRAFT_BODY_${suffix}`;
-    const changedBody = `SMOKE_CHANGED_DRAFT_BODY_${suffix}`;
-    const altText = `Smoke media alt ${suffix}`;
+    const firstXBody = `SMOKE_FIRST_X_BODY_${suffix}`;
+    const firstLinkedInBody = `SMOKE_FIRST_LINKEDIN_BODY_${suffix}`;
+    const changedXBody = `SMOKE_CHANGED_X_BODY_${suffix}`;
+    const changedLinkedInBody = `SMOKE_CHANGED_LINKEDIN_BODY_${suffix}`;
+    const altText = `SMOKE_MEDIA_ALT_${suffix}`;
     const startedAt = Date.now() - 1_000;
+    const runStartedAt = new Date(startedAt);
     if (!smokeBot || !smokeAgentUrl) throw new Error("Missing smoke Bot.");
-    const vendor = startFakeTypefullyVendor(fakeApi);
-    const agentEndpoint = fakeAgent(smokeAgentUrl);
+    let vendor: ReturnType<typeof startFakeTypefullyVendor> | undefined;
+    let agentEndpoint: ReturnType<typeof fakeAgent> | undefined;
     const createdComponents: string[] = [];
+    const createdToolNames: string[] = [];
+    const createdPluginGrants: Array<{ kind: "mcp"; ref: string }> = [];
+    const createdComponentGrants: string[] = [];
     const botId = smokeBot;
     let channelId: string | undefined;
     let draftId: string | undefined;
-    let connectionAttempted = false;
     let connectionCreated = false;
     let createdCredentialId: string | undefined;
+    let actorId: string | undefined;
+    let actorEmail: string | undefined;
     let serverCreated = false;
     let ui: ReturnType<typeof openTypefullySmokeUi> | undefined;
-
-    const beforeServers = await database
-      .select()
-      .from(mcpServers)
-      .where(eq(mcpServers.id, "typefully"));
-    serverCreated = beforeServers.length === 0;
-    const beforeTools = await database
-      .select()
-      .from(mcpTools)
-      .where(eq(mcpTools.serverId, "typefully"));
-    const beforeCredentials = await database
-      .select()
-      .from(credentials)
-      .where(eq(credentials.provider, "typefully"));
-    const beforeAssociations = await database
-      .select()
-      .from(mcpUserCredentials)
-      .where(eq(mcpUserCredentials.serverId, "typefully"));
+    let beforeServers: (typeof mcpServers.$inferSelect)[] = [];
+    let beforeTools: (typeof mcpTools.$inferSelect)[] = [];
+    let beforeCredentials: (typeof credentials.$inferSelect)[] = [];
+    let beforeAssociations: (typeof mcpUserCredentials.$inferSelect)[] = [];
     const componentNames = [
       "connectTypefullyAccount",
       "approveTypefullyPublication",
     ];
-    const beforeComponents = await database
-      .select()
-      .from(components)
-      .where(inArray(components.name, componentNames));
-    const beforeBotGrants = await database
-      .select()
-      .from(pluginGrants)
-      .where(eq(pluginGrants.agentId, botId));
-    const beforeBotComponents = await database
-      .select()
-      .from(componentExclusions)
-      .where(eq(componentExclusions.agentId, botId));
+    let beforeComponents: (typeof components.$inferSelect)[] = [];
+    let beforeBotGrants: (typeof pluginGrants.$inferSelect)[] = [];
+    let beforeBotComponents: (typeof componentExclusions.$inferSelect)[] = [];
+    let snapshotsCaptured = false;
+    let journeyFailure: unknown;
+    let finalFailures: Error[] = [];
 
     try {
+      vendor = startFakeTypefullyVendor(fakeApi);
+      agentEndpoint = fakeAgent(smokeAgentUrl);
+      beforeServers = await database
+        .select()
+        .from(mcpServers)
+        .where(eq(mcpServers.id, "typefully"));
+      beforeTools = await database
+        .select()
+        .from(mcpTools)
+        .where(eq(mcpTools.serverId, "typefully"));
+      beforeCredentials = await database
+        .select()
+        .from(credentials)
+        .where(eq(credentials.provider, "typefully"));
+      beforeAssociations = await database
+        .select()
+        .from(mcpUserCredentials)
+        .where(eq(mcpUserCredentials.serverId, "typefully"));
+      beforeComponents = await database
+        .select()
+        .from(components)
+        .where(inArray(components.name, componentNames));
+      beforeBotGrants = await database
+        .select()
+        .from(pluginGrants)
+        .where(eq(pluginGrants.agentId, botId));
+      beforeBotComponents = await database
+        .select()
+        .from(componentExclusions)
+        .where(eq(componentExclusions.agentId, botId));
+      snapshotsCaptured = true;
+      const actor = await json<{ user: { id: string; email: string } }>(
+        "/api/me",
+      );
+      actorId = actor.user.id;
+      actorEmail = actor.user.email;
       const connections = await json<{
         connections: { serverId: string }[];
       }>("/api/plugins/connections");
@@ -295,10 +320,19 @@ describe.skipIf(!asked)("the running Typefully deployment journey", () => {
         "/api/plugins",
       );
       if (!pluginState.servers.some(({ id }) => id === "typefully")) {
-        await json("/api/plugins/servers", {
+        const installed = await json<{
+          server: { id: string; tools: Array<{ name: string }> };
+        }>("/api/plugins/servers", {
           method: "POST",
           body: JSON.stringify({ key: "typefully" }),
         });
+        if (installed.server.id !== "typefully") {
+          throw new Error("The connector response did not identify Typefully.");
+        }
+        createdToolNames.push(
+          ...installed.server.tools.map(({ name }) => name),
+        );
+        serverCreated = true;
       }
 
       const announced = beforeComponents.map(({ name }) => name);
@@ -306,7 +340,6 @@ describe.skipIf(!asked)("the running Typefully deployment journey", () => {
         (name) => !announced.includes(name),
       );
       if (missing.length) {
-        createdComponents.push(...missing);
         await json("/api/components/catalogue", {
           method: "PUT",
           body: JSON.stringify({
@@ -317,12 +350,13 @@ describe.skipIf(!asked)("the running Typefully deployment journey", () => {
                   ? "Connect Typefully"
                   : "Approve Typefully publication",
               kind: "decision",
-              description: `${name} smoke UI contract`,
+              description: `${name} smoke UI contract ${suffix}`,
               defaultPublished: false,
               grantMode: "explicit",
             })),
           }),
         });
+        createdComponents.push(...missing);
         for (const name of missing) {
           await json(`/api/components/${name}/publication`, {
             method: "POST",
@@ -366,6 +400,7 @@ describe.skipIf(!asked)("the running Typefully deployment journey", () => {
           method: "POST",
           body: JSON.stringify({ kind: "mcp", ref, agentId: botId }),
         });
+        createdPluginGrants.push({ kind: "mcp", ref });
       }
       for (const name of componentNames) {
         if (beforeBotComponents.some((grant) => grant.componentName === name)) {
@@ -375,6 +410,7 @@ describe.skipIf(!asked)("the running Typefully deployment journey", () => {
           method: "POST",
           body: JSON.stringify({ agentId: botId }),
         });
+        createdComponentGrants.push(name);
       }
 
       const initialDocument = {
@@ -422,6 +458,8 @@ describe.skipIf(!asked)("the running Typefully deployment journey", () => {
       let pendingPublication:
         | { args: JsonObject; resolve: (value: unknown) => void }
         | undefined;
+      let connectionDecisionResult: unknown;
+      let publicationDecisionResult: unknown;
       let draftRouteEvidence:
         | {
             reviewedDraftId: string;
@@ -442,7 +480,8 @@ describe.skipIf(!asked)("the running Typefully deployment journey", () => {
             draftRouteEvidence = await ui.reviewEditReloadAndClose({
               args,
               channelId,
-              xText: firstBody,
+              xText: firstXBody,
+              linkedinText: firstLinkedInBody,
               altText,
             });
             return {
@@ -492,7 +531,7 @@ describe.skipIf(!asked)("the running Typefully deployment journey", () => {
       }>(`/api/typefully/drafts/${draftId}`);
       expect(local.draft.document).toMatchObject({
         media: [{ altText }],
-        posts: [{ x: firstBody }],
+        posts: [{ x: firstXBody, linkedin: firstLinkedInBody }],
       });
 
       const unconnected = await request(
@@ -522,20 +561,43 @@ describe.skipIf(!asked)("the running Typefully deployment journey", () => {
       const connectionRun = protocol.run("Sync the reviewed local draft.");
       await waitForValue(() => pendingConnection, "connection decision");
       if (!pendingConnection) throw new Error("Connection decision missing.");
-      connectionAttempted = true;
       await ui.connectAndResume({
         args: pendingConnection.args,
         apiKey,
-        respond: async (result) => pendingConnection?.resolve(result),
+        respond: async (result) => {
+          connectionDecisionResult = result;
+          pendingConnection?.resolve(result);
+        },
       });
+      if (connectionDecisionResult === undefined) {
+        throw new Error(
+          "The connection mutation did not produce a confirmed resumed decision.",
+        );
+      }
       const afterConnectAssociations = await database
         .select()
         .from(mcpUserCredentials)
-        .where(eq(mcpUserCredentials.serverId, "typefully"));
-      const createdAssociation = ownedSmokeTypefullyAssociation({
-        before: beforeAssociations,
-        current: afterConnectAssociations,
-        connectionAttempted,
+        .where(
+          and(
+            eq(mcpUserCredentials.serverId, "typefully"),
+            eq(mcpUserCredentials.userId, actorId),
+          ),
+        );
+      const afterConnectCredentials = await database
+        .select({
+          id: credentials.id,
+          provider: credentials.provider,
+          keyId: credentials.keyId,
+          createdAt: credentials.createdAt,
+        })
+        .from(credentials)
+        .where(eq(credentials.provider, "typefully"));
+      const createdAssociation = confirmedSmokeTypefullyAssociation({
+        connectionConfirmed: true,
+        actorId,
+        runStartedAt,
+        associations: afterConnectAssociations,
+        credentials: afterConnectCredentials,
       });
       if (!createdAssociation) {
         throw new Error(
@@ -581,8 +643,8 @@ describe.skipIf(!asked)("the running Typefully deployment journey", () => {
       }
       changedPosts[0] = {
         ...changedPosts[0],
-        x: changedBody,
-        linkedin: changedBody,
+        x: changedXBody,
+        linkedin: changedLinkedInBody,
       };
       await json(`/api/typefully/drafts/${draftId}`, {
         method: "PUT",
@@ -650,7 +712,10 @@ describe.skipIf(!asked)("the running Typefully deployment journey", () => {
       if (!pendingPublication) throw new Error("Publication decision missing.");
       await ui.publish({
         args: pendingPublication.args,
-        respond: async (result) => pendingPublication?.resolve(result),
+        respond: async (result) => {
+          publicationDecisionResult = result;
+          pendingPublication?.resolve(result);
+        },
       });
       await publicationRun;
       expect(vendor.publishCalls).toBe(1);
@@ -661,7 +726,9 @@ describe.skipIf(!asked)("the running Typefully deployment journey", () => {
 
       const trail = await json<{
         events: Array<{
+          actorUserId: string | null;
           eventType: string;
+          targetType: string;
           targetId: string | null;
           payload: unknown;
           createdAt: string;
@@ -670,25 +737,61 @@ describe.skipIf(!asked)("the running Typefully deployment journey", () => {
       const journeyAudits = trail.events.filter(
         (event) => Date.parse(event.createdAt) >= startedAt,
       );
-      expect(
-        journeyAudits.some(
-          ({ payload }) =>
-            payload !== null &&
-            typeof payload === "object" &&
-            "outcome" in payload &&
-            payload.outcome === "published",
-        ),
-      ).toBe(true);
-      const transcript = JSON.stringify(protocol.agent.messages);
-      expect(transcript).toContain(
-        "Published to X and LinkedIn after explicit approval.",
+      const publicationAudit = journeyAudits.find(
+        (event) =>
+          event.eventType === "configuration.changed" &&
+          event.targetType === "typefully_publication_proposal" &&
+          event.targetId === secondProposal.id &&
+          event.actorUserId === actorId &&
+          event.payload !== null &&
+          typeof event.payload === "object" &&
+          "decision" in event.payload &&
+          event.payload.decision === "approved" &&
+          "outcome" in event.payload &&
+          event.payload.outcome === "published" &&
+          "draftId" in event.payload &&
+          event.payload.draftId === secondProposal.draftId &&
+          "version" in event.payload &&
+          event.payload.version === secondProposal.version &&
+          "destinations" in event.payload &&
+          JSON.stringify(event.payload.destinations) ===
+            JSON.stringify(secondProposal.destinations),
       );
+      expect(publicationAudit).toBeDefined();
+      expect(publicationDecisionResult).toMatchObject({
+        outcome: "published",
+        proposalId: secondProposal.id,
+        draftId: secondProposal.draftId,
+        version: secondProposal.version,
+      });
+      expect(componentArgs.at(-1)).toEqual({
+        name: "approveTypefullyPublication",
+        args: approvalArgs,
+      });
+      const publicationToolResult = correlatedRuntimeToolResult(
+        protocol.agent.messages,
+        "approveTypefullyPublication",
+      );
+      expect(publicationToolResult?.result).toEqual(publicationDecisionResult);
+      expect(
+        correlatedRuntimeToolResult(
+          protocol.agent.messages,
+          "connectTypefullyAccount",
+        )?.result,
+      ).toEqual(connectionDecisionResult);
       const boundedSurfaces = JSON.stringify({
         transcript: protocol.agent.messages,
         componentArgs,
         audits: journeyAudits,
       });
-      for (const forbidden of [apiKey, firstBody, changedBody]) {
+      for (const forbidden of [
+        apiKey,
+        altText,
+        firstXBody,
+        firstLinkedInBody,
+        changedXBody,
+        changedLinkedInBody,
+      ]) {
         expect(boundedSurfaces).not.toContain(forbidden);
       }
       expect(componentArgs.map(({ name }) => name)).toEqual([
@@ -697,136 +800,243 @@ describe.skipIf(!asked)("the running Typefully deployment journey", () => {
         "approveTypefullyPublication",
       ]);
       expect(agentEndpoint.runs.length).toBeGreaterThanOrEqual(6);
+    } catch (error) {
+      journeyFailure = error;
     } finally {
-      ui?.close();
-      const currentAssociations = await database
-        .select()
-        .from(mcpUserCredentials)
-        .where(eq(mcpUserCredentials.serverId, "typefully"));
-      const createdAssociation = ownedSmokeTypefullyAssociation({
-        before: beforeAssociations,
-        current: currentAssociations,
-        connectionAttempted,
-        ...(createdCredentialId ? { credentialId: createdCredentialId } : {}),
-      });
-      if (createdAssociation && !createdCredentialId) {
-        createdCredentialId = createdAssociation.credentialId;
-        connectionCreated = true;
-      }
-      if (connectionCreated && createdAssociation) {
-        await request("/api/plugins/connections/typefully", {
-          method: "DELETE",
-        });
-      }
-      if (draftId) {
-        await database
-          .delete(typefullyPublicationProposals)
-          .where(eq(typefullyPublicationProposals.draftId, draftId));
-        await database
-          .delete(typefullyDrafts)
-          .where(eq(typefullyDrafts.id, draftId));
-      }
-      await database.delete(componentExclusions).where(
-        beforeBotComponents.length
-          ? and(
-              eq(componentExclusions.agentId, botId),
-              notInArray(
-                componentExclusions.componentName,
-                beforeBotComponents.map(({ componentName }) => componentName),
-              ),
-            )
-          : eq(componentExclusions.agentId, botId),
+      const cleanupErrors: Error[] = [];
+      cleanupErrors.push(
+        ...(await settleSmokeCleanup([
+          { name: "UI globals", run: () => ui?.close() },
+          {
+            name: "owned Typefully connection",
+            run: async () => {
+              if (!connectionCreated || !createdCredentialId) return;
+              const response = await request(
+                "/api/plugins/connections/typefully",
+                { method: "DELETE" },
+              );
+              if (!response.ok) {
+                throw new Error(`disconnect answered ${response.status}`);
+              }
+            },
+          },
+          {
+            name: "owned draft and channel",
+            run: async () => {
+              if (draftId) {
+                await database
+                  .delete(typefullyPublicationProposals)
+                  .where(eq(typefullyPublicationProposals.draftId, draftId));
+                await database
+                  .delete(typefullyDrafts)
+                  .where(eq(typefullyDrafts.id, draftId));
+              }
+              if (channelId) {
+                await database
+                  .delete(channelAgents)
+                  .where(eq(channelAgents.channelId, channelId));
+                await database
+                  .delete(channelMemberships)
+                  .where(eq(channelMemberships.channelId, channelId));
+                await database
+                  .delete(channels)
+                  .where(eq(channels.id, channelId));
+              }
+            },
+          },
+          ...createdComponentGrants.map((componentName) => ({
+            name: `component grant ${componentName}`,
+            run: async () => {
+              await database
+                .delete(componentExclusions)
+                .where(
+                  and(
+                    eq(componentExclusions.agentId, botId),
+                    eq(componentExclusions.componentName, componentName),
+                    eq(componentExclusions.withheldBy, actorEmail),
+                    gte(componentExclusions.withheldAt, runStartedAt),
+                  ),
+                );
+            },
+          })),
+          ...createdPluginGrants.map((grant) => ({
+            name: `plugin grant ${grant.kind}:${grant.ref}`,
+            run: async () => {
+              await database
+                .delete(pluginGrants)
+                .where(
+                  and(
+                    eq(pluginGrants.agentId, botId),
+                    eq(pluginGrants.kind, grant.kind),
+                    eq(pluginGrants.ref, grant.ref),
+                    eq(pluginGrants.grantedBy, actorEmail),
+                    gte(pluginGrants.grantedAt, runStartedAt),
+                  ),
+                );
+            },
+          })),
+        ])),
       );
-      const priorGrantKeys = beforeBotGrants.map(
-        ({ kind, ref }) => `${kind}:${ref}`,
+      cleanupErrors.push(
+        ...(await settleSmokeCleanup([
+          {
+            name: "owned components",
+            run: async () => {
+              if (!createdComponents.length) return;
+              for (const name of createdComponents) {
+                await database
+                  .delete(components)
+                  .where(
+                    and(
+                      eq(components.name, name),
+                      eq(
+                        components.draftDescription,
+                        `${name} smoke UI contract ${suffix}`,
+                      ),
+                      eq(components.updatedBy, actorEmail),
+                      gte(components.createdAt, runStartedAt),
+                    ),
+                  );
+              }
+            },
+          },
+          {
+            name: "owned credential",
+            run: async () => {
+              if (!createdCredentialId) return;
+              await database
+                .delete(credentials)
+                .where(eq(credentials.id, createdCredentialId));
+            },
+          },
+          {
+            name: "owned connector",
+            run: async () => {
+              if (!serverCreated) return;
+              for (const name of createdToolNames) {
+                await database
+                  .delete(mcpTools)
+                  .where(
+                    and(
+                      eq(mcpTools.serverId, "typefully"),
+                      eq(mcpTools.name, name),
+                    ),
+                  );
+              }
+              const remainingTools = await database
+                .select({ name: mcpTools.name })
+                .from(mcpTools)
+                .where(eq(mcpTools.serverId, "typefully"));
+              if (remainingTools.length) {
+                throw new Error(
+                  "Typefully gained tools outside this run; leaving the shared connector intact.",
+                );
+              }
+              await database
+                .delete(mcpServers)
+                .where(
+                  and(
+                    eq(mcpServers.id, "typefully"),
+                    eq(mcpServers.addedBy, actorEmail),
+                    gte(mcpServers.createdAt, runStartedAt),
+                  ),
+                );
+            },
+          },
+          { name: "fake vendor", run: () => vendor?.close() },
+          { name: "fake AG-UI agent", run: () => agentEndpoint?.close() },
+        ])),
       );
-      const currentBotGrants = await database
-        .select()
-        .from(pluginGrants)
-        .where(eq(pluginGrants.agentId, botId));
-      for (const grant of currentBotGrants) {
-        if (!priorGrantKeys.includes(`${grant.kind}:${grant.ref}`)) {
-          await database
-            .delete(pluginGrants)
-            .where(
-              and(
-                eq(pluginGrants.agentId, botId),
-                eq(pluginGrants.kind, grant.kind),
-                eq(pluginGrants.ref, grant.ref),
-              ),
-            );
-        }
-      }
-      if (channelId) {
-        await database
-          .delete(channelAgents)
-          .where(eq(channelAgents.channelId, channelId));
-        await database
-          .delete(channelMemberships)
-          .where(eq(channelMemberships.channelId, channelId));
-        await database.delete(channels).where(eq(channels.id, channelId));
-      }
-      if (createdComponents.length) {
-        await database
-          .delete(components)
-          .where(inArray(components.name, createdComponents));
-      }
-      if (createdCredentialId) {
-        await database
-          .delete(credentials)
-          .where(eq(credentials.id, createdCredentialId));
-      }
-      if (serverCreated) {
-        await database
-          .delete(mcpTools)
-          .where(eq(mcpTools.serverId, "typefully"));
-        await database.delete(mcpServers).where(eq(mcpServers.id, "typefully"));
-      }
-      vendor.close();
-      agentEndpoint.close();
 
-      expect(
-        await database
-          .select()
-          .from(mcpServers)
-          .where(eq(mcpServers.id, "typefully")),
-      ).toEqual(beforeServers);
-      expect(
-        await database
-          .select()
-          .from(mcpTools)
-          .where(eq(mcpTools.serverId, "typefully")),
-      ).toEqual(beforeTools);
-      expect(
-        await database
-          .select()
-          .from(credentials)
-          .where(eq(credentials.provider, "typefully")),
-      ).toEqual(beforeCredentials);
-      expect(
-        await database
-          .select()
-          .from(mcpUserCredentials)
-          .where(eq(mcpUserCredentials.serverId, "typefully")),
-      ).toEqual(beforeAssociations);
-      expect(
-        await database
-          .select()
-          .from(components)
-          .where(inArray(components.name, componentNames)),
-      ).toEqual(beforeComponents);
-      expect(
-        await database
-          .select()
-          .from(pluginGrants)
-          .where(eq(pluginGrants.agentId, botId)),
-      ).toEqual(beforeBotGrants);
-      expect(
-        await database
-          .select()
-          .from(componentExclusions)
-          .where(eq(componentExclusions.agentId, botId)),
-      ).toEqual(beforeBotComponents);
+      if (snapshotsCaptured) {
+        cleanupErrors.push(
+          ...(await settleSmokeCleanup([
+            {
+              name: "server snapshot",
+              run: async () =>
+                expect(
+                  await database
+                    .select()
+                    .from(mcpServers)
+                    .where(eq(mcpServers.id, "typefully")),
+                ).toEqual(beforeServers),
+            },
+            {
+              name: "tool snapshot",
+              run: async () =>
+                expect(
+                  await database
+                    .select()
+                    .from(mcpTools)
+                    .where(eq(mcpTools.serverId, "typefully")),
+                ).toEqual(beforeTools),
+            },
+            {
+              name: "credential snapshot",
+              run: async () =>
+                expect(
+                  await database
+                    .select()
+                    .from(credentials)
+                    .where(eq(credentials.provider, "typefully")),
+                ).toEqual(beforeCredentials),
+            },
+            {
+              name: "connection snapshot",
+              run: async () =>
+                expect(
+                  await database
+                    .select()
+                    .from(mcpUserCredentials)
+                    .where(eq(mcpUserCredentials.serverId, "typefully")),
+                ).toEqual(beforeAssociations),
+            },
+            {
+              name: "component snapshot",
+              run: async () =>
+                expect(
+                  await database
+                    .select()
+                    .from(components)
+                    .where(inArray(components.name, componentNames)),
+                ).toEqual(beforeComponents),
+            },
+            {
+              name: "plugin grant snapshot",
+              run: async () =>
+                expect(
+                  await database
+                    .select()
+                    .from(pluginGrants)
+                    .where(eq(pluginGrants.agentId, botId)),
+                ).toEqual(beforeBotGrants),
+            },
+            {
+              name: "component grant snapshot",
+              run: async () =>
+                expect(
+                  await database
+                    .select()
+                    .from(componentExclusions)
+                    .where(eq(componentExclusions.agentId, botId)),
+                ).toEqual(beforeBotComponents),
+            },
+          ])),
+        );
+      }
+      finalFailures = [
+        ...(journeyFailure === undefined
+          ? []
+          : [
+              journeyFailure instanceof Error
+                ? journeyFailure
+                : new Error(String(journeyFailure)),
+            ]),
+        ...cleanupErrors,
+      ];
+    }
+    if (finalFailures.length) {
+      throw new AggregateError(finalFailures, "Typefully smoke journey failed");
     }
   }, 120_000);
 });

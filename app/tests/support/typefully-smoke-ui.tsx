@@ -83,6 +83,7 @@ export function openTypefullySmokeUi(apiUrl: string) {
   GlobalRegistrator.register();
   const originalFetch = globalThis.fetch;
   globalThis.fetch = absoluteApiFetch(apiUrl, originalFetch);
+  let closed = false;
 
   const client = () =>
     new QueryClient({
@@ -97,6 +98,7 @@ export function openTypefullySmokeUi(apiUrl: string) {
       args: Record<string, unknown>;
       channelId: string;
       xText: string;
+      linkedinText: string;
       altText: string;
     }) {
       const draft = TypefullyDraftProps.parse(input.args);
@@ -142,6 +144,9 @@ export function openTypefullySmokeUi(apiUrl: string) {
       const xEditor = await view.findByLabelText("X post 1");
       await user.clear(xEditor);
       await user.type(xEditor, input.xText);
+      const linkedinEditor = await view.findByLabelText("LinkedIn post 1");
+      await user.clear(linkedinEditor);
+      await user.type(linkedinEditor, input.linkedinText);
       const alt = await view.findByLabelText("Alt text for image 1");
       await user.clear(alt);
       await user.type(alt, input.altText);
@@ -269,9 +274,14 @@ export function openTypefullySmokeUi(apiUrl: string) {
     },
 
     close() {
-      cleanup();
-      globalThis.fetch = originalFetch;
-      GlobalRegistrator.unregister();
+      if (closed) return;
+      closed = true;
+      try {
+        cleanup();
+      } finally {
+        globalThis.fetch = originalFetch;
+        GlobalRegistrator.unregister();
+      }
     },
   };
 }

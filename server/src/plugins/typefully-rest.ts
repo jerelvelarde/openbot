@@ -156,9 +156,10 @@ export function createTypefullySmokeFetch(
     }
     const relative = `${source.pathname.slice(official.pathname.length)}${source.search}`;
     const target = new URL(relative, smokeBase);
+    const pinnedInit: RequestInit = { ...init, redirect: "error" };
     return input instanceof Request
-      ? fetchImplementation(new Request(target, input), init)
-      : fetchImplementation(target, init);
+      ? fetchImplementation(new Request(target, input), pinnedInit)
+      : fetchImplementation(target, pinnedInit);
   }) as FetchImplementation;
 }
 

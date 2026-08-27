@@ -4,33 +4,33 @@ export type TypefullyCredentialAssociation = {
   credentialId: string;
 };
 
-function existedBefore(
-  association: TypefullyCredentialAssociation,
-  before: TypefullyCredentialAssociation[],
-) {
-  return before.some(
-    (candidate) =>
-      candidate.serverId === association.serverId &&
-      candidate.userId === association.userId &&
-      candidate.credentialId === association.credentialId,
-  );
-}
+export type TypefullyCredentialRecord = {
+  id: string;
+  provider: string;
+  keyId: string;
+  createdAt: Date;
+};
 
-/** Resolve only the one personal association an attempted smoke connection can prove it created. */
-export function ownedSmokeTypefullyAssociation(input: {
-  before: TypefullyCredentialAssociation[];
-  current: TypefullyCredentialAssociation[];
-  connectionAttempted: boolean;
-  credentialId?: string;
+/** Capture cleanup authority only after a successful mutation, never from a snapshot difference. */
+export function confirmedSmokeTypefullyAssociation(input: {
+  connectionConfirmed: boolean;
+  actorId: string;
+  runStartedAt: Date;
+  associations: TypefullyCredentialAssociation[];
+  credentials: TypefullyCredentialRecord[];
 }): TypefullyCredentialAssociation | undefined {
-  if (!input.connectionAttempted) return undefined;
-  const created = input.current.filter(
-    (association) => !existedBefore(association, input.before),
+  if (!input.connectionConfirmed) return undefined;
+  const association = input.associations.find(
+    (candidate) =>
+      candidate.serverId === "typefully" && candidate.userId === input.actorId,
   );
-  if (input.credentialId) {
-    return created.find(
-      (association) => association.credentialId === input.credentialId,
-    );
-  }
-  return created.length === 1 ? created[0] : undefined;
+  if (!association) return undefined;
+  const credential = input.credentials.find(
+    (candidate) =>
+      candidate.id === association.credentialId &&
+      candidate.provider === "typefully" &&
+      candidate.keyId === input.actorId &&
+      candidate.createdAt.getTime() >= input.runStartedAt.getTime(),
+  );
+  return credential ? association : undefined;
 }

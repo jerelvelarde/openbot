@@ -18,21 +18,118 @@ import { remoteMatchesSnapshot } from "../src/typefully/publication";
 import { startFakeTypefullyVendor } from "./support/fake-typefully-vendor";
 
 test("the smoke transport rewrites only the pinned Typefully origin", async () => {
-  const calls: string[] = [];
+  const calls: Array<{ url: string; redirect: RequestRedirect | undefined }> =
+    [];
   const smokeFetch = createTypefullySmokeFetch(
     "http://127.0.0.1:43199/v2",
-    (async (input) => {
-      calls.push(String(input));
+    (async (input, init) => {
+      calls.push({ url: String(input), redirect: init?.redirect });
       return Response.json({ ok: true });
     }) as typeof fetch,
   );
 
   await smokeFetch("https://api.typefully.com/v2/me");
-  expect(calls).toEqual(["http://127.0.0.1:43199/v2/me"]);
+  expect(calls).toEqual([
+    { url: "http://127.0.0.1:43199/v2/me", redirect: "error" },
+  ]);
   await expect(smokeFetch("https://example.com/v2/me")).rejects.toThrow(
     "refused a non-Typefully URL",
   );
 });
+
+test.each([307, 308])(
+  "the smoke transport refuses %s redirects before a second hop can receive auth or body",
+  async (status) => {
+    let firstHop = 0;
+    let secondHop = 0;
+    const target = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: async (request) => {
+        secondHop += 1;
+        expect(request.headers.get("authorization")).toBeNull();
+        expect(await request.text()).toBe("");
+        return Response.json({ ok: true });
+      },
+    });
+    const redirector = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: () => {
+        firstHop += 1;
+        return new Response(null, {
+          status,
+          headers: { location: `http://127.0.0.1:${target.port}/capture` },
+        });
+      },
+    });
+    try {
+      const smokeFetch = createTypefullySmokeFetch(
+        `http://127.0.0.1:${redirector.port}/v2`,
+      );
+      await expect(
+        smokeFetch("https://api.typefully.com/v2/drafts", {
+          method: "POST",
+          headers: { authorization: "Bearer tf-never-forward" },
+          body: "private-draft-body",
+          redirect: "follow",
+        }),
+      ).rejects.toThrow();
+      expect(firstHop).toBe(1);
+      expect(secondHop).toBe(0);
+    } finally {
+      redirector.stop(true);
+      target.stop(true);
+    }
+  },
+);
+
+test.each([307, 308])(
+  "the smoke transport also refuses external %s redirects without following",
+  async (status) => {
+    const calls: Array<{
+      url: string;
+      authorization: string | null;
+      body: string;
+    }> = [];
+    const smokeFetch = createTypefullySmokeFetch(
+      "http://127.0.0.1:43199/v2",
+      (async (input, init) => {
+        const request = new Request(input, init);
+        calls.push({
+          url: request.url,
+          authorization: request.headers.get("authorization"),
+          body: await request.text(),
+        });
+        if (init?.redirect !== "error") {
+          calls.push({
+            url: "https://external.example/capture",
+            authorization: request.headers.get("authorization"),
+            body: "private-draft-body",
+          });
+        }
+        throw new TypeError(
+          `fetch failed: external ${status} redirect mode is error`,
+        );
+      }) as typeof fetch,
+    );
+
+    await expect(
+      smokeFetch("https://api.typefully.com/v2/drafts", {
+        method: "POST",
+        headers: { authorization: "Bearer tf-never-forward" },
+        body: "private-draft-body",
+      }),
+    ).rejects.toThrow("redirect mode is error");
+    expect(calls).toEqual([
+      {
+        url: "http://127.0.0.1:43199/v2/drafts",
+        authorization: "Bearer tf-never-forward",
+        body: "private-draft-body",
+      },
+    ]);
+  },
+);
 
 test("the fake vendor returns an authoritative reviewed draft before one publish PATCH", async () => {
   const fake = startFakeTypefullyVendor("http://127.0.0.1:0/v2");
