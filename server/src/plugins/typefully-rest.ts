@@ -13,10 +13,35 @@ const SAFE_MESSAGE_CHARS = 400;
 const SAFE_ERROR_BODY_CHARS = 2_048;
 const RETRY_AFTER_CHARS = 120;
 const MAX_REDACTABLE_TOKEN_BYTES = 4_096;
+const TYPEFULLY_ACCOUNT_FIELD_CHARS = 200;
+const TYPEFULLY_ME_MAX_BYTES = 16_384;
 export const TYPEFULLY_REMOVE_MEDIA_MAX_DRAFT_BYTES = 1_000_000;
 
 type Connection = { url: string; token?: string };
 type FetchImplementation = typeof globalThis.fetch;
+
+export type TypefullyApiKeyMetadata = {
+  accountId: string | null;
+  accountLabel: string | null;
+  keyLabel: string | null;
+};
+
+export type TypefullyApiKeyValidationCode =
+  | "invalid_api_key"
+  | "validation_timeout"
+  | "rate_limited"
+  | "validation_unavailable";
+
+/** A bounded, non-secret failure suitable for returning from the connection route. */
+export class TypefullyApiKeyValidationError extends Error {
+  constructor(
+    readonly code: TypefullyApiKeyValidationCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = "TypefullyApiKeyValidationError";
+  }
+}
 
 const TOOL_DESCRIPTIONS: Record<TypefullyToolName, string> = {
   list_social_sets:
@@ -287,6 +312,138 @@ function decodeBody(
     offset += chunk.byteLength;
   }
   return { text: new TextDecoder().decode(joined), truncated };
+}
+
+function boundedAccountField(value: unknown, apiKey: string): string | null {
+  if (typeof value !== "string") return null;
+  if (value.includes(apiKey)) return null;
+  const sanitized = value
+    .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!sanitized) return null;
+  return boundedCharacters(sanitized, TYPEFULLY_ACCOUNT_FIELD_CHARS).text;
+}
+
+/** Validate a personal key against Typefully's pinned identity endpoint before it is persisted. */
+export function assertValidTypefullyApiKeyInput(apiKey: string): void {
+  const keyBytes = new TextEncoder().encode(apiKey).byteLength;
+  if (
+    !apiKey.trim() ||
+    keyBytes > MAX_REDACTABLE_TOKEN_BYTES ||
+    /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(apiKey)
+  ) {
+    throw new TypefullyApiKeyValidationError(
+      "invalid_api_key",
+      "Enter a valid Typefully API key.",
+    );
+  }
+}
+
+/** Validate a personal key against Typefully's pinned identity endpoint before it is persisted. */
+export async function validateTypefullyApiKey(
+  apiKey: string,
+  fetchImplementation: FetchImplementation = globalThis.fetch,
+  timeoutMs = REQUEST_TIMEOUT_MS,
+): Promise<TypefullyApiKeyMetadata> {
+  assertValidTypefullyApiKeyInput(apiKey);
+
+  let response: Response;
+  try {
+    response = await fetchImplementation(`${TYPEFULLY_API_URL}/me`, {
+      method: "GET",
+      headers: { authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      (error.name === "TimeoutError" || error.name === "AbortError")
+    ) {
+      throw new TypefullyApiKeyValidationError(
+        "validation_timeout",
+        "Typefully did not answer in time. Try again.",
+      );
+    }
+    throw new TypefullyApiKeyValidationError(
+      "validation_unavailable",
+      "Typefully could not be reached to validate this key. Try again.",
+    );
+  }
+
+  if (response.status === 401 || response.status === 403) {
+    await response.body?.cancel().catch(() => {});
+    throw new TypefullyApiKeyValidationError(
+      "invalid_api_key",
+      "Typefully did not accept this API key.",
+    );
+  }
+  if (response.status === 429) {
+    await response.body?.cancel().catch(() => {});
+    throw new TypefullyApiKeyValidationError(
+      "rate_limited",
+      "Typefully is rate limiting key validation. Try again later.",
+    );
+  }
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => {});
+    throw new TypefullyApiKeyValidationError(
+      "validation_unavailable",
+      `Typefully could not validate this key (${response.status}). Try again.`,
+    );
+  }
+
+  let body: BoundedBody;
+  try {
+    body = await readBoundedBody(response, TYPEFULLY_ME_MAX_BYTES);
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      (error.name === "TimeoutError" || error.name === "AbortError")
+    ) {
+      throw new TypefullyApiKeyValidationError(
+        "validation_timeout",
+        "Typefully did not finish answering in time. Try again.",
+      );
+    }
+    throw new TypefullyApiKeyValidationError(
+      "validation_unavailable",
+      "Typefully's validation response could not be read. Try again.",
+    );
+  }
+  if (body.truncated) {
+    throw new TypefullyApiKeyValidationError(
+      "validation_unavailable",
+      "Typefully's validation response was too large to read safely.",
+    );
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body.text);
+  } catch {
+    throw new TypefullyApiKeyValidationError(
+      "validation_unavailable",
+      "Typefully returned an unreadable validation response.",
+    );
+  }
+  if (!isRecord(parsed)) {
+    throw new TypefullyApiKeyValidationError(
+      "validation_unavailable",
+      "Typefully returned an invalid validation response.",
+    );
+  }
+
+  const rawId = parsed.id;
+  const accountId =
+    typeof rawId === "string" || typeof rawId === "number"
+      ? boundedAccountField(String(rawId), apiKey)
+      : null;
+  return {
+    accountId,
+    accountLabel: boundedAccountField(parsed.name, apiKey),
+    keyLabel: boundedAccountField(parsed.api_key_label, apiKey),
+  };
 }
 
 type RawResponse = { response: Response; body: BoundedBody };

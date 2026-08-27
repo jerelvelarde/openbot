@@ -37,6 +37,11 @@ import {
 import { McpServerError } from "./mcp";
 import { registerDynamicClient } from "./oauth";
 import { transportFor } from "./transport";
+import {
+  assertValidTypefullyApiKeyInput,
+  type TypefullyApiKeyMetadata,
+  validateTypefullyApiKey,
+} from "./typefully-rest";
 
 /**
  * Plugins: what this deployment has added, which Bots may use it, and the one path a call takes.
@@ -177,6 +182,34 @@ export class PluginRefusedError extends Error {
   }
 }
 
+export class ConnectionRequiredError extends PluginRefusedError {
+  readonly code = "connection_required" as const;
+  readonly serverId: string;
+  readonly connectPath: string;
+
+  constructor(serverId: string, title: string) {
+    super(
+      `You have not connected your ${title} account. Connect it in Settings and ask again.`,
+      null,
+    );
+    this.name = "ConnectionRequiredError";
+    this.serverId = serverId;
+    this.connectPath = `/settings/connected-accounts/${serverId}`;
+  }
+}
+
+export type UserConnectionErrorCode = "connector_not_enabled" | "not_connected";
+
+export class UserConnectionError extends Error {
+  constructor(
+    readonly code: UserConnectionErrorCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = "UserConnectionError";
+  }
+}
+
 export class CatalogueEntryUnknownError extends Error {
   constructor(key: string) {
     super(`${key} is not a server this deployment will connect to.`);
@@ -281,6 +314,19 @@ export function unlistedAdvertisedTools(
 
 const iso = (value: Date | string | null): string | null =>
   value === null ? null : value instanceof Date ? value.toISOString() : value;
+
+function safeAccountLabel(metadata: unknown): string | null {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+    return null;
+  }
+  const value = (metadata as Record<string, unknown>).accountLabel;
+  if (typeof value !== "string") return null;
+  const sanitized = value
+    .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return sanitized ? Array.from(sanitized).slice(0, 200).join("") : null;
+}
 
 /**
  * Whose credential reaches this server, as the trail names it.
@@ -520,6 +566,11 @@ export type PluginStoreOptions = {
   }) => Promise<OAuthClient | null>;
   /** Where the vendor sends people back; needed to (re)register a dynamic client. */
   redirectUri?: string;
+  /** Validate before any vault or association write. Defaults to Typefully's pinned `/v2/me`. */
+  validateUserApiKey?: (input: {
+    serverId: string;
+    apiKey: string;
+  }) => Promise<TypefullyApiKeyMetadata>;
 };
 
 export function createPluginStore(options: PluginStoreOptions) {
@@ -533,6 +584,17 @@ export function createPluginStore(options: PluginStoreOptions) {
   const exchangeRefreshToken =
     options.exchangeRefreshToken ?? exchangeRefreshTokenOverHttp;
   const registerClient = options.registerClient ?? registerDynamicClient;
+  const validateUserApiKey =
+    options.validateUserApiKey ??
+    (async ({ serverId, apiKey }) => {
+      if (serverId !== "typefully") {
+        throw new UserConnectionError(
+          "connector_not_enabled",
+          `${serverId} does not support personal API-key validation.`,
+        );
+      }
+      return await validateTypefullyApiKey(apiKey);
+    });
 
   /*
    * One exchange at a time per (server, person). A rotating vendor invalidates the refresh
@@ -694,13 +756,10 @@ export function createPluginStore(options: PluginStoreOptions) {
     entry: CatalogueEntry | null,
     actorId: string,
   ): Promise<{ token?: string }> {
-    if (entry?.auth.kind === "user-api-key") {
-      throw new PluginRefusedError(
-        `Personal ${entry.title} connection setup is not available yet. An administrator must finish enabling personal API-key connections before this tool can be used.`,
-        null,
-      );
-    }
-    if (entry?.auth.kind !== "user-oauth") {
+    if (
+      entry?.auth.kind !== "user-oauth" &&
+      entry?.auth.kind !== "user-api-key"
+    ) {
       const token = row.credentialId
         ? await secretFor(
             row.credentialId,
@@ -724,6 +783,53 @@ export function createPluginStore(options: PluginStoreOptions) {
       );
     }
 
+    if (entry.auth.kind === "user-api-key") {
+      const [held] = await database
+        .select({
+          credentialId: mcpUserCredentials.credentialId,
+          authMethod: mcpUserCredentials.authMethod,
+          scope: mcpUserCredentials.scope,
+          kind: credentialRows.kind,
+          provider: credentialRows.provider,
+          keyId: credentialRows.keyId,
+          revokedAt: credentialRows.revokedAt,
+        })
+        .from(mcpUserCredentials)
+        .leftJoin(
+          credentialRows,
+          eq(credentialRows.id, mcpUserCredentials.credentialId),
+        )
+        .where(
+          and(
+            eq(mcpUserCredentials.serverId, row.id),
+            eq(mcpUserCredentials.userId, actorId),
+          ),
+        )
+        .limit(1);
+
+      if (!held) throw new ConnectionRequiredError(row.id, entry.title);
+      if (
+        held.authMethod !== "api_key" ||
+        held.scope !== null ||
+        held.kind !== "mcp_user_api_key" ||
+        held.provider !== row.id ||
+        held.keyId !== actorId ||
+        held.revokedAt !== null
+      ) {
+        throw new PluginRefusedError(
+          `Your ${entry.title} connection is unusable. Disconnect it and connect it again in Settings.`,
+          null,
+        );
+      }
+
+      return {
+        token: await secretFor(
+          held.credentialId,
+          `Your ${entry.title} access was withdrawn. Connect it again in Settings.`,
+        ),
+      };
+    }
+
     /*
      * Whether this person has connected at all, which is a refusal worth reaching before anything
      * queues behind another call. WHICH credential they hold is read again inside the critical
@@ -731,7 +837,11 @@ export function createPluginStore(options: PluginStoreOptions) {
      * when the row stays put, the secret inside it does not.
      */
     const [held] = await database
-      .select({ credentialId: mcpUserCredentials.credentialId })
+      .select({
+        credentialId: mcpUserCredentials.credentialId,
+        authMethod: mcpUserCredentials.authMethod,
+        scope: mcpUserCredentials.scope,
+      })
       .from(mcpUserCredentials)
       .where(
         and(
@@ -744,6 +854,12 @@ export function createPluginStore(options: PluginStoreOptions) {
     if (!held) {
       throw new PluginRefusedError(
         `You have not connected your ${entry.title} account. Connect it in Settings and ask again.`,
+        null,
+      );
+    }
+    if (held.authMethod !== "oauth" || held.scope === null) {
+      throw new PluginRefusedError(
+        `Your ${entry.title} connection is unusable. Disconnect it and connect it again in Settings.`,
         null,
       );
     }
@@ -891,6 +1007,7 @@ export function createPluginStore(options: PluginStoreOptions) {
             .select({
               credentialId: mcpUserCredentials.credentialId,
               scope: mcpUserCredentials.scope,
+              authMethod: mcpUserCredentials.authMethod,
             })
             .from(mcpUserCredentials)
             .where(
@@ -909,11 +1026,20 @@ export function createPluginStore(options: PluginStoreOptions) {
               null,
             );
           }
+          if (current.authMethod !== "oauth" || current.scope === null) {
+            throw new PluginRefusedError(
+              `Your ${title} connection is unusable. Disconnect it and connect it again in Settings.`,
+              null,
+            );
+          }
 
           const [locked] = await transaction
             .select({
               encryptedValue: credentialRows.encryptedValue,
               revokedAt: credentialRows.revokedAt,
+              kind: credentialRows.kind,
+              provider: credentialRows.provider,
+              keyId: credentialRows.keyId,
             })
             .from(credentialRows)
             .where(eq(credentialRows.id, current.credentialId))
@@ -923,7 +1049,13 @@ export function createPluginStore(options: PluginStoreOptions) {
            * nobody's fault and connecting again is the step. Reached by a replica that waited here
            * while somebody disconnected, as well as by one that was told after the fact.
            */
-          if (!locked || locked.revokedAt) {
+          if (
+            !locked ||
+            locked.revokedAt ||
+            locked.kind !== "mcp_user_token" ||
+            locked.provider !== row.id ||
+            locked.keyId !== actorId
+          ) {
             throw new PluginRefusedError(
               `Your ${title} access was withdrawn. Connect it again in Settings.`,
               null,
@@ -1048,6 +1180,24 @@ export function createPluginStore(options: PluginStoreOptions) {
     throw new PluginRefusedError(input.refusal, null);
   }
 
+  async function lockServerLifecycle(
+    transaction: Transaction,
+    serverId: string,
+  ): Promise<void> {
+    await transaction.execute(
+      sql`select pg_advisory_xact_lock(hashtext(${`mcp-server-lifecycle:${serverId}`}))`,
+    );
+  }
+
+  async function lockUserConnections(
+    transaction: Transaction,
+    userId: string,
+  ): Promise<void> {
+    await transaction.execute(
+      sql`select pg_advisory_xact_lock(hashtext(${`mcp-user-connections:${userId}`}))`,
+    );
+  }
+
   /**
    * Point one person's connection at a new refresh token, revoking the one it replaces.
    *
@@ -1090,6 +1240,8 @@ export function createPluginStore(options: PluginStoreOptions) {
     };
 
     return await database.transaction(async (transaction) => {
+      await lockServerLifecycle(transaction, input.serverId);
+      await lockUserConnections(transaction, input.userId);
       /*
        * `credentials_active_key_idx` holds one live credential per key, so a second insert for the
        * same person and server would be refused. Asked of the key rather than of the connection row,
@@ -1110,12 +1262,14 @@ export function createPluginStore(options: PluginStoreOptions) {
           serverId: input.serverId,
           userId: input.userId,
           credentialId: stored.id,
+          authMethod: "oauth",
           scope: input.scope,
         })
         .onConflictDoUpdate({
           target: [mcpUserCredentials.serverId, mcpUserCredentials.userId],
           set: {
             credentialId: stored.id,
+            authMethod: "oauth",
             scope: input.scope,
             updatedAt: new Date(),
           },
@@ -1751,39 +1905,59 @@ export function createPluginStore(options: PluginStoreOptions) {
      * delete-then-revoke leaves live secrets no server references and no operation can reach.
      */
     async removeServer(serverId: string, by: string): Promise<void> {
-      const [existing] = await database
-        .select({ credentialId: mcpServers.credentialId })
-        .from(mcpServers)
-        .where(eq(mcpServers.id, serverId));
+      const removed = await database.transaction(async (transaction) => {
+        await lockServerLifecycle(transaction, serverId);
+        const [existing] = await transaction
+          .select({ credentialId: mcpServers.credentialId })
+          .from(mcpServers)
+          .where(eq(mcpServers.id, serverId))
+          .for("update");
 
-      /**
-       * Whether that token is still live, read rather than inferred from a
-       * thrown error, so a token a previous attempt already revoked, or one
-       * whose row is gone entirely, is skipped while a database fault still
-       * propagates and leaves the server row in place to be removed again.
-       *
-       * Two queries rather than a join because `mcp_servers.credential_id` is
-       * `text` and `credentials.id` is `uuid`, so the two columns do not
-       * compare without a cast.
-       */
-      const [live] = existing?.credentialId
-        ? await database
-            .select({ id: credentialRows.id })
-            .from(credentialRows)
-            .where(
-              and(
-                eq(credentialRows.id, existing.credentialId),
-                isNull(credentialRows.revokedAt),
-              ),
-            )
-        : [];
+        const [deploymentCredential] = existing?.credentialId
+          ? await transaction
+              .select({ id: credentialRows.id })
+              .from(credentialRows)
+              .where(
+                and(
+                  eq(credentialRows.id, existing.credentialId),
+                  isNull(credentialRows.revokedAt),
+                ),
+              )
+          : [];
+        if (deploymentCredential) {
+          await credentials.revoke(deploymentCredential.id, transaction);
+        }
 
-      if (live) {
-        await credentials.revoke(live.id);
+        const held = await transaction
+          .select({ id: credentialRows.id, keyId: credentialRows.keyId })
+          .from(credentialRows)
+          .where(
+            and(
+              inArray(credentialRows.kind, [
+                "mcp_user_token",
+                "mcp_user_api_key",
+              ]),
+              eq(credentialRows.provider, serverId),
+              isNull(credentialRows.revokedAt),
+            ),
+          )
+          .orderBy(asc(credentialRows.keyId));
+        for (const grant of held) {
+          await credentials.revoke(grant.id, transaction);
+        }
+
+        await transaction.delete(mcpServers).where(eq(mcpServers.id, serverId));
+        return {
+          deploymentCredentialId: deploymentCredential?.id ?? null,
+          grants: held,
+        };
+      });
+
+      if (removed.deploymentCredentialId) {
         await recordAuditEvent(auditStore, {
           eventType: "credential.revoked",
           targetType: "credential",
-          targetId: live.id,
+          targetId: removed.deploymentCredentialId,
           payload: {
             actor: by,
             reason: "mcp_server_removed",
@@ -1792,29 +1966,7 @@ export function createPluginStore(options: PluginStoreOptions) {
         });
       }
 
-      /*
-       * Every person's grant for this server, read out of the VAULT rather than through the join
-       * table.
-       *
-       * `credentials.provider` holds the server id for an `mcp_user_token`, so the vault can be asked
-       * directly — which matters because the join row is the thing about to be cascaded away, and a
-       * grant whose pointer has already gone (a person removed earlier) would otherwise be invisible
-       * here too. The same argument `retireConnectionsFor` makes from the other direction.
-       */
-      const held = await database
-        .select({ id: credentialRows.id, keyId: credentialRows.keyId })
-        .from(credentialRows)
-        .where(
-          and(
-            eq(credentialRows.kind, "mcp_user_token"),
-            eq(credentialRows.provider, serverId),
-            isNull(credentialRows.revokedAt),
-          ),
-        )
-        .orderBy(asc(credentialRows.keyId));
-
-      for (const grant of held) {
-        await credentials.revoke(grant.id);
+      for (const grant of removed.grants) {
         await recordAuditEvent(auditStore, {
           eventType: "mcp.account_disconnected",
           targetType: "mcp_server",
@@ -1835,8 +1987,6 @@ export function createPluginStore(options: PluginStoreOptions) {
           },
         });
       }
-
-      await database.delete(mcpServers).where(eq(mcpServers.id, serverId));
       await recordAuditEvent(auditStore, {
         eventType: "configuration.changed",
         targetType: "mcp_server",
@@ -2513,6 +2663,310 @@ export function createPluginStore(options: PluginStoreOptions) {
       });
     },
 
+    async connectUserApiKey(input: {
+      serverId: string;
+      userId: string;
+      apiKey: string;
+      by: string;
+    }): Promise<{
+      serverId: string;
+      authMethod: "api_key";
+      accountLabel: string | null;
+      connectedAt: string;
+    }> {
+      if (!input.userId) {
+        throw new UserConnectionError(
+          "not_connected",
+          "An authenticated person is required to connect an account.",
+        );
+      }
+      let entry: CatalogueEntry | null;
+      try {
+        ({ entry } = await requireServer(input.serverId));
+      } catch (error) {
+        if (error instanceof CatalogueEntryUnknownError) {
+          throw new UserConnectionError(
+            "connector_not_enabled",
+            `${input.serverId} is not enabled on this deployment.`,
+          );
+        }
+        throw error;
+      }
+      if (entry?.auth.kind !== "user-api-key") {
+        throw new UserConnectionError(
+          "connector_not_enabled",
+          `${input.serverId} is not enabled for personal API-key connections.`,
+        );
+      }
+
+      // No vault/database write precedes the vendor's proof that this key belongs to an account.
+      assertValidTypefullyApiKeyInput(input.apiKey);
+      const metadata = await validateUserApiKey({
+        serverId: input.serverId,
+        apiKey: input.apiKey,
+      });
+      const encryptedValue = await encryptSecret(encryptionKey, input.apiKey);
+      const connectedAt = new Date();
+      const key = {
+        kind: "mcp_user_api_key" as const,
+        provider: input.serverId,
+        keyId: input.userId,
+      };
+      const value = {
+        ...key,
+        encryptedValue,
+        metadata: {
+          server: input.serverId,
+          accountId: metadata.accountId,
+          accountLabel: metadata.accountLabel,
+          keyLabel: metadata.keyLabel,
+        },
+      };
+
+      const stored = await database.transaction(async (transaction) => {
+        await lockServerLifecycle(transaction, input.serverId);
+        await lockUserConnections(transaction, input.userId);
+        await transaction.execute(
+          sql`select pg_advisory_xact_lock(hashtext(${`user-api-key:${input.serverId}:${input.userId}`}))`,
+        );
+        const [enabled] = await transaction
+          .select({ id: mcpServers.id })
+          .from(mcpServers)
+          .where(eq(mcpServers.id, input.serverId))
+          .for("key share");
+        if (
+          !enabled ||
+          catalogueEntry(enabled.id)?.auth.kind !== "user-api-key"
+        ) {
+          throw new UserConnectionError(
+            "connector_not_enabled",
+            `${input.serverId} is not enabled for personal API-key connections.`,
+          );
+        }
+        const [current] = await transaction
+          .select({
+            credentialId: mcpUserCredentials.credentialId,
+            authMethod: mcpUserCredentials.authMethod,
+            scope: mcpUserCredentials.scope,
+          })
+          .from(mcpUserCredentials)
+          .where(
+            and(
+              eq(mcpUserCredentials.serverId, input.serverId),
+              eq(mcpUserCredentials.userId, input.userId),
+            ),
+          )
+          .for("update");
+
+        let previousCredentialId: string | null = null;
+        if (current) {
+          if (current.authMethod !== "api_key" || current.scope !== null) {
+            throw new PluginRefusedError(
+              "The existing connection uses a different authentication method.",
+              null,
+            );
+          }
+          const [previous] = await transaction
+            .select({
+              kind: credentialRows.kind,
+              provider: credentialRows.provider,
+              keyId: credentialRows.keyId,
+              revokedAt: credentialRows.revokedAt,
+            })
+            .from(credentialRows)
+            .where(eq(credentialRows.id, current.credentialId));
+          if (
+            !previous ||
+            previous.revokedAt ||
+            previous.kind !== key.kind ||
+            previous.provider !== key.provider ||
+            previous.keyId !== key.keyId
+          ) {
+            throw new PluginRefusedError(
+              "The existing connection does not reference this person's live API key.",
+              null,
+            );
+          }
+          previousCredentialId = current.credentialId;
+        } else {
+          const orphan = await credentials.findLiveByKey(key, transaction);
+          if (orphan) {
+            throw new PluginRefusedError(
+              "A live API key exists without a matching connection. An administrator must retire it before reconnecting.",
+              null,
+            );
+          }
+        }
+
+        const next = previousCredentialId
+          ? await credentials.rotate(
+              { ...value, previousCredentialId },
+              transaction,
+            )
+          : await credentials.create(value, transaction);
+
+        await transaction
+          .insert(mcpUserCredentials)
+          .values({
+            serverId: input.serverId,
+            userId: input.userId,
+            credentialId: next.id,
+            authMethod: "api_key",
+            scope: null,
+            connectedAt,
+          })
+          .onConflictDoUpdate({
+            target: [mcpUserCredentials.serverId, mcpUserCredentials.userId],
+            set: {
+              credentialId: next.id,
+              authMethod: "api_key",
+              scope: null,
+              connectedAt,
+              updatedAt: connectedAt,
+            },
+          });
+        return { id: next.id, previousCredentialId };
+      });
+
+      await recordAuditEvent(auditStore, {
+        eventType: "mcp.account_connected",
+        targetType: "mcp_server",
+        targetId: input.serverId,
+        payload: {
+          actor: input.by,
+          server: input.serverId,
+          owner: input.userId,
+          authMethod: "api_key",
+          accountLabel: metadata.accountLabel,
+          reconnected: stored.previousCredentialId !== null,
+          oldCredentialId: stored.previousCredentialId,
+          newCredentialId: stored.id,
+        },
+      });
+
+      return {
+        serverId: input.serverId,
+        authMethod: "api_key",
+        accountLabel: metadata.accountLabel,
+        connectedAt: connectedAt.toISOString(),
+      };
+    },
+
+    async disconnectUserConnection(input: {
+      serverId: string;
+      userId: string;
+      by: string;
+    }): Promise<void> {
+      if (!input.userId) {
+        throw new UserConnectionError(
+          "not_connected",
+          "There is no connected account to disconnect.",
+        );
+      }
+      try {
+        await requireServer(input.serverId);
+      } catch (error) {
+        if (error instanceof CatalogueEntryUnknownError) {
+          throw new UserConnectionError(
+            "connector_not_enabled",
+            `${input.serverId} is not enabled on this deployment.`,
+          );
+        }
+        throw error;
+      }
+      const retired = await database.transaction(async (transaction) => {
+        await lockServerLifecycle(transaction, input.serverId);
+        await lockUserConnections(transaction, input.userId);
+        await transaction.execute(
+          sql`select pg_advisory_xact_lock(hashtext(${`user-api-key:${input.serverId}:${input.userId}`}))`,
+        );
+        const [association] = await transaction
+          .select({
+            credentialId: mcpUserCredentials.credentialId,
+            authMethod: mcpUserCredentials.authMethod,
+            scope: mcpUserCredentials.scope,
+          })
+          .from(mcpUserCredentials)
+          .where(
+            and(
+              eq(mcpUserCredentials.serverId, input.serverId),
+              eq(mcpUserCredentials.userId, input.userId),
+            ),
+          )
+          .for("update");
+        if (!association) {
+          throw new UserConnectionError(
+            "not_connected",
+            `No ${input.serverId} account is connected.`,
+          );
+        }
+
+        const expectedKind =
+          association.authMethod === "oauth"
+            ? "mcp_user_token"
+            : "mcp_user_api_key";
+        if (
+          (association.authMethod === "oauth") !==
+          (association.scope !== null)
+        ) {
+          throw new PluginRefusedError(
+            "The connection's authentication method and scope do not match.",
+            null,
+          );
+        }
+        const [credential] = await transaction
+          .select({
+            kind: credentialRows.kind,
+            provider: credentialRows.provider,
+            keyId: credentialRows.keyId,
+            revokedAt: credentialRows.revokedAt,
+          })
+          .from(credentialRows)
+          .where(eq(credentialRows.id, association.credentialId));
+        if (
+          !credential ||
+          credential.revokedAt ||
+          credential.kind !== expectedKind ||
+          credential.provider !== input.serverId ||
+          credential.keyId !== input.userId
+        ) {
+          throw new PluginRefusedError(
+            "The connection does not reference this person's live credential.",
+            null,
+          );
+        }
+
+        await credentials.revoke(association.credentialId, transaction);
+        await transaction
+          .delete(mcpUserCredentials)
+          .where(
+            and(
+              eq(mcpUserCredentials.serverId, input.serverId),
+              eq(mcpUserCredentials.userId, input.userId),
+            ),
+          );
+        return {
+          credentialId: association.credentialId,
+          authMethod: association.authMethod,
+        };
+      });
+
+      await recordAuditEvent(auditStore, {
+        eventType: "mcp.account_disconnected",
+        targetType: "mcp_server",
+        targetId: input.serverId,
+        payload: {
+          actor: input.by,
+          server: input.serverId,
+          owner: input.userId,
+          authMethod: retired.authMethod,
+          credentialId: retired.credentialId,
+          reason: "person_disconnected",
+          vendorRevoked: false,
+        },
+      });
+    },
+
     /**
      * The deployment's OAuth client for a server, or null if none is registered.
      *
@@ -2520,36 +2974,66 @@ export function createPluginStore(options: PluginStoreOptions) {
      */
     oauthClientFor: storedOAuthClient,
 
-    /** Which `user-oauth` servers this person has connected, for their own settings page. */
-    async connectionsFor(
-      userId: string,
-    ): Promise<{ serverId: string; scope: string; connectedAt: string }[]> {
+    /** Live, owner-matched personal connections for this person's settings page. */
+    async connectionsFor(userId: string): Promise<
+      {
+        serverId: string;
+        authMethod: "oauth" | "api_key";
+        scope: string | null;
+        accountLabel: string | null;
+        connectedAt: string;
+      }[]
+    > {
       const rows = await database
         .select({
           serverId: mcpUserCredentials.serverId,
+          userId: mcpUserCredentials.userId,
+          authMethod: mcpUserCredentials.authMethod,
           scope: mcpUserCredentials.scope,
           connectedAt: mcpUserCredentials.connectedAt,
+          kind: credentialRows.kind,
+          provider: credentialRows.provider,
+          keyId: credentialRows.keyId,
+          metadata: credentialRows.metadata,
+          revokedAt: credentialRows.revokedAt,
         })
         .from(mcpUserCredentials)
-        .where(
-          and(
-            eq(mcpUserCredentials.userId, userId),
-            eq(mcpUserCredentials.authMethod, "oauth"),
-          ),
+        .innerJoin(
+          credentialRows,
+          eq(credentialRows.id, mcpUserCredentials.credentialId),
         )
+        .where(eq(mcpUserCredentials.userId, userId))
         .orderBy(asc(mcpUserCredentials.serverId));
 
-      return rows.map((row) => {
-        if (row.scope === null) {
-          throw new Error(
-            `OAuth connection for ${row.serverId} is missing its granted scope`,
-          );
+      return rows.flatMap((row) => {
+        const validOAuth =
+          row.authMethod === "oauth" &&
+          row.scope !== null &&
+          row.kind === "mcp_user_token";
+        const validApiKey =
+          row.authMethod === "api_key" &&
+          row.scope === null &&
+          row.kind === "mcp_user_api_key";
+        if (
+          row.revokedAt !== null ||
+          row.provider !== row.serverId ||
+          row.keyId !== row.userId ||
+          (!validOAuth && !validApiKey)
+        ) {
+          return [];
         }
-        return {
-          serverId: row.serverId,
-          scope: row.scope,
-          connectedAt: iso(row.connectedAt) ?? "",
-        };
+        return [
+          {
+            serverId: row.serverId,
+            authMethod: row.authMethod,
+            scope: row.scope,
+            accountLabel:
+              row.authMethod === "api_key"
+                ? safeAccountLabel(row.metadata)
+                : null,
+            connectedAt: iso(row.connectedAt) ?? "",
+          },
+        ];
       });
     },
 
@@ -2585,27 +3069,42 @@ export function createPluginStore(options: PluginStoreOptions) {
     ): Promise<{ retired: number }> {
       if (!userId) return { retired: 0 };
 
-      const owned = await database
-        .select({
-          id: credentialRows.id,
-          provider: credentialRows.provider,
-          revokedAt: credentialRows.revokedAt,
-        })
-        .from(credentialRows)
-        .where(
-          and(
-            eq(credentialRows.kind, "mcp_user_token"),
-            eq(credentialRows.keyId, userId),
-          ),
-        );
+      const retiredCredentials = await database.transaction(
+        async (transaction) => {
+          await lockUserConnections(transaction, userId);
+          const owned = await transaction
+            .select({
+              id: credentialRows.id,
+              provider: credentialRows.provider,
+              revokedAt: credentialRows.revokedAt,
+            })
+            .from(credentialRows)
+            .where(
+              and(
+                inArray(credentialRows.kind, [
+                  "mcp_user_token",
+                  "mcp_user_api_key",
+                ]),
+                eq(credentialRows.keyId, userId),
+              ),
+            );
 
-      let retired = 0;
-      for (const credential of owned) {
-        // Already revoked is not a failure. Retiring twice is something an administrator can
-        // legitimately do, and the second time should be quiet rather than an error.
-        if (credential.revokedAt) continue;
-        await credentials.revoke(credential.id);
-        retired += 1;
+          const retired: { id: string; provider: string }[] = [];
+          for (const credential of owned) {
+            // Already revoked is not a failure. Retiring twice is legitimately idempotent.
+            if (credential.revokedAt) continue;
+            await credentials.revoke(credential.id, transaction);
+            retired.push({ id: credential.id, provider: credential.provider });
+          }
+
+          await transaction
+            .delete(mcpUserCredentials)
+            .where(eq(mcpUserCredentials.userId, userId));
+          return retired;
+        },
+      );
+
+      for (const credential of retiredCredentials) {
         await recordAuditEvent(auditStore, {
           eventType: "mcp.account_disconnected",
           targetType: "mcp_server",
@@ -2625,12 +3124,7 @@ export function createPluginStore(options: PluginStoreOptions) {
           },
         });
       }
-
-      await database
-        .delete(mcpUserCredentials)
-        .where(eq(mcpUserCredentials.userId, userId));
-
-      return { retired };
+      return { retired: retiredCredentials.length };
     },
 
     /**

@@ -6,7 +6,9 @@ import { createPluginRoutes } from "../src/plugins/routes";
 import {
   CatalogueEntryUnknownError,
   type OAuthClient,
+  UserConnectionError,
 } from "../src/plugins/store";
+import { TypefullyApiKeyValidationError } from "../src/plugins/typefully-rest";
 
 /**
  * `POST /servers/:id/connect`, for a dynamically registered vendor.
@@ -38,6 +40,7 @@ function app(store: {
     serverId: string,
     by: string,
   ) => Promise<OAuthClient | null>;
+  [key: string]: unknown;
 }) {
   const routes = createPluginRoutes(
     store as never,
@@ -50,6 +53,15 @@ function app(store: {
       // Only the callback asks this. Every test here stops at the authorization URL.
       personHasAccess: async () => true,
     },
+  );
+  return new Hono().route("/api/plugins", routes);
+}
+
+function personalConnectionApp(store: Record<string, unknown>) {
+  const routes = createPluginRoutes(
+    store as never,
+    signedIn(),
+    async () => true,
   );
   return new Hono().route("/api/plugins", routes);
 }
@@ -157,5 +169,184 @@ describe("connecting a vendor this deployment has not added", () => {
     expect(body.error).toBe(
       "Notion has not been added to this deployment yet. An administrator has to add it first.",
     );
+  });
+});
+
+describe("personal Typefully connection routes", () => {
+  test("requires authentication before either connection method", async () => {
+    let calls = 0;
+    const reject: MiddlewareHandler<{ Variables: AppVariables }> = (context) =>
+      context.json({ error: "Sign in required." }, 401);
+    const routes = createPluginRoutes(
+      {
+        connectUserApiKey: async () => {
+          calls += 1;
+        },
+        disconnectUserConnection: async () => {
+          calls += 1;
+        },
+      } as never,
+      reject,
+      async () => true,
+    );
+    const hono = new Hono().route("/api/plugins", routes);
+
+    const put = await hono.request(
+      "http://t/api/plugins/connections/typefully/api-key",
+      {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ apiKey: "tf" }),
+      },
+    );
+    const remove = await hono.request(
+      "http://t/api/plugins/connections/typefully",
+      { method: "DELETE" },
+    );
+    expect([put.status, remove.status]).toEqual([401, 401]);
+    expect(calls).toBe(0);
+  });
+
+  test("derives ownership from the session and never echoes the key", async () => {
+    const calls: unknown[] = [];
+    const hono = personalConnectionApp({
+      connectUserApiKey: async (input: unknown) => {
+        calls.push(input);
+        return {
+          serverId: "typefully",
+          authMethod: "api_key",
+          accountLabel: "Personal Typefully",
+          connectedAt: "2026-08-27T00:00:00.000Z",
+        };
+      },
+    });
+
+    const response = await hono.request(
+      "http://t/api/plugins/connections/typefully/api-key",
+      {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ apiKey: "tf-route-secret" }),
+      },
+    );
+
+    expect(response.status).toBe(200);
+    expect(calls).toEqual([
+      {
+        serverId: "typefully",
+        userId: "user-1",
+        apiKey: "tf-route-secret",
+        by: "user-1",
+      },
+    ]);
+    expect(await response.text()).not.toContain("tf-route-secret");
+  });
+
+  test("rejects unknown fields and invalid field types before the store", async () => {
+    let calls = 0;
+    const hono = personalConnectionApp({
+      connectUserApiKey: async () => {
+        calls += 1;
+      },
+    });
+
+    for (const body of [
+      { apiKey: "tf", userId: "somebody-else" },
+      { apiKey: 123 },
+      {},
+    ]) {
+      const response = await hono.request(
+        "http://t/api/plugins/connections/typefully/api-key",
+        {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        },
+      );
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ code: "invalid_request" });
+    }
+    expect(calls).toBe(0);
+  });
+
+  test("maps validation failures to stable status and code pairs", async () => {
+    for (const [code, status] of [
+      ["invalid_api_key", 400],
+      ["validation_timeout", 503],
+      ["validation_unavailable", 503],
+      ["rate_limited", 429],
+    ] as const) {
+      const hono = personalConnectionApp({
+        connectUserApiKey: async () => {
+          throw new TypefullyApiKeyValidationError(code, "safe failure");
+        },
+      });
+      const response = await hono.request(
+        "http://t/api/plugins/connections/typefully/api-key",
+        {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ apiKey: "tf-never-echo" }),
+        },
+      );
+      expect(response.status).toBe(status);
+      expect(await response.json()).toEqual({ error: "safe failure", code });
+    }
+  });
+
+  test("reports a connector that is not enabled with a stable conflict", async () => {
+    const hono = personalConnectionApp({
+      connectUserApiKey: async () => {
+        throw new UserConnectionError(
+          "connector_not_enabled",
+          "Typefully is not enabled.",
+        );
+      },
+    });
+    const response = await hono.request(
+      "http://t/api/plugins/connections/typefully/api-key",
+      {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ apiKey: "tf" }),
+      },
+    );
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({
+      error: "Typefully is not enabled.",
+      code: "connector_not_enabled",
+    });
+  });
+
+  test("disconnect derives the same owner and reports repeated disconnect stably", async () => {
+    const calls: unknown[] = [];
+    const connected = personalConnectionApp({
+      disconnectUserConnection: async (input: unknown) => {
+        calls.push(input);
+      },
+    });
+    const first = await connected.request(
+      "http://t/api/plugins/connections/typefully",
+      { method: "DELETE" },
+    );
+    expect(first.status).toBe(200);
+    expect(calls).toEqual([
+      { serverId: "typefully", userId: "user-1", by: "user-1" },
+    ]);
+
+    const absent = personalConnectionApp({
+      disconnectUserConnection: async () => {
+        throw new UserConnectionError("not_connected", "Not connected.");
+      },
+    });
+    const second = await absent.request(
+      "http://t/api/plugins/connections/typefully",
+      { method: "DELETE" },
+    );
+    expect(second.status).toBe(404);
+    expect(await second.json()).toEqual({
+      error: "Not connected.",
+      code: "not_connected",
+    });
   });
 });

@@ -7,6 +7,8 @@ import {
   createTypefullyRestTransport,
   listTools,
   TYPEFULLY_REMOVE_MEDIA_MAX_DRAFT_BYTES,
+  TypefullyApiKeyValidationError,
+  validateTypefullyApiKey,
 } from "../src/plugins/typefully-rest";
 
 const connection = {
@@ -219,6 +221,111 @@ describe("the reviewed Typefully tool surface", () => {
     expect(secondSchema?.properties?.socialSetId?.description).not.toBe(
       "mutated nested schema",
     );
+  });
+});
+
+describe("Typefully API-key validation", () => {
+  test("calls the pinned /v2/me endpoint and returns bounded safe metadata", async () => {
+    const { fetch, calls } = recordingFetch({
+      body: {
+        id: 123,
+        name: "Typefully Account",
+        email: "unnecessary@example.com",
+        profile_image_url: "https://example.com/private.png",
+        signup_date: "2026-01-01",
+        api_key_label: "OpenBot",
+      },
+    });
+
+    const metadata = await validateTypefullyApiKey("tf-valid-secret", fetch);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      url: "https://api.typefully.com/v2/me",
+      method: "GET",
+      authorization: "Bearer tf-valid-secret",
+    });
+    expect(metadata).toEqual({
+      accountId: "123",
+      accountLabel: "Typefully Account",
+      keyLabel: "OpenBot",
+    });
+    expect(JSON.stringify(metadata)).not.toContain("unnecessary@example.com");
+  });
+
+  test("rejects malformed keys before fetch", async () => {
+    let calls = 0;
+    const fetch = (async () => {
+      calls += 1;
+      return new Response();
+    }) as typeof globalThis.fetch;
+
+    await expect(
+      validateTypefullyApiKey("bad\nkey", fetch),
+    ).rejects.toMatchObject({
+      code: "invalid_api_key",
+    });
+    expect(calls).toBe(0);
+  });
+
+  test("never keeps a key reflected in identity metadata", async () => {
+    const secret = "tf-reflected-secret";
+    const { fetch } = recordingFetch({
+      body: {
+        id: secret,
+        name: `Account ${secret}`,
+        api_key_label: secret,
+      },
+    });
+
+    const metadata = await validateTypefullyApiKey(secret, fetch);
+    expect(JSON.stringify(metadata)).not.toContain(secret);
+  });
+
+  test("distinguishes invalid keys and rate limits without reflecting the key", async () => {
+    for (const [status, code] of [
+      [401, "invalid_api_key"],
+      [429, "rate_limited"],
+    ] as const) {
+      const secret = `secret-${status}`;
+      const { fetch } = recordingFetch({ status, text: secret });
+      const error = await validateTypefullyApiKey(secret, fetch).catch(
+        (caught) => caught,
+      );
+      expect(error).toBeInstanceOf(TypefullyApiKeyValidationError);
+      expect(error).toMatchObject({ code });
+      expect(String(error)).not.toContain(secret);
+    }
+  });
+
+  test("distinguishes validation timeouts", async () => {
+    const fetch = (async (_input, init) =>
+      await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          reject(new DOMException("timed out", "AbortError"));
+        });
+      })) as typeof globalThis.fetch;
+
+    await expect(
+      validateTypefullyApiKey("tf-valid", fetch, 1),
+    ).rejects.toMatchObject({ code: "validation_timeout" });
+  });
+
+  test("keeps the timeout active while reading the bounded identity stream", async () => {
+    const fetch = (async (_input, init) =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            init?.signal?.addEventListener("abort", () => {
+              controller.error(new DOMException("timed out", "AbortError"));
+            });
+          },
+        }),
+      )) as typeof globalThis.fetch;
+
+    await expect(
+      validateTypefullyApiKey("tf-valid", fetch, 1),
+    ).rejects.toMatchObject({ code: "validation_timeout" });
   });
 });
 
