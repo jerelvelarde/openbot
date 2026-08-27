@@ -233,7 +233,59 @@ describe("the crappy paths: secrets", () => {
       Object.keys(control.get())
         .filter((k) => /secret/i.test(k))
         .sort(),
-    ).toEqual(["secretRef", "secretSnapshotId", "secretWanted"]);
+    ).toEqual([
+      // Which of the browser's pages the field is on. A number, and the reason it is here is that a
+      // ref alone stopped being enough once the Bot began following the windows a site opens.
+      "secretActivation",
+      "secretRef",
+      "secretSnapshotId",
+      "secretWanted",
+    ]);
+  });
+
+  /**
+   * A ref is only meaningful against the document it was taken from.
+   *
+   * The Bot follows a page a site opens in a second window, because a person cannot finish a popup
+   * sign-in they cannot see. That made the browser able to be somewhere else by the time somebody
+   * answers a secret request, and refs are minted per snapshot, so `e3` exists on that page too and
+   * names something else on it. Measured before this existed: the request was for an API key field on
+   * the page underneath, and the value went into the popup's public search box, with `supplied: true`
+   * in the response.
+   *
+   * The rest of the secret path is deliberately permissive about the snapshot generation, because a
+   * Bot may reasonably take another snapshot of the same page while waiting. This is the one thing it
+   * cannot be permissive about.
+   */
+  test("a secret request remembers which page it was made for", () => {
+    const { control } = fixture();
+    control.requestSecret({ ref: "e12", label: "API key", activation: 9 });
+
+    expect(control.pendingSecret()?.activation).toBe(9);
+  });
+
+  test("an activation of zero is not a page, so nothing is compared", () => {
+    // Zero is what a session that has not looked at a page yet carries, and no real activation is
+    // ever zero. Kept as a number, it would refuse every secret from a caller that never snapshotted.
+    const { control } = fixture();
+    control.requestSecret({ ref: "e12", activation: 0 });
+
+    expect(control.pendingSecret()?.activation).toBeUndefined();
+  });
+
+  test("a non-numeric activation is dropped rather than carried as junk", () => {
+    const { control } = fixture();
+    control.requestSecret({ ref: "e12", activation: "9" });
+
+    expect(control.pendingSecret()?.activation).toBeUndefined();
+  });
+
+  test("the page a request was for goes when the request does", () => {
+    const { control } = fixture();
+    control.requestSecret({ ref: "e12", activation: 9 });
+    control.secretSupplied();
+
+    expect(control.get().secretActivation).toBeUndefined();
   });
 });
 

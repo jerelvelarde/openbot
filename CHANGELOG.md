@@ -8,6 +8,33 @@ Newest first. `Unreleased` is what is on `main` and not yet tagged.
 
 ## Unreleased
 
+### A Bot follows the window a site opens, so popup sign-ins can be finished
+
+A Bot was bound to the page its browser launched with. Anything a site opened in a second window or
+tab existed, loaded and had focus, and nothing in OpenBot could see it or reach it: the live screen
+kept showing the page underneath, and every click and keystroke went there too.
+
+That landed hardest on taking the wheel, which exists so a person can finish the sign-ins a Bot
+cannot. Popup OAuth is how most "Sign in with Google" buttons work, so the flows most likely to need
+a human were the ones the human could not see. In a Typefully login the Bot handed over, three of the
+four buttons took a popup route; only "Email" could be completed at all.
+
+The Bot now follows the window. The live screen moves to it, input goes to it, and `/read`,
+`/snapshot`, `/screenshot` and every action address it. Closing it comes back to the page underneath,
+and closing the last tab opens a fresh one rather than restarting the browser, so a sign-in that just
+succeeded is not thrown away with it.
+
+Refs do not travel between pages. An element ref belongs to the document it was taken from — `e3` is
+"Delete everything" on one page and "Deny" on the next — so moving to another page invalidates them
+the same way navigating does, and an action carrying an older snapshot is answered with "take a new
+snapshot". A Bot may lose a turn to that where the page it left would still have resolved. It is the
+side to be wrong on.
+
+A secret a person is asked for is refused if the browser has moved on since the Bot asked. Secret
+entry names a field by ref and deliberately does not re-check the snapshot generation, so without
+this a window opening mid-request put the person's value into a field on a page the Bot never
+described and reported it as delivered.
+
 ### A channel a Bot has spoken in unseen shows a dot
 
 The sidebar marks a channel when a Bot has said something since you last had it open: a dot beside

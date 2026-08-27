@@ -112,6 +112,14 @@ type BotSession = {
   control: Control;
   /** This Bot's snapshot generation. See the note above on staleness. */
   snapshotId: number;
+  /**
+   * Which of the browser's pages this session last saw. See {@link currentPage}.
+   *
+   * Zero means "none yet", which no real activation ever is, so the first call after a session is
+   * created counts as a change. That costs a generation nobody was using: a session with no page has
+   * handed out no refs.
+   */
+  pageActivation: number;
   /** The one live screen viewer for this Bot, if a person is watching. */
   viewer?: {
     socket: unknown;
@@ -145,7 +153,11 @@ function forgetIdleSessions(): void {
 function sessionFor(botId: string): BotSession {
   const existing = sessions.get(botId);
   if (existing) return existing;
-  const created: BotSession = { control: createControl(), snapshotId: 0 };
+  const created: BotSession = {
+    control: createControl(),
+    snapshotId: 0,
+    pageActivation: 0,
+  };
   sessions.set(botId, created);
   // Cheap, and only ever on the path that adds one, so the map cannot grow without this running.
   if (sessions.size > 32) forgetIdleSessions();
@@ -209,8 +221,48 @@ const DEFAULT_BOT_ID = (() => {
   return configured;
 })();
 
+/**
+ * The page this Bot is on, and the single place a page switch is noticed.
+ *
+ * Every route funnels through here — the live screen, a person's input, `/navigate`, `/screenshot`,
+ * `/read`, `/snapshot` and every action — which is what makes this the right place to put the
+ * consequence of the browser having moved somewhere else. A site that calls `window.open` gets a
+ * second page and Chromium gives it focus; profiles.ts follows it, and this is where the rest of the
+ * process finds out.
+ *
+ * WHAT HAPPENS TO REFS TAKEN AGAINST THE PAGE THAT JUST LOST FOCUS. They are invalidated: the
+ * snapshot generation is bumped exactly as a navigation bumps it, so an action carrying an older one
+ * is refused with "take a new snapshot" rather than tried against a document it was never describing.
+ * Invalidated rather than quietly re-resolved, because a ref is minted per snapshot and therefore
+ * exists on the popup as well, naming something else there. Measured on a two-button page: `e3` was
+ * "Delete everything" on the opener and "Deny" on the window it opened.
+ *
+ * ON THIS PATH THE BUMP IS THE MESSAGE RATHER THAN THE SAFETY, and saying so is worth more than
+ * implying otherwise. Playwright keeps its `aria-ref` registry per page, and nothing here fills one
+ * except `/snapshot`, which moves the generation itself. So a popup nobody has snapshotted resolves
+ * no ref at all, and one somebody has snapshotted has already invalidated the old generation.
+ * Verified both ways round. What the bump buys is the honest refusal — "the page is now at 4, take a
+ * new snapshot" instead of "nothing on this page has the ref e3", which describes an element as
+ * missing from a page the Bot does not yet know it is on.
+ *
+ * Where it is load-bearing is `/human/secret`, which deliberately does not check the generation at
+ * all. That path compares the activation instead, and the note there says what it costs not to.
+ *
+ * The price of invalidating is a wasted turn whenever a popup opens and closes between a snapshot and
+ * the action it was taken for, even where the opener's refs would still have been good. That is the
+ * trade the other way round from #236 and #163, and it is the right way round here: a stale ref that
+ * fails loudly is a retry, and a stale ref that resolves is an action nobody asked for.
+ */
 async function currentPage(botId: string): Promise<Page> {
-  return profiles.page(botId);
+  const { page, activation } = await profiles.activePage(botId);
+  const session = sessionFor(botId);
+  if (session.pageActivation !== activation) {
+    session.pageActivation = activation;
+    // The same bump a new document gets from `/navigate`, for the same reason: every ref handed out
+    // before now describes a document that is no longer the one being acted on.
+    session.snapshotId += 1;
+  }
+  return page;
 }
 
 /**
@@ -555,7 +607,15 @@ serve<StreamData>({
         snapshotId?: unknown;
       } | null;
       try {
-        return json(session.control.requestSecret(body ?? {}));
+        return json(
+          session.control.requestSecret({
+            ...(body ?? {}),
+            // Which of the browser's pages the ref came from. The Bot has necessarily taken a
+            // snapshot to have a ref at all, and a snapshot goes through `currentPage`, so this is
+            // the page it was describing. See the note on `secretActivation` in control.ts.
+            activation: session.pageActivation,
+          }),
+        );
       } catch (error) {
         if (error instanceof ControlRequestError) {
           return json({ error: error.message }, 400);
@@ -591,6 +651,38 @@ serve<StreamData>({
       }
       try {
         const target = await currentPage(botId);
+        /*
+         * The browser has to still be on the page the Bot was looking at when it asked.
+         *
+         * This is the one guard the secret path cannot do without. Everything else here is
+         * deliberately permissive about the snapshot generation, because a Bot may reasonably take
+         * another snapshot of the same page while waiting, and Playwright's `aria-ref` rules keep a
+         * ref honest across that. They do not keep it honest across a change of document: refs are
+         * minted per snapshot, so `e3` exists on the popup too and names something else entirely.
+         *
+         * Measured with the check taken out, on a Bot that had asked for an API key naming a field on
+         * the page underneath: a window opened, the Bot snapshotted it, and the person's value went
+         * into that window's public search box. The response said `supplied: true` and named the
+         * popup's URL, and nothing anywhere said the field had not been the one the Bot described.
+         * This is the hazard that following a popup at all creates, so it is closed here rather than
+         * left for whoever meets it.
+         */
+        if (
+          pending.activation !== undefined &&
+          pending.activation !== session.pageActivation
+        ) {
+          // Closed rather than left open. The ref names a field on a page that is no longer in front
+          // of the browser, so retyping cannot help; the Bot sees nothing pending on its next turn
+          // and asks again against a snapshot of the page that is actually there.
+          session.control.secretSupplied();
+          return json(
+            {
+              error:
+                "The browser has moved to another page since that value was asked for, so the field it named is not the one in front of you. Ask the assistant to request it again.",
+            },
+            409,
+          );
+        }
         // Focus the field the Bot named, and let this throw if it cannot be found. A secret must not
         // be reported as delivered unless a field receives it.
         //

@@ -36,6 +36,7 @@
 import { readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { type BrowserContext, chromium, type Page } from "playwright";
+import { createPageStack, type PageStack } from "./active-page";
 import { profileDirectoryFor } from "./bot-id";
 import { chooseEvictions, chooseIdle } from "./browser-eviction";
 import { egressFor, egressLabel } from "./egress";
@@ -127,6 +128,19 @@ export type BotBrowser = {
   page: Page;
 };
 
+/**
+ * The page a Bot is on, and which activation that is.
+ *
+ * The number travels with the page rather than being asked for separately, because the two are one
+ * fact and reading them in two calls is a race: a popup that opens between them hands the caller a
+ * page from after the switch and a number from before it, which is the exact combination that makes
+ * a stale ref look current. See active-page.ts for what the number is for.
+ */
+export type ActivePage = {
+  page: Page;
+  activation: number;
+};
+
 export type ProfileSummary = {
   botId: string;
   /** Whether a browser is running for this Bot right now. */
@@ -181,18 +195,22 @@ const IDLE_SWEEP_MS = 60_000;
 
 export function createProfiles(root: string) {
   /** One running browser per Bot, up to {@link MAX_LIVE_BROWSERS}. */
-  const live = new Map<
-    string,
-    {
-      context: BrowserContext;
-      page: Page;
-      startedAt: string;
-      /** When this Bot last asked for its page. Decides what the cap and the sweep close. */
-      usedAt: number;
-    }
-  >();
+  type Running = {
+    context: BrowserContext;
+    /**
+     * Every page this browser has open, and which one is live.
+     *
+     * A stack rather than a single page, because a site that calls `window.open` gets a second page
+     * and the Bot's screen has to follow it there and back. See active-page.ts.
+     */
+    pages: PageStack<Page>;
+    startedAt: string;
+    /** When this Bot last asked for its page. Decides what the cap and the sweep close. */
+    usedAt: number;
+  };
+  const live = new Map<string, Running>();
   /** Launches in flight, so a cold computer is started once however many callers ask at once. */
-  const starting = new Map<string, Promise<Page>>();
+  const starting = new Map<string, Promise<ActivePage>>();
 
   // Checked, not joined. `join(root, botId)` normalizes `..` away, so a Bot id of `../workspace`
   // used to resolve outside the root and `reset` would delete whatever was there.
@@ -249,6 +267,55 @@ export function createProfiles(root: string) {
   // Housekeeping must not hold the process open on the way out.
   idleSweep.unref?.();
 
+  /**
+   * Follow a page for as long as it is open.
+   *
+   * Registered for the page a browser starts with and for every page the context announces after it,
+   * which is how a `window.open` popup becomes the page the Bot is on rather than a window nobody can
+   * see. The close handler is what brings the screen back to the page underneath when the popup goes
+   * away; without it the stack would keep handing out a page Chromium has already destroyed, and
+   * every call would fail with `Target page, context or browser has been closed` until the browser
+   * was restarted.
+   */
+  const watch = (pages: PageStack<Page>, page: Page): void => {
+    // Already following it. Chromium announces a page we opened ourselves through the context event
+    // as well, and a second `close` handler on the same page would be a second listener leaking per
+    // tab for the life of the browser.
+    if (pages.all().includes(page)) return;
+    pages.opened(page);
+    page.once("close", () => {
+      pages.closed(page);
+    });
+  };
+
+  /**
+   * The live page of a running browser, opening one if every page has gone.
+   *
+   * The close listener is the ordinary path back from a popup, and this is the belt to its braces: a
+   * page reports `isClosed()` the moment Chromium destroys it, while the event that removes it from
+   * the stack arrives on a later tick. A caller that asked in between would be handed a dead page and
+   * get a Playwright error naming a closed target, which says nothing about what to do next.
+   *
+   * An empty stack means a person closed the last tab, which is an ordinary thing to do at the end of
+   * a sign-in. A fresh tab is opened rather than the whole browser being restarted: the browser is
+   * fine, its cookies are what the sign-in was for, and throwing it away to get a blank page back
+   * would discard the thing that just succeeded.
+   */
+  const activeIn = async (running: Running): Promise<ActivePage> => {
+    for (const page of running.pages.all()) {
+      if (page.isClosed()) running.pages.closed(page);
+    }
+    const open = running.pages.active();
+    if (open) return { page: open, activation: running.pages.activation() };
+
+    const replacement = await running.context.newPage();
+    watch(running.pages, replacement);
+    return {
+      page: replacement,
+      activation: running.pages.activation(),
+    };
+  };
+
   const sweepLocks = async (dir: string): Promise<void> => {
     await Promise.all(
       SINGLETON_FILES.map((name) =>
@@ -259,13 +326,17 @@ export function createProfiles(root: string) {
 
   return {
     /**
-     * The Bot's page, starting its browser if it is not running.
+     * The page the Bot is on, starting its browser if it is not running.
      *
      * Started on first use rather than at boot, and re-created if it died: a crashed Chromium would
      * otherwise leave this process alive and answering the same error for every request until the
      * container restarts. This turns that into one slow request instead of an outage.
+     *
+     * "The page the Bot is on" rather than "the Bot's page": a browser holds as many pages as the
+     * sites in it decide to open, and the one that matters is whichever is on top. The activation
+     * number comes back with it so a caller can tell that it moved. See active-page.ts.
      */
-    async page(botId: string): Promise<Page> {
+    async activePage(botId: string): Promise<ActivePage> {
       /*
        * One launch at a time per Bot. Calls that arrive during a launch wait for that launch instead
        * of starting another browser against the same profile directory.
@@ -274,17 +345,18 @@ export function createProfiles(root: string) {
       if (launching) return launching;
 
       const existing = live.get(botId);
-      if (
-        existing?.context.browser()?.isConnected() &&
-        !existing.page.isClosed()
-      ) {
+      if (existing?.context.browser()?.isConnected()) {
         // Touched on every use, which is what makes "least recently used" mean anything.
         existing.usedAt = Date.now();
-        return existing.page;
+        // A closed page no longer means a dead browser. It used to: there was one page, so losing it
+        // left nothing to act on and the only repair was to start over. Now it means a popup was
+        // dismissed, and the answer is the page underneath it rather than a restart that would make
+        // finishing a sign-in and closing the window cost the Bot its whole browser.
+        return activeIn(existing);
       }
       if (existing) {
-        // Half-dead: the browser went away, or its page did. Dropped rather than repaired, because a
-        // context whose browser has gone is not usable for anything.
+        // Half-dead: the browser went away. Dropped rather than repaired, because a context whose
+        // browser has gone is not usable for anything.
         await existing.context.close().catch(() => undefined);
         live.delete(botId);
       }
@@ -308,17 +380,41 @@ export function createProfiles(root: string) {
           ...(proxy ? { proxy } : {}),
         });
         // Persistent contexts open with a page already; reuse it rather than leaving an extra blank tab.
-        const page = context.pages()[0] ?? (await context.newPage());
+        const first = context.pages()[0] ?? (await context.newPage());
+        const pages = createPageStack<Page>();
+        /*
+         * Every page this browser opens from here on, followed as it appears.
+         *
+         * This is the listener whose absence made popup sign-in impossible: Chromium creates a second
+         * page for `window.open` and gives it focus, and with nothing subscribed the Bot's screen kept
+         * streaming the page underneath while the person's clicks and keystrokes went to it too.
+         */
+        context.on("page", (opened) => {
+          watch(pages, opened);
+        });
+        // The page the browser came up on, announced the same way as any other so that it gets the
+        // same close handler. Before anything is awaited, so no caller can see an empty stack.
+        watch(pages, first);
+        /*
+         * Anything that opened between the launch returning and the listener above being attached.
+         * A profile can restore tabs on start-up, so this is not hypothetical, and a page that exists
+         * but was never announced would be one the Bot could never reach.
+         */
+        for (const page of context.pages()) watch(pages, page);
+
         live.set(botId, {
           context,
-          page,
+          pages,
           startedAt: new Date().toISOString(),
           usedAt: Date.now(),
         });
         // After the new one is in the map, so the cap counts what is really running and the Bot that
         // just asked is the most recently used and therefore never the one closed.
         await enforceCap();
-        return page;
+        return {
+          page: pages.active() ?? first,
+          activation: pages.activation(),
+        };
       })();
 
       starting.set(botId, launch);

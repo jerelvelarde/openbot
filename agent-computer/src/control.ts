@@ -47,6 +47,21 @@ export type ControlState = {
    */
   secretRef?: string;
   secretSnapshotId?: number;
+  /**
+   * Which of the browser's pages the field is on, as an activation number from active-page.ts.
+   *
+   * Here because a ref is only meaningful against the document it was taken from, and the browser can
+   * move to another one while the request is open: a site that calls `window.open` gets a second page
+   * and the Bot follows it there. Refs are minted per snapshot, so `e3` exists on that page too and
+   * names something else — an ordinary search box rather than the field the Bot described. Without
+   * this, a popup opening while somebody was reaching for their password manager put their secret
+   * into it and reported success. Measured, not theorised.
+   *
+   * Absent means the request was made before anything had looked at a page, which no real Bot does:
+   * it has to snapshot to have a ref at all. Nothing is compared in that case rather than refusing on
+   * a number that means "not yet".
+   */
+  secretActivation?: number;
 };
 
 /** Refusal because a person is driving. Distinct from a failure, so the Bot can be told to wait. */
@@ -146,6 +161,7 @@ export function createControl(
       label?: unknown;
       ref?: unknown;
       snapshotId?: unknown;
+      activation?: unknown;
     }): ControlState {
       if (typeof input.ref !== "string" || !input.ref.trim()) {
         throw new ControlRequestError(
@@ -161,6 +177,10 @@ export function createControl(
         secretRef: input.ref.trim(),
         secretSnapshotId:
           typeof input.snapshotId === "number" ? input.snapshotId : undefined,
+        secretActivation:
+          typeof input.activation === "number" && input.activation > 0
+            ? input.activation
+            : undefined,
       };
       return this.get();
     },
@@ -171,9 +191,17 @@ export function createControl(
      * Read before typing so the caller can refuse when nothing asked for one: this is what keeps the
      * masked box from being a general-purpose way to type into the page.
      */
-    pendingSecret(): { ref: string; snapshotId?: number } | null {
+    pendingSecret(): {
+      ref: string;
+      snapshotId?: number;
+      activation?: number;
+    } | null {
       if (!state.secretWanted || !state.secretRef) return null;
-      return { ref: state.secretRef, snapshotId: state.secretSnapshotId };
+      return {
+        ref: state.secretRef,
+        snapshotId: state.secretSnapshotId,
+        activation: state.secretActivation,
+      };
     },
 
     /**
@@ -188,6 +216,7 @@ export function createControl(
         secretWanted: undefined,
         secretRef: undefined,
         secretSnapshotId: undefined,
+        secretActivation: undefined,
       };
     },
 
