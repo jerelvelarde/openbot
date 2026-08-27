@@ -983,18 +983,14 @@ describe("Typefully mutation contracts", () => {
       expected: { code: "grant_required", ref: "typefully/upload_media" },
     },
     {
-      name: "a connection prompt",
-      envelope: {
-        code: "connection_required",
-        serverId: "typefully",
-        draftId: "draft-1",
-        connectPath: "/settings/connected-accounts/typefully",
-      },
-      expected: {
-        code: "connection_required",
-        serverId: "typefully",
-        draftId: "draft-1",
-      },
+      name: "a detached bot refusal",
+      envelope: { code: "bot_not_attached" },
+      expected: { code: "bot_not_attached" },
+    },
+    {
+      name: "an invalid request",
+      envelope: { code: "invalid_request", message: "Invalid media fields." },
+      expected: { code: "invalid_request" },
     },
     {
       name: "a version conflict",
@@ -1007,18 +1003,6 @@ describe("Typefully mutation contracts", () => {
         code: "version_conflict",
         currentVersion: 2,
         currentHash: "hash-2",
-      },
-    },
-    {
-      name: "a bounded retry time",
-      envelope: {
-        code: "remote_error",
-        retryAt: "2026-08-28T00:00:00.000Z",
-        message: "Try again later.",
-      },
-      expected: {
-        code: "remote_error",
-        retryAt: "2026-08-28T00:00:00.000Z",
       },
     },
   ])(
@@ -1034,6 +1018,369 @@ describe("Typefully mutation contracts", () => {
           file: new File(["x"], "x.png", { type: "image/png" }),
         }),
       ).rejects.toMatchObject(expected);
+    },
+  );
+
+  test.each([
+    "remote_error",
+    "reconciliation_required",
+    "connection_required",
+    "remote_refused",
+    "sync_in_progress",
+  ] as const)(
+    "rejects post-persistence code %s without committed recovery",
+    async (code) => {
+      globalThis.fetch = (async () => json({ code }, 409)) as typeof fetch;
+
+      let failure: unknown;
+      try {
+        await mutate(uploadMediaMutationOptions(), {
+          draftId: "draft-1",
+          expectedVersion: 1,
+          kind: "image",
+          altText: "Envelope",
+          file: new File(["x"], "x.png", { type: "image/png" }),
+        });
+      } catch (error) {
+        failure = error;
+      }
+
+      expect(failure).toMatchObject({ code: "remote_invalid_response" });
+      expect((failure as TypefullyClientError).draft).toBeUndefined();
+      expect((failure as TypefullyClientError).media).toBeUndefined();
+    },
+  );
+
+  test.each([
+    "media_too_large",
+    "unsupported_media",
+    "invalid_request",
+    "draft_not_found",
+    "version_conflict",
+  ] as const)(
+    "rejects committed recovery metadata for pre-persistence code %s",
+    async (code) => {
+      const queryClient = new QueryClient({
+        defaultOptions: { mutations: { retry: false } },
+      });
+      const original = { draft: authoritativeDraft(1) };
+      queryClient.setQueryData(typefullyKeys.draft("draft-1"), original);
+      const recovery = {
+        draft: { ...draftSummary(2, "remote_error"), mediaCount: 1 },
+        media: {
+          id: "committed-media",
+          kind: "image",
+          order: 0,
+          altText: "Envelope",
+          remoteId: null,
+        },
+      };
+      globalThis.fetch = (async () =>
+        json(
+          {
+            code,
+            ...(code === "version_conflict"
+              ? { currentVersion: 2, currentHash: "hash-2" }
+              : {}),
+            ...recovery,
+          },
+          409,
+        )) as typeof fetch;
+
+      let failure: unknown;
+      try {
+        await mutate(uploadMediaMutationOptions(queryClient), {
+          draftId: "draft-1",
+          expectedVersion: 1,
+          kind: "image",
+          altText: "Envelope",
+          file: new File(["x"], "x.png", { type: "image/png" }),
+        });
+      } catch (error) {
+        failure = error;
+      }
+
+      expect(failure).toMatchObject({ code: "remote_invalid_response" });
+      expect((failure as TypefullyClientError).draft).toBeUndefined();
+      expect((failure as TypefullyClientError).media).toBeUndefined();
+      expect(queryClient.getQueryData(typefullyKeys.draft("draft-1"))).toEqual(
+        original,
+      );
+    },
+  );
+
+  test.each([
+    {
+      code: "grant_required",
+      details: { ref: "typefully/upload_media" },
+    },
+    { code: "bot_not_attached", details: {} },
+    { code: "remote_refused", details: {} },
+    { code: "sync_in_progress", details: {} },
+  ] as const)(
+    "accepts committed recovery for post-persistence $code",
+    async ({ code, details }) => {
+      globalThis.fetch = (async () =>
+        json(
+          {
+            code,
+            ...details,
+            draft: {
+              ...draftSummary(2, "remote_error"),
+              mediaCount: 1,
+            },
+            media: {
+              id: `committed-${code}`,
+              kind: "image",
+              order: 0,
+              altText: "Committed refusal",
+              remoteId: null,
+            },
+          },
+          409,
+        )) as typeof fetch;
+
+      await expect(
+        mutate(uploadMediaMutationOptions(), {
+          draftId: "draft-1",
+          expectedVersion: 1,
+          kind: "image",
+          altText: "Committed refusal",
+          file: new File(["x"], "x.png", { type: "image/png" }),
+        }),
+      ).rejects.toMatchObject({
+        code,
+        draft: { version: 2 },
+        media: { id: `committed-${code}` },
+      });
+    },
+  );
+
+  test.each([
+    {
+      name: "a later new-upload generation",
+      input: { expectedVersion: 1 },
+      draftVersion: 4,
+      mediaCount: 1,
+      order: 0,
+      remoteId: "remote-media",
+    },
+    {
+      name: "an empty media summary",
+      input: { expectedVersion: 1 },
+      draftVersion: 2,
+      mediaCount: 0,
+      order: 0,
+      remoteId: null,
+    },
+    {
+      name: "an order outside the summary count",
+      input: { expectedVersion: 1 },
+      draftVersion: 2,
+      mediaCount: 1,
+      order: 1,
+      remoteId: null,
+    },
+    {
+      name: "a new descriptor that was not appended",
+      input: { expectedVersion: 1 },
+      draftVersion: 2,
+      mediaCount: 2,
+      order: 0,
+      remoteId: null,
+    },
+    {
+      name: "a mismatched media kind",
+      input: { expectedVersion: 1 },
+      draftVersion: 2,
+      mediaCount: 1,
+      order: 0,
+      remoteId: null,
+      kind: "video",
+    },
+    {
+      name: "mismatched alt text",
+      input: { expectedVersion: 1 },
+      draftVersion: 2,
+      mediaCount: 1,
+      order: 0,
+      remoteId: null,
+      altText: "Different",
+    },
+    {
+      name: "a completed new-upload generation without a remote id",
+      input: { expectedVersion: 1 },
+      draftVersion: 3,
+      mediaCount: 1,
+      order: 0,
+      remoteId: null,
+    },
+    {
+      name: "a completed retry generation without a remote id",
+      input: { expectedVersion: 2, mediaId: "committed-media" },
+      draftVersion: 3,
+      mediaCount: 1,
+      order: 0,
+      remoteId: null,
+    },
+    {
+      name: "a new-upload refusal after remote-id persistence",
+      input: { expectedVersion: 1 },
+      draftVersion: 3,
+      mediaCount: 1,
+      order: 0,
+      remoteId: "remote-media",
+      code: "remote_refused",
+    },
+    {
+      name: "a retry grant refusal after remote-id persistence",
+      input: { expectedVersion: 2, mediaId: "committed-media" },
+      draftVersion: 3,
+      mediaCount: 1,
+      order: 0,
+      remoteId: "remote-media",
+      code: "grant_required",
+      details: { ref: "typefully/upload_media" },
+    },
+  ])(
+    "rejects committed upload recovery with $name",
+    async ({
+      input,
+      draftVersion,
+      mediaCount,
+      order,
+      remoteId,
+      kind = "image",
+      altText = "Envelope",
+      code = "remote_error",
+      details = {},
+    }) => {
+      const queryClient = new QueryClient({
+        defaultOptions: { mutations: { retry: false } },
+      });
+      const original = { draft: authoritativeDraft(input.expectedVersion) };
+      queryClient.setQueryData(typefullyKeys.draft("draft-1"), original);
+      globalThis.fetch = (async () =>
+        json(
+          {
+            code,
+            ...details,
+            draft: {
+              ...draftSummary(draftVersion, "remote_error"),
+              mediaCount,
+            },
+            media: {
+              id: "committed-media",
+              kind,
+              order,
+              altText,
+              remoteId,
+            },
+          },
+          502,
+        )) as typeof fetch;
+
+      let failure: unknown;
+      try {
+        await mutate(uploadMediaMutationOptions(queryClient), {
+          draftId: "draft-1",
+          expectedVersion: input.expectedVersion,
+          kind: "image",
+          altText: "Envelope",
+          ...(input.mediaId ? { mediaId: input.mediaId } : {}),
+          file: new File(["x"], "x.png", { type: "image/png" }),
+        });
+      } catch (error) {
+        failure = error;
+      }
+
+      expect(failure).toMatchObject({ code: "remote_invalid_response" });
+      expect((failure as TypefullyClientError).draft).toBeUndefined();
+      expect((failure as TypefullyClientError).media).toBeUndefined();
+      expect(queryClient.getQueryData(typefullyKeys.draft("draft-1"))).toEqual(
+        original,
+      );
+    },
+  );
+
+  test.each([
+    {
+      name: "new upload after descriptor persistence",
+      input: { expectedVersion: 1 },
+      draftVersion: 2,
+      mediaId: "new-boundary-one",
+      remoteId: null,
+      code: "connection_required",
+      details: {
+        serverId: "typefully",
+        draftId: "draft-1",
+        connectPath: "/settings/connected-accounts/typefully",
+      },
+    },
+    {
+      name: "new upload after remote-id persistence",
+      input: { expectedVersion: 1 },
+      draftVersion: 3,
+      mediaId: "new-boundary-two",
+      remoteId: "remote-boundary-two",
+      code: "reconciliation_required",
+      details: { draftId: "draft-1" },
+    },
+    {
+      name: "retry before remote-id persistence",
+      input: { expectedVersion: 2, mediaId: "retry-boundary-zero" },
+      draftVersion: 2,
+      mediaId: "retry-boundary-zero",
+      remoteId: null,
+      code: "remote_error",
+      details: { retryAt: "2026-08-28T00:00:00.000Z" },
+    },
+    {
+      name: "retry after remote-id persistence",
+      input: { expectedVersion: 2, mediaId: "retry-boundary-one" },
+      draftVersion: 3,
+      mediaId: "retry-boundary-one",
+      remoteId: "remote-boundary-one",
+      code: "remote_error",
+      details: {},
+    },
+  ] as const)(
+    "accepts the committed version boundary for $name",
+    async ({ input, draftVersion, mediaId, remoteId, code, details }) => {
+      globalThis.fetch = (async () =>
+        json(
+          {
+            code,
+            ...details,
+            draft: {
+              ...draftSummary(draftVersion, "remote_error"),
+              mediaCount: 1,
+            },
+            media: {
+              id: mediaId,
+              kind: "image",
+              order: 0,
+              altText: "Boundary",
+              remoteId,
+            },
+          },
+          409,
+        )) as typeof fetch;
+
+      await expect(
+        mutate(uploadMediaMutationOptions(), {
+          draftId: "draft-1",
+          expectedVersion: input.expectedVersion,
+          kind: "image",
+          altText: "Boundary",
+          ...(input.mediaId ? { mediaId: input.mediaId } : {}),
+          file: new File(["x"], "x.png", { type: "image/png" }),
+        }),
+      ).rejects.toMatchObject({
+        code,
+        draft: { version: draftVersion },
+        media: { id: mediaId, remoteId },
+      });
     },
   );
 

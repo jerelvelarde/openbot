@@ -13,7 +13,6 @@ import {
   type RemoteDraftState,
   remoteDraftState,
   TypefullyClientError,
-  typefullyErrorCode,
   typefullyKeys,
   typefullyRequest,
 } from "./queries";
@@ -89,15 +88,21 @@ function boundMediaMutationFailure(
   return error;
 }
 
-const uploadErrorCodeSchema = z
-  .string()
-  .min(1)
-  .max(64)
-  .refine((value) => typefullyErrorCode(value) !== undefined);
 const uploadErrorCommonShape = {
-  code: uploadErrorCodeSchema,
   error: z.string().min(1).max(500).optional(),
   message: z.string().min(1).max(500).optional(),
+};
+const uploadPrePersistenceErrorSchema = z.strictObject({
+  ...uploadErrorCommonShape,
+  code: z.enum([
+    "media_too_large",
+    "unsupported_media",
+    "invalid_request",
+    "draft_not_found",
+    "version_conflict",
+    "bot_not_attached",
+    "grant_required",
+  ]),
   currentVersion: z
     .number()
     .int()
@@ -105,15 +110,24 @@ const uploadErrorCommonShape = {
     .max(Number.MAX_SAFE_INTEGER)
     .optional(),
   currentHash: z.string().min(1).max(128).optional(),
+  ref: z.string().trim().min(1).max(240).optional(),
+});
+const uploadCommittedErrorSchema = z.strictObject({
+  ...uploadErrorCommonShape,
+  code: z.enum([
+    "remote_error",
+    "reconciliation_required",
+    "connection_required",
+    "grant_required",
+    "bot_not_attached",
+    "remote_refused",
+    "sync_in_progress",
+  ]),
   serverId: z.string().trim().min(1).max(120).optional(),
   draftId: z.string().trim().min(1).max(120).optional(),
   connectPath: z.string().min(1).max(500).startsWith("/").optional(),
   ref: z.string().trim().min(1).max(240).optional(),
   retryAt: z.string().datetime().optional(),
-};
-const uploadPrePersistenceErrorSchema = z.strictObject(uploadErrorCommonShape);
-const uploadCommittedErrorSchema = z.strictObject({
-  ...uploadErrorCommonShape,
   draft: z.unknown(),
   media: z.unknown(),
   remote: z.unknown().optional(),
@@ -122,10 +136,23 @@ const uploadErrorEnvelopeSchema = z.union([
   uploadCommittedErrorSchema,
   uploadPrePersistenceErrorSchema,
 ]);
+const uploadEarlyFailureCodes = new Set([
+  "connection_required",
+  "grant_required",
+  "bot_not_attached",
+  "remote_refused",
+  "sync_in_progress",
+]);
 
 function normalizeMediaMutationErrorPayload(
   payload: unknown,
-  input: { draftId: string; mediaId?: string },
+  input: {
+    draftId: string;
+    expectedVersion: number;
+    kind: "image" | "video";
+    altText: string;
+    mediaId?: string;
+  },
 ): unknown {
   const parsed = uploadErrorEnvelopeSchema.safeParse(payload);
   if (!parsed.success) {
@@ -133,40 +160,65 @@ function normalizeMediaMutationErrorPayload(
   }
   const record = parsed.data;
   const hasRecovery = "draft" in record;
-  const connectionFieldsPresent =
-    record.serverId !== undefined || record.connectPath !== undefined;
-  const conflictFieldsPresent =
-    record.currentVersion !== undefined || record.currentHash !== undefined;
-  if (
-    (record.draftId !== undefined && record.draftId !== input.draftId) ||
-    (record.serverId !== undefined && record.serverId !== "typefully") ||
-    (record.connectPath !== undefined &&
-      record.connectPath !== "/settings/connected-accounts/typefully") ||
-    (record.ref !== undefined && record.ref !== "typefully/upload_media") ||
-    (record.currentVersion === undefined) !==
-      (record.currentHash === undefined) ||
-    (record.serverId === undefined) !== (record.connectPath === undefined) ||
-    (record.code === "connection_required") !== connectionFieldsPresent ||
-    (record.code === "grant_required") !== (record.ref !== undefined) ||
-    (record.code === "version_conflict") !== conflictFieldsPresent ||
-    (hasRecovery && conflictFieldsPresent) ||
-    (record.retryAt !== undefined &&
-      record.code !== "remote_error" &&
-      record.code !== "rate_limited")
-  ) {
-    throw new TypefullyClientError("remote_invalid_response");
+  if (!hasRecovery) {
+    const conflictFieldsPresent =
+      record.currentVersion !== undefined || record.currentHash !== undefined;
+    if (
+      (record.currentVersion === undefined) !==
+        (record.currentHash === undefined) ||
+      (record.code === "version_conflict") !== conflictFieldsPresent ||
+      (record.code === "grant_required") !== (record.ref !== undefined) ||
+      (record.ref !== undefined && record.ref !== "typefully/upload_media")
+    ) {
+      throw new TypefullyClientError("remote_invalid_response");
+    }
+    return record;
   }
-  if (!hasRecovery) return record;
   const draft = draftSummary(record.draft);
   const media = mediaDescriptor(record.media);
   const hasRemote = "remote" in record;
   const remote = hasRemote ? remoteDraftState(record.remote) : undefined;
+  const versionDelta = draft
+    ? draft.version - input.expectedVersion
+    : Number.NaN;
+  const allowedVersion = input.mediaId
+    ? versionDelta === 0 || versionDelta === 1
+    : versionDelta === 1 || versionDelta === 2;
+  const lateVersionDelta = input.mediaId ? 1 : 2;
+  const isEarlyFailure = uploadEarlyFailureCodes.has(record.code);
+  const requiresDraftId =
+    record.code === "connection_required" ||
+    record.code === "reconciliation_required";
+  const connectionFieldsPresent =
+    record.serverId !== undefined || record.connectPath !== undefined;
   if (
     !draft ||
     !media ||
+    !allowedVersion ||
     draft.id !== input.draftId ||
     (input.mediaId !== undefined && media.id !== input.mediaId) ||
     (record.draftId !== undefined && record.draftId !== draft.id) ||
+    draft.mediaCount < 1 ||
+    media.order >= draft.mediaCount ||
+    (input.mediaId === undefined && media.order !== draft.mediaCount - 1) ||
+    media.kind !== input.kind ||
+    media.altText !== input.altText ||
+    (versionDelta === lateVersionDelta && media.remoteId === null) ||
+    (isEarlyFailure && versionDelta === lateVersionDelta) ||
+    (isEarlyFailure &&
+      input.mediaId === undefined &&
+      media.remoteId !== null) ||
+    (record.serverId !== undefined && record.serverId !== "typefully") ||
+    (record.connectPath !== undefined &&
+      record.connectPath !== "/settings/connected-accounts/typefully") ||
+    (record.serverId === undefined) !== (record.connectPath === undefined) ||
+    (record.code === "connection_required") !== connectionFieldsPresent ||
+    (record.code === "grant_required") !== (record.ref !== undefined) ||
+    (record.ref !== undefined && record.ref !== "typefully/upload_media") ||
+    (requiresDraftId
+      ? record.draftId !== input.draftId
+      : record.draftId !== undefined) ||
+    (record.retryAt !== undefined && record.code !== "remote_error") ||
     (hasRemote &&
       (!remote ||
         remote.state !== draft.syncStatus ||
