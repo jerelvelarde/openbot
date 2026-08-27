@@ -1,6 +1,12 @@
 import { IconX } from "@tabler/icons-react";
 import { motion, useReducedMotion } from "motion/react";
-import { type ReactNode, useEffect, useRef } from "react";
+import {
+  type ReactNode,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import { Button } from "@/components/ui/button";
 import { EASE_OUT } from "@/lib/motion";
 
@@ -16,6 +22,7 @@ import { EASE_OUT } from "@/lib/motion";
 
 const ANIMATION_DURATION_SECONDS = 0.3;
 const DEFAULT_DETAIL_WIDTH = 400;
+const MINIMUM_SPLIT_MAIN_WIDTH = 320;
 
 /**
  * The content overlaps the tail of the pane rather than following it.
@@ -54,12 +61,37 @@ export function DetailPanel({
 }) {
   // Reduced motion keeps the fade, which explains the change, and drops the movement.
   const shouldReduceMotion = useReducedMotion();
+  const panelRef = useRef<HTMLDivElement>(null);
+  const [availableWidth, setAvailableWidth] = useState<number | null>(null);
   const headingRef = useRef<HTMLHeadingElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
   const managedFocusRef = useRef(false);
   const previousFocusKeyRef = useRef<string | undefined>(undefined);
   const hasTitle = title !== undefined && title !== null;
+  const collapsed =
+    collapseAtNarrow &&
+    open &&
+    (availableWidth === null ||
+      availableWidth < detailWidth + MINIMUM_SPLIT_MAIN_WIDTH);
+
+  useLayoutEffect(() => {
+    if (!collapseAtNarrow) return;
+    const panel = panelRef.current;
+    if (!panel) return;
+    const measure = () =>
+      setAvailableWidth(panel.getBoundingClientRect().width);
+    measure();
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", measure);
+      return () => window.removeEventListener("resize", measure);
+    }
+    const observer = new ResizeObserver(([entry]) => {
+      if (entry) setAvailableWidth(entry.contentRect.width);
+    });
+    observer.observe(panel);
+    return () => observer.disconnect();
+  }, [collapseAtNarrow]);
 
   useEffect(() => {
     const shouldMoveFocus =
@@ -99,22 +131,20 @@ export function DetailPanel({
   return (
     <div
       className="flex h-full min-h-0"
+      data-layout={open ? (collapsed ? "collapsed" : "split") : "closed"}
       data-detail-width={detailWidth}
       data-testid="detail-panel"
+      ref={panelRef}
     >
       <div
-        className={`flex flex-1 min-w-0 flex-col ${
-          collapseAtNarrow && open ? "max-md:hidden" : ""
-        }`}
+        className={`flex flex-1 min-w-0 flex-col ${collapsed ? "hidden" : ""}`}
         data-testid="detail-panel-main"
       >
         {children}
       </div>
       <motion.div
-        animate={{ width: open ? detailWidth : 0 }}
-        className={`shrink-0 overflow-hidden ${
-          collapseAtNarrow && open ? "max-md:!w-full max-md:flex-1" : ""
-        }`}
+        animate={{ width: open ? (collapsed ? "100%" : detailWidth) : 0 }}
+        className={`shrink-0 overflow-hidden ${collapsed ? "flex-1" : ""}`}
         data-testid="detail-panel-pane"
         // No entry animation on first paint: URL-opened panels should appear as initial state.
         initial={false}
@@ -124,57 +154,56 @@ export function DetailPanel({
         }}
       >
         <div
-          className={`flex h-full flex-col bg-sidebar border-l border-border ${
-            collapseAtNarrow && open ? "max-md:!w-full" : ""
-          }`}
-          style={{ width: detailWidth }}
+          className="flex h-full flex-col bg-sidebar border-l border-border"
+          data-testid="detail-panel-content"
+          style={{ width: collapsed ? "100%" : detailWidth }}
         >
-          {/* Rendered for the whole animation, so the way out is available immediately. */}
-          <div className="h-12 shrink-0 sticky top-0 flex flex-row items-center justify-between px-2 gap-2">
-            {hasTitle ? (
-              <h2
-                className="flex min-w-0 w-full items-center gap-1.5 outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                ref={headingRef}
-                tabIndex={-1}
-              >
-                {title}
-              </h2>
-            ) : (
-              <div className="flex min-w-0 w-full items-center gap-1.5" />
-            )}
-            <div className="flex flex-row gap-1.5">
-              <Button
-                aria-label="Close detail panel"
-                onClick={onClose}
-                ref={closeRef}
-                variant="ghost"
-                size="icon"
-              >
-                <IconX className="size-4.5" />
-              </Button>
-            </div>
-          </div>
-          {/*
-           * Unmount while closed so dismissed form state and detail queries do not remain active.
-           */}
           {open ? (
-            <motion.div
-              animate={{ opacity: 1, transform: "translateY(0px)" }}
-              className="flex-1 min-h-0 overflow-y-auto"
-              initial={{
-                opacity: 0,
-                transform: shouldReduceMotion
-                  ? "none"
-                  : CONTENT_ENTRANCE_OFFSET,
-              }}
-              transition={{
-                delay: shouldReduceMotion ? 0 : CONTENT_ENTRANCE_DELAY_SECONDS,
-                duration: CONTENT_ENTRANCE_SECONDS,
-                ease: EASE_OUT,
-              }}
-            >
-              {detail}
-            </motion.div>
+            <>
+              <div className="h-12 shrink-0 sticky top-0 flex flex-row items-center justify-between px-2 gap-2">
+                {hasTitle ? (
+                  <h2
+                    className="flex min-w-0 w-full items-center gap-1.5 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    ref={headingRef}
+                    tabIndex={-1}
+                  >
+                    {title}
+                  </h2>
+                ) : (
+                  <div className="flex min-w-0 w-full items-center gap-1.5" />
+                )}
+                <div className="flex flex-row gap-1.5">
+                  <Button
+                    aria-label="Close detail panel"
+                    onClick={onClose}
+                    ref={closeRef}
+                    variant="ghost"
+                    size="icon"
+                  >
+                    <IconX className="size-4.5" />
+                  </Button>
+                </div>
+              </div>
+              <motion.div
+                animate={{ opacity: 1, transform: "translateY(0px)" }}
+                className="flex-1 min-h-0 overflow-y-auto"
+                initial={{
+                  opacity: 0,
+                  transform: shouldReduceMotion
+                    ? "none"
+                    : CONTENT_ENTRANCE_OFFSET,
+                }}
+                transition={{
+                  delay: shouldReduceMotion
+                    ? 0
+                    : CONTENT_ENTRANCE_DELAY_SECONDS,
+                  duration: CONTENT_ENTRANCE_SECONDS,
+                  ease: EASE_OUT,
+                }}
+              >
+                {detail}
+              </motion.div>
+            </>
           ) : null}
         </div>
       </motion.div>

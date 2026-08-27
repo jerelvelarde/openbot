@@ -1,4 +1,5 @@
 import { queryOptions } from "@tanstack/react-query";
+import { z } from "zod";
 
 export type TypefullyDestination = "x" | "linkedin";
 export type DraftSyncStatus =
@@ -64,6 +65,80 @@ export type AuthoritativeDraft = {
   createdAt: string;
   updatedAt: string;
 };
+
+const stableIdSchema = z.string().trim().min(1).max(120);
+const destinationSchema = z.enum(["x", "linkedin"]);
+const uniqueDestinationsSchema = z
+  .array(destinationSchema)
+  .min(1)
+  .max(2)
+  .refine((items) => new Set(items).size === items.length);
+const postSchema = z.strictObject({
+  id: stableIdSchema,
+  x: z.string().max(100_000),
+  linkedin: z.string().max(100_000),
+});
+const postsSchema = z
+  .array(postSchema)
+  .min(1)
+  .max(50)
+  .refine((items) => new Set(items.map(({ id }) => id)).size === items.length);
+const mediaSchema = z
+  .array(
+    z.strictObject({
+      id: stableIdSchema,
+      kind: z.enum(["image", "video"]),
+      order: z
+        .number()
+        .int()
+        .min(Number.MIN_SAFE_INTEGER)
+        .max(Number.MAX_SAFE_INTEGER),
+      altText: z.string().max(10_000),
+      remoteId: z.string().trim().min(1).max(240).nullable(),
+    }),
+  )
+  .max(20)
+  .refine(
+    (items) =>
+      new Set(items.map(({ id }) => id)).size === items.length &&
+      new Set(items.map(({ order }) => order)).size === items.length,
+  );
+const canonicalDraftDocumentSchema = z.strictObject({
+  title: z.string().trim().max(160),
+  destinations: uniqueDestinationsSchema,
+  socialSetId: z.string().trim().max(120).nullable(),
+  accountLabel: z.string().trim().max(160).nullable(),
+  posts: postsSchema,
+  media: mediaSchema,
+  scheduleAt: z.string().datetime().nullable(),
+});
+const positiveSafeInteger = z
+  .number()
+  .int()
+  .positive()
+  .max(Number.MAX_SAFE_INTEGER);
+const authoritativeDraftResponseSchema = z.strictObject({
+  draft: z.strictObject({
+    id: z.string().uuid(),
+    document: canonicalDraftDocumentSchema,
+    version: positiveSafeInteger,
+    contentHash: z.string().min(1).max(128),
+    remoteDraftId: z.string().trim().min(1).max(240).nullable(),
+    remoteVersion: positiveSafeInteger.nullable(),
+    remoteHash: z.string().min(1).max(128).nullable(),
+    syncStatus: z.enum([
+      "local",
+      "syncing",
+      "synced",
+      "connection_required",
+      "remote_error",
+      "grant_blocked",
+    ]),
+    lastError: z.string().max(500).nullable(),
+    createdAt: z.string().datetime(),
+    updatedAt: z.string().datetime(),
+  }),
+});
 
 export type PublicationProposal = {
   id: string;
@@ -395,10 +470,20 @@ export function draftQueryOptions(draftId: string) {
   return queryOptions({
     queryKey: typefullyKeys.draft(draftId),
     enabled: draftId.length > 0,
-    queryFn: ({ signal }): Promise<{ draft: AuthoritativeDraft }> =>
-      typefullyRequest(`/api/typefully/drafts/${encodeURIComponent(draftId)}`, {
-        signal,
-      }),
+    gcTime: 0,
+    queryFn: async ({ signal }): Promise<{ draft: AuthoritativeDraft }> => {
+      const payload = await typefullyRequest<unknown>(
+        `/api/typefully/drafts/${encodeURIComponent(draftId)}`,
+        {
+          signal,
+        },
+      );
+      const parsed = authoritativeDraftResponseSchema.safeParse(payload);
+      if (!parsed.success) {
+        throw new TypefullyClientError("remote_invalid_response");
+      }
+      return parsed.data;
+    },
   });
 }
 

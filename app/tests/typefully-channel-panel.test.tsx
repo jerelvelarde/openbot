@@ -133,12 +133,99 @@ test("wide detail panel becomes the main surface at the app narrow breakpoint", 
 
   const panel = view.getByTestId("detail-panel");
   expect(panel.getAttribute("data-detail-width")).toBe("720");
-  expect(view.getByTestId("detail-panel-main").className).toContain(
-    "max-md:hidden",
+  expect(panel.dataset.layout).toBe("collapsed");
+  expect(view.getByTestId("detail-panel-main").className).toContain("hidden");
+  expect(view.getByTestId("detail-panel-content").style.width).toBe("100%");
+});
+
+test("a closed detail panel exposes no close control or hidden dialog content", () => {
+  const view = render(
+    <DetailPanel
+      detail={<button type="button">Hidden detail action</button>}
+      onClose={() => {}}
+      open={false}
+      title={<span>Hidden detail</span>}
+    >
+      <button type="button">Main action</button>
+    </DetailPanel>,
   );
-  expect(view.getByTestId("detail-panel-pane").className).toContain(
-    "max-md:!w-full",
+
+  expect(view.queryByRole("button", { name: "Close detail panel" })).toBeNull();
+  expect(
+    view.queryByRole("button", { name: "Hidden detail action" }),
+  ).toBeNull();
+  expect(view.getAllByRole("button")).toHaveLength(1);
+});
+
+test("draft layout uses available channel width and never leaves a clipped 720px sliver", () => {
+  const originalResizeObserver = globalThis.ResizeObserver;
+  let resize = (_width: number) => {};
+  globalThis.ResizeObserver = class {
+    constructor(callback: ResizeObserverCallback) {
+      resize = (width) =>
+        callback(
+          [{ contentRect: { width } } as ResizeObserverEntry],
+          this as ResizeObserver,
+        );
+    }
+    disconnect() {}
+    observe() {}
+    unobserve() {}
+  };
+  try {
+    const view = render(
+      <DetailPanel
+        collapseAtNarrow
+        detail={<button type="button">Canvas content</button>}
+        detailWidth={720}
+        focusKey={draftId}
+        onClose={() => {}}
+        open
+        title={<span>Typefully draft</span>}
+      >
+        <div>Chat</div>
+      </DetailPanel>,
+    );
+
+    for (const [viewport, available] of [
+      [768, 428],
+      [900, 560],
+      [1059, 719],
+      [1200, 860],
+    ]) {
+      act(() => resize(available));
+      expect(view.getByTestId("detail-panel").dataset.layout).toBe("collapsed");
+      expect(view.getByTestId("detail-panel-content").style.width).toBe("100%");
+      expect(
+        view.getByRole("button", { name: "Close detail panel" }),
+      ).toBeTruthy();
+      expect(view.getByRole("button", { name: "Canvas content" })).toBeTruthy();
+      expect(viewport).toBeGreaterThanOrEqual(768);
+    }
+    act(() => resize(1060));
+    expect(view.getByTestId("detail-panel").dataset.layout).toBe("split");
+    expect(view.getByTestId("detail-panel-content").style.width).toBe("720px");
+  } finally {
+    globalThis.ResizeObserver = originalResizeObserver;
+  }
+});
+
+test("watch and settings detail panes keep their existing split layout", () => {
+  const view = render(
+    <DetailPanel
+      detail={<div>Watch screen</div>}
+      detailWidth={400}
+      onClose={() => {}}
+      open
+    >
+      <div>Chat</div>
+    </DetailPanel>,
   );
+  expect(view.getByTestId("detail-panel").dataset.layout).toBe("split");
+  expect(view.getByTestId("detail-panel-main").className).not.toContain(
+    "hidden",
+  );
+  expect(view.getByTestId("detail-panel-content").style.width).toBe("400px");
 });
 
 test("detail focus enters the canvas and returns to the originating review control", async () => {
@@ -172,6 +259,7 @@ test("detail focus enters the canvas and returns to the originating review contr
   );
   await user.click(view.getByRole("button", { name: "Close detail panel" }));
   await waitFor(() => expect(document.activeElement).toBe(review));
+  expect(view.queryByRole("button", { name: "Close detail panel" })).toBeNull();
 });
 
 test("a directly linked canvas closes safely to the channel fallback", async () => {
@@ -325,9 +413,7 @@ test("the production route preserves focus on automatic watch and backs out of a
   expect(
     view.getByTestId("detail-panel").getAttribute("data-detail-width"),
   ).toBe("720");
-  expect(view.getByTestId("detail-panel-main").className).toContain(
-    "max-md:hidden",
-  );
+  expect(view.getByTestId("detail-panel").dataset.layout).toBe("collapsed");
 
   await act(async () => {
     await productionRouter.history.back();
@@ -390,8 +476,14 @@ test("an authoritative draft is fetched only while its canvas is mounted", async
     "../src/components/typefully/draft-canvas"
   );
   const calls: string[] = [];
+  let resolveSecond: ((response: Response) => void) | undefined;
   const { queryClient } = queryView((async (input) => {
     calls.push(String(input));
+    if (calls.length === 2) {
+      return await new Promise<Response>((resolve) => {
+        resolveSecond = resolve;
+      });
+    }
     return new Response(
       JSON.stringify({
         draft: {
@@ -451,6 +543,98 @@ test("an authoritative draft is fetched only while its canvas is mounted", async
   );
   await waitFor(() => expect(calls).toHaveLength(1));
   expect(await view.findByText("Private body")).toBeTruthy();
+
+  view.rerender(
+    <QueryClientProvider client={queryClient}>
+      <DetailPanel
+        collapseAtNarrow
+        detail={<DraftCanvas draftId={draftId} />}
+        detailWidth={720}
+        onClose={() => {}}
+        open={false}
+      >
+        <div>Chat</div>
+      </DetailPanel>
+    </QueryClientProvider>,
+  );
+  await waitFor(() =>
+    expect(queryClient.getQueryData(typefullyKeys.draft(draftId))).toBe(
+      undefined,
+    ),
+  );
+
+  view.rerender(
+    <QueryClientProvider client={queryClient}>
+      <DetailPanel
+        collapseAtNarrow
+        detail={<DraftCanvas draftId={draftId} />}
+        detailWidth={720}
+        onClose={() => {}}
+        open
+      >
+        <div>Chat</div>
+      </DetailPanel>
+    </QueryClientProvider>,
+  );
+  await waitFor(() => expect(calls).toHaveLength(2));
+  expect(view.queryByText("Private body")).toBeNull();
+  expect(view.getByRole("status").textContent).toContain("Loading draft");
+  resolveSecond?.(
+    new Response(JSON.stringify({ draft: authoritativeDraft() }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }),
+  );
+  expect(await view.findByText("Production route draft")).toBeTruthy();
+});
+
+test("closing a draft aborts its active authorized fetch and removes its query", async () => {
+  const { DraftCanvas } = await import(
+    "../src/components/typefully/draft-canvas"
+  );
+  let aborted = false;
+  const { queryClient } = queryView((async (_input, init) => {
+    return await new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => {
+        aborted = true;
+        reject(new DOMException("Aborted", "AbortError"));
+      });
+    });
+  }) as typeof fetch);
+  const view = render(
+    <QueryClientProvider client={queryClient}>
+      <DetailPanel
+        detail={<DraftCanvas draftId={draftId} />}
+        onClose={() => {}}
+        open
+      >
+        <div>Chat</div>
+      </DetailPanel>
+    </QueryClientProvider>,
+  );
+  await waitFor(() =>
+    expect(
+      queryClient.getQueryState(typefullyKeys.draft(draftId)),
+    ).toBeTruthy(),
+  );
+
+  view.rerender(
+    <QueryClientProvider client={queryClient}>
+      <DetailPanel
+        detail={<DraftCanvas draftId={draftId} />}
+        onClose={() => {}}
+        open={false}
+      >
+        <div>Chat</div>
+      </DetailPanel>
+    </QueryClientProvider>,
+  );
+  await waitFor(() => expect(aborted).toBe(true));
+  await waitFor(() =>
+    expect(queryClient.getQueryState(typefullyKeys.draft(draftId))).toBe(
+      undefined,
+    ),
+  );
 });
 
 test("draft canvas handles owner-safe refusal states without content", async () => {
@@ -484,4 +668,36 @@ test("draft canvas handles owner-safe refusal states without content", async () 
   expect(new TypefullyClientError("draft_not_found").code).toBe(
     "draft_not_found",
   );
+});
+
+test("draft canvas refuses malformed successful payloads without rendering their body", async () => {
+  const { DraftCanvas } = await import(
+    "../src/components/typefully/draft-canvas"
+  );
+  const { queryClient } = queryView(
+    (async () =>
+      new Response(
+        JSON.stringify({
+          draft: {
+            ...authoritativeDraft(),
+            syncStatus: "invented",
+            document: {
+              ...authoritativeDraft().document,
+              posts: [{ id: "p1", x: "must never render", linkedin: "" }],
+            },
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )) as typeof fetch,
+  );
+  const view = render(
+    <QueryClientProvider client={queryClient}>
+      <DraftCanvas draftId={draftId} />
+    </QueryClientProvider>,
+  );
+
+  expect((await view.findByRole("alert")).textContent).toContain(
+    "could not load",
+  );
+  expect(view.container.textContent).not.toContain("must never render");
 });

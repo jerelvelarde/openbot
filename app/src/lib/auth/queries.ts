@@ -1,5 +1,6 @@
-import { queryOptions } from "@tanstack/react-query";
+import { type QueryClient, queryOptions } from "@tanstack/react-query";
 import { client, tryClient } from "@/lib/client";
+import { typefullyKeys } from "@/lib/typefully/queries";
 
 export type AuthenticatedUser = {
   id: string;
@@ -59,13 +60,26 @@ export function authProvidersQueryOptions() {
   });
 }
 
-async function currentUser(): Promise<AuthenticatedUser | null> {
+/** Full draft bodies are user-scoped and must not survive a session identity boundary. */
+export function clearTypefullyUserCache(queryClient: QueryClient): void {
+  queryClient.removeQueries({ queryKey: typefullyKeys.all });
+}
+
+async function currentUser({
+  client: queryClient,
+}: {
+  client: QueryClient;
+}): Promise<AuthenticatedUser | null> {
+  const previous = queryClient.getQueryData<AuthenticatedUser | null>(
+    authKeys.currentUser(),
+  );
   /*
    * `tryClient` rather than `client`: not being signed in is an answer here, not a failure, and it
    * arrives as a 401 that has to be read before anything decides the request went wrong.
    */
   const response = await tryClient("/api/me");
   if (response.status === 401) {
+    if (previous !== null) clearTypefullyUserCache(queryClient);
     return null;
   }
   if (!response.ok) {
@@ -73,6 +87,7 @@ async function currentUser(): Promise<AuthenticatedUser | null> {
   }
 
   const body = (await response.json()) as { user: AuthenticatedUser };
+  if (previous?.id !== body.user.id) clearTypefullyUserCache(queryClient);
   return body.user;
 }
 

@@ -97,7 +97,11 @@ async function mutate<TVariables>(
 
 describe("Typefully query contracts", () => {
   test("uses stable, secret-free keys and exact load routes", async () => {
-    const calls = capture({ draft: { id: "draft-1" } });
+    const calls = capture({
+      draft: authoritativeDraft(1, {
+        id: "8b1c61f1-2154-4a5d-8c9a-7c8df8f9ae53",
+      }),
+    });
     expect(typefullyKeys.all).toEqual(["typefully"]);
     expect(typefullyKeys.draft("draft/one")).toEqual([
       "typefully",
@@ -111,13 +115,70 @@ describe("Typefully query contracts", () => {
     ]);
     expect(typefullyKeys.lists()).toEqual(["typefully", "list"]);
 
-    await draftQueryOptions("draft/one").queryFn?.({} as never);
+    const abort = new AbortController();
+    await draftQueryOptions("draft/one").queryFn?.({
+      signal: abort.signal,
+    } as never);
     await proposalQueryOptions("proposal/one").queryFn?.({} as never);
 
     expect(calls.map(({ url, init }) => [url, init?.method ?? "GET"])).toEqual([
       ["/api/typefully/drafts/draft%2Fone", "GET"],
       ["/api/typefully/proposals/proposal%2Fone", "GET"],
     ]);
+    expect(calls[0]?.init?.signal).toBe(abort.signal);
+    expect(draftQueryOptions("draft/one").gcTime).toBe(0);
+  });
+
+  test("strictly validates bounded authoritative draft responses", async () => {
+    const valid = authoritativeDraft(1, {
+      id: "8b1c61f1-2154-4a5d-8c9a-7c8df8f9ae53",
+    });
+    for (const malformed of [
+      null,
+      [],
+      {},
+      { draft: null },
+      { draft: { ...valid, syncStatus: "regressed" } },
+      {
+        draft: {
+          ...valid,
+          document: { ...valid.document, destinations: ["threads"] },
+        },
+      },
+      {
+        draft: {
+          ...valid,
+          document: { ...valid.document, posts: [{ id: "missing-bodies" }] },
+        },
+      },
+      { draft: { ...valid, lastError: "e".repeat(501) } },
+      {
+        draft: {
+          ...valid,
+          document: {
+            ...valid.document,
+            posts: [{ id: "post-1", x: "x".repeat(100_001), linkedin: "ok" }],
+          },
+        },
+      },
+    ]) {
+      capture(malformed);
+      const error = await draftQueryOptions(valid.id)
+        .queryFn?.({} as never)
+        .then(() => null)
+        .catch((caught) => caught);
+      expect(error).toBeInstanceOf(TypefullyClientError);
+      expect((error as TypefullyClientError).code).toBe(
+        "remote_invalid_response",
+      );
+      expect((error as Error).message).not.toContain("regressed");
+      expect((error as Error).message).not.toContain("threads");
+    }
+
+    capture({ draft: valid });
+    expect(await draftQueryOptions(valid.id).queryFn?.({} as never)).toEqual({
+      draft: valid,
+    });
   });
 });
 
@@ -1285,6 +1346,7 @@ describe("Typefully mutation contracts", () => {
                 draft: Record<string, unknown>;
               }
             ).draft,
+            id: "8b1c61f1-2154-4a5d-8c9a-7c8df8f9ae53",
             version: 7,
             syncStatus: "connection_required",
           },
