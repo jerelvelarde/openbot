@@ -57,8 +57,8 @@ import { createExternalThreadStore } from "./external/thread-store";
 import { createPeopleStore } from "./people/store";
 import { redirectUriFor } from "./plugins/oauth";
 import { createPluginStore, type PluginStore } from "./plugins/store";
-import { createTypefullyPublicationVendor } from "./plugins/typefully-rest";
 import { grantedSkills, grantedTools } from "./plugins/tools";
+import { createTypefullyPublicationVendor } from "./plugins/typefully-rest";
 import { createIntentRouter } from "./routing/classify";
 import { createModelCompleter } from "./routing/model";
 import { createCoworkerRoutingService } from "./routing/service";
@@ -824,7 +824,7 @@ const startWeb = () => serve<SocketData>(serverOptions);
 
 const managedHost = startManagedChannelHost({
   startWeb,
-  stopWeb: (server) => server.stop(),
+  stopWeb: (server) => server.stop(true),
   channels: copilotHandler.channels,
   signals: process,
   stopOthers: [

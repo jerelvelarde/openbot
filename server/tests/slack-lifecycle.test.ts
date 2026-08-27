@@ -99,6 +99,7 @@ describe("managed Channels lifecycle", () => {
     };
     let channelStops = 0;
     let httpStops = 0;
+    const httpStopForces: Array<boolean | undefined> = [];
     let listenerStops = 0;
     let exits = 0;
     let markExited: (() => void) | undefined;
@@ -107,11 +108,14 @@ describe("managed Channels lifecycle", () => {
     });
     await startManagedChannelHost({
       startWeb: () => ({
-        stop: async () => {
+        stop(force?: boolean): Promise<void> {
           httpStops += 1;
+          httpStopForces.push(force);
+          if (force) return Promise.resolve();
+          return new Promise(() => {});
         },
       }),
-      stopWeb: (web) => web.stop(),
+      stopWeb: (web) => web.stop(true),
       channels: {
         ready: async () => {},
         stop: async () => {
@@ -139,10 +143,19 @@ describe("managed Channels lifecycle", () => {
 
     expect(channelStops).toBe(1);
     expect(httpStops).toBe(1);
+    expect(httpStopForces).toEqual([true]);
     expect(listenerStops).toBe(1);
     expect(exits).toBe(1);
     expect(signals.count("SIGINT")).toBe(0);
     expect(signals.count("SIGTERM")).toBe(0);
+  });
+
+  test("the production Bun host force-stops active WebSockets", async () => {
+    const source = await Bun.file(
+      new URL("../src/index.ts", import.meta.url),
+    ).text();
+
+    expect(source).toContain("stopWeb: (server) => server.stop(true)");
   });
 
   test("starts a live web host before managed activation and keeps it live on rejection", async () => {
