@@ -9,6 +9,7 @@ import {
   credentials,
   mcpServers,
   mcpUserCredentials,
+  revokedAccess,
   users,
 } from "../src/db/schema";
 import { createPluginStore } from "../src/plugins/store";
@@ -91,6 +92,9 @@ afterAll(async () => {
         inArray(credentials.keyId, [userId, secondUserId]),
       ),
     );
+  await database
+    .delete(revokedAccess)
+    .where(eq(revokedAccess.email, `${secondUserId}@openbot.test`));
   await database.delete(users).where(inArray(users.id, [userId, secondUserId]));
   if (!serverExisted) {
     await database.delete(mcpServers).where(eq(mcpServers.id, serverId));
@@ -280,6 +284,10 @@ describe("personal Typefully API-key connections", () => {
       apiKey: `${apiKey}-offboarded`,
       by: secondUserId,
     });
+    await database.insert(revokedAccess).values({
+      email: `${secondUserId}@openbot.test`,
+      revokedBy: "admin@openbot.test",
+    });
 
     const result = await store.retireConnectionsFor(
       secondUserId,
@@ -299,6 +307,35 @@ describe("personal Typefully API-key connections", () => {
       );
     expect(live).toEqual([]);
     expect(await store.connectionsFor(secondUserId)).toEqual([]);
+
+    await expect(
+      store.connectUserApiKey({
+        serverId,
+        userId: secondUserId,
+        apiKey: `${apiKey}-reconnect-after-offboarding`,
+        by: secondUserId,
+      }),
+    ).rejects.toMatchObject({ code: "access_revoked" });
+    await expect(
+      store.recordConnection({
+        serverId,
+        userId: secondUserId,
+        refreshToken: "oauth-never-stored-after-offboarding",
+        scope: "read",
+      }),
+    ).rejects.toMatchObject({ code: "access_revoked" });
+    const liveAfterReconnect = await database
+      .select({ id: credentials.id })
+      .from(credentials)
+      .where(
+        and(
+          eq(credentials.kind, "mcp_user_api_key"),
+          eq(credentials.provider, serverId),
+          eq(credentials.keyId, secondUserId),
+          isNull(credentials.revokedAt),
+        ),
+      );
+    expect(liveAfterReconnect).toEqual([]);
   });
 
   test("disconnect revokes only the exact connection and repeats as not_connected", async () => {

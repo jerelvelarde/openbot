@@ -4,6 +4,7 @@ import { Hono } from "hono";
 import type { AppVariables } from "../src/auth/guards";
 import { challengeFor, sealConnectState } from "../src/plugins/oauth";
 import { createPluginRoutes } from "../src/plugins/routes";
+import { UserConnectionError } from "../src/plugins/store";
 
 /**
  * `GET /oauth/callback`: the request the vendor sends somebody back on.
@@ -48,11 +49,14 @@ function app(input: {
   recorded: Recorded[];
   /** Whether the person named by the state still has access. Present by default. */
   personHasAccess?: (userId: string) => Promise<boolean>;
+  recordConnection?: (connection: Recorded) => Promise<void>;
 }) {
   const store = {
     oauthClientFor: async () => ({ clientId: "dyn-1", clientSecret: "" }),
     ensureOAuthClient: async () => ({ clientId: "dyn-1", clientSecret: "" }),
     recordConnection: async (connection: Recorded) => {
+      if (input.recordConnection)
+        return await input.recordConnection(connection);
       input.recorded.push(connection);
     },
   };
@@ -190,6 +194,37 @@ describe("a consent that outlived the person's access", () => {
       expect(response.headers.get("location")).toBe(FAILED);
     });
     expect(recorded).toEqual([]);
+  });
+
+  test("fails anonymously when access is revoked while the code is redeemed", async () => {
+    const recorded: Recorded[] = [];
+    const hono = app({
+      recorded,
+      personHasAccess: async () => true,
+      recordConnection: async () => {
+        throw new UserConnectionError(
+          "access_revoked",
+          "This person no longer has access to connect an account.",
+        );
+      },
+    });
+    const state = await sealConnectState(
+      {
+        userId: "removed-during-redemption",
+        serverId: "notion",
+        verifier: "v-1",
+      },
+      KEY,
+    );
+
+    const requests = await withWillingVendor(async (requests) => {
+      const response = await hono.request(callbackUrl(state));
+      expect(response.headers.get("location")).toBe(FAILED);
+      return requests;
+    });
+
+    expect(recorded).toEqual([]);
+    expect(requests).toHaveLength(1);
   });
 });
 

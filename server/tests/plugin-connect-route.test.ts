@@ -318,6 +318,30 @@ describe("personal Typefully connection routes", () => {
     });
   });
 
+  test("refuses a connection for an offboarded actor", async () => {
+    const hono = personalConnectionApp({
+      connectUserApiKey: async () => {
+        throw new UserConnectionError(
+          "access_revoked",
+          "This user's access has been revoked.",
+        );
+      },
+    });
+    const response = await hono.request(
+      "http://t/api/plugins/connections/typefully/api-key",
+      {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ apiKey: "tf-never-echo" }),
+      },
+    );
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({
+      error: "This user's access has been revoked.",
+      code: "access_revoked",
+    });
+  });
+
   test("disconnect derives the same owner and reports repeated disconnect stably", async () => {
     const calls: unknown[] = [];
     const connected = personalConnectionApp({

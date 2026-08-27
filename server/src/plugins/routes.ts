@@ -391,10 +391,13 @@ export function createPluginRoutes(
         return context.json({ error: error.message, code: error.code }, status);
       }
       if (error instanceof UserConnectionError) {
-        return context.json(
-          { error: error.message, code: error.code },
-          error.code === "connector_not_enabled" ? 409 : 404,
-        );
+        const status =
+          error.code === "connector_not_enabled"
+            ? 409
+            : error.code === "access_revoked"
+              ? 403
+              : 404;
+        return context.json({ error: error.message, code: error.code }, status);
       }
       if (error instanceof PluginRefusedError) {
         return context.json(
@@ -593,12 +596,24 @@ export function createPluginRoutes(
     });
     if (!grant) return context.redirect(failed);
 
-    await store.recordConnection({
-      serverId: state.serverId,
-      userId: state.userId,
-      refreshToken: grant.refreshToken,
-      scope: grant.scope,
-    });
+    try {
+      await store.recordConnection({
+        serverId: state.serverId,
+        userId: state.userId,
+        refreshToken: grant.refreshToken,
+        scope: grant.scope,
+      });
+    } catch (error) {
+      // Access may have been revoked while the authorization code was being redeemed. Keep the
+      // callback's anonymous failure shape and never disclose whether this person is deny-listed.
+      if (
+        error instanceof UserConnectionError &&
+        error.code === "access_revoked"
+      ) {
+        return context.redirect(failed);
+      }
+      throw error;
+    }
 
     return context.redirect(
       connectedAccountsUrlFor(

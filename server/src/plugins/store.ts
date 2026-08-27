@@ -23,8 +23,10 @@ import {
   mcpTools,
   mcpUserCredentials,
   pluginGrants,
+  revokedAccess,
   skills,
   skillTools,
+  users,
 } from "../db/schema";
 import {
   type CatalogueEntry,
@@ -198,7 +200,10 @@ export class ConnectionRequiredError extends PluginRefusedError {
   }
 }
 
-export type UserConnectionErrorCode = "connector_not_enabled" | "not_connected";
+export type UserConnectionErrorCode =
+  | "access_revoked"
+  | "connector_not_enabled"
+  | "not_connected";
 
 export class UserConnectionError extends Error {
   constructor(
@@ -1198,6 +1203,26 @@ export function createPluginStore(options: PluginStoreOptions) {
     );
   }
 
+  async function requireActiveUser(
+    transaction: Transaction,
+    userId: string,
+  ): Promise<void> {
+    const [activeUser] = await transaction
+      .select({ id: users.id })
+      .from(users)
+      .leftJoin(
+        revokedAccess,
+        eq(revokedAccess.email, sql`lower(${users.email})`),
+      )
+      .where(and(eq(users.id, userId), isNull(revokedAccess.email)));
+    if (!activeUser) {
+      throw new UserConnectionError(
+        "access_revoked",
+        "This person no longer has access to connect an account.",
+      );
+    }
+  }
+
   /**
    * Point one person's connection at a new refresh token, revoking the one it replaces.
    *
@@ -1242,6 +1267,7 @@ export function createPluginStore(options: PluginStoreOptions) {
     return await database.transaction(async (transaction) => {
       await lockServerLifecycle(transaction, input.serverId);
       await lockUserConnections(transaction, input.userId);
+      await requireActiveUser(transaction, input.userId);
       /*
        * `credentials_active_key_idx` holds one live credential per key, so a second insert for the
        * same person and server would be refused. Asked of the key rather than of the connection row,
@@ -2726,6 +2752,7 @@ export function createPluginStore(options: PluginStoreOptions) {
       const stored = await database.transaction(async (transaction) => {
         await lockServerLifecycle(transaction, input.serverId);
         await lockUserConnections(transaction, input.userId);
+        await requireActiveUser(transaction, input.userId);
         await transaction.execute(
           sql`select pg_advisory_xact_lock(hashtext(${`user-api-key:${input.serverId}:${input.userId}`}))`,
         );
