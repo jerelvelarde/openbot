@@ -986,6 +986,97 @@ test("draft media add omits an id, then retry and remove use the server-authorit
   );
 });
 
+test("a retry cannot adopt or rekey mismatched non-2xx recovery media", async () => {
+  const { DraftCanvas } = await import(
+    "../src/components/typefully/draft-canvas"
+  );
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
+    },
+  });
+  queryClient.setQueryData(typefullyKeys.draft(draftId), {
+    draft: authoritativeDraft(),
+  });
+  const authoritativeMedia = {
+    id: "authoritative-retry-media",
+    kind: "image" as const,
+    order: 0,
+    altText: "",
+    remoteId: null,
+  };
+  let uploads = 0;
+  globalThis.fetch = (async (_input, init) => {
+    if ((init?.method ?? "GET") === "POST") {
+      uploads += 1;
+      const media =
+        uploads === 1
+          ? authoritativeMedia
+          : { ...authoritativeMedia, id: "different-retry-media" };
+      return new Response(
+        JSON.stringify({
+          code: "remote_error",
+          draft: {
+            id: draftId,
+            title: "Production route draft",
+            destinations: ["x"],
+            socialSetLabel: "Route account",
+            mediaCount: 1,
+            version: uploads + 1,
+            syncStatus: "remote_error",
+            proposalStatus: null,
+          },
+          media,
+        }),
+        { status: 502, headers: { "content-type": "application/json" } },
+      );
+    }
+    return new Response(
+      JSON.stringify({
+        draft: {
+          ...authoritativeDraft(),
+          document: {
+            ...authoritativeDraft().document,
+            media: [authoritativeMedia],
+          },
+          version: 2,
+          contentHash: "hash-2",
+          remoteVersion: 1,
+          syncStatus: "remote_error",
+        },
+      }),
+      { headers: { "content-type": "application/json" } },
+    );
+  }) as typeof fetch;
+  const view = render(
+    <QueryClientProvider client={queryClient}>
+      <DraftCanvas draftId={draftId} />
+    </QueryClientProvider>,
+  );
+  const user = userEvent.setup({ document });
+  await user.upload(
+    view.getByLabelText("Add media"),
+    new File(["image"], "launch.png", { type: "image/png" }),
+  );
+  const retry = await view.findByRole("button", { name: "Retry image 1" });
+  await user.click(retry);
+  await waitFor(() => expect(uploads).toBe(2));
+  expect(view.getByRole("alert").textContent).toContain("invalid response");
+  expect(view.getByRole("button", { name: "Retry image 1" })).toBeTruthy();
+  expect(
+    view.queryByRole("button", { name: /different-retry-media/ }),
+  ).toBeNull();
+  expect(queryClient.getQueryData(typefullyKeys.draft(draftId))).toMatchObject({
+    draft: {
+      version: 2,
+      document: { media: [authoritativeMedia] },
+    },
+  });
+
+  await user.click(view.getByRole("button", { name: "Retry image 1" }));
+  await waitFor(() => expect(uploads).toBe(3));
+});
+
 test("media busy locks edits and an autosave error blocks media operations", async () => {
   const { DraftCanvas } = await import(
     "../src/components/typefully/draft-canvas"
@@ -1100,6 +1191,35 @@ for (const [label, uploadResult] of [
             },
           }),
           { status: 201, headers: { "content-type": "application/json" } },
+        ),
+      ),
+  ],
+  [
+    "wrong-draft committed failure",
+    () =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            code: "remote_error",
+            draft: {
+              id: "a2847b7f-1371-4fa7-88c8-aa80c610e50e",
+              title: "Another draft",
+              destinations: ["x"],
+              socialSetLabel: "Route account",
+              mediaCount: 1,
+              version: 2,
+              syncStatus: "remote_error",
+              proposalStatus: null,
+            },
+            media: {
+              id: "untrusted-media-id",
+              kind: "image",
+              order: 0,
+              altText: "",
+              remoteId: null,
+            },
+          }),
+          { status: 502, headers: { "content-type": "application/json" } },
         ),
       ),
   ],

@@ -747,6 +747,78 @@ describe("Typefully mutation contracts", () => {
     ).toBe(true);
   });
 
+  test.each([
+    {
+      name: "a different draft on a new upload",
+      inputMediaId: undefined,
+      draftId: "other-draft",
+      mediaId: "authoritative-media",
+    },
+    {
+      name: "a different media identity on retry",
+      inputMediaId: "expected-media",
+      draftId: "draft-1",
+      mediaId: "different-media",
+    },
+  ])(
+    "rejects non-2xx recovery metadata for $name before cache adoption",
+    async ({ inputMediaId, draftId: responseDraftId, mediaId }) => {
+      const queryClient = new QueryClient({
+        defaultOptions: {
+          mutations: { retry: false },
+          queries: { retry: false },
+        },
+      });
+      const original = authoritativeDraft(1);
+      queryClient.setQueryData(typefullyKeys.draft("draft-1"), {
+        draft: original,
+      });
+      globalThis.fetch = (async () =>
+        json(
+          {
+            code: "remote_error",
+            draft: {
+              ...draftSummary(2, "remote_error"),
+              id: responseDraftId,
+              mediaCount: 1,
+            },
+            media: {
+              id: mediaId,
+              kind: "image",
+              order: 0,
+              altText: "Untrusted recovery",
+              remoteId: null,
+            },
+          },
+          502,
+        )) as typeof fetch;
+      const observer = new MutationObserver(
+        queryClient,
+        uploadMediaMutationOptions(queryClient),
+      );
+
+      let failure: unknown;
+      try {
+        await observer.mutate({
+          draftId: "draft-1",
+          expectedVersion: 1,
+          kind: "image",
+          altText: "Launch",
+          file: new File(["x"], "x.png", { type: "image/png" }),
+          ...(inputMediaId ? { mediaId: inputMediaId } : {}),
+        });
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toMatchObject({ code: "remote_invalid_response" });
+      expect((failure as TypefullyClientError).draft).toBeUndefined();
+      expect((failure as TypefullyClientError).media).toBeUndefined();
+      expect(queryClient.getQueryData(typefullyKeys.draft("draft-1"))).toEqual({
+        draft: original,
+      });
+    },
+  );
+
   test("persists a completed upload descriptor returned at version plus two even when refetch fails", async () => {
     const queryClient = new QueryClient({
       defaultOptions: {

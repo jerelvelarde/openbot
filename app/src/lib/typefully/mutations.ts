@@ -67,6 +67,26 @@ function parseMediaMutationSuccess(
   return { draft, media, ...(remote ? { remote } : {}) };
 }
 
+function boundMediaMutationFailure(
+  error: TypefullyClientError,
+  input: { draftId: string; mediaId?: string },
+): TypefullyClientError {
+  const hasRecovery =
+    error.draft !== undefined ||
+    error.media !== undefined ||
+    error.remote !== undefined;
+  if (!hasRecovery) return error;
+  if (
+    !error.draft ||
+    !error.media ||
+    error.draft.id !== input.draftId ||
+    (input.mediaId !== undefined && error.media.id !== input.mediaId)
+  ) {
+    return new TypefullyClientError("remote_invalid_response");
+  }
+  return error;
+}
+
 async function convergeDraftCache(
   queryClient: QueryClient | undefined,
   draftId: string,
@@ -304,11 +324,18 @@ export function uploadMediaMutationOptions(queryClient?: QueryClient) {
       form.set("kind", input.kind);
       form.set("altText", input.altText);
       if (input.mediaId !== undefined) form.set("mediaId", input.mediaId);
-      const payload = await typefullyRequest<unknown>(
-        `/api/typefully/drafts/${encodeURIComponent(input.draftId)}/media`,
-        { method: "POST", form, signal: input.signal },
-      );
-      return parseMediaMutationSuccess(payload, input);
+      try {
+        const payload = await typefullyRequest<unknown>(
+          `/api/typefully/drafts/${encodeURIComponent(input.draftId)}/media`,
+          { method: "POST", form, signal: input.signal },
+        );
+        return parseMediaMutationSuccess(payload, input);
+      } catch (error) {
+        if (error instanceof TypefullyClientError) {
+          throw boundMediaMutationFailure(error, input);
+        }
+        throw error;
+      }
     },
     onSuccess: (result, input) =>
       convergeDraftCache(
