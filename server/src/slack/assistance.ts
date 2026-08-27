@@ -141,8 +141,8 @@ export async function requestSlackHelp(
   options: SlackAssistanceOptions,
 ) {
   const { agentId, actor } = actorAndAgent();
-  await gateway.requestHelp(agentId, actor, reason);
   const url = await assistanceUrl(options);
+  await gateway.requestHelp(agentId, actor, reason);
   await context.thread.post(assistanceMessage(reason, url));
   const outcome = await waitForAssistance({
     control: () => gateway.control(agentId),
@@ -167,8 +167,8 @@ export async function requestSlackSecret(
   options: SlackAssistanceOptions,
 ) {
   const { agentId, actor } = actorAndAgent();
-  await gateway.requestSecret(agentId, actor, input);
   const url = await assistanceUrl(options);
+  await gateway.requestSecret(agentId, actor, input);
   await context.thread.post(
     assistanceMessage(`Open OpenBot to enter ${input.label}.`, url),
   );
