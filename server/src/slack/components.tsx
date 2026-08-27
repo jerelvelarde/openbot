@@ -2,18 +2,23 @@
 import { defineChannelComponent } from "@copilotkit/channels";
 import { Actions, Button, Message, Section } from "@copilotkit/channels/ui";
 import { z } from "zod";
+import type { SlackApprovalAuthorization } from "./approval-authorizer";
 import type {
   ApprovalDecisionStore,
   ApprovalPresentation,
 } from "./approval-store";
-import { maybeCurrentSlackExecution } from "./execution-context";
+import {
+  maybeCurrentSlackExecution,
+  runWithSlackExecution,
+  type SlackExecution,
+} from "./execution-context";
 
 type ApprovalDependencies = {
   store: ApprovalDecisionStore;
   authorize(input: {
     userId: string;
     presentation: ApprovalPresentation;
-  }): Promise<boolean>;
+  }): Promise<boolean | SlackApprovalAuthorization>;
   now(): number;
   retentionMs: number;
 };
@@ -54,6 +59,7 @@ async function claimAndResume(
   actionId: string,
   userId: string | null,
   conversationKey: string | null,
+  initialExecution: SlackExecution | null,
   resume: (decision: { approved: boolean }) => Promise<unknown>,
 ): Promise<void> {
   const dependencies = approvalDependencies;
@@ -65,11 +71,11 @@ async function claimAndResume(
   }
   const decision = approvalAction.parse(value);
   const presentation = await dependencies.store.get(decision.presentationId);
-  if (
-    !presentation ||
-    presentation.conversationKey !== conversationKey ||
-    !(await dependencies.authorize({ userId, presentation }))
-  ) {
+  if (!presentation || presentation.conversationKey !== conversationKey) {
+    throw new Error("This approval interaction could not be authorized.");
+  }
+  const authorization = await dependencies.authorize({ userId, presentation });
+  if (!authorization) {
     throw new Error("This approval interaction could not be authorized.");
   }
   const claimed = await dependencies.store.begin({
@@ -78,8 +84,41 @@ async function claimAndResume(
     decidedByUserId: userId,
   });
   if (claimed === "rejected") return;
-  await resume({ approved: decision.approved });
+  const execution = approvalExecution(
+    authorization,
+    presentation,
+    initialExecution,
+    userId,
+  );
+  if (execution) {
+    await runWithSlackExecution(execution, () =>
+      resume({ approved: decision.approved }),
+    );
+  } else {
+    // Non-OpenBot Channels may use the component with a boolean authorizer and an agent that does
+    // not require Slack execution facts. OpenBot's authorizer always returns the complete subject.
+    await resume({ approved: decision.approved });
+  }
   await dependencies.store.complete(decision.presentationId, actionId);
+}
+
+function approvalExecution(
+  authorization: true | SlackApprovalAuthorization,
+  presentation: ApprovalPresentation,
+  initial: SlackExecution | null,
+  userId: string,
+): SlackExecution | null {
+  if (authorization !== true) {
+    return {
+      ...authorization,
+      channelsThreadId: presentation.channelsThreadId,
+      channelsConversationKey: presentation.conversationKey,
+      messageText: "",
+      agentId: presentation.agentId,
+    };
+  }
+  if (!initial || initial.actor.id !== userId) return null;
+  return { ...initial };
 }
 
 function threadConversationKey(thread: unknown): string | null {
@@ -136,6 +175,7 @@ export const ApprovalCard = defineChannelComponent({
                 action.id,
                 user?.id ?? null,
                 threadConversationKey(thread),
+                execution,
                 (decision) => thread.resume(decision),
               );
             }}
@@ -159,6 +199,7 @@ export const ApprovalCard = defineChannelComponent({
                 action.id,
                 user?.id ?? null,
                 threadConversationKey(thread),
+                execution,
                 (decision) => thread.resume(decision),
               );
             }}

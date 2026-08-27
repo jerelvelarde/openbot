@@ -3,6 +3,15 @@ import type { ExternalLinkAuthorizationStore } from "../external/link-store";
 import type { ExternalThreadStore } from "../external/thread-store";
 import type { ApprovalPresentation } from "./approval-store";
 
+export type SlackApprovalAuthorization = {
+  actor: { id: string; role: "admin" | "user" };
+  applicationUser: { id: string; name: string };
+  provider: "slack";
+  providerTenantId: string;
+  providerConversationId: string;
+  providerThreadId: string;
+};
+
 export type ApprovalAuthorizerDependencies = {
   links: ExternalLinkAuthorizationStore;
   threads: ExternalThreadStore;
@@ -16,7 +25,7 @@ export function createApprovalAuthorizer(
   return async (input: {
     userId: string;
     presentation: ApprovalPresentation;
-  }): Promise<boolean> => {
+  }): Promise<false | SlackApprovalAuthorization> => {
     const active = await dependencies.links.resolveActiveUser(input.userId);
     if (!active || active.id !== input.userId) return false;
     const binding = await dependencies.threads.getByChannelsThreadId(
@@ -24,11 +33,20 @@ export function createApprovalAuthorizer(
     );
     if (!binding || binding.agentId !== input.presentation.agentId)
       return false;
-    return (
-      (await dependencies.profiles.get(
-        { id: active.id, role: active.role },
-        input.presentation.agentId,
-      )) !== null
-    );
+    const actor = { id: active.id, role: active.role };
+    if (
+      (await dependencies.profiles.get(actor, input.presentation.agentId)) ===
+      null
+    ) {
+      return false;
+    }
+    return {
+      actor,
+      applicationUser: { id: active.id, name: active.name },
+      provider: "slack",
+      providerTenantId: binding.providerTenantId,
+      providerConversationId: binding.providerConversationId,
+      providerThreadId: binding.providerThreadId,
+    };
   };
 }
