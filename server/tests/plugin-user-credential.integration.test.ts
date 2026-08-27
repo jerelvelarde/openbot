@@ -45,6 +45,8 @@ const otherId = `user_oauth_other_${suite}`;
 const apiKeyUserId = `user_api_key_${suite}`;
 const brokenOauthUserId = `user_oauth_no_scope_${suite}`;
 const listingOauthUserId = `user_oauth_listing_${suite}`;
+const listingApiKeyUserId = `user_api_key_listing_${suite}`;
+const noScopeListingOauthUserId = `user_oauth_no_scope_listing_${suite}`;
 const mismatchedCatalogueUserId = `user_catalogue_mismatch_${suite}`;
 const serverId = "google-drive";
 const toolName = "search_files";
@@ -324,6 +326,11 @@ beforeAll(async () => {
     [apiKeyUserId, `${apiKeyUserId}@openbot.test`],
     [brokenOauthUserId, `${brokenOauthUserId}@openbot.test`],
     [listingOauthUserId, `${listingOauthUserId}@openbot.test`],
+    [listingApiKeyUserId, `${listingApiKeyUserId}@openbot.test`],
+    [
+      noScopeListingOauthUserId,
+      `${noScopeListingOauthUserId}@openbot.test`,
+    ],
     [mismatchedCatalogueUserId, `${mismatchedCatalogueUserId}@openbot.test`],
   ]) {
     await database
@@ -440,6 +447,8 @@ afterAll(async () => {
         apiKeyUserId,
         brokenOauthUserId,
         listingOauthUserId,
+        listingApiKeyUserId,
+        noScopeListingOauthUserId,
         mismatchedCatalogueUserId,
       ]),
     );
@@ -524,6 +533,8 @@ afterAll(async () => {
         apiKeyUserId,
         brokenOauthUserId,
         listingOauthUserId,
+        listingApiKeyUserId,
+        noScopeListingOauthUserId,
         mismatchedCatalogueUserId,
       ]),
     );
@@ -912,7 +923,7 @@ describe("a person who has connected", () => {
 describe("live connection listing", () => {
   test("includes safe rows only when the method matches the catalogue", async () => {
     await connectFixture({
-      userId: apiKeyUserId,
+      userId: listingApiKeyUserId,
       kind: "mcp_user_api_key",
       authMethod: "api_key",
       scope: null,
@@ -925,7 +936,7 @@ describe("live connection listing", () => {
       scope: "https://www.googleapis.com/auth/drive.readonly",
     });
 
-    expect(await store.connectionsFor(apiKeyUserId)).toEqual([
+    expect(await store.connectionsFor(listingApiKeyUserId)).toEqual([
       {
         serverId: typefullyServerId,
         authMethod: "api_key",
@@ -981,13 +992,13 @@ describe("live connection listing", () => {
 
   test("excludes an OAuth row with no scope", async () => {
     await connectFixture({
-      userId: brokenOauthUserId,
+      userId: noScopeListingOauthUserId,
       kind: "mcp_user_token",
       authMethod: "oauth",
       scope: null,
     });
 
-    expect(await store.connectionsFor(brokenOauthUserId)).toEqual([]);
+    expect(await store.connectionsFor(noScopeListingOauthUserId)).toEqual([]);
   });
 });
 
