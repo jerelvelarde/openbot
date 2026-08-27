@@ -21,6 +21,7 @@ import {
 
 const LAST_ERROR_MAX_LENGTH = 500;
 const DEFAULT_VENDOR_ID = "typefully";
+type RemoteDraftOperation = "create_draft" | "update_draft";
 
 type AuthorizationSurface = {
   decide(kind: PluginKind, ref: string, botId: string): Promise<PluginDecision>;
@@ -161,6 +162,10 @@ function boundedError(error: unknown): string {
       /\b(api[\s_-]?key|authorization|access[\s_-]?token|refresh[\s_-]?token|secret)(?:\s*[:=]\s*|\s+)(?:"[^"]*"|'[^']*'|[^\s,;&]+)/giu,
       "$1=[redacted]",
     )
+    .replace(
+      /\btoken\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;&]+)/giu,
+      "token=[redacted]",
+    )
     .replace(/\s+/g, " ")
     .trim();
   const safe = Array.from(redacted).slice(0, LAST_ERROR_MAX_LENGTH).join("");
@@ -266,6 +271,10 @@ function auditPayload(draft: TypefullyDraft) {
   };
 }
 
+function remoteOperationFor(draft: TypefullyDraft): RemoteDraftOperation {
+  return draft.remoteDraftId ? "update_draft" : "create_draft";
+}
+
 export function createTypefullyStore(options: {
   database: Database;
   plugin: () => AuthorizationSurface;
@@ -274,11 +283,11 @@ export function createTypefullyStore(options: {
 }) {
   const { database, plugin, auditStore } = options;
   const serverId = serverIdFor(options.vendor);
-  const grantRef = (operation: "create_draft" | "update_draft") =>
+  const grantRef = (operation: RemoteDraftOperation) =>
     `${serverId}/${operation}`;
 
   async function isGranted(
-    operation: "create_draft" | "update_draft",
+    operation: RemoteDraftOperation,
     botId: string,
   ): Promise<boolean> {
     const decision = await plugin().decide("mcp", grantRef(operation), botId);
@@ -348,10 +357,21 @@ export function createTypefullyStore(options: {
     }): Promise<TypefullyDraft> {
       const canonical = canonicalizeDraft(input.document);
       const visible = await ownedDraft(database, input.draftId, input.actorId);
+      let grantOperation = remoteOperationFor(visible);
       // A grant is advisory for a local save. It is read immediately before the transaction so no
       // database transaction spans a plugin call. A revocation after this decision is unavoidable;
       // Task 6 preflights again before any vendor action, so it can never authorize remote work.
-      const granted = await isGranted("update_draft", visible.botId);
+      let granted = await isGranted(grantOperation, visible.botId);
+      const refreshed = await ownedDraft(
+        database,
+        input.draftId,
+        input.actorId,
+      );
+      const refreshedOperation = remoteOperationFor(refreshed);
+      if (refreshedOperation !== grantOperation) {
+        grantOperation = refreshedOperation;
+        granted = await isGranted(grantOperation, refreshed.botId);
+      }
       return database.transaction(async (transaction) => {
         const current = await ownedDraft(
           transaction,
@@ -369,7 +389,9 @@ export function createTypefullyStore(options: {
           current.botId,
         );
         const syncStatus: DraftSyncStatus =
-          attached && granted ? "local" : "grant_blocked";
+          attached && granted && remoteOperationFor(current) === grantOperation
+            ? "local"
+            : "grant_blocked";
         const now = new Date();
         const [row] = await transaction
           .update(typefullyDrafts)
@@ -438,9 +460,7 @@ export function createTypefullyStore(options: {
       actorId: string;
     }): Promise<{ draft: TypefullyDraft; ref: string }> {
       let draft = await ownedDraft(database, input.draftId, input.actorId);
-      let operation: "create_draft" | "update_draft" = draft.remoteDraftId
-        ? "update_draft"
-        : "create_draft";
+      let operation = remoteOperationFor(draft);
       let ref = grantRef(operation);
       let decision = await plugin().decide("mcp", ref, draft.botId);
       if (!decision.allowed) {
@@ -451,9 +471,7 @@ export function createTypefullyStore(options: {
       // completed while authorization was being evaluated, and a concurrent first sync may have
       // changed the required grant from create to update.
       draft = await ownedDraft(database, input.draftId, input.actorId);
-      const currentOperation = draft.remoteDraftId
-        ? "update_draft"
-        : "create_draft";
+      const currentOperation = remoteOperationFor(draft);
       if (currentOperation !== operation) {
         operation = currentOperation;
         ref = grantRef(operation);

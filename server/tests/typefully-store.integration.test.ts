@@ -309,6 +309,17 @@ describe("owned local Typefully drafts", () => {
     createGranted = false;
     updateGranted = false;
     try {
+      await expect(
+        store.authorizeRemoteOperation({
+          draftId: created.id,
+          actorId: ownerId,
+        }),
+      ).rejects.toMatchObject({
+        code: "grant_required",
+        status: 403,
+        ref: "typefully/create_draft",
+      });
+
       const saved = await store.saveDraft({
         draftId: created.id,
         actorId: ownerId,
@@ -336,6 +347,73 @@ describe("owned local Typefully drafts", () => {
         error: "Vendor failed after authorization.",
       });
       expect(failed.syncStatus).toBe("remote_error");
+    } finally {
+      createGranted = true;
+      updateGranted = true;
+    }
+  });
+
+  test("uses asymmetric create and update grants for preflight and advisory local-save status", async () => {
+    const localOnly = await createOwnedDraft();
+    createGranted = false;
+    updateGranted = true;
+    try {
+      await expect(
+        store.authorizeRemoteOperation({
+          draftId: localOnly.id,
+          actorId: ownerId,
+        }),
+      ).rejects.toMatchObject({
+        code: "grant_required",
+        status: 403,
+        ref: "typefully/create_draft",
+      });
+      const locallySaved = await store.saveDraft({
+        draftId: localOnly.id,
+        actorId: ownerId,
+        expectedVersion: 1,
+        document: document("Create denied, local save retained."),
+      });
+      expect(locallySaved).toMatchObject({
+        version: 2,
+        syncStatus: "grant_blocked",
+      });
+    } finally {
+      createGranted = true;
+      updateGranted = true;
+    }
+
+    const remoteBacked = await createOwnedDraft();
+    await store.recordRemoteConfirmation({
+      draftId: remoteBacked.id,
+      actorId: ownerId,
+      expectedVersion: 1,
+      remoteDraftId: "remote-asymmetric",
+    });
+    createGranted = true;
+    updateGranted = false;
+    try {
+      await expect(
+        store.authorizeRemoteOperation({
+          draftId: remoteBacked.id,
+          actorId: ownerId,
+        }),
+      ).rejects.toMatchObject({
+        code: "grant_required",
+        status: 403,
+        ref: "typefully/update_draft",
+      });
+      const locallySaved = await store.saveDraft({
+        draftId: remoteBacked.id,
+        actorId: ownerId,
+        expectedVersion: 1,
+        document: document("Update denied, local save retained."),
+      });
+      expect(locallySaved).toMatchObject({
+        version: 2,
+        syncStatus: "grant_blocked",
+        remoteDraftId: "remote-asymmetric",
+      });
     } finally {
       createGranted = true;
       updateGranted = true;
@@ -552,7 +630,7 @@ describe("owned local Typefully drafts", () => {
       actorId: ownerId,
       expectedVersion: 1,
       error:
-        "Vendor\0 refused\u0007 Authorization: Bearer sk-live-secret api_key=tf-live-secret API\0key tf-third-secret",
+        'Vendor\0 refused\u0007 Authorization: Bearer sk-live-secret api_key=tf-live-secret API\0key tf-third-secret token="generic-token-secret"; token budget stays readable',
     });
 
     expect(failed.lastError).toContain("Vendor refused");
@@ -560,6 +638,8 @@ describe("owned local Typefully drafts", () => {
     expect(failed.lastError).not.toContain("sk-live-secret");
     expect(failed.lastError).not.toContain("tf-live-secret");
     expect(failed.lastError).not.toContain("tf-third-secret");
+    expect(failed.lastError).not.toContain("generic-token-secret");
+    expect(failed.lastError).toContain("token budget stays readable");
     expect(failed.lastError).not.toMatch(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u);
     expect(Array.from(failed.lastError ?? "").length).toBeLessThanOrEqual(500);
   });
