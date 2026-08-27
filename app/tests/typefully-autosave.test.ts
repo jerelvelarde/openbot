@@ -396,6 +396,38 @@ describe("Typefully autosave controller", () => {
     expect(normalSaves).toBe(1);
   });
 
+  test("does not start deferred recovery after dispose", async () => {
+    const timer = clock();
+    let recoveryCalls = 0;
+    let normalSaves = 0;
+    const controller = createAutosaveController({
+      initialDraftId: "draft-current",
+      initialDocument: base,
+      initialVersion: 2,
+      scheduler: timer.scheduler,
+      save: async () => {
+        normalSaves += 1;
+        throw new TypefullyClientError("version_conflict", {
+          currentVersion: 3,
+        });
+      },
+      saveAsNewDraft: async () => {
+        recoveryCalls += 1;
+        return newDraftResult;
+      },
+    });
+    controller.textChanged(edited("preserved"));
+    timer.fire();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const operation = controller.saveAsNewDraft();
+    controller.dispose();
+    expect(await operation).toBeUndefined();
+    expect(recoveryCalls).toBe(0);
+    expect(normalSaves).toBe(1);
+  });
+
   test("rebinding recovery queues in-flight edits onto the new draft target", async () => {
     const timer = clock();
     const recovery = deferred<typeof newDraftResult>();

@@ -227,6 +227,7 @@ export function createAutosaveController(options: AutosaveOptions) {
         // Defer user code until the single-flight handle below is installed. A
         // synchronous throw must not let finally clear state before assignment.
         await Promise.resolve();
+        if (disposed || abort.signal.aborted) return undefined;
         const result = await options.saveAsNewDraft?.(local, abort.signal);
         if (!result || disposed || abort.signal.aborted) return undefined;
         targetDraftId = result.draftId;
