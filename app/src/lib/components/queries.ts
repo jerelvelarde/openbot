@@ -13,8 +13,11 @@ export type ComponentRecord = {
   updatedBy: string | null;
   updatedAt: string;
   hasUnpublishedChanges: boolean;
+  grantMode: "open" | "explicit";
   /** The Bots held back from this. Every other Bot may answer with it. */
   withheldFrom: string[];
+  /** Bots explicitly allowed to use a sensitive opt-in component. */
+  grantedTo: string[];
   /** The data functions this component may read. Empty means it draws only what the model hands it. */
   functions: string[];
 };
@@ -77,6 +80,8 @@ export async function announceGallery(
     title: string;
     kind: string;
     description: string;
+    defaultPublished: boolean;
+    grantMode: "open" | "explicit";
   }[],
 ): Promise<string[]> {
   try {

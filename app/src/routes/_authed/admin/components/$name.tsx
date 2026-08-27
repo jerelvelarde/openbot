@@ -265,10 +265,15 @@ function ComponentDetail({
   const [sheet, setSheet] = useState<Sheet>(null);
   const [draft, setDraft] = useState(component.draftDescription);
   const withheld = new Set(component.withheldFrom);
+  const explicitlyGranted = new Set(component.grantedTo);
   const heldFunctions = new Set(component.functions);
   const renderable = RENDERABLE_NAMES.has(component.name);
 
-  const granted = bots.filter((bot) => !withheld.has(bot.id));
+  const granted = bots.filter((bot) =>
+    component.grantMode === "explicit"
+      ? explicitlyGranted.has(bot.id)
+      : !withheld.has(bot.id),
+  );
   const held = dataFunctions.filter((fn) => heldFunctions.has(fn.name));
 
   const grantSummary =

@@ -8,13 +8,13 @@ import {
   createComponentStore,
 } from "../src/components/store";
 import { createDatabase } from "../src/db/client";
-import { TEST_POOL } from "./support/database";
 import {
   agents,
   componentExclusions,
   componentFunctions,
   components,
 } from "../src/db/schema";
+import { TEST_POOL } from "./support/database";
 
 /**
  * The grant surface, against a real database.
@@ -244,6 +244,15 @@ describe("learning what a build ships", () => {
     kind: "card",
     description: "Arrived from a build rather than from a list on the server.",
   };
+  const optIn = {
+    name: "connectTypefullyAccount",
+    title: "Explicit opt-in",
+    kind: "decision",
+    description: "Requires both publication and a per-Bot grant.",
+    // A signed-in browser is not trusted to weaken the compiled sensitive-component policy.
+    defaultPublished: true,
+    grantMode: "open" as const,
+  };
 
   test("a component the deployment has never seen is added, published and available to every Bot", async () => {
     const { added } = await store.syncCatalogue([announced]);
@@ -261,6 +270,38 @@ describe("learning what a build ships", () => {
   test("announcing again adds nothing", async () => {
     // Runs on every page load, so a second call must be a no-op rather than a duplicate-key crash.
     expect((await store.syncCatalogue([announced])).added).toEqual([]);
+  });
+
+  test("an explicit component stays unavailable until publication and a per-Bot grant", async () => {
+    expect((await store.syncCatalogue([optIn])).added).toEqual([optIn.name]);
+
+    const inserted = (await store.list()).find(
+      (component) => component.name === optIn.name,
+    );
+    expect(inserted).toMatchObject({
+      published: false,
+      grantMode: "explicit",
+      grantedTo: [],
+    });
+    expect(
+      (await store.listForAgent(botA)).map((item) => item.name),
+    ).not.toContain(optIn.name);
+
+    await store.publish(optIn.name, "admin@example.test");
+    expect(
+      (await store.listForAgent(botA)).map((item) => item.name),
+    ).not.toContain(optIn.name);
+    expect(
+      (await store.listForAgent(botB)).map((item) => item.name),
+    ).not.toContain(optIn.name);
+
+    await store.grant(optIn.name, botA);
+    expect((await store.listForAgent(botA)).map((item) => item.name)).toContain(
+      optIn.name,
+    );
+    expect(
+      (await store.listForAgent(botB)).map((item) => item.name),
+    ).not.toContain(optIn.name);
   });
 
   test("announcing NEVER overwrites what the deployment decided", async () => {
@@ -325,10 +366,15 @@ describe("learning what a build ships", () => {
   afterAll(async () => {
     await database
       .delete(componentExclusions)
-      .where(eq(componentExclusions.componentName, announced.name));
+      .where(
+        inArray(componentExclusions.componentName, [
+          announced.name,
+          optIn.name,
+        ]),
+      );
     await database
       .delete(components)
-      .where(eq(components.name, announced.name));
+      .where(inArray(components.name, [announced.name, optIn.name]));
   });
 });
 

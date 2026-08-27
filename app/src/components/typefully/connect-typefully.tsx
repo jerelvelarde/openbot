@@ -8,6 +8,7 @@ import {
 } from "@/lib/plugins/mutations";
 import {
   connectionsQueryOptions,
+  loadConnections,
   type PluginConnection,
 } from "@/lib/plugins/queries";
 import {
@@ -17,6 +18,7 @@ import {
 import {
   type AuthoritativeDraft,
   draftQueryOptions,
+  loadAuthoritativeDraft,
   TypefullyClientError,
   typefullyKeys,
 } from "@/lib/typefully/queries";
@@ -114,6 +116,7 @@ export async function resumeTypefullyAfterConnection(
       loadConnection: async (signal) => {
         const connected = await queryClient.fetchQuery({
           ...connectionsQueryOptions(),
+          queryFn: () => loadConnections(signal),
           staleTime: 0,
         });
         signal?.throwIfAborted();
@@ -126,9 +129,10 @@ export async function resumeTypefullyAfterConnection(
           throw new TypefullyClientError("connection_required");
         }
       },
-      loadDraft: async (draftId) => {
+      loadDraft: async (draftId, signal) => {
         const loaded = await queryClient.fetchQuery({
           ...draftQueryOptions(draftId),
+          queryFn: () => loadAuthoritativeDraft(draftId, signal),
           staleTime: 0,
         });
         return loaded.draft;
@@ -276,6 +280,21 @@ export function ConnectTypefully({
               ? "Disconnecting…"
               : "Disconnect Typefully"}
           </Button>
+          {onCancel && pending === "connect" ? (
+            <Button
+              onClick={() => {
+                request.current?.abort();
+                request.current = null;
+                setPending(null);
+                onCancel();
+              }}
+              size="sm"
+              type="button"
+              variant="outline"
+            >
+              Cancel
+            </Button>
+          ) : null}
         </div>
       </section>
     );

@@ -1,12 +1,14 @@
 import { afterAll, afterEach, beforeAll, expect, mock, test } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, waitFor } from "@testing-library/react";
+import { act, cleanup, render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import {
+  ConnectTypefully,
   type PendingTypefullyOperation,
   resumePendingTypefullyOperation,
 } from "../src/components/typefully/connect-typefully";
+import { pluginKeys } from "../src/lib/plugins/queries";
 import { typefullyKeys } from "../src/lib/typefully/queries";
 
 const draftId = "8b1c61f1-2154-4a5d-8c9a-7c8df8f9ae53";
@@ -35,6 +37,24 @@ function authoritativeDraft(version = 5) {
     updatedAt: "2026-08-27T08:00:00.000Z",
   };
 }
+
+function syncedDraft(version = 5) {
+  return {
+    ...authoritativeDraft(version),
+    remoteDraftId: "remote-draft",
+    remoteVersion: version,
+    remoteHash: `hash-${version}`,
+    syncStatus: "synced" as const,
+  };
+}
+
+const typefullyConnection = {
+  serverId: "typefully",
+  authMethod: "api_key" as const,
+  scope: null,
+  accountLabel: "Product team",
+  connectedAt: "2026-08-27T08:00:00.000Z",
+};
 
 beforeAll(() => GlobalRegistrator.register());
 afterEach(() => {
@@ -346,6 +366,229 @@ test("the draft canvas keeps the local draft visible when connection is cancelle
   ).toBe("Hello");
   expect(queryClient.getQueryData(typefullyKeys.draft(draftId))).toBe(cached);
   expect(view.getByRole("button", { name: "Connect Typefully" })).toBeTruthy();
+});
+
+test("disconnecting an active canvas clears remote authority but preserves the local draft", async () => {
+  const { DraftCanvas } = await import(
+    "../src/components/typefully/draft-canvas"
+  );
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
+    },
+  });
+  queryClient.setQueryData(typefullyKeys.draft(draftId), {
+    draft: syncedDraft(),
+  });
+  queryClient.setQueryData(pluginKeys.connections(), {
+    connections: [typefullyConnection],
+    redirectUri: null,
+  });
+  globalThis.fetch = (async (input, init) => {
+    if (
+      String(input) === "/api/plugins/connections/typefully" &&
+      init?.method === "DELETE"
+    ) {
+      return new Response(JSON.stringify({ disconnected: true }), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (String(input) === "/api/plugins/connections") {
+      return new Response(
+        JSON.stringify({ connections: [], redirectUri: null }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    throw new Error(`Unexpected request: ${String(input)}`);
+  }) as typeof fetch;
+  const view = render(
+    <QueryClientProvider client={queryClient}>
+      <DraftCanvas draftId={draftId} />
+      <ConnectTypefully connection={typefullyConnection} />
+    </QueryClientProvider>,
+  );
+  expect(view.getByTestId("publish-readiness").textContent).toContain(
+    "Ready for approval",
+  );
+
+  await userEvent
+    .setup({ document })
+    .click(view.getByRole("button", { name: "Disconnect Typefully" }));
+
+  await waitFor(() =>
+    expect(view.getByTestId("canvas-status").textContent).toContain(
+      "Saved in OpenBot",
+    ),
+  );
+  expect(view.getByTestId("publish-readiness").textContent).toContain(
+    "Connect Typefully",
+  );
+  expect(
+    view
+      .getByRole("button", { name: "Review & publish" })
+      .hasAttribute("disabled"),
+  ).toBeTrue();
+  expect(
+    (view.getByRole("textbox", { name: "X post 1" }) as HTMLTextAreaElement)
+      .value,
+  ).toBe("Hello");
+  expect(queryClient.getQueryData(typefullyKeys.draft(draftId))).toMatchObject({
+    draft: {
+      document: { posts: [{ x: "Hello" }] },
+      remoteDraftId: null,
+      remoteVersion: null,
+      remoteHash: null,
+      syncStatus: "local",
+    },
+  });
+});
+
+test("unmounting the inline canvas aborts authority revalidation before sync", async () => {
+  const { DraftCanvas } = await import(
+    "../src/components/typefully/draft-canvas"
+  );
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
+    },
+  });
+  queryClient.setQueryData(typefullyKeys.draft(draftId), {
+    draft: authoritativeDraft(),
+  });
+  let finishConnectionCheck!: (response: Response) => void;
+  let connectionCheckStarted!: () => void;
+  const connectionCheck = new Promise<void>((resolve) => {
+    connectionCheckStarted = resolve;
+  });
+  const requests: string[] = [];
+  let connectionRequestSignal: AbortSignal | null = null;
+  globalThis.fetch = (async (input, init) => {
+    const url = String(input);
+    const method = init?.method ?? "GET";
+    requests.push(`${method} ${url}`);
+    if (url.endsWith("/api-key")) {
+      return new Response(JSON.stringify({ connection: typefullyConnection }), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (url === "/api/plugins/connections") {
+      connectionRequestSignal = init?.signal ?? null;
+      connectionCheckStarted();
+      return await new Promise<Response>((resolve) => {
+        finishConnectionCheck = resolve;
+      });
+    }
+    if (url === `/api/typefully/drafts/${draftId}`) {
+      return new Response(JSON.stringify({ draft: authoritativeDraft() }), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (url.endsWith("/sync")) {
+      return new Response(JSON.stringify({}), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+    throw new Error(`Unexpected request: ${method} ${url}`);
+  }) as typeof fetch;
+  const view = render(
+    <QueryClientProvider client={queryClient}>
+      <DraftCanvas draftId={draftId} />
+    </QueryClientProvider>,
+  );
+  const user = userEvent.setup({ document });
+  await user.type(view.getByLabelText("Typefully API key"), "tf_inline_abort");
+  await user.click(view.getByRole("button", { name: "Connect Typefully" }));
+  await connectionCheck;
+
+  view.unmount();
+  expect(connectionRequestSignal?.aborted).toBeTrue();
+  await act(async () => {
+    finishConnectionCheck(
+      new Response(
+        JSON.stringify({
+          connections: [typefullyConnection],
+          redirectUri: null,
+        }),
+        { headers: { "content-type": "application/json" } },
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+
+  expect(requests.some((request) => request.endsWith("/sync"))).toBeFalse();
+});
+
+test("cancelling inline authority revalidation aborts before sync", async () => {
+  const { DraftCanvas } = await import(
+    "../src/components/typefully/draft-canvas"
+  );
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
+    },
+  });
+  queryClient.setQueryData(typefullyKeys.draft(draftId), {
+    draft: authoritativeDraft(),
+  });
+  let finishConnectionCheck!: (response: Response) => void;
+  let connectionCheckStarted!: () => void;
+  const connectionCheck = new Promise<void>((resolve) => {
+    connectionCheckStarted = resolve;
+  });
+  const requests: string[] = [];
+  globalThis.fetch = (async (input, init) => {
+    const url = String(input);
+    const method = init?.method ?? "GET";
+    requests.push(`${method} ${url}`);
+    if (url.endsWith("/api-key")) {
+      return new Response(JSON.stringify({ connection: typefullyConnection }), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (url === "/api/plugins/connections") {
+      connectionCheckStarted();
+      return await new Promise<Response>((resolve) => {
+        finishConnectionCheck = resolve;
+      });
+    }
+    if (url === `/api/typefully/drafts/${draftId}`) {
+      return new Response(JSON.stringify({ draft: authoritativeDraft() }), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (url.endsWith("/sync")) {
+      return new Response(JSON.stringify({}), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+    throw new Error(`Unexpected request: ${method} ${url}`);
+  }) as typeof fetch;
+  const view = render(
+    <QueryClientProvider client={queryClient}>
+      <DraftCanvas draftId={draftId} />
+    </QueryClientProvider>,
+  );
+  const user = userEvent.setup({ document });
+  await user.type(view.getByLabelText("Typefully API key"), "tf_inline_cancel");
+  await user.click(view.getByRole("button", { name: "Connect Typefully" }));
+  await connectionCheck;
+
+  await user.click(view.getByRole("button", { name: "Cancel" }));
+  await act(async () => {
+    finishConnectionCheck(
+      new Response(
+        JSON.stringify({
+          connections: [typefullyConnection],
+          redirectUri: null,
+        }),
+        { headers: { "content-type": "application/json" } },
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+
+  expect(requests.some((request) => request.endsWith("/sync"))).toBeFalse();
+  expect(view.getByRole("textbox", { name: "X post 1" })).toBeTruthy();
 });
 
 test("the draft canvas refetches authority and resumes a pending sync once", async () => {

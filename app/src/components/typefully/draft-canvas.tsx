@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { connectionsQueryOptions } from "@/lib/plugins/queries";
 import { createAutosaveController } from "@/lib/typefully/autosave";
 import {
   copyDraftMutationOptions,
@@ -60,6 +61,15 @@ export function DraftCanvas({
   onDraftCreated?: (draftId: string) => void;
 }) {
   const draft = useQuery(draftQueryOptions(draftId));
+  const connections = useQuery({
+    ...connectionsQueryOptions(),
+    enabled: false,
+  });
+  const remoteConnected = connections.data
+    ? connections.data.connections.some(
+        (connection) => connection.serverId === "typefully",
+      )
+    : undefined;
 
   if (draft.isPending) {
     return (
@@ -80,6 +90,7 @@ export function DraftCanvas({
       draft={draft.data.draft}
       key={draft.data.draft.id}
       onDraftCreated={onDraftCreated}
+      remoteConnected={remoteConnected}
     />
   );
 }
@@ -127,9 +138,11 @@ function replaceMediaIdentity(
 function EditableDraftCanvas({
   draft,
   onDraftCreated,
+  remoteConnected,
 }: {
   draft: AuthoritativeDraft;
   onDraftCreated?: (draftId: string) => void;
+  remoteConnected?: boolean;
 }) {
   const queryClient = useQueryClient();
   const save = useMutation(saveDraftMutationOptions(queryClient));
@@ -139,6 +152,7 @@ function EditableDraftCanvas({
   const prepareProposal = useMutation(
     prepareProposalMutationOptions(queryClient),
   );
+  const resetPrepareProposal = prepareProposal.reset;
   const [proposal, setProposal] = useState<ProposalSummary | null>(null);
   const [mediaStates, setMediaStates] = useState<
     Record<string, MediaItemState>
@@ -167,6 +181,9 @@ function EditableDraftCanvas({
   const mediaBusyRef = useRef(false);
   const mediaOperation = useRef(0);
   const connectionResume = useRef(0);
+  const connectionResumeAbort = useRef<AbortController | null>(null);
+  const proposalAbort = useRef<AbortController | null>(null);
+  const mounted = useRef(true);
   const routedDraft = useRef<string | null>(null);
   const files = useRef(new Map<string, File>());
   const urls = useRef(new Map<string, string>());
@@ -279,15 +296,41 @@ function EditableDraftCanvas({
     );
   }, [connectionDismissed, draft]);
 
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    if (remoteConnected !== false) return;
+    connectionResume.current += 1;
+    connectionResumeAbort.current?.abort();
+    connectionResumeAbort.current = null;
+    proposalAbort.current?.abort();
+    proposalAbort.current = null;
+    resetPrepareProposal();
+    setPendingConnection(null);
+    setConnectionDismissed(true);
+    setConnectionNotice(
+      "Typefully disconnected. Your draft remains saved in OpenBot.",
+    );
+    setProposal(null);
+    const current = controller.getSnapshot();
+    controller.adoptAuthoritative(
+      current.document,
+      current.target.version,
+      current.target.draftId,
+      "local",
+    );
+  }, [controller, remoteConnected, resetPrepareProposal]);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      connectionResumeAbort.current?.abort();
+      proposalAbort.current?.abort();
       controller.dispose();
       for (const url of urls.current.values()) URL.revokeObjectURL?.(url);
       urls.current.clear();
       files.current.clear();
-    },
-    [controller],
-  );
+    };
+  }, [controller]);
 
   const bindUrl = (mediaId: string, file: File) => {
     if (typeof URL.createObjectURL !== "function") return;
@@ -606,12 +649,14 @@ function EditableDraftCanvas({
       setMediaBusy(false);
     }
   };
-  const reload = async () => {
+  const reload = async (signal?: AbortSignal) => {
     const targetDraftId = controller.getSnapshot().target.draftId;
     try {
+      signal?.throwIfAborted();
       const result = await queryClient.fetchQuery(
         draftQueryOptions(targetDraftId),
       );
+      signal?.throwIfAborted();
       const authority = result.draft;
       const confirmed =
         authority.syncStatus === "synced" &&
@@ -624,6 +669,7 @@ function EditableDraftCanvas({
         confirmed ? "confirmed" : "local",
       );
     } catch (error) {
+      if (signal?.aborted || !mounted.current) return;
       const current = controller.getSnapshot();
       controller.remoteFailed(
         current.document,
@@ -635,14 +681,21 @@ function EditableDraftCanvas({
   };
   const preparePublication = async () => {
     const current = controller.getSnapshot();
+    proposalAbort.current?.abort();
+    const abort = new AbortController();
+    proposalAbort.current = abort;
     try {
       const result = await prepareProposal.mutateAsync({
         draftId: current.target.draftId,
         expectedVersion: current.target.version,
+        signal: abort.signal,
       });
+      if (!mounted.current || abort.signal.aborted) return;
       setProposal(result.proposal);
     } catch (error) {
       if (
+        mounted.current &&
+        !abort.signal.aborted &&
         error instanceof TypefullyClientError &&
         error.code === "connection_required"
       ) {
@@ -654,37 +707,60 @@ function EditableDraftCanvas({
         });
       }
       // The mutation exposes a bounded client error below; it never publishes.
+    } finally {
+      if (proposalAbort.current === abort) proposalAbort.current = null;
     }
   };
 
   const resumeAfterConnection = async () => {
     const pending = pendingConnection;
     if (!pending) return;
+    connectionResumeAbort.current?.abort();
+    const abort = new AbortController();
+    connectionResumeAbort.current = abort;
     const operation = ++connectionResume.current;
     setConnectionNotice("Rechecking the draft and Typefully access…");
     try {
-      const result = await resumeTypefullyAfterConnection(queryClient, pending);
-      if (connectionResume.current !== operation) return;
+      const result = await resumeTypefullyAfterConnection(
+        queryClient,
+        pending,
+        { signal: abort.signal },
+      );
+      if (
+        !mounted.current ||
+        abort.signal.aborted ||
+        connectionResume.current !== operation
+      )
+        return;
       setPendingConnection(null);
       setConnectionDismissed(true);
       if (result.outcome === "stale") {
         setConnectionNotice(
           `The draft changed to version ${result.currentVersion}. Review it before retrying ${result.operation.replaceAll("_", " ")}.`,
         );
-        await reload();
+        await reload(abort.signal);
         return;
       }
       setConnectionNotice(
         "Typefully connected and the draft operation resumed.",
       );
-      await reload();
+      await reload(abort.signal);
     } catch {
-      if (connectionResume.current !== operation) return;
+      if (
+        !mounted.current ||
+        abort.signal.aborted ||
+        connectionResume.current !== operation
+      )
+        return;
       setConnectionNotice(
         "Typefully connected, but this draft operation could not resume. Review the draft and try again.",
       );
       setPendingConnection(null);
       setConnectionDismissed(true);
+    } finally {
+      if (connectionResumeAbort.current === abort) {
+        connectionResumeAbort.current = null;
+      }
     }
   };
 
@@ -699,6 +775,8 @@ function EditableDraftCanvas({
             connection={null}
             onCancel={() => {
               connectionResume.current += 1;
+              connectionResumeAbort.current?.abort();
+              connectionResumeAbort.current = null;
               setPendingConnection(null);
               setConnectionDismissed(true);
               setConnectionNotice(
@@ -714,12 +792,28 @@ function EditableDraftCanvas({
           role="status"
         >
           <span>{connectionNotice}</span>
-          {draft.syncStatus === "connection_required" ? (
+          {draft.syncStatus === "connection_required" ||
+          remoteConnected === false ? (
             <button
               className="shrink-0 rounded-[4px] border border-border px-2 py-1 text-xs"
               onClick={() => {
                 setConnectionDismissed(false);
                 setConnectionNotice(null);
+                if (remoteConnected === false) {
+                  const current = controller.getSnapshot();
+                  setPendingConnection(
+                    current.document.scheduleAt
+                      ? {
+                          kind: "schedule",
+                          draftId: current.target.draftId,
+                          expectedVersion: current.target.version,
+                        }
+                      : {
+                          kind: "sync",
+                          draftId: current.target.draftId,
+                        },
+                  );
+                }
               }}
               type="button"
             >
@@ -764,6 +858,7 @@ function EditableDraftCanvas({
               : null
         }
         proposalPreparing={prepareProposal.isPending}
+        remoteConnected={remoteConnected}
       />
     </div>
   );

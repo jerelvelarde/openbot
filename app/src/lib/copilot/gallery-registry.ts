@@ -22,6 +22,10 @@ export type GalleryComponent = {
   /** What a person sees in Admin and in a refusal. */
   title: string;
   kind: GalleryKind;
+  /** New catalogue rows publish immediately unless this component is security-sensitive. */
+  defaultPublished?: boolean;
+  /** Most presentation components are open; sensitive decisions require an explicit per-Bot grant. */
+  grantMode?: "open" | "explicit";
   /**
    * What the model reads while deciding whether to call this. A starting value only: a deployment
    * edits and publishes its own, and that is what a running Bot is given.
@@ -115,15 +119,21 @@ export type GalleryManifestEntry = {
   title: string;
   kind: GalleryKind;
   description: string;
+  defaultPublished: boolean;
+  grantMode: "open" | "explicit";
 };
 
 export function galleryManifest(): GalleryManifestEntry[] {
-  return GALLERY_COMPONENTS.map(({ name, title, kind, description }) => ({
-    name,
-    title,
-    kind,
-    description,
-  }));
+  return GALLERY_COMPONENTS.map(
+    ({ name, title, kind, description, defaultPublished, grantMode }) => ({
+      name,
+      title,
+      kind,
+      description,
+      defaultPublished: defaultPublished ?? true,
+      grantMode: grantMode ?? "open",
+    }),
+  );
 }
 
 /** The names this build can actually draw, for telling a catalogue row from a component. */

@@ -201,7 +201,7 @@ test("a Typefully timeout leaves an explicit retry without exposing the key", as
   expect(view.container.textContent).not.toContain(apiKey);
 });
 
-test("disconnect removes only the personal connection and returns to local state", async () => {
+test("disconnect removes personal remote caches and returns to local state", async () => {
   const { ConnectTypefully } = await import(
     "../src/components/typefully/connect-typefully"
   );
@@ -243,9 +243,9 @@ test("disconnect removes only the personal connection and returns to local state
   expect(
     view.getByText("Your OpenBot drafts stay available locally."),
   ).toBeTruthy();
-  expect(queryClient.getQueryData(["typefully", "draft", "local-draft"])).toBe(
-    draft,
-  );
+  expect(
+    queryClient.getQueryData(["typefully", "draft", "local-draft"]),
+  ).toBeUndefined();
 });
 
 test("connected-account settings list both OAuth and personal API-key vendors", async () => {

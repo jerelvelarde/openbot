@@ -1,8 +1,12 @@
 import { mutationOptions, type QueryClient } from "@tanstack/react-query";
 import { client } from "@/lib/client";
 import { connectTypefully } from "@/lib/typefully/mutations";
-import { typefullyRequest } from "@/lib/typefully/queries";
-import type { PluginConnection } from "./queries";
+import {
+  type AuthoritativeDraft,
+  typefullyKeys,
+  typefullyRequest,
+} from "@/lib/typefully/queries";
+import type { PluginConnection, PluginConnections } from "./queries";
 import { pluginKeys } from "./queries";
 
 /**
@@ -87,6 +91,40 @@ export async function connectPersonalTypefully(
 export async function disconnectPersonalTypefully(queryClient: QueryClient) {
   await typefullyRequest("/api/plugins/connections/typefully", {
     method: "DELETE",
+  });
+  queryClient.setQueryData<PluginConnections>(
+    pluginKeys.connections(),
+    (current) => ({
+      connections: (current?.connections ?? []).filter(
+        (connection) => connection.serverId !== "typefully",
+      ),
+      redirectUri: current?.redirectUri ?? null,
+    }),
+  );
+  for (const [key, cached] of queryClient.getQueriesData<{
+    draft: AuthoritativeDraft;
+  }>({ queryKey: typefullyKeys.all })) {
+    if (
+      key[1] !== "draft" ||
+      !cached?.draft ||
+      typeof cached.draft !== "object"
+    )
+      continue;
+    queryClient.setQueryData(key, {
+      draft: {
+        ...cached.draft,
+        remoteDraftId: null,
+        remoteVersion: null,
+        remoteHash: null,
+        syncStatus: "local" as const,
+        lastError: null,
+      },
+    });
+  }
+  queryClient.removeQueries({
+    predicate: (query) =>
+      query.queryKey[0] === typefullyKeys.all[0] &&
+      (query.queryKey[1] !== "draft" || query.getObserversCount() === 0),
   });
   await queryClient.invalidateQueries({ queryKey: pluginKeys.connections() });
 }

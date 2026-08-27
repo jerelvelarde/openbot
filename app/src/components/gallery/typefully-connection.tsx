@@ -211,6 +211,8 @@ export const GALLERY: GalleryComponent[] = [
     name: "connectTypefullyAccount",
     title: "Connect Typefully",
     kind: "decision",
+    defaultPublished: false,
+    grantMode: "explicit",
     description:
       "Ask the person to securely connect their own Typefully API key only after a Typefully draft operation returned connection_required. Pass only the local draft id, the bounded operation, and its expected version. CRITICAL: never ask for or pass an API key in chat.",
     parameters: TypefullyConnectionArgs,

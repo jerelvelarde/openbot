@@ -202,6 +202,16 @@ function normalizeConnections(value: unknown): PluginConnections {
   return { connections, redirectUri };
 }
 
+export async function loadConnections(
+  signal?: AbortSignal,
+): Promise<PluginConnections> {
+  const response = await client("/api/plugins/connections", {
+    fallback: "Your connected accounts could not be loaded.",
+    signal,
+  });
+  return normalizeConnections(await response.json());
+}
+
 /**
  * The signed-in person's own connections.
  *
@@ -211,12 +221,8 @@ function normalizeConnections(value: unknown): PluginConnections {
 export function connectionsQueryOptions() {
   return queryOptions({
     queryKey: pluginKeys.connections(),
-    queryFn: async (): Promise<PluginConnections> => {
-      const response = await client("/api/plugins/connections", {
-        fallback: "Your connected accounts could not be loaded.",
-      });
-      return normalizeConnections(await response.json());
-    },
+    queryFn: ({ signal }): Promise<PluginConnections> =>
+      loadConnections(signal),
   });
 }
 

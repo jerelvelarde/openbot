@@ -153,6 +153,7 @@ function autosaveLabel(
   snapshot: AutosaveSnapshot | undefined,
   draft: AuthoritativeDraft,
   mediaBusy: boolean,
+  remoteConnected?: boolean,
 ) {
   if (mediaBusy) return "Saving…";
   if (!snapshot) return SYNC_LABELS[draft.syncStatus];
@@ -160,6 +161,7 @@ function autosaveLabel(
     return "Saving…";
   if (snapshot.state.kind === "conflict") return "Save conflict";
   if (snapshot.state.kind === "error") return "Not saved to Typefully";
+  if (remoteConnected === false) return "Saved in OpenBot";
   return snapshot.state.remote === "confirmed"
     ? "Saved to Typefully"
     : "Saved in OpenBot";
@@ -171,6 +173,7 @@ function readiness(
   snapshot: AutosaveSnapshot | undefined,
   mediaStates: Readonly<Record<string, MediaItemState>>,
   mediaBusy: boolean,
+  remoteConnected?: boolean,
 ) {
   if (
     document.posts.some((post) =>
@@ -187,6 +190,8 @@ function readiness(
     Object.values(mediaStates).some((state) => state.kind !== "ready")
   )
     return "Resolve media uploads before requesting approval";
+  if (remoteConnected === false)
+    return "Connect Typefully before requesting approval";
   if (snapshot) {
     if (snapshot.state.kind === "dirty" || snapshot.state.kind === "saving")
       return "Wait for saving to finish";
@@ -238,6 +243,7 @@ export type CanvasShellProps = {
   proposal?: ProposalSummary | null;
   proposalPreparing?: boolean;
   proposalError?: string | null;
+  remoteConnected?: boolean;
 };
 
 export function CanvasShell({
@@ -262,6 +268,7 @@ export function CanvasShell({
   proposal = null,
   proposalPreparing = false,
   proposalError = null,
+  remoteConnected,
 }: CanvasShellProps) {
   const destinations = document.destinations;
   const [requestedPlatform, setRequestedPlatform] =
@@ -311,6 +318,7 @@ export function CanvasShell({
     autosave,
     mediaStates,
     mediaBusy,
+    remoteConnected,
   );
   const publicationReady =
     readinessMessage === "Ready for approval" &&
@@ -336,8 +344,8 @@ export function CanvasShell({
               className="text-xs text-muted-foreground"
               role="status"
             >
-              {autosaveLabel(autosave, draft, mediaBusy)} · Version{" "}
-              {autosave?.target.version ?? draft.version}
+              {autosaveLabel(autosave, draft, mediaBusy, remoteConnected)} ·
+              Version {autosave?.target.version ?? draft.version}
             </p>
           </div>
           <span

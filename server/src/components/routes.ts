@@ -6,7 +6,11 @@ import { recordAuditEvent } from "../audit";
 import type { AppVariables } from "../auth/guards";
 import { requireAdmin } from "../auth/guards";
 import { DATA_FUNCTIONS, dataFunction } from "./functions";
-import { ComponentNotFoundError, type ComponentStore } from "./store";
+import {
+  ComponentNotFoundError,
+  type ComponentStore,
+  requiresExplicitComponentGrant,
+} from "./store";
 
 /**
  * The local development actor, which is not a row in `users`.
@@ -72,8 +76,8 @@ export function createComponentRoutes(
    * The build knows what exists; this deployment decides what it may do. A component is an ordinary
    * React file, so the only thing that can truthfully enumerate them is the app that compiled them.
    * A second list kept here would be a copy to keep in step, and the first thing to fall out of it.
-   * Drop a file in and it appears here, published, and any Bot may draw it until somebody says
-   * otherwise.
+   * Ordinary presentation components arrive published and open. Security-sensitive components may
+   * explicitly arrive unpublished and require per-Bot grants.
    *
    * Additive only, and not an administrator action: any signed-in person's browser announces it on
    * load, and it cannot change who may use a component, its publication state or its description.
@@ -89,30 +93,56 @@ export function createComponentRoutes(
 
     const valid = entries.flatMap((entry) => {
       if (!entry || typeof entry !== "object") return [];
-      const { name, title, kind, description } = entry as Record<
-        string,
-        unknown
-      >;
+      const { name, title, kind, description, defaultPublished, grantMode } =
+        entry as Record<string, unknown>;
       if (
         typeof name !== "string" ||
         !name ||
         typeof title !== "string" ||
         typeof kind !== "string" ||
         typeof description !== "string" ||
-        !description
+        !description ||
+        (defaultPublished !== undefined &&
+          typeof defaultPublished !== "boolean") ||
+        (grantMode !== undefined &&
+          grantMode !== "open" &&
+          grantMode !== "explicit")
       ) {
         return [];
       }
-      return [{ name, title, kind, description }];
+      return [
+        {
+          name,
+          title,
+          kind,
+          description,
+          defaultPublished: defaultPublished !== false,
+          grantMode:
+            grantMode === "explicit"
+              ? ("explicit" as const)
+              : ("open" as const),
+        },
+      ];
     });
 
     const { added } = await store.syncCatalogue(valid);
     // Only arrivals are recorded. Announcing happens on every page load, and a row per load would
     // bury the trail it is written into.
     for (const name of added) {
-      await audit(context, "component.published", name, {
-        note: "First seen in a build, published and available to every Bot.",
-      });
+      const announced = valid.find((entry) => entry.name === name);
+      const initiallyPublished =
+        !requiresExplicitComponentGrant(name) &&
+        announced?.defaultPublished !== false;
+      await audit(
+        context,
+        initiallyPublished ? "component.published" : "component.draft_saved",
+        name,
+        {
+          note: initiallyPublished
+            ? "First seen in a build, published under its compiled default governance."
+            : "First seen in a build, awaiting explicit publication and Bot grant.",
+        },
+      );
     }
     return context.json({ added });
   });

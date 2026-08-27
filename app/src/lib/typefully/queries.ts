@@ -428,24 +428,28 @@ export const typefullyKeys = {
     ["typefully", "proposal", proposalId] as const,
 };
 
+export async function loadAuthoritativeDraft(
+  draftId: string,
+  signal?: AbortSignal,
+): Promise<{ draft: AuthoritativeDraft }> {
+  const payload = await typefullyRequest<unknown>(
+    `/api/typefully/drafts/${encodeURIComponent(draftId)}`,
+    { signal },
+  );
+  const parsed = authoritativeDraftResponseSchema.safeParse(payload);
+  if (!parsed.success || parsed.data.draft.id !== draftId) {
+    throw new TypefullyClientError("remote_invalid_response");
+  }
+  return parsed.data;
+}
+
 export function draftQueryOptions(draftId: string) {
   return queryOptions({
     queryKey: typefullyKeys.draft(draftId),
     enabled: draftId.length > 0,
     gcTime: 0,
-    queryFn: async ({ signal }): Promise<{ draft: AuthoritativeDraft }> => {
-      const payload = await typefullyRequest<unknown>(
-        `/api/typefully/drafts/${encodeURIComponent(draftId)}`,
-        {
-          signal,
-        },
-      );
-      const parsed = authoritativeDraftResponseSchema.safeParse(payload);
-      if (!parsed.success || parsed.data.draft.id !== draftId) {
-        throw new TypefullyClientError("remote_invalid_response");
-      }
-      return parsed.data;
-    },
+    queryFn: ({ signal }): Promise<{ draft: AuthoritativeDraft }> =>
+      loadAuthoritativeDraft(draftId, signal),
   });
 }
 

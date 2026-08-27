@@ -293,12 +293,29 @@ test("the production Vite registry discovers Typefully exactly once and rejects 
   try {
     const production = (await vite.ssrLoadModule(
       "/src/lib/copilot/gallery-registry.ts",
-    )) as { GALLERY_COMPONENTS: Array<{ name: string }> };
+    )) as {
+      GALLERY_COMPONENTS: Array<{ name: string }>;
+      galleryManifest(): Array<{
+        name: string;
+        defaultPublished: boolean;
+        grantMode: "open" | "explicit";
+      }>;
+    };
     expect(
       production.GALLERY_COMPONENTS.filter(
         (component) => component.name === "showTypefullyDraft",
       ),
     ).toHaveLength(1);
+    expect(
+      production
+        .galleryManifest()
+        .find((component) => component.name === "connectTypefullyAccount"),
+    ).toMatchObject({ defaultPublished: false, grantMode: "explicit" });
+    expect(
+      production
+        .galleryManifest()
+        .find((component) => component.name === "showTypefullyDraft"),
+    ).toMatchObject({ defaultPublished: true, grantMode: "open" });
   } finally {
     await vite.close();
   }
