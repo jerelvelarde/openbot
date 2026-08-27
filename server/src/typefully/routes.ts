@@ -9,6 +9,7 @@ import {
   BotNotAttachedError,
   DraftNotFoundError,
   GrantRequiredError,
+  SyncInProgressError,
   type TypefullyDraft,
   type TypefullyStore,
   VersionConflictError,
@@ -18,6 +19,7 @@ const MAX_JSON_BYTES = 1_000_000;
 const MAX_MEDIA_BYTES = 25_000_000;
 const MAX_ERROR_CHARS = 500;
 const MEDIA_UPLOAD_TIMEOUT_MS = 30_000;
+const MAX_MULTIPART_BYTES = MAX_MEDIA_BYTES + 1_000_000;
 const ALLOWED_MEDIA = new Set([
   "image/jpeg",
   "image/png",
@@ -28,6 +30,8 @@ const ALLOWED_MEDIA = new Set([
 ]);
 
 type MediaDescriptor = TypefullyDraft["document"]["media"][number];
+
+class MediaTooLargeError extends Error {}
 
 function summary(draft: TypefullyDraft) {
   return draftSummary({
@@ -80,11 +84,17 @@ function safeError(error: unknown): string {
 }
 
 function retryAt(message: string): string | undefined {
-  const match = message.match(/Retry-After:\s*(\d{1,8})\b/i);
+  const match = message.match(/Retry-After:\s*(.+?)(?:\.\s*$|$)/i);
   if (!match) return undefined;
-  const seconds = Number(match[1]);
-  if (!Number.isSafeInteger(seconds) || seconds < 0) return undefined;
-  return new Date(Date.now() + Math.min(seconds, 86_400) * 1_000).toISOString();
+  const value = match[1]?.trim() ?? "";
+  const now = Date.now();
+  const seconds = /^\d{1,8}$/.test(value) ? Number(value) : null;
+  const requested =
+    seconds === null
+      ? Date.parse(value)
+      : now + Math.min(seconds, 86_400) * 1_000;
+  if (!Number.isFinite(requested) || requested <= now) return undefined;
+  return new Date(Math.min(requested, now + 86_400_000)).toISOString();
 }
 
 function errorResponse(
@@ -109,6 +119,9 @@ function errorResponse(
   }
   if (error instanceof GrantRequiredError) {
     return context.json({ code: error.code, ref: error.ref }, 403);
+  }
+  if (error instanceof SyncInProgressError) {
+    return context.json({ code: error.code }, 409);
   }
   if (error instanceof ConnectionRequiredError) {
     return context.json(
@@ -148,8 +161,14 @@ async function synchronize(
   store: TypefullyStore,
   draftId: string,
   actorId: string,
+  expected?: { version: number; hash: string },
 ) {
-  const outcome = await store.syncDraft({ draftId, actorId });
+  const outcome = await store.syncDraft({
+    draftId,
+    actorId,
+    expectedVersion: expected?.version,
+    expectedHash: expected?.hash,
+  });
   if (outcome.result.isError) {
     const message = safeError(outcome.result.text);
     return {
@@ -207,12 +226,54 @@ async function uploadMediaBytes(file: File, uploadUrl: string): Promise<void> {
     method: "PUT",
     headers: { "content-type": file.type },
     body: file,
+    redirect: "manual",
     signal: AbortSignal.timeout(MEDIA_UPLOAD_TIMEOUT_MS),
   });
   await response.body?.cancel().catch(() => {});
   if (!response.ok) {
     throw new Error(`Typefully media upload failed (${response.status}).`);
   }
+}
+
+async function boundedFormData(request: Request): Promise<FormData> {
+  const declared = request.headers.get("content-length");
+  if (
+    declared &&
+    /^\d+$/.test(declared) &&
+    Number(declared) > MAX_MULTIPART_BYTES
+  ) {
+    await request.body?.cancel().catch(() => {});
+    throw new MediaTooLargeError();
+  }
+  const reader = request.body?.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  if (reader) {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > MAX_MULTIPART_BYTES) {
+        await reader.cancel().catch(() => {});
+        throw new MediaTooLargeError();
+      }
+      chunks.push(value);
+    }
+  }
+  const contentType = request.headers.get("content-type");
+  if (!contentType?.toLowerCase().startsWith("multipart/form-data")) {
+    throw new Error("A multipart form is required.");
+  }
+  const joined = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return await new Response(joined.buffer as ArrayBuffer, {
+    headers: { "content-type": contentType },
+  }).formData();
 }
 
 export function createTypefullyRoutes(
@@ -236,6 +297,7 @@ export function createTypefullyRoutes(
         channelId: body.channelId,
         botId: body.botId,
         document: body.document,
+        requireGrant: true,
       });
       return context.json({ draft: summary(draft) }, 201);
     } catch (error) {
@@ -277,7 +339,15 @@ export function createTypefullyRoutes(
         });
       }
       try {
-        const synced = await synchronize(store, saved.id, context.var.actor.id);
+        const synced = await synchronize(
+          store,
+          saved.id,
+          context.var.actor.id,
+          {
+            version: saved.version,
+            hash: saved.contentHash,
+          },
+        );
         if (!synced.ok) {
           return context.json(
             {
@@ -301,7 +371,8 @@ export function createTypefullyRoutes(
         }
         if (
           error instanceof GrantRequiredError ||
-          error instanceof BotNotAttachedError
+          error instanceof BotNotAttachedError ||
+          error instanceof SyncInProgressError
         ) {
           return context.json({
             draft: summary(saved),
@@ -351,11 +422,7 @@ export function createTypefullyRoutes(
 
   routes.post("/drafts/:id/media", async (context) => {
     try {
-      const contentLength = Number(context.req.header("content-length") ?? 0);
-      if (contentLength > MAX_MEDIA_BYTES + 1_000_000) {
-        return context.json({ code: "media_too_large" }, 413);
-      }
-      const form = await context.req.formData();
+      const form = await boundedFormData(context.req.raw);
       const file = form.get("file");
       const expectedVersion = Number(form.get("expectedVersion"));
       const kind = form.get("kind");
@@ -449,6 +516,7 @@ export function createTypefullyRoutes(
           store,
           confirmed.id,
           context.var.actor.id,
+          { version: confirmed.version, hash: confirmed.contentHash },
         );
         if (!synced.ok) {
           return context.json(
@@ -475,6 +543,13 @@ export function createTypefullyRoutes(
             201,
           );
         }
+        if (
+          error instanceof GrantRequiredError ||
+          error instanceof BotNotAttachedError ||
+          error instanceof PluginRefusedError
+        ) {
+          return errorResponse(context, error);
+        }
         const failed = await store.recordRemoteFailure({
           draftId: saved.id,
           actorId: context.var.actor.id,
@@ -492,6 +567,9 @@ export function createTypefullyRoutes(
         );
       }
     } catch (error) {
+      if (error instanceof MediaTooLargeError) {
+        return context.json({ code: "media_too_large" }, 413);
+      }
       return errorResponse(context, error);
     }
   });
@@ -506,51 +584,48 @@ export function createTypefullyRoutes(
         context.req.param("id"),
         context.var.actor.id,
       );
+      const descriptor = current.document.media.find(
+        (item) => item.id === context.req.param("mediaId"),
+      );
+      if (!descriptor) throw new DraftNotFoundError();
+      await store.authorizeTool({
+        draftId: current.id,
+        actorId: context.var.actor.id,
+        toolName: "remove_media",
+      });
+      if (descriptor.remoteId !== null && current.remoteDraftId !== null) {
+        const removed = await store.callRemoteTool({
+          draftId: current.id,
+          actorId: context.var.actor.id,
+          toolName: "remove_media",
+          args: {
+            socialSetId: Number(current.document.socialSetId),
+            draftId: Number(current.remoteDraftId),
+            platform: current.document.destinations[0],
+            postIndex: 0,
+            mediaId: descriptor.remoteId,
+          },
+        });
+        if (removed.isError) {
+          return context.json(
+            { code: "remote_error", message: safeError(removed.text) },
+            502,
+          );
+        }
+      }
       const media = current.document.media.filter(
         (item) => item.id !== context.req.param("mediaId"),
       );
-      if (media.length === current.document.media.length)
-        throw new DraftNotFoundError();
       const draft = await store.saveDraft({
         draftId: current.id,
         actorId: context.var.actor.id,
         expectedVersion: body.expectedVersion as number,
         document: { ...current.document, media },
       });
-      if (draft.syncStatus === "grant_blocked") {
-        return context.json({
-          draft: summary(draft),
-          remote: remoteState(draft),
-        });
-      }
-      try {
-        const synced = await synchronize(store, draft.id, context.var.actor.id);
-        if (!synced.ok) {
-          return context.json(
-            {
-              ...synced.error,
-              draft: summary(synced.draft),
-              remote: remoteState(synced.draft),
-            },
-            502,
-          );
-        }
-        return context.json({
-          draft: summary(synced.draft),
-          remote: remoteState(synced.draft),
-        });
-      } catch (error) {
-        if (
-          error instanceof ConnectionRequiredError ||
-          error instanceof GrantRequiredError
-        ) {
-          return context.json({
-            draft: summary(draft),
-            remote: remoteState(draft),
-          });
-        }
-        throw error;
-      }
+      return context.json({
+        draft: summary(draft),
+        remote: remoteState(draft),
+      });
     } catch (error) {
       return errorResponse(context, error);
     }

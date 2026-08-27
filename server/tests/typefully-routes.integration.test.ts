@@ -1,12 +1,16 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { Hono, type MiddlewareHandler } from "hono";
+import { mintRunAssertion } from "../src/agents/callback-token";
+import { createApp } from "../src/app";
 import { createAuditStore } from "../src/audit";
 import type { AppVariables } from "../src/auth/guards";
+import { loadConfig } from "../src/config";
 import { createDatabase } from "../src/db/client";
 import {
   agents,
+  auditEvents,
   channelAgents,
   channelMemberships,
   channels,
@@ -23,6 +27,7 @@ import {
 import { createTypefullyRoutes } from "../src/typefully/routes";
 import { createTypefullyStore } from "../src/typefully/store";
 import { TEST_POOL } from "./support/database";
+import { testEnvironment } from "./support/environment";
 
 const database = createDatabase(
   process.env.DATABASE_URL ??
@@ -224,6 +229,37 @@ describe("Typefully draft routes", () => {
     expect(await botRefusal.json()).toEqual({ code: "bot_not_attached" });
   });
 
+  test("creation requires the current create grant and persists nothing when refused", async () => {
+    const whereOwnerChannel = and(
+      eq(typefullyDrafts.ownerUserId, ownerId),
+      eq(typefullyDrafts.channelId, channelId),
+    );
+    const before = await database
+      .select({ id: typefullyDrafts.id })
+      .from(typefullyDrafts)
+      .where(whereOwnerChannel);
+    granted = false;
+    try {
+      const response = await app.request("/api/typefully/drafts", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ channelId, botId, document: document() }),
+      });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toEqual({
+        code: "grant_required",
+        ref: "typefully/create_draft",
+      });
+    } finally {
+      granted = true;
+    }
+    const after = await database
+      .select({ id: typefullyDrafts.id })
+      .from(typefullyDrafts)
+      .where(whereOwnerChannel);
+    expect(after).toHaveLength(before.length);
+  });
+
   test("PUT saves locally and stale updates expose only the current version and hash", async () => {
     const { body } = await createDraft();
     const saved = await app.request(`/api/typefully/drafts/${body.draft.id}`, {
@@ -301,6 +337,165 @@ describe("Typefully draft routes", () => {
       id: createdSummary.id,
       version: 2,
     });
+  });
+
+  test("the signed agent callback preserves actor and Bot identity for local drafts", async () => {
+    const token = "typefully-agent-callback-token";
+    const config = loadConfig(
+      testEnvironment({
+        AGENT_TOOL_TOKEN: token,
+        KEY_ENCRYPTION_KEY: "b3BlbmJvdC1wcm9kdWN0aW9uLXRlc3Qta2V5LTMyMzI=",
+      }),
+    );
+    const callbackApp = createApp(
+      config,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { agentForCallbackToken: async () => null } as never,
+      undefined,
+      undefined,
+      createAuditStore(database),
+      undefined,
+      governedPluginStore,
+    );
+    const run = mintRunAssertion(
+      { botId, actorId: ownerId, runId: `typefully-run-${suffix}` },
+      config.keyEncryptionKey,
+    );
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const response = await callbackApp.request("/api/agent-tools/call", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-openbot-agent-token": token,
+        },
+        body: JSON.stringify({ name, args, run }),
+      });
+      return await response.json();
+    };
+    const created = await call("mcp__typefully__create_draft", {
+      channelId,
+      document: document("Signed callback"),
+    });
+    const createdSummary = JSON.parse(created.text);
+    draftIds.push(createdSummary.id);
+    expect(createdSummary).toMatchObject({
+      title: "Launch",
+      socialSetLabel: "OpenBot",
+      version: 1,
+    });
+    expect(createdSummary).not.toHaveProperty("document");
+    const persisted = await store.readDraft(createdSummary.id, ownerId);
+    expect(persisted).toMatchObject({ ownerUserId: ownerId, botId });
+
+    const updated = await call("mcp__typefully__update_draft", {
+      draftId: createdSummary.id,
+      expectedVersion: 1,
+      document: document("Signed callback update"),
+    });
+    expect(JSON.parse(updated.text)).toMatchObject({
+      id: createdSummary.id,
+      version: 2,
+      socialSetLabel: "OpenBot",
+    });
+  });
+
+  test("generic MCP audit rows never retain vendor error text", async () => {
+    const unpublished = `unpublished-post-${randomUUID()}`;
+    const leakServerId = `audit-leak-${suffix}`;
+    const leakRef = `${leakServerId}/echo_error`;
+    await database.insert(mcpServers).values({
+      id: leakServerId,
+      title: "Audit leak test",
+      vendor: "test",
+      url: "https://vendor.invalid/mcp",
+      provenance: "custom",
+    });
+    await database.insert(mcpTools).values({
+      serverId: leakServerId,
+      name: "echo_error",
+      description: "Returns a vendor error.",
+      inputSchema: { type: "object", additionalProperties: true },
+    });
+    await database.insert(pluginGrants).values({
+      kind: "mcp",
+      ref: leakRef,
+      agentId: botId,
+    });
+    const leakingStore = createPluginStore({
+      database,
+      auditStore: createAuditStore(database),
+      credentials: {
+        readSecret: async () => null,
+        create: async () => {
+          throw new Error("not used");
+        },
+        updateSecret: async () => {
+          throw new Error("not used");
+        },
+        revoke: async () => new Date(),
+      },
+      encryptionKey: "x".repeat(44),
+      policy: () => ({ mode: "enforce", allow: ["true"], deny: [] }),
+      callVendor: async () => ({ text: unpublished, isError: true }),
+    });
+    try {
+      await leakingStore.callTool({
+        ref: leakRef,
+        args: { draft: unpublished },
+        botId,
+        actorId: ownerId,
+      });
+      const rows = await database
+        .select({ payload: auditEvents.payload })
+        .from(auditEvents)
+        .where(eq(auditEvents.targetId, leakRef));
+      const latest = rows.at(-1)?.payload;
+      expect(JSON.stringify(latest)).not.toContain(unpublished);
+      expect(latest).toMatchObject({ failureClass: "tool_reported_error" });
+    } finally {
+      await database.delete(pluginGrants).where(eq(pluginGrants.ref, leakRef));
+      await database
+        .delete(mcpTools)
+        .where(eq(mcpTools.serverId, leakServerId));
+      await database.delete(mcpServers).where(eq(mcpServers.id, leakServerId));
+    }
+  });
+
+  test("bounds multipart streams before parsing without trusting Content-Length", async () => {
+    const oversizedRequest = (declared?: string) => {
+      const chunk = new Uint8Array(13_100_000);
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(chunk);
+          controller.enqueue(chunk);
+          controller.close();
+        },
+      });
+      return new Request(
+        "http://openbot.test/api/typefully/drafts/nope/media",
+        {
+          method: "POST",
+          headers: {
+            "content-type": "multipart/form-data; boundary=bounded-test",
+            ...(declared === undefined ? {} : { "content-length": declared }),
+          },
+          body,
+          duplex: "half",
+        } as RequestInit & { duplex: "half" },
+      );
+    };
+    for (const declared of [undefined, "not-a-number"]) {
+      const response = await app.request(oversizedRequest(declared));
+      expect(response.status).toBe(413);
+      expect(await response.json()).toEqual({ code: "media_too_large" });
+    }
   });
 
   test("a revoked grant blocks remote sync but preserves a local PUT", async () => {

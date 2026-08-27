@@ -49,9 +49,9 @@ const TOOL_DESCRIPTIONS: Record<TypefullyToolName, string> = {
   list_drafts: "List drafts in one Typefully social set.",
   get_draft: "Get one Typefully draft.",
   create_draft:
-    "Create an unscheduled or inertly planned Typefully draft. This tool cannot publish immediately.",
+    "Create a local OpenBot draft for this channel. It can be edited before Typefully is connected and never publishes immediately.",
   update_draft:
-    "Update reviewed fields on a Typefully draft. This tool cannot publish immediately.",
+    "Update an existing local OpenBot draft with optimistic versioning. It never publishes immediately.",
   upload_media:
     "Request a presigned Typefully media-upload URL. This only initiates the upload and never accepts file bytes.",
   remove_media: `Remove one named media reference from an authoritative Typefully draft. For safety, this refuses draft responses larger than the ${TYPEFULLY_REMOVE_MEDIA_MAX_DRAFT_BYTES / 1_000_000} MB limit.`,

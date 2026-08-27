@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { catalogueEntry } from "../src/plugins/catalogue";
 import { MAX_RESULT_CHARS } from "../src/plugins/mcp";
 import { transportFor } from "../src/plugins/transport";
+import { vendorInputSchemaFor } from "../src/plugins/typefully-contracts";
 import {
   callTool,
   createTypefullyRestTransport,
@@ -111,10 +112,7 @@ describe("the reviewed Typefully tool surface", () => {
   });
 
   test("pins the live v2 post, media, and create-share bounds in the schema", async () => {
-    const tools = await listTools({ url: connection.url });
-    const create = tools.find((tool) => tool.name === "create_draft");
-    const update = tools.find((tool) => tool.name === "update_draft");
-    const schema = create?.inputSchema as {
+    const schema = vendorInputSchemaFor("create_draft") as {
       allOf?: {
         anyOf?: {
           properties?: {
@@ -174,9 +172,11 @@ describe("the reviewed Typefully tool surface", () => {
       64,
     );
     expect(
-      (update?.inputSchema.anyOf as { required?: string[] }[] | undefined)?.map(
-        (branch) => branch.required,
-      ),
+      (
+        vendorInputSchemaFor("update_draft").anyOf as
+          | { required?: string[] }[]
+          | undefined
+      )?.map((branch) => branch.required),
     ).toEqual([["platforms"], ["draftTitle"], ["share"], ["planAt"]]);
     expect(
       schema.allOf?.[0]?.anyOf?.map((branch) => ({
@@ -193,6 +193,21 @@ describe("the reviewed Typefully tool surface", () => {
       { platform: "bluesky", enabled: true },
       { platform: "mastodon", enabled: true },
     ]);
+  });
+
+  test("advertises local-first create and update contracts to Bots", async () => {
+    const tools = await listTools({ url: connection.url });
+    const create = tools.find((tool) => tool.name === "create_draft");
+    const update = tools.find((tool) => tool.name === "update_draft");
+    expect(create?.description).toContain("local OpenBot draft");
+    expect(create?.inputSchema.required).toEqual(["channelId", "document"]);
+    expect(create?.inputSchema.properties).not.toHaveProperty("platforms");
+    expect(update?.inputSchema.required).toEqual([
+      "draftId",
+      "expectedVersion",
+      "document",
+    ]);
+    expect(update?.inputSchema.properties).not.toHaveProperty("socialSetId");
   });
 
   test("is registered for the frozen Typefully catalogue entry", () => {

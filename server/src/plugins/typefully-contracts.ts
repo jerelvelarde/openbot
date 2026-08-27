@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { draftDocumentSchema } from "../typefully/document";
 
 const MEDIA_ID_MAX_CHARS = 240;
 const PLAN_AT_MAX_CHARS = 64;
@@ -157,7 +158,7 @@ export const TYPEFULLY_TOOL_NAMES = [
 
 export type TypefullyToolName = (typeof TYPEFULLY_TOOL_NAMES)[number];
 
-export const typefullyContracts = {
+export const typefullyVendorContracts = {
   list_social_sets: z.strictObject({ limit, offset }),
   list_drafts: z.strictObject({ socialSetId, limit, offset }),
   get_draft: z.strictObject({ socialSetId, draftId }),
@@ -217,7 +218,23 @@ export const typefullyContracts = {
   delete_draft: z.strictObject({ socialSetId, draftId }),
 } satisfies Record<TypefullyToolName, z.ZodType>;
 
-type ContractMap = typeof typefullyContracts;
+const localCreateDraft = z.strictObject({
+  channelId: z.string().trim().min(1).max(240),
+  document: draftDocumentSchema,
+});
+const localUpdateDraft = z.strictObject({
+  draftId: z.string().uuid(),
+  expectedVersion: z.number().int().positive().safe(),
+  document: draftDocumentSchema,
+});
+
+export const typefullyBotContracts = {
+  ...typefullyVendorContracts,
+  create_draft: localCreateDraft,
+  update_draft: localUpdateDraft,
+} satisfies Record<TypefullyToolName, z.ZodType>;
+
+type ContractMap = typeof typefullyVendorContracts;
 export type TypefullyCall = {
   [Name in TypefullyToolName]: {
     toolName: Name;
@@ -239,7 +256,7 @@ export function parseTypefullyCall(
       message: `${toolName} is not a tool this connector implements. Refresh the stored tool list.`,
     };
   }
-  const parsed = typefullyContracts[toolName].safeParse(args);
+  const parsed = typefullyVendorContracts[toolName].safeParse(args);
   if (!parsed.success) {
     const issue = parsed.error.issues[0];
     const path = issue?.path.length ? `${issue.path.join(".")}: ` : "";
@@ -254,14 +271,17 @@ export function parseTypefullyCall(
   };
 }
 
-export function inputSchemaFor(
+function schemaFor(
   toolName: TypefullyToolName,
+  contracts: Record<TypefullyToolName, z.ZodType>,
 ): Record<string, unknown> {
-  const schema = z.toJSONSchema(typefullyContracts[toolName]) as Record<
-    string,
-    unknown
-  >;
-  if (toolName === "create_draft" || toolName === "update_draft") {
+  const schema = z.toJSONSchema(contracts[toolName], {
+    io: "input",
+  }) as Record<string, unknown>;
+  if (
+    contracts === typefullyVendorContracts &&
+    (toolName === "create_draft" || toolName === "update_draft")
+  ) {
     const properties = schema.properties;
     if (properties && typeof properties === "object") {
       const platformSchema = (properties as Record<string, unknown>).platforms;
@@ -271,10 +291,10 @@ export function inputSchemaFor(
       }
     }
   }
-  if (toolName === "update_draft") {
+  if (contracts === typefullyVendorContracts && toolName === "update_draft") {
     schema.anyOf = UPDATE_DRAFT_FIELDS.map((field) => ({ required: [field] }));
   }
-  if (toolName === "create_draft") {
+  if (contracts === typefullyVendorContracts && toolName === "create_draft") {
     schema.allOf = [
       {
         anyOf: PLATFORM_NAMES.map((platformName) => ({
@@ -294,4 +314,12 @@ export function inputSchemaFor(
     ];
   }
   return schema;
+}
+
+export function inputSchemaFor(toolName: TypefullyToolName) {
+  return schemaFor(toolName, typefullyBotContracts);
+}
+
+export function vendorInputSchemaFor(toolName: TypefullyToolName) {
+  return schemaFor(toolName, typefullyVendorContracts);
 }

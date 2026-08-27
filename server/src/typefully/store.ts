@@ -12,6 +12,7 @@ import {
   typefullyPublicationProposals,
 } from "../db/schema";
 import type { PluginDecision, PluginKind } from "../plugins/store";
+import { typefullyBotContracts } from "../plugins/typefully-contracts";
 import {
   type CanonicalDraftDocument,
   canonicalizeDraft,
@@ -37,6 +38,7 @@ type AuthorizationSurface = {
     args: Record<string, unknown>;
     botId: string;
     actorId: string;
+    _vendorDispatch?: boolean;
   }): Promise<{ text: string; isError: boolean }>;
 };
 
@@ -127,6 +129,15 @@ export class RemoteConfirmationConflictError extends Error {
   constructor(readonly currentRemoteDraftId: string) {
     super("This draft revision is already attached to another remote draft.");
     this.name = "RemoteConfirmationConflictError";
+  }
+}
+
+export class SyncInProgressError extends Error {
+  readonly code = "sync_in_progress" as const;
+  readonly status = 409 as const;
+  constructor() {
+    super("This draft revision is already syncing.");
+    this.name = "SyncInProgressError";
   }
 }
 
@@ -421,17 +432,20 @@ export function createTypefullyStore(options: {
     }): Promise<{ text: string; isError: boolean } | null> {
       if (input.serverId !== serverId) return null;
       if (input.toolName === "create_draft") {
-        if (
-          typeof input.args.channelId !== "string" ||
-          !("document" in input.args)
-        ) {
-          return null;
+        const parsed = typefullyBotContracts.create_draft.safeParse(input.args);
+        if (!parsed.success) {
+          return {
+            text:
+              parsed.error.issues[0]?.message ??
+              "Invalid local draft arguments",
+            isError: true,
+          };
         }
         const draft = await store.createDraft({
           ownerUserId: input.actorId,
-          channelId: input.args.channelId,
+          channelId: parsed.data.channelId,
           botId: input.botId,
-          document: input.args.document,
+          document: parsed.data.document,
         });
         return {
           text: JSON.stringify(
@@ -440,24 +454,27 @@ export function createTypefullyStore(options: {
               document: draft.document,
               version: draft.version,
               syncStatus: draft.syncStatus,
+              socialSetLabel: draft.document.accountLabel,
             }),
           ),
           isError: false,
         };
       }
       if (input.toolName === "update_draft") {
-        if (
-          typeof input.args.draftId !== "string" ||
-          !Number.isSafeInteger(input.args.expectedVersion) ||
-          !("document" in input.args)
-        ) {
-          return null;
+        const parsed = typefullyBotContracts.update_draft.safeParse(input.args);
+        if (!parsed.success) {
+          return {
+            text:
+              parsed.error.issues[0]?.message ??
+              "Invalid local draft arguments",
+            isError: true,
+          };
         }
         const draft = await store.saveDraft({
-          draftId: input.args.draftId,
+          draftId: parsed.data.draftId,
           actorId: input.actorId,
-          expectedVersion: input.args.expectedVersion as number,
-          document: input.args.document,
+          expectedVersion: parsed.data.expectedVersion,
+          document: parsed.data.document,
         });
         return {
           text: JSON.stringify(
@@ -466,6 +483,7 @@ export function createTypefullyStore(options: {
               document: draft.document,
               version: draft.version,
               syncStatus: draft.syncStatus,
+              socialSetLabel: draft.document.accountLabel,
             }),
           ),
           isError: false,
@@ -479,6 +497,7 @@ export function createTypefullyStore(options: {
       channelId: string;
       botId: string;
       document: unknown;
+      requireGrant?: boolean;
     }): Promise<TypefullyDraft> {
       const canonical = canonicalizeDraft(input.document);
       const granted = await isGranted("create_draft", input.botId);
@@ -498,6 +517,12 @@ export function createTypefullyStore(options: {
           input.botId,
         );
         if (!attached) throw new BotNotAttachedError();
+        if (input.requireGrant && !granted) {
+          throw new GrantRequiredError(
+            grantRef("create_draft"),
+            "This Bot no longer has permission to create Typefully drafts.",
+          );
+        }
         const syncStatus = granted ? "local" : "grant_blocked";
         const [row] = await transaction
           .insert(typefullyDrafts)
@@ -568,9 +593,13 @@ export function createTypefullyStore(options: {
           current.botId,
         );
         const syncStatus: DraftSyncStatus =
-          attached && granted && remoteOperationFor(current) === grantOperation
-            ? "local"
-            : "grant_blocked";
+          current.syncStatus === "syncing" && current.remoteDraftId === null
+            ? "syncing"
+            : attached &&
+                granted &&
+                remoteOperationFor(current) === grantOperation
+              ? "local"
+              : "grant_blocked";
         const now = new Date();
         const [row] = await transaction
           .update(typefullyDrafts)
@@ -637,6 +666,8 @@ export function createTypefullyStore(options: {
     async authorizeRemoteOperation(input: {
       draftId: string;
       actorId: string;
+      expectedVersion?: number;
+      expectedHash?: string;
     }): Promise<{ draft: TypefullyDraft; ref: string }> {
       let draft = await ownedDraft(database, input.draftId, input.actorId);
       let operation = remoteOperationFor(draft);
@@ -663,23 +694,64 @@ export function createTypefullyStore(options: {
       if (!(await isBotAttached(database, draft.channelId, draft.botId))) {
         throw new BotNotAttachedError();
       }
+      if (
+        (input.expectedVersion !== undefined &&
+          draft.version !== input.expectedVersion) ||
+        (input.expectedHash !== undefined &&
+          draft.contentHash !== input.expectedHash)
+      ) {
+        throw new VersionConflictError(draft.version, draft.contentHash);
+      }
       return { draft, ref };
     },
 
-    async syncDraft(input: { draftId: string; actorId: string }): Promise<{
+    async syncDraft(input: {
+      draftId: string;
+      actorId: string;
+      expectedVersion?: number;
+      expectedHash?: string;
+    }): Promise<{
       draft: TypefullyDraft;
       result: { text: string; isError: boolean };
     }> {
       const authorized = await store.authorizeRemoteOperation(input);
+      const [claimed] = await database
+        .update(typefullyDrafts)
+        .set({ syncStatus: "syncing", updatedAt: new Date() })
+        .where(
+          and(
+            eq(typefullyDrafts.id, authorized.draft.id),
+            eq(typefullyDrafts.ownerUserId, input.actorId),
+            eq(typefullyDrafts.version, authorized.draft.version),
+            eq(typefullyDrafts.contentHash, authorized.draft.contentHash),
+            ne(typefullyDrafts.syncStatus, "syncing"),
+          ),
+        )
+        .returning(draftSelection);
+      if (!claimed) {
+        const latest = await ownedDraft(database, input.draftId, input.actorId);
+        if (
+          latest.version === authorized.draft.version &&
+          latest.contentHash === authorized.draft.contentHash &&
+          latest.syncStatus === "syncing"
+        ) {
+          throw new SyncInProgressError();
+        }
+        throw new VersionConflictError(latest.version, latest.contentHash);
+      }
+      authorized.draft = asDraft(claimed);
       const callTool = plugin().callTool;
-      if (!callTool) throw new Error("Typefully remote calls are unavailable.");
       let result: { text: string; isError: boolean };
       try {
+        if (!callTool) {
+          throw new Error("Typefully remote calls are unavailable.");
+        }
         result = await callTool({
           ref: authorized.ref,
           args: remoteArgs(authorized.draft),
           botId: authorized.draft.botId,
           actorId: input.actorId,
+          _vendorDispatch: true,
         });
       } catch (error) {
         if (
@@ -689,12 +761,33 @@ export function createTypefullyStore(options: {
             error.code === "connection_required") ||
           (error instanceof Error && error.name === "PluginRefusedError")
         ) {
+          await database
+            .update(typefullyDrafts)
+            .set({
+              syncStatus:
+                error &&
+                typeof error === "object" &&
+                "code" in error &&
+                error.code === "connection_required"
+                  ? "connection_required"
+                  : "grant_blocked",
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(typefullyDrafts.id, authorized.draft.id),
+                eq(typefullyDrafts.version, authorized.draft.version),
+                eq(typefullyDrafts.contentHash, authorized.draft.contentHash),
+                eq(typefullyDrafts.syncStatus, "syncing"),
+              ),
+            );
           throw error;
         }
         const draft = await store.recordRemoteFailure({
           draftId: input.draftId,
           actorId: input.actorId,
           expectedVersion: authorized.draft.version,
+          expectedHash: authorized.draft.contentHash,
           error,
         });
         return {
@@ -707,6 +800,7 @@ export function createTypefullyStore(options: {
           draftId: input.draftId,
           actorId: input.actorId,
           expectedVersion: authorized.draft.version,
+          expectedHash: authorized.draft.contentHash,
           error: result.text,
         });
         return { draft, result };
@@ -730,17 +824,35 @@ export function createTypefullyStore(options: {
           draftId: input.draftId,
           actorId: input.actorId,
           expectedVersion: authorized.draft.version,
+          expectedHash: authorized.draft.contentHash,
           error: failure.text,
         });
         return { draft, result: failure };
       }
-      const draft = await store.recordRemoteConfirmation({
-        draftId: input.draftId,
-        actorId: input.actorId,
-        expectedVersion: authorized.draft.version,
-        remoteDraftId: remoteId,
-      });
-      return { draft, result };
+      try {
+        const draft = await store.recordRemoteConfirmation({
+          draftId: input.draftId,
+          actorId: input.actorId,
+          expectedVersion: authorized.draft.version,
+          expectedHash: authorized.draft.contentHash,
+          remoteDraftId: remoteId,
+        });
+        return { draft, result };
+      } catch (error) {
+        if (!(error instanceof InvalidRemoteDraftIdError)) throw error;
+        const failure = {
+          text: "Typefully returned an invalid draft id.",
+          isError: true,
+        };
+        const draft = await store.recordRemoteFailure({
+          draftId: input.draftId,
+          actorId: input.actorId,
+          expectedVersion: authorized.draft.version,
+          expectedHash: authorized.draft.contentHash,
+          error: failure.text,
+        });
+        return { draft, result: failure };
+      }
     },
 
     async callRemoteTool(input: {
@@ -749,10 +861,11 @@ export function createTypefullyStore(options: {
       toolName: "upload_media" | "remove_media";
       args: Record<string, unknown>;
     }): Promise<{ draft: TypefullyDraft; text: string; isError: boolean }> {
-      const draft = await ownedDraft(database, input.draftId, input.actorId);
-      if (!(await isBotAttached(database, draft.channelId, draft.botId))) {
-        throw new BotNotAttachedError();
-      }
+      const draft = await store.authorizeTool({
+        draftId: input.draftId,
+        actorId: input.actorId,
+        toolName: input.toolName,
+      });
       const callTool = plugin().callTool;
       if (!callTool) throw new Error("Typefully remote calls are unavailable.");
       const result = await callTool({
@@ -760,14 +873,31 @@ export function createTypefullyStore(options: {
         args: input.args,
         botId: draft.botId,
         actorId: input.actorId,
+        _vendorDispatch: true,
       });
       return { draft, ...result };
+    },
+
+    async authorizeTool(input: {
+      draftId: string;
+      actorId: string;
+      toolName: "upload_media" | "remove_media";
+    }): Promise<TypefullyDraft> {
+      const draft = await ownedDraft(database, input.draftId, input.actorId);
+      if (!(await isBotAttached(database, draft.channelId, draft.botId))) {
+        throw new BotNotAttachedError();
+      }
+      const ref = `${serverId}/${input.toolName}`;
+      const decision = await plugin().decide("mcp", ref, draft.botId);
+      if (!decision.allowed) throw new GrantRequiredError(ref, decision.reason);
+      return draft;
     },
 
     async recordRemoteConfirmation(input: {
       draftId: string;
       actorId: string;
       expectedVersion: number;
+      expectedHash?: string;
       remoteDraftId: string;
     }): Promise<TypefullyDraft> {
       const remoteDraftId = validRemoteDraftId(input.remoteDraftId);
@@ -782,13 +912,30 @@ export function createTypefullyStore(options: {
         ) {
           throw new DraftNotFoundError();
         }
+        const expectedHash = input.expectedHash ?? current.contentHash;
+        if (
+          current.remoteDraftId !== null &&
+          current.remoteDraftId !== remoteDraftId
+        ) {
+          throw new RemoteConfirmationConflictError(current.remoteDraftId);
+        }
+        if (
+          current.remoteDraftId === remoteDraftId &&
+          current.remoteVersion !== null &&
+          current.remoteVersion > input.expectedVersion
+        ) {
+          return current;
+        }
+        const confirmsCurrent =
+          current.version === input.expectedVersion &&
+          current.contentHash === expectedHash;
         const [row] = await transaction
           .update(typefullyDrafts)
           .set({
             remoteDraftId,
-            remoteVersion: current.version,
-            remoteHash: current.contentHash,
-            syncStatus: "synced",
+            remoteVersion: input.expectedVersion,
+            remoteHash: expectedHash,
+            syncStatus: confirmsCurrent ? "synced" : "local",
             lastError: null,
             updatedAt: new Date(),
           })
@@ -796,17 +943,19 @@ export function createTypefullyStore(options: {
             and(
               eq(typefullyDrafts.id, input.draftId),
               eq(typefullyDrafts.ownerUserId, input.actorId),
-              eq(typefullyDrafts.version, input.expectedVersion),
-              eq(typefullyDrafts.contentHash, current.contentHash),
               or(
                 isNull(typefullyDrafts.remoteDraftId),
                 eq(typefullyDrafts.remoteDraftId, remoteDraftId),
               ),
               or(
                 isNull(typefullyDrafts.remoteVersion),
-                ne(typefullyDrafts.remoteVersion, current.version),
+                ne(typefullyDrafts.remoteVersion, input.expectedVersion),
                 isNull(typefullyDrafts.remoteHash),
-                ne(typefullyDrafts.remoteHash, current.contentHash),
+                ne(typefullyDrafts.remoteHash, expectedHash),
+                ne(
+                  typefullyDrafts.syncStatus,
+                  confirmsCurrent ? "synced" : "local",
+                ),
               ),
             ),
           )
@@ -818,12 +967,6 @@ export function createTypefullyStore(options: {
             input.actorId,
           );
           if (
-            latest.version !== input.expectedVersion ||
-            latest.contentHash !== current.contentHash
-          ) {
-            throw new VersionConflictError(latest.version, latest.contentHash);
-          }
-          if (
             latest.remoteDraftId !== null &&
             latest.remoteDraftId !== remoteDraftId
           ) {
@@ -831,7 +974,8 @@ export function createTypefullyStore(options: {
           }
           if (
             latest.remoteDraftId === remoteDraftId &&
-            isCurrentRevisionConfirmed(latest)
+            latest.remoteVersion === input.expectedVersion &&
+            latest.remoteHash === expectedHash
           ) {
             return latest;
           }
@@ -853,6 +997,7 @@ export function createTypefullyStore(options: {
       draftId: string;
       actorId: string;
       expectedVersion: number;
+      expectedHash?: string;
       error: unknown;
     }): Promise<TypefullyDraft> {
       const lastError = boundedError(input.error);
@@ -867,6 +1012,31 @@ export function createTypefullyStore(options: {
         ) {
           throw new DraftNotFoundError();
         }
+        const expectedHash = input.expectedHash ?? current.contentHash;
+        if (
+          current.version !== input.expectedVersion ||
+          current.contentHash !== expectedHash
+        ) {
+          if (current.syncStatus !== "syncing") return current;
+          const [released] = await transaction
+            .update(typefullyDrafts)
+            .set({
+              syncStatus: "local",
+              lastError: null,
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(typefullyDrafts.id, input.draftId),
+                eq(typefullyDrafts.ownerUserId, input.actorId),
+                eq(typefullyDrafts.version, current.version),
+                eq(typefullyDrafts.contentHash, current.contentHash),
+                eq(typefullyDrafts.syncStatus, "syncing"),
+              ),
+            )
+            .returning(draftSelection);
+          return released ? asDraft(released) : current;
+        }
         const [row] = await transaction
           .update(typefullyDrafts)
           .set({
@@ -879,7 +1049,7 @@ export function createTypefullyStore(options: {
               eq(typefullyDrafts.id, input.draftId),
               eq(typefullyDrafts.ownerUserId, input.actorId),
               eq(typefullyDrafts.version, input.expectedVersion),
-              eq(typefullyDrafts.contentHash, current.contentHash),
+              eq(typefullyDrafts.contentHash, expectedHash),
               or(
                 isNull(typefullyDrafts.remoteVersion),
                 ne(typefullyDrafts.remoteVersion, current.version),

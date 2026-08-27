@@ -3363,6 +3363,8 @@ export function createPluginStore(options: PluginStoreOptions) {
       args: Record<string, unknown>;
       botId: string;
       actorId: string;
+      /** Server-only: local orchestration has already produced the immutable vendor DTO. */
+      _vendorDispatch?: boolean;
     }): Promise<{ text: string; isError: boolean }> {
       const [serverId, ...rest] = input.ref.split("/");
       const toolName = rest.join("/");
@@ -3501,24 +3503,22 @@ export function createPluginStore(options: PluginStoreOptions) {
        * it did.
        */
       try {
-        const local = await options.firstPartyTool?.({
-          serverId,
-          toolName,
-          args,
-          botId: input.botId,
-          actorId: input.actorId,
-        });
+        const local = input._vendorDispatch
+          ? null
+          : await options.firstPartyTool?.({
+              serverId,
+              toolName,
+              args,
+              botId: input.botId,
+              actorId: input.actorId,
+            });
         if (local) {
           await recordAuditEvent(auditStore, {
             eventType: local.isError ? "mcp.call_failed" : "mcp.call_succeeded",
             targetType: "mcp_tool",
             targetId: input.ref,
             payload: local.isError
-              ? {
-                  ...decided,
-                  failure:
-                    local.text.slice(0, 400) || "the tool reported an error",
-                }
+              ? { ...decided, failureClass: "tool_reported_error" }
               : decided,
           });
           return local;
@@ -3534,36 +3534,18 @@ export function createPluginStore(options: PluginStoreOptions) {
           eventType: result.isError ? "mcp.call_failed" : "mcp.call_succeeded",
           targetType: "mcp_tool",
           targetId: input.ref,
-          /*
-           * The vendor's own words, when it is reporting a failure.
-           *
-           * Only on the failure branch, and this is the whole point of the distinction. A successful
-           * result is somebody's data — a file listing, a document — and it has no business in an
-           * audit row that an administrator can read. An `isError` result is a message written for
-           * whoever operates this deployment, and it is the most useful sentence available: Google
-           * refuses the Drive MCP server with "The caller does not have permission", which named the
-           * problem after a generic message had already cost a round of probing.
-           *
-           * Capped, because the failure branch is not a promise about length.
-           */
+          // Vendor messages can echo private draft content. Audit only the bounded failure class;
+          // the caller still receives the original protocol result through the normal response.
           payload: result.isError
-            ? {
-                ...decided,
-                failure:
-                  result.text.slice(0, 400) || "the tool reported an error",
-              }
+            ? { ...decided, failureClass: "tool_reported_error" }
             : decided,
         });
         return { text: result.text, isError: result.isError };
       } catch (error) {
         /*
          * Recorded, then rethrown unchanged. The caller's behaviour is unaffected — what changes is
-         * that the failure now exists in the trail, which is where somebody asking "is this connector
-         * working" looks. The vendor's own sentence is kept, since for a 403 that is the sentence
-         * naming which API is not enabled.
-         *
-         * Capped like the `isError` branch above, and for the same reason: parts of this sentence
-         * came from the vendor, and a failure is not a promise about length.
+         * that the failure class now exists in the trail, which is enough to distinguish connection,
+         * policy and transport failures without retaining vendor text that may contain private data.
          */
         await recordAuditEvent(auditStore, {
           eventType: "mcp.call_failed",
@@ -3571,10 +3553,12 @@ export function createPluginStore(options: PluginStoreOptions) {
           targetId: input.ref,
           payload: {
             ...decided,
-            failure: (error instanceof Error
-              ? error.message
-              : String(error)
-            ).slice(0, 400),
+            failureClass:
+              error instanceof ConnectionRequiredError
+                ? "connection_required"
+                : error instanceof PluginRefusedError
+                  ? "refused"
+                  : "transport_error",
           },
         });
         throw error;
