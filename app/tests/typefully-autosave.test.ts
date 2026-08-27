@@ -385,6 +385,7 @@ describe("Typefully autosave controller", () => {
     const first = controller.saveAsNewDraft();
     const second = controller.saveAsNewDraft();
     expect(first).toBe(second);
+    await Promise.resolve();
     expect(calls).toBe(1);
     controller.mediaSettled(edited("queued before dispose"));
     expect(normalSaves).toBe(1);
@@ -514,6 +515,47 @@ describe("Typefully autosave controller", () => {
     expect(controller.getSnapshot().target).toEqual({
       draftId: "new-draft",
       version: 3,
+    });
+  });
+
+  test("retries recovery after a synchronous create throw without wedging single-flight state", async () => {
+    const timer = clock();
+    let createAttempts = 0;
+    const controller = createAutosaveController({
+      initialDraftId: "old-draft",
+      initialDocument: base,
+      initialVersion: 1,
+      scheduler: timer.scheduler,
+      save: async () => {
+        throw new TypefullyClientError("version_conflict", {
+          currentVersion: 2,
+        });
+      },
+      saveAsNewDraft: () => {
+        createAttempts += 1;
+        if (createAttempts === 1) throw new Error("synchronous create failure");
+        return Promise.resolve(newDraftResult);
+      },
+    });
+    controller.textChanged(edited("conflict"));
+    timer.fire();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const first = controller.saveAsNewDraft();
+    const duplicate = controller.saveAsNewDraft();
+    expect(first).toBe(duplicate);
+    expect(await first).toBeUndefined();
+    expect(createAttempts).toBe(1);
+    expect(controller.getSnapshot().state.kind).toBe("error");
+
+    const retried = await controller.retry();
+    expect(createAttempts).toBe(2);
+    expect(retried?.draftId).toBe("new-draft");
+    expect(controller.getSnapshot()).toMatchObject({
+      target: { draftId: "new-draft", version: 1 },
+      createdDraft: newDraftResult,
+      state: { kind: "saved", version: 1 },
     });
   });
 

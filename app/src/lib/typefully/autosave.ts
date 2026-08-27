@@ -221,8 +221,12 @@ export function createAutosaveController(options: AutosaveOptions) {
     state = { kind: "saving", baseVersion: version };
     emit();
     let shouldDrain = false;
-    const operation = (async () => {
+    let operation!: Promise<SaveAsNewDraftResult | undefined>;
+    operation = (async () => {
       try {
+        // Defer user code until the single-flight handle below is installed. A
+        // synchronous throw must not let finally clear state before assignment.
+        await Promise.resolve();
         const result = await options.saveAsNewDraft?.(local, abort.signal);
         if (!result || disposed || abort.signal.aborted) return undefined;
         targetDraftId = result.draftId;
@@ -253,7 +257,7 @@ export function createAutosaveController(options: AutosaveOptions) {
         emit();
         return undefined;
       } finally {
-        if (recoveryToken === token) {
+        if (recoveryPromise === operation && recoveryToken === token) {
           recoveryPromise = undefined;
           recoveryToken = undefined;
         }
