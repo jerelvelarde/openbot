@@ -248,16 +248,21 @@ function boundedString(value: unknown, limit: number): string | undefined {
 }
 
 function errorCode(value: unknown): TypefullyErrorCode {
-  if (typeof value !== "string") return "invalid_request";
-  return ERROR_CODES.has(value)
-    ? (value as TypefullyErrorCode)
-    : "invalid_request";
+  return typefullyErrorCode(value) ?? "invalid_request";
 }
 
 const ERROR_CODES = new Set<string>([
   ...Object.keys(ERROR_MESSAGES),
   "invalid_request",
 ]);
+
+export function typefullyErrorCode(
+  value: unknown,
+): TypefullyErrorCode | undefined {
+  return typeof value === "string" && ERROR_CODES.has(value)
+    ? (value as TypefullyErrorCode)
+    : undefined;
+}
 
 const draftSummarySchema = z.strictObject({
   id: stableIdSchema,

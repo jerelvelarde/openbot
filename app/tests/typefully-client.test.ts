@@ -894,6 +894,149 @@ describe("Typefully mutation contracts", () => {
     },
   );
 
+  test.each([
+    { name: "numeric code", envelope: { code: 502 } },
+    {
+      name: "object error",
+      envelope: { code: "remote_error", error: { secret: true } },
+    },
+    {
+      name: "numeric message",
+      envelope: { code: "remote_error", message: 502 },
+    },
+    {
+      name: "string currentVersion",
+      envelope: {
+        code: "version_conflict",
+        currentVersion: "2",
+        currentHash: "hash-2",
+      },
+    },
+    {
+      name: "contradictory top-level draftId",
+      envelope: {
+        code: "connection_required",
+        serverId: "typefully",
+        draftId: "other-draft",
+        connectPath: "/settings/connected-accounts/typefully",
+      },
+    },
+    {
+      name: "numeric serverId",
+      envelope: {
+        code: "connection_required",
+        serverId: 42,
+        connectPath: "/settings/connected-accounts/typefully",
+      },
+    },
+    {
+      name: "numeric currentHash",
+      envelope: {
+        code: "version_conflict",
+        currentVersion: 2,
+        currentHash: 42,
+      },
+    },
+    {
+      name: "malformed retryAt",
+      envelope: { code: "remote_error", retryAt: "tomorrow" },
+    },
+    {
+      name: "malformed connectPath",
+      envelope: {
+        code: "connection_required",
+        serverId: "typefully",
+        connectPath: "https://evil.example/settings",
+      },
+    },
+    {
+      name: "malformed ref",
+      envelope: { code: "grant_required", ref: "other/upload_media" },
+    },
+    {
+      name: "an unknown field",
+      envelope: { code: "remote_error", vendorBody: "untrusted" },
+    },
+  ])("rejects an upload error envelope with $name", async ({ envelope }) => {
+    globalThis.fetch = (async () => json(envelope, 409)) as typeof fetch;
+    let failure: unknown;
+    try {
+      await mutate(uploadMediaMutationOptions(), {
+        draftId: "draft-1",
+        expectedVersion: 1,
+        kind: "image",
+        altText: "Envelope",
+        file: new File(["x"], "x.png", { type: "image/png" }),
+      });
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toMatchObject({ code: "remote_invalid_response" });
+    expect((failure as TypefullyClientError).draft).toBeUndefined();
+    expect((failure as TypefullyClientError).media).toBeUndefined();
+  });
+
+  test.each([
+    {
+      name: "a grant refusal",
+      envelope: { code: "grant_required", ref: "typefully/upload_media" },
+      expected: { code: "grant_required", ref: "typefully/upload_media" },
+    },
+    {
+      name: "a connection prompt",
+      envelope: {
+        code: "connection_required",
+        serverId: "typefully",
+        draftId: "draft-1",
+        connectPath: "/settings/connected-accounts/typefully",
+      },
+      expected: {
+        code: "connection_required",
+        serverId: "typefully",
+        draftId: "draft-1",
+      },
+    },
+    {
+      name: "a version conflict",
+      envelope: {
+        code: "version_conflict",
+        currentVersion: 2,
+        currentHash: "hash-2",
+      },
+      expected: {
+        code: "version_conflict",
+        currentVersion: 2,
+        currentHash: "hash-2",
+      },
+    },
+    {
+      name: "a bounded retry time",
+      envelope: {
+        code: "remote_error",
+        retryAt: "2026-08-28T00:00:00.000Z",
+        message: "Try again later.",
+      },
+      expected: {
+        code: "remote_error",
+        retryAt: "2026-08-28T00:00:00.000Z",
+      },
+    },
+  ])(
+    "preserves valid pre-persistence envelope for $name",
+    async ({ envelope, expected }) => {
+      globalThis.fetch = (async () => json(envelope, 409)) as typeof fetch;
+      await expect(
+        mutate(uploadMediaMutationOptions(), {
+          draftId: "draft-1",
+          expectedVersion: 1,
+          kind: "image",
+          altText: "Envelope",
+          file: new File(["x"], "x.png", { type: "image/png" }),
+        }),
+      ).rejects.toMatchObject(expected);
+    },
+  );
+
   test("persists a completed upload descriptor returned at version plus two even when refetch fails", async () => {
     const queryClient = new QueryClient({
       defaultOptions: {

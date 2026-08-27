@@ -1,4 +1,5 @@
 import { mutationOptions, type QueryClient } from "@tanstack/react-query";
+import { z } from "zod";
 import { ALLOWED_MEDIA_TYPES, MAX_MEDIA_BYTES } from "./preview";
 import {
   type AuthoritativeDraft,
@@ -12,6 +13,7 @@ import {
   type RemoteDraftState,
   remoteDraftState,
   TypefullyClientError,
+  typefullyErrorCode,
   typefullyKeys,
   typefullyRequest,
 } from "./queries";
@@ -87,48 +89,91 @@ function boundMediaMutationFailure(
   return error;
 }
 
-const MEDIA_ERROR_KEYS = new Set([
-  "code",
-  "message",
-  "currentVersion",
-  "currentHash",
-  "serverId",
-  "draftId",
-  "connectPath",
-  "ref",
-  "retryAt",
-  "draft",
-  "remote",
-  "media",
+const uploadErrorCodeSchema = z
+  .string()
+  .min(1)
+  .max(64)
+  .refine((value) => typefullyErrorCode(value) !== undefined);
+const uploadErrorCommonShape = {
+  code: uploadErrorCodeSchema,
+  error: z.string().min(1).max(500).optional(),
+  message: z.string().min(1).max(500).optional(),
+  currentVersion: z
+    .number()
+    .int()
+    .positive()
+    .max(Number.MAX_SAFE_INTEGER)
+    .optional(),
+  currentHash: z.string().min(1).max(128).optional(),
+  serverId: z.string().trim().min(1).max(120).optional(),
+  draftId: z.string().trim().min(1).max(120).optional(),
+  connectPath: z.string().min(1).max(500).startsWith("/").optional(),
+  ref: z.string().trim().min(1).max(240).optional(),
+  retryAt: z.string().datetime().optional(),
+};
+const uploadPrePersistenceErrorSchema = z.strictObject(uploadErrorCommonShape);
+const uploadCommittedErrorSchema = z.strictObject({
+  ...uploadErrorCommonShape,
+  draft: z.unknown(),
+  media: z.unknown(),
+  remote: z.unknown().optional(),
+});
+const uploadErrorEnvelopeSchema = z.union([
+  uploadCommittedErrorSchema,
+  uploadPrePersistenceErrorSchema,
 ]);
 
 function normalizeMediaMutationErrorPayload(
   payload: unknown,
   input: { draftId: string; mediaId?: string },
 ): unknown {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-    return payload;
-  }
-  const record = payload as Record<string, unknown>;
-  const hasRecovery = ["draft", "media", "remote"].some((key) =>
-    Object.hasOwn(record, key),
-  );
-  if (!hasRecovery) return payload;
-  if (Object.keys(record).some((key) => !MEDIA_ERROR_KEYS.has(key))) {
+  const parsed = uploadErrorEnvelopeSchema.safeParse(payload);
+  if (!parsed.success) {
     throw new TypefullyClientError("remote_invalid_response");
   }
+  const record = parsed.data;
+  const hasRecovery = "draft" in record;
+  const connectionFieldsPresent =
+    record.serverId !== undefined || record.connectPath !== undefined;
+  const conflictFieldsPresent =
+    record.currentVersion !== undefined || record.currentHash !== undefined;
+  if (
+    (record.draftId !== undefined && record.draftId !== input.draftId) ||
+    (record.serverId !== undefined && record.serverId !== "typefully") ||
+    (record.connectPath !== undefined &&
+      record.connectPath !== "/settings/connected-accounts/typefully") ||
+    (record.ref !== undefined && record.ref !== "typefully/upload_media") ||
+    (record.currentVersion === undefined) !==
+      (record.currentHash === undefined) ||
+    (record.serverId === undefined) !== (record.connectPath === undefined) ||
+    (record.code === "connection_required") !== connectionFieldsPresent ||
+    (record.code === "grant_required") !== (record.ref !== undefined) ||
+    (record.code === "version_conflict") !== conflictFieldsPresent ||
+    (hasRecovery && conflictFieldsPresent) ||
+    (record.retryAt !== undefined &&
+      record.code !== "remote_error" &&
+      record.code !== "rate_limited")
+  ) {
+    throw new TypefullyClientError("remote_invalid_response");
+  }
+  if (!hasRecovery) return record;
   const draft = draftSummary(record.draft);
   const media = mediaDescriptor(record.media);
-  const hasRemote = Object.hasOwn(record, "remote");
+  const hasRemote = "remote" in record;
   const remote = hasRemote ? remoteDraftState(record.remote) : undefined;
   if (
-    !Object.hasOwn(record, "draft") ||
-    !Object.hasOwn(record, "media") ||
     !draft ||
     !media ||
     draft.id !== input.draftId ||
     (input.mediaId !== undefined && media.id !== input.mediaId) ||
-    (hasRemote && !remote)
+    (record.draftId !== undefined && record.draftId !== draft.id) ||
+    (hasRemote &&
+      (!remote ||
+        remote.state !== draft.syncStatus ||
+        (remote.confirmedVersion !== null &&
+          remote.confirmedVersion > draft.version) ||
+        (remote.state === "synced" &&
+          remote.confirmedVersion !== draft.version)))
   ) {
     throw new TypefullyClientError("remote_invalid_response");
   }
