@@ -7,13 +7,16 @@ import {
   createRouter,
   Outlet,
   RouterProvider,
+  useNavigate,
 } from "@tanstack/react-router";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
+import { TypefullyDraftSummary } from "../src/components/gallery/typefully-draft";
 import { DetailPanel } from "../src/components/layout/detail-panel";
 import { agentKeys } from "../src/lib/agents/queries";
 import { channelKeys } from "../src/lib/channels/queries";
+import { reportComputerActivity } from "../src/lib/copilot/computer-activity";
 import {
   TypefullyClientError,
   typefullyKeys,
@@ -48,6 +51,34 @@ const channel = {
   threadId: "thread-1",
   active: true,
 };
+
+function ProductionTestRoot() {
+  const navigate = useNavigate();
+  return (
+    <>
+      <TypefullyDraftSummary
+        destinations={["x"]}
+        draftId={draftId}
+        mediaCount={0}
+        onReview={() => {
+          void navigate({
+            params: { channelId: channel.id },
+            search: (previous) =>
+              channelPaneSearch(previous as { watch?: true }, {
+                draft: draftId,
+              }),
+            to: "/channel/$channelId",
+          });
+        }}
+        socialSetLabel="Route account"
+        status="synced"
+        title="Draft summary"
+        version={1}
+      />
+      <Outlet />
+    </>
+  );
+}
 
 function authoritativeDraft() {
   return {
@@ -118,6 +149,7 @@ test("detail focus enters the canvas and returns to the originating review contr
         collapseAtNarrow
         detail={<div>Canvas</div>}
         detailWidth={720}
+        focusKey={open ? draftId : undefined}
         onClose={() => setOpen(false)}
         open={open}
         title={<span>Typefully draft</span>}
@@ -150,6 +182,7 @@ test("a directly linked canvas closes safely to the channel fallback", async () 
         collapseAtNarrow
         detail={<div>Canvas</div>}
         detailWidth={720}
+        focusKey={open ? draftId : undefined}
         onClose={() => setOpen(false)}
         open={open}
         title={<span>Typefully draft</span>}
@@ -197,7 +230,7 @@ test("closing the draft removes only its pane key and pane transitions stay excl
   });
 });
 
-test("the production channel route restores, closes, and backs through a URL-opened canvas", async () => {
+test("the production route preserves focus on automatic watch and backs out of a real Review draft action", async () => {
   globalThis.fetch = (async (input) => {
     const url = typeof input === "string" ? input : input.url;
     const body = url.includes("/api/copilotkit/info")
@@ -252,9 +285,9 @@ test("the production channel route restores, closes, and backs through a URL-ope
     draft: authoritativeDraft(),
   });
   const history = createMemoryHistory({
-    initialEntries: [`/channel/${channel.id}?draft=${draftId}`],
+    initialEntries: [`/channel/${channel.id}`],
   });
-  const root = createRootRoute({ component: Outlet });
+  const root = createRootRoute({ component: ProductionTestRoot });
   const productionChannel = ProductionChannelRoute.update({
     id: "/channel/$channelId",
     path: "/channel/$channelId",
@@ -274,6 +307,15 @@ test("the production channel route restores, closes, and backs through a URL-ope
   );
   const user = userEvent.setup({ document });
 
+  const currentControl = view.getByRole("button", { name: "Channel coworker" });
+  currentControl.focus();
+  act(() => reportComputerActivity("bot-1"));
+  await waitFor(() =>
+    expect(productionRouter.state.location.search).toEqual({ watch: true }),
+  );
+  expect(document.activeElement).toBe(currentControl);
+
+  await user.click(view.getByRole("button", { name: "Review draft" }));
   expect(await view.findByText("Production route draft")).toBeTruthy();
   await waitFor(() =>
     expect(document.activeElement).toBe(
@@ -287,16 +329,17 @@ test("the production channel route restores, closes, and backs through a URL-ope
     "max-md:hidden",
   );
 
-  await user.click(view.getByRole("button", { name: "Channel coworker" }));
-  await waitFor(() =>
-    expect(productionRouter.state.location.search).toEqual({ settings: true }),
-  );
-  await user.click(
-    view.getByRole("button", { name: "Watch this Bot's screen" }),
-  );
+  await act(async () => {
+    await productionRouter.history.back();
+  });
   await waitFor(() =>
     expect(productionRouter.state.location.search).toEqual({ watch: true }),
   );
+  expect(view.queryByText("Production route draft")).toBeNull();
+  expect(document.activeElement).toBe(
+    view.getByRole("button", { name: "Review draft" }),
+  );
+
   await act(async () => {
     await productionRouter.navigate({
       search: (previous) =>

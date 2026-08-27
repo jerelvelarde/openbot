@@ -45,7 +45,10 @@ export function DetailPanel({
   detailWidth?: number;
   /** On the app's narrow layout, let a large detail replace the main surface instead of squeezing it. */
   collapseAtNarrow?: boolean;
-  /** Changes when an already-open pane becomes a new focus destination, such as a selected draft. */
+  /**
+   * Opts this pane into focus entry/restoration. Change the value when an already-open pane becomes
+   * a new user focus destination, such as a selected draft. Automatic panes should leave it unset.
+   */
   focusKey?: string;
   children: ReactNode;
 }) {
@@ -54,27 +57,31 @@ export function DetailPanel({
   const headingRef = useRef<HTMLHeadingElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
-  const wasOpenRef = useRef(false);
+  const managedFocusRef = useRef(false);
   const previousFocusKeyRef = useRef<string | undefined>(undefined);
   const hasTitle = title !== undefined && title !== null;
 
   useEffect(() => {
-    const opening =
+    const shouldMoveFocus =
       open &&
-      (!wasOpenRef.current ||
-        (focusKey !== undefined && focusKey !== previousFocusKeyRef.current));
-    if (opening) {
-      const active = document.activeElement;
-      returnFocusRef.current =
-        active instanceof HTMLElement && active !== document.body
-          ? active
-          : null;
+      focusKey !== undefined &&
+      (!managedFocusRef.current || focusKey !== previousFocusKeyRef.current);
+    if (shouldMoveFocus) {
+      if (!managedFocusRef.current) {
+        const active = document.activeElement;
+        returnFocusRef.current =
+          active instanceof HTMLElement && active !== document.body
+            ? active
+            : null;
+      }
       queueMicrotask(() => {
         const destination = hasTitle ? headingRef.current : closeRef.current;
         if (destination?.isConnected) destination.focus();
       });
     }
-    if (!open && wasOpenRef.current) {
+    const leavingManagedPane =
+      managedFocusRef.current && (!open || focusKey === undefined);
+    if (leavingManagedPane) {
       const origin = returnFocusRef.current;
       queueMicrotask(() => {
         const fallback = document.querySelector<HTMLElement>(
@@ -85,7 +92,7 @@ export function DetailPanel({
       });
       returnFocusRef.current = null;
     }
-    wasOpenRef.current = open;
+    managedFocusRef.current = open && focusKey !== undefined;
     previousFocusKeyRef.current = focusKey;
   }, [focusKey, hasTitle, open]);
 
