@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import {
   type AuditEventInput,
   createAuditStore,
@@ -332,10 +332,10 @@ describe("owned local Typefully drafts", () => {
         draftId: created.id,
         actorId: ownerId,
         expectedVersion: 2,
-        remoteDraftId: "remote-after-revocation",
+        remoteDraftId: "101",
       });
       expect(confirmed).toMatchObject({
-        remoteDraftId: "remote-after-revocation",
+        remoteDraftId: "101",
         remoteVersion: 2,
         syncStatus: "synced",
       });
@@ -346,7 +346,7 @@ describe("owned local Typefully drafts", () => {
         expectedVersion: 2,
         error: "Vendor failed after authorization.",
       });
-      expect(failed.syncStatus).toBe("remote_error");
+      expect(failed.syncStatus).toBe("synced");
     } finally {
       createGranted = true;
       updateGranted = true;
@@ -388,7 +388,7 @@ describe("owned local Typefully drafts", () => {
       draftId: remoteBacked.id,
       actorId: ownerId,
       expectedVersion: 1,
-      remoteDraftId: "remote-asymmetric",
+      remoteDraftId: "102",
     });
     createGranted = true;
     updateGranted = false;
@@ -412,7 +412,7 @@ describe("owned local Typefully drafts", () => {
       expect(locallySaved).toMatchObject({
         version: 2,
         syncStatus: "grant_blocked",
-        remoteDraftId: "remote-asymmetric",
+        remoteDraftId: "102",
       });
     } finally {
       createGranted = true;
@@ -434,7 +434,7 @@ describe("owned local Typefully drafts", () => {
       draftId: created.id,
       actorId: ownerId,
       expectedVersion: 1,
-      remoteDraftId: "remote-for-update",
+      remoteDraftId: "103",
     });
     expect(
       await store.authorizeRemoteOperation({
@@ -464,7 +464,7 @@ describe("owned local Typefully drafts", () => {
         expectedVersion: 1,
         error: "The already-started vendor attempt failed.",
       });
-      expect(recorded.syncStatus).toBe("remote_error");
+      expect(recorded.syncStatus).toBe("synced");
     } finally {
       await database
         .insert(channelAgents)
@@ -558,14 +558,14 @@ describe("owned local Typefully drafts", () => {
           draftId: created.id,
           actorId: otherId,
           expectedVersion: 1,
-          remoteDraftId: "must-not-land",
+          remoteDraftId: "104",
         }),
       () =>
         store.recordRemoteConfirmation({
           draftId: created.id,
           actorId: outsiderId,
           expectedVersion: 1,
-          remoteDraftId: "must-not-land",
+          remoteDraftId: "104",
         }),
       () =>
         store.recordRemoteFailure({
@@ -591,36 +591,238 @@ describe("owned local Typefully drafts", () => {
     }
   });
 
-  test("records exact remote confirmation and bounded remote failure without changing local content", async () => {
+  test("keeps a confirmed revision synced when its vendor failure arrives late", async () => {
     const created = await createOwnedDraft();
     const confirmed = await store.recordRemoteConfirmation({
       draftId: created.id,
       actorId: ownerId,
       expectedVersion: 1,
-      remoteDraftId: "remote-1",
+      remoteDraftId: "105",
     });
     expect(confirmed).toMatchObject({
       version: 1,
-      remoteDraftId: "remote-1",
+      remoteDraftId: "105",
       remoteVersion: 1,
       remoteHash: created.contentHash,
       syncStatus: "synced",
       lastError: null,
     });
 
-    const failed = await store.recordRemoteFailure({
+    const failuresBefore = await database
+      .select({ id: auditEvents.id })
+      .from(auditEvents)
+      .where(
+        and(
+          eq(auditEvents.targetId, created.id),
+          eq(auditEvents.eventType, "connector.sync_failed"),
+        ),
+      );
+    const lateFailure = await store.recordRemoteFailure({
       draftId: created.id,
       actorId: ownerId,
       expectedVersion: 1,
       error: `vendor refused ${"x".repeat(5_000)}`,
     });
-    expect(failed).toMatchObject({
+    expect(lateFailure).toMatchObject({
       version: 1,
       contentHash: created.contentHash,
       document: created.document,
+      syncStatus: "synced",
+      remoteDraftId: "105",
+      lastError: null,
+    });
+    const failuresAfter = await database
+      .select({ id: auditEvents.id })
+      .from(auditEvents)
+      .where(
+        and(
+          eq(auditEvents.targetId, created.id),
+          eq(auditEvents.eventType, "connector.sync_failed"),
+        ),
+      );
+    expect(failuresAfter).toHaveLength(failuresBefore.length);
+  });
+
+  test("makes remote confirmation identity first-writer-wins and idempotent per revision", async () => {
+    const created = await createOwnedDraft();
+    const first = await store.recordRemoteConfirmation({
+      draftId: created.id,
+      actorId: ownerId,
+      expectedVersion: 1,
+      remoteDraftId: "201",
+    });
+    const repeated = await store.recordRemoteConfirmation({
+      draftId: created.id,
+      actorId: ownerId,
+      expectedVersion: 1,
+      remoteDraftId: "201",
+    });
+    expect(repeated).toEqual(first);
+    await expect(
+      store.recordRemoteConfirmation({
+        draftId: created.id,
+        actorId: ownerId,
+        expectedVersion: 1,
+        remoteDraftId: "202",
+      }),
+    ).rejects.toMatchObject({
+      code: "remote_confirmation_conflict",
+      status: 409,
+      currentRemoteDraftId: "201",
+    });
+    expect((await store.readDraft(created.id, ownerId)).remoteDraftId).toBe(
+      "201",
+    );
+    const confirmations = await database
+      .select({ id: auditEvents.id })
+      .from(auditEvents)
+      .where(
+        and(
+          eq(auditEvents.targetId, created.id),
+          eq(auditEvents.eventType, "connector.sync_succeeded"),
+        ),
+      );
+    expect(confirmations).toHaveLength(1);
+
+    const saved = await store.saveDraft({
+      draftId: created.id,
+      actorId: ownerId,
+      expectedVersion: 1,
+      document: document("A new local revision."),
+    });
+    const reconfirmed = await store.recordRemoteConfirmation({
+      draftId: created.id,
+      actorId: ownerId,
+      expectedVersion: 2,
+      remoteDraftId: "201",
+    });
+    expect(reconfirmed).toMatchObject({
+      version: 2,
+      remoteVersion: 2,
+      remoteHash: saved.contentHash,
+      remoteDraftId: "201",
+      syncStatus: "synced",
+    });
+
+    const nextRevision = await store.saveDraft({
+      draftId: created.id,
+      actorId: ownerId,
+      expectedVersion: 2,
+      document: document("A third local revision."),
+    });
+    const nextFailure = await store.recordRemoteFailure({
+      draftId: created.id,
+      actorId: ownerId,
+      expectedVersion: 3,
+      error: "The newest revision failed remotely.",
+    });
+    expect(nextFailure).toMatchObject({
+      version: 3,
+      contentHash: nextRevision.contentHash,
+      remoteVersion: 2,
+      remoteDraftId: "201",
       syncStatus: "remote_error",
     });
-    expect(failed.lastError?.length).toBeLessThanOrEqual(500);
+  });
+
+  test("serializes competing first confirmations without orphaning a remote identity", async () => {
+    const created = await createOwnedDraft();
+    const results = await Promise.allSettled([
+      store.recordRemoteConfirmation({
+        draftId: created.id,
+        actorId: ownerId,
+        expectedVersion: 1,
+        remoteDraftId: "211",
+      }),
+      store.recordRemoteConfirmation({
+        draftId: created.id,
+        actorId: ownerId,
+        expectedVersion: 1,
+        remoteDraftId: "212",
+      }),
+    ]);
+    const fulfilled = results.filter(
+      (
+        result,
+      ): result is PromiseFulfilledResult<
+        Awaited<ReturnType<typeof store.recordRemoteConfirmation>>
+      > => result.status === "fulfilled",
+    );
+    const rejected = results.filter(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]?.reason).toMatchObject({
+      code: "remote_confirmation_conflict",
+      status: 409,
+    });
+    expect((await store.readDraft(created.id, ownerId)).remoteDraftId).toBe(
+      fulfilled[0]?.value.remoteDraftId,
+    );
+  });
+
+  test("allows confirmation to upgrade a failure for the same revision", async () => {
+    const created = await createOwnedDraft();
+    const failed = await store.recordRemoteFailure({
+      draftId: created.id,
+      actorId: ownerId,
+      expectedVersion: 1,
+      error: "Vendor temporarily unavailable.",
+    });
+    expect(failed.syncStatus).toBe("remote_error");
+    const confirmed = await store.recordRemoteConfirmation({
+      draftId: created.id,
+      actorId: ownerId,
+      expectedVersion: 1,
+      remoteDraftId: "221",
+    });
+    expect(confirmed).toMatchObject({
+      syncStatus: "synced",
+      remoteVersion: 1,
+      remoteHash: created.contentHash,
+      remoteDraftId: "221",
+      lastError: null,
+    });
+  });
+
+  test("rejects unusable Typefully v2 remote draft ids before persistence", async () => {
+    const created = await createOwnedDraft();
+    for (const remoteDraftId of [
+      "",
+      " ",
+      "0",
+      "-1",
+      "1.5",
+      "01",
+      "123\0",
+      "draft-1",
+      "9".repeat(241),
+      "9007199254740992",
+    ]) {
+      await expect(
+        store.recordRemoteConfirmation({
+          draftId: created.id,
+          actorId: ownerId,
+          expectedVersion: 1,
+          remoteDraftId,
+        }),
+      ).rejects.toMatchObject({
+        code: "invalid_remote_draft_id",
+        status: 400,
+      });
+    }
+    expect(
+      (await store.readDraft(created.id, ownerId)).remoteDraftId,
+    ).toBeNull();
+
+    const valid = await store.recordRemoteConfirmation({
+      draftId: created.id,
+      actorId: ownerId,
+      expectedVersion: 1,
+      remoteDraftId: "9007199254740991",
+    });
+    expect(valid.remoteDraftId).toBe("9007199254740991");
   });
 
   test("sanitizes control characters and credential-shaped remote errors", async () => {
@@ -630,7 +832,7 @@ describe("owned local Typefully drafts", () => {
       actorId: ownerId,
       expectedVersion: 1,
       error:
-        'Vendor\0 refused\u0007 Authorization: Bearer sk-live-secret api_key=tf-live-secret API\0key tf-third-secret token="generic-token-secret"; token budget stays readable',
+        'Vendor\0 refused\u0007 Authorization: Bearer sk-live-secret api_key=tf-live-secret API\0key tf-third-secret token="generic-token-secret"; api\u200b\u200bkey="zero-width-secret" ACCESS  TOKEN=\'access-secret\' client_secret=client-secret Id_Token : "id-secret"; token budget stays readable',
     });
 
     expect(failed.lastError).toContain("Vendor refused");
@@ -639,9 +841,46 @@ describe("owned local Typefully drafts", () => {
     expect(failed.lastError).not.toContain("tf-live-secret");
     expect(failed.lastError).not.toContain("tf-third-secret");
     expect(failed.lastError).not.toContain("generic-token-secret");
+    expect(failed.lastError).not.toContain("zero-width-secret");
+    expect(failed.lastError).not.toContain("access-secret");
+    expect(failed.lastError).not.toContain("client-secret");
+    expect(failed.lastError).not.toContain("id-secret");
     expect(failed.lastError).toContain("token budget stays readable");
     expect(failed.lastError).not.toMatch(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u);
     expect(Array.from(failed.lastError ?? "").length).toBeLessThanOrEqual(500);
+  });
+
+  test("redacts repeated Unicode and multi-separator credential fields", async () => {
+    const created = await createOwnedDraft();
+    const failed = await store.recordRemoteFailure({
+      draftId: created.id,
+      actorId: ownerId,
+      expectedVersion: 1,
+      error: [
+        'api\u2028key : = "line-secret"',
+        "client\u2060secret : = client-secret-value",
+        'id—token：： "id-secret-value"',
+        "refresh___token = = refresh-secret-value",
+        "access\u00a0\u00a0token ::: access-secret-value",
+        "Authorization : = Bearer auth-secret-value",
+        "client_secret=second-client-secret",
+      ].join("; "),
+    });
+
+    for (const secret of [
+      "line-secret",
+      "client-secret-value",
+      "id-secret-value",
+      "refresh-secret-value",
+      "access-secret-value",
+      "auth-secret-value",
+      "second-client-secret",
+    ]) {
+      expect(failed.lastError).not.toContain(secret);
+    }
+    expect(
+      failed.lastError?.match(/\[redacted\]/g)?.length,
+    ).toBeGreaterThanOrEqual(7);
   });
 
   test("holds membership and attachment references through committing local mutations", async () => {

@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, isNull, ne, or } from "drizzle-orm";
 import {
   type AuditTransaction,
   recordAuditEvent,
@@ -21,7 +21,11 @@ import {
 
 const LAST_ERROR_MAX_LENGTH = 500;
 const DEFAULT_VENDOR_ID = "typefully";
+const MAX_TYPEFULLY_DRAFT_ID = BigInt(Number.MAX_SAFE_INTEGER);
 type RemoteDraftOperation = "create_draft" | "update_draft";
+
+const SENSITIVE_ERROR_FIELD =
+  /\b(api[\p{P}\p{Z}\s]*key|authorization|access[\p{P}\p{Z}\s]*token|refresh[\p{P}\p{Z}\s]*token|client[\p{P}\p{Z}\s]*secret|id[\p{P}\p{Z}\s]*token|token|secret)(\s*(?:[:=]\s*)+|\s+)("[^"]*"|'[^']*'|[^\s,;&]+)/giu;
 
 type AuthorizationSurface = {
   decide(kind: PluginKind, ref: string, botId: string): Promise<PluginDecision>;
@@ -97,6 +101,26 @@ export class GrantRequiredError extends Error {
   }
 }
 
+export class InvalidRemoteDraftIdError extends Error {
+  readonly code = "invalid_remote_draft_id" as const;
+  readonly status = 400 as const;
+
+  constructor() {
+    super("Typefully returned an invalid draft id.");
+    this.name = "InvalidRemoteDraftIdError";
+  }
+}
+
+export class RemoteConfirmationConflictError extends Error {
+  readonly code = "remote_confirmation_conflict" as const;
+  readonly status = 409 as const;
+
+  constructor(readonly currentRemoteDraftId: string) {
+    super("This draft revision is already attached to another remote draft.");
+    this.name = "RemoteConfirmationConflictError";
+  }
+}
+
 const draftSelection = {
   id: typefullyDrafts.id,
   ownerUserId: typefullyDrafts.ownerUserId,
@@ -153,23 +177,47 @@ function serverIdFor(vendor: VendorIdentity | undefined): string {
   return DEFAULT_VENDOR_ID;
 }
 
+function redactSensitiveErrorFields(value: string): string {
+  return value.replace(
+    SENSITIVE_ERROR_FIELD,
+    (match, label: string, separator: string) => {
+      const normalizedLabel = label
+        .replaceAll(/[^a-zA-Z0-9]/g, "")
+        .toLowerCase();
+      if (!separator.includes(":") && !separator.includes("=")) {
+        // Keep ordinary prose ("token budget", "secret sauce") readable. The API-key form is
+        // also commonly emitted as "API key abc123", so it is the one whitespace-only label.
+        if (normalizedLabel !== "apikey") return match;
+      }
+      return `${label.replaceAll(/\s+/g, " ")}=[redacted]`;
+    },
+  );
+}
+
 function boundedError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
-  const redacted = message
+  const normalized = message
+    .normalize("NFKC")
     .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ")
     .replace(/\bBearer\s+[^\s,;&]+/giu, "Bearer [redacted]")
-    .replace(
-      /\b(api[\s_-]?key|authorization|access[\s_-]?token|refresh[\s_-]?token|secret)(?:\s*[:=]\s*|\s+)(?:"[^"]*"|'[^']*'|[^\s,;&]+)/giu,
-      "$1=[redacted]",
-    )
-    .replace(
-      /\btoken\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;&]+)/giu,
-      "token=[redacted]",
-    )
+    .replace(/\s+/g, " ");
+  const redacted = redactSensitiveErrorFields(normalized)
     .replace(/\s+/g, " ")
     .trim();
   const safe = Array.from(redacted).slice(0, LAST_ERROR_MAX_LENGTH).join("");
   return safe || "The remote operation failed.";
+}
+
+function validRemoteDraftId(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    !/^[1-9]\d*$/.test(value) ||
+    value.length > String(Number.MAX_SAFE_INTEGER).length ||
+    BigInt(value) > MAX_TYPEFULLY_DRAFT_ID
+  ) {
+    throw new InvalidRemoteDraftIdError();
+  }
+  return value;
 }
 
 async function ownedDraft(
@@ -273,6 +321,14 @@ function auditPayload(draft: TypefullyDraft) {
 
 function remoteOperationFor(draft: TypefullyDraft): RemoteDraftOperation {
   return draft.remoteDraftId ? "update_draft" : "create_draft";
+}
+
+function isCurrentRevisionConfirmed(draft: TypefullyDraft): boolean {
+  return (
+    draft.remoteDraftId !== null &&
+    draft.remoteVersion === draft.version &&
+    draft.remoteHash === draft.contentHash
+  );
 }
 
 export function createTypefullyStore(options: {
@@ -493,6 +549,7 @@ export function createTypefullyStore(options: {
       expectedVersion: number;
       remoteDraftId: string;
     }): Promise<TypefullyDraft> {
+      const remoteDraftId = validRemoteDraftId(input.remoteDraftId);
       return database.transaction(async (transaction) => {
         const current = await ownedDraft(
           transaction,
@@ -507,7 +564,7 @@ export function createTypefullyStore(options: {
         const [row] = await transaction
           .update(typefullyDrafts)
           .set({
-            remoteDraftId: input.remoteDraftId,
+            remoteDraftId,
             remoteVersion: current.version,
             remoteHash: current.contentHash,
             syncStatus: "synced",
@@ -519,6 +576,17 @@ export function createTypefullyStore(options: {
               eq(typefullyDrafts.id, input.draftId),
               eq(typefullyDrafts.ownerUserId, input.actorId),
               eq(typefullyDrafts.version, input.expectedVersion),
+              eq(typefullyDrafts.contentHash, current.contentHash),
+              or(
+                isNull(typefullyDrafts.remoteDraftId),
+                eq(typefullyDrafts.remoteDraftId, remoteDraftId),
+              ),
+              or(
+                isNull(typefullyDrafts.remoteVersion),
+                ne(typefullyDrafts.remoteVersion, current.version),
+                isNull(typefullyDrafts.remoteHash),
+                ne(typefullyDrafts.remoteHash, current.contentHash),
+              ),
             ),
           )
           .returning(draftSelection);
@@ -528,6 +596,24 @@ export function createTypefullyStore(options: {
             input.draftId,
             input.actorId,
           );
+          if (
+            latest.version !== input.expectedVersion ||
+            latest.contentHash !== current.contentHash
+          ) {
+            throw new VersionConflictError(latest.version, latest.contentHash);
+          }
+          if (
+            latest.remoteDraftId !== null &&
+            latest.remoteDraftId !== remoteDraftId
+          ) {
+            throw new RemoteConfirmationConflictError(latest.remoteDraftId);
+          }
+          if (
+            latest.remoteDraftId === remoteDraftId &&
+            isCurrentRevisionConfirmed(latest)
+          ) {
+            return latest;
+          }
           throw new VersionConflictError(latest.version, latest.contentHash);
         }
         const draft = asDraft(row);
@@ -548,6 +634,7 @@ export function createTypefullyStore(options: {
       expectedVersion: number;
       error: unknown;
     }): Promise<TypefullyDraft> {
+      const lastError = boundedError(input.error);
       return database.transaction(async (transaction) => {
         const current = await ownedDraft(
           transaction,
@@ -563,7 +650,7 @@ export function createTypefullyStore(options: {
           .update(typefullyDrafts)
           .set({
             syncStatus: "remote_error",
-            lastError: boundedError(input.error),
+            lastError,
             updatedAt: new Date(),
           })
           .where(
@@ -571,6 +658,18 @@ export function createTypefullyStore(options: {
               eq(typefullyDrafts.id, input.draftId),
               eq(typefullyDrafts.ownerUserId, input.actorId),
               eq(typefullyDrafts.version, input.expectedVersion),
+              eq(typefullyDrafts.contentHash, current.contentHash),
+              or(
+                isNull(typefullyDrafts.remoteVersion),
+                ne(typefullyDrafts.remoteVersion, current.version),
+                isNull(typefullyDrafts.remoteHash),
+                ne(typefullyDrafts.remoteHash, current.contentHash),
+              ),
+              or(
+                ne(typefullyDrafts.syncStatus, "remote_error"),
+                isNull(typefullyDrafts.lastError),
+                ne(typefullyDrafts.lastError, lastError),
+              ),
             ),
           )
           .returning(draftSelection);
@@ -580,6 +679,19 @@ export function createTypefullyStore(options: {
             input.draftId,
             input.actorId,
           );
+          if (
+            latest.version !== input.expectedVersion ||
+            latest.contentHash !== current.contentHash
+          ) {
+            throw new VersionConflictError(latest.version, latest.contentHash);
+          }
+          if (
+            isCurrentRevisionConfirmed(latest) ||
+            (latest.syncStatus === "remote_error" &&
+              latest.lastError === lastError)
+          ) {
+            return latest;
+          }
           throw new VersionConflictError(latest.version, latest.contentHash);
         }
         const draft = asDraft(row);
