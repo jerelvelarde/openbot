@@ -35,6 +35,7 @@ import type { PolicyStore } from "./computer/policy-store";
 import { createComputerRoutes } from "./computer/routes";
 import { configuredAuthProviders, type DeploymentConfig } from "./config";
 import type { CredentialAdminService, CredentialInput } from "./credentials";
+import { RequestBodyTooLargeError, readBoundedJson } from "./http/bounded-json";
 import { createIntelligenceClient } from "./intelligence-client";
 import type { PeopleStore } from "./people/store";
 import { createPluginRoutes } from "./plugins/routes";
@@ -797,7 +798,15 @@ export function createApp(
        * anything holding that token could spend any Bot's grants and write any name into the audit
        * trail. A forgeable trail is worse than no trail, because it is believed.
        */
-      const body = (await context.req.json().catch(() => null)) as {
+      let parsedBody: unknown = null;
+      try {
+        parsedBody = await readBoundedJson(context.req.raw, 12_000_000);
+      } catch (error) {
+        if (error instanceof RequestBodyTooLargeError) {
+          return context.json({ error: "Request body is too large." }, 413);
+        }
+      }
+      const body = parsedBody as {
         name?: string;
         args?: Record<string, unknown>;
         run?: unknown;

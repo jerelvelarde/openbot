@@ -41,6 +41,16 @@ export const typefullyDrafts = pgTable(
     syncStatus: text("sync_status").notNull(),
     /** Length is bounded when application input is validated; Postgres keeps the full diagnostic. */
     lastError: text("last_error"),
+    /** Durable single-flight ownership for remote draft/media work. Never exposed to Bots. */
+    attemptId: uuid("attempt_id"),
+    attemptKind: text("attempt_kind"),
+    attemptState: text("attempt_state"),
+    attemptVersion: integer("attempt_version"),
+    attemptHash: text("attempt_hash"),
+    attemptRemoteDraftId: text("attempt_remote_draft_id"),
+    attemptLeaseExpiresAt: timestamp("attempt_lease_expires_at", {
+      withTimezone: true,
+    }),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
@@ -56,6 +66,14 @@ export const typefullyDrafts = pgTable(
       table.channelId,
     ),
     check("typefully_drafts_version_positive", sql`${table.version} > 0`),
+    check(
+      "typefully_drafts_attempt_complete",
+      sql`(${table.attemptId} IS NULL AND ${table.attemptKind} IS NULL AND ${table.attemptState} IS NULL AND ${table.attemptVersion} IS NULL AND ${table.attemptHash} IS NULL AND ${table.attemptLeaseExpiresAt} IS NULL) OR (${table.attemptId} IS NOT NULL AND ${table.attemptKind} IS NOT NULL AND ${table.attemptState} IS NOT NULL AND ${table.attemptVersion} IS NOT NULL AND ${table.attemptHash} IS NOT NULL AND ${table.attemptLeaseExpiresAt} IS NOT NULL)`,
+    ),
+    check(
+      "typefully_drafts_attempt_state_valid",
+      sql`${table.attemptState} IS NULL OR ${table.attemptState} IN ('in_flight', 'outcome_uncertain')`,
+    ),
   ],
 );
 

@@ -47,7 +47,10 @@ const plugin = {
     deniedRefs.has(ref)
       ? ({ allowed: false, reason: "Grant removed." } as const)
       : ({ allowed: true } as const),
-  callTool: async (input: { ref: string; args: Record<string, unknown> }) => {
+  dispatchVendor: async (input: {
+    ref: string;
+    args: Record<string, unknown>;
+  }) => {
     calls.push({ ref: input.ref, args: input.args });
     if (vendorGate) {
       vendorGate.entered();
@@ -77,7 +80,24 @@ const requireUser: MiddlewareHandler<{ Variables: AppVariables }> = async (
   await next();
 };
 const app = new Hono<{ Variables: AppVariables }>();
-app.route("/api/typefully", createTypefullyRoutes(store, requireUser));
+let uploadStatus = 200;
+const byteUploads: Array<{ url: string; address: string; bytes: number }> = [];
+app.route(
+  "/api/typefully",
+  createTypefullyRoutes(store, requireUser, {
+    mediaUpload: {
+      resolve: async () => [{ address: "203.0.113.10", family: 4 }],
+      put: async ({ url, address, bytes }) => {
+        byteUploads.push({
+          url: url.toString(),
+          address: address.address,
+          bytes: bytes.byteLength,
+        });
+        return uploadStatus;
+      },
+    },
+  }),
+);
 
 const document = (text = "First") => ({
   title: "Sync",
@@ -243,7 +263,7 @@ describe("Typefully synchronization", () => {
     expect(calls.length).toBe(before + 1);
   });
 
-  test("persists malformed successful remote ids as remote_error", async () => {
+  test("makes malformed successful create ids require reconciliation", async () => {
     for (const invalid of ["", "0", "9007199254740992"]) {
       const id = await createDraft();
       queuedResults.push({
@@ -253,26 +273,31 @@ describe("Typefully synchronization", () => {
       const response = await app.request(`/api/typefully/drafts/${id}/sync`, {
         method: "POST",
       });
-      expect(response.status).toBe(502);
+      expect(response.status).toBe(409);
       expect(await response.json()).toMatchObject({
-        code: "remote_error",
-        draft: { version: 1, syncStatus: "remote_error" },
+        code: "reconciliation_required",
+        draftId: id,
       });
+      const callsAfter = calls.length;
+      const retry = await app.request(`/api/typefully/drafts/${id}/sync`, {
+        method: "POST",
+      });
+      expect(retry.status).toBe(409);
+      expect(calls.length).toBe(callsAfter);
     }
   });
 
-  test("a thrown vendor transport failure is persisted as remote_error", async () => {
+  test("an ambiguous create transport failure cannot be blindly retried", async () => {
     const id = await createDraft();
     thrownFailure = new Error("socket closed before Typefully answered");
     const response = await app.request(`/api/typefully/drafts/${id}/sync`, {
       method: "POST",
     });
     thrownFailure = null;
-    expect(response.status).toBe(502);
+    expect(response.status).toBe(409);
     expect(await response.json()).toMatchObject({
-      code: "remote_error",
-      message: "socket closed before Typefully answered",
-      draft: { version: 1, syncStatus: "remote_error" },
+      code: "reconciliation_required",
+      draftId: id,
     });
   });
 
@@ -339,40 +364,27 @@ describe("Typefully synchronization", () => {
       },
       { text: JSON.stringify({ id: "503" }), isError: false },
     );
-    const originalFetch = globalThis.fetch;
-    const byteUploads: Request[] = [];
-    globalThis.fetch = (async (
-      input: RequestInfo | URL,
-      init?: RequestInit,
-    ) => {
-      byteUploads.push(new Request(input, init));
-      return new Response(null, { status: 200 });
-    }) as typeof fetch;
-    try {
-      const retry = new FormData();
-      retry.set("expectedVersion", "2");
-      retry.set("mediaId", failedBody.media.id);
-      retry.set("kind", "image");
-      retry.set("altText", "Release image");
-      retry.set(
-        "file",
-        new File(["image"], "release.png", { type: "image/png" }),
-      );
-      const retried = await app.request(`/api/typefully/drafts/${id}/media`, {
-        method: "POST",
-        body: retry,
-      });
-      expect(retried.status).toBe(201);
-      expect(await retried.json()).toMatchObject({
-        draft: { version: 3, mediaCount: 1, syncStatus: "synced" },
-        media: { id: failedBody.media.id, remoteId: "media-1" },
-      });
-      expect(byteUploads).toHaveLength(1);
-      expect(byteUploads[0]?.method).toBe("PUT");
-      expect(byteUploads[0]?.headers.get("content-type")).toBe("image/png");
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
+    byteUploads.length = 0;
+    const retry = new FormData();
+    retry.set("expectedVersion", "2");
+    retry.set("mediaId", failedBody.media.id);
+    retry.set("kind", "image");
+    retry.set("altText", "Release image");
+    retry.set(
+      "file",
+      new File(["image"], "release.png", { type: "image/png" }),
+    );
+    const retried = await app.request(`/api/typefully/drafts/${id}/media`, {
+      method: "POST",
+      body: retry,
+    });
+    expect(retried.status).toBe(201);
+    expect(await retried.json()).toMatchObject({
+      draft: { version: 3, mediaCount: 1, syncStatus: "synced" },
+      media: { id: failedBody.media.id, remoteId: "media-1" },
+    });
+    expect(byteUploads).toHaveLength(1);
+    expect(byteUploads[0]?.bytes).toBe(5);
   });
 
   test("does not forward media bytes through a presigned redirect", async () => {
@@ -384,42 +396,20 @@ describe("Typefully synchronization", () => {
       }),
       isError: false,
     });
-    const originalFetch = globalThis.fetch;
-    const uploads: { url: string; redirect: RequestRedirect | undefined }[] =
-      [];
-    globalThis.fetch = (async (
-      input: RequestInfo | URL,
-      init?: RequestInit,
-    ) => {
-      uploads.push({ url: String(input), redirect: init?.redirect });
-      return new Response(null, {
-        status: 307,
-        headers: { location: "http://169.254.169.254/latest/meta-data" },
-      });
-    }) as typeof fetch;
-    try {
-      const form = new FormData();
-      form.set("expectedVersion", "1");
-      form.set("kind", "image");
-      form.set("altText", "Release image");
-      form.set(
-        "file",
-        new File(["image"], "release.png", { type: "image/png" }),
-      );
-      const response = await app.request(`/api/typefully/drafts/${id}/media`, {
-        method: "POST",
-        body: form,
-      });
-      expect(response.status).toBe(502);
-      expect(uploads).toEqual([
-        {
-          url: "https://uploads.typefully.test/presigned",
-          redirect: "manual",
-        },
-      ]);
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
+    byteUploads.length = 0;
+    uploadStatus = 307;
+    const form = new FormData();
+    form.set("expectedVersion", "1");
+    form.set("kind", "image");
+    form.set("altText", "Release image");
+    form.set("file", new File(["image"], "release.png", { type: "image/png" }));
+    const response = await app.request(`/api/typefully/drafts/${id}/media`, {
+      method: "POST",
+      body: form,
+    });
+    expect(response.status).toBe(502);
+    expect(byteUploads).toHaveLength(1);
+    uploadStatus = 200;
   });
 
   test("uses upload and remove grants independently from draft update", async () => {

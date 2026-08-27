@@ -569,6 +569,15 @@ export type PluginStoreOptions = {
     botId: string;
     actorId: string;
   }) => Promise<{ text: string; isError: boolean } | null>;
+  /** Receives a closure that can bypass local dispatch; it is never exposed on PluginStore. */
+  vendorDispatcherReady?: (
+    dispatch: (input: {
+      ref: string;
+      args: Record<string, unknown>;
+      botId: string;
+      actorId: string;
+    }) => Promise<{ text: string; isError: boolean }>,
+  ) => void;
   /** Trading a refresh token for a short-lived access token. Defaults to a real HTTP exchange. */
   exchangeRefreshToken?: (input: {
     tokenUrl: string;
@@ -611,6 +620,25 @@ export function createPluginStore(options: PluginStoreOptions) {
       }
       return await validateTypefullyApiKey(apiKey);
     });
+  const vendorDispatch = Symbol("first-party-vendor-dispatch");
+
+  async function recordOutcomeAudit(
+    event: Parameters<typeof recordAuditEvent>[1],
+  ): Promise<void> {
+    try {
+      await recordAuditEvent(auditStore, event);
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          type: "mcp-outcome-audit-write-failed",
+          eventType: event.eventType,
+          targetId: event.targetId,
+          failureClass:
+            error instanceof Error ? error.name : "unknown_audit_failure",
+        }),
+      );
+    }
+  }
 
   /*
    * One exchange at a time per (server, person). A rotating vendor invalidates the refresh
@@ -1806,7 +1834,7 @@ export function createPluginStore(options: PluginStoreOptions) {
     return { row, entry };
   }
 
-  return {
+  const store = {
     /**
      * Add a server from the catalogue.
      *
@@ -3363,8 +3391,6 @@ export function createPluginStore(options: PluginStoreOptions) {
       args: Record<string, unknown>;
       botId: string;
       actorId: string;
-      /** Server-only: local orchestration has already produced the immutable vendor DTO. */
-      _vendorDispatch?: boolean;
     }): Promise<{ text: string; isError: boolean }> {
       const [serverId, ...rest] = input.ref.split("/");
       const toolName = rest.join("/");
@@ -3503,7 +3529,9 @@ export function createPluginStore(options: PluginStoreOptions) {
        * it did.
        */
       try {
-        const local = input._vendorDispatch
+        const local = (input as typeof input & { [vendorDispatch]?: true })[
+          vendorDispatch
+        ]
           ? null
           : await options.firstPartyTool?.({
               serverId,
@@ -3513,7 +3541,7 @@ export function createPluginStore(options: PluginStoreOptions) {
               actorId: input.actorId,
             });
         if (local) {
-          await recordAuditEvent(auditStore, {
+          await recordOutcomeAudit({
             eventType: local.isError ? "mcp.call_failed" : "mcp.call_succeeded",
             targetType: "mcp_tool",
             targetId: input.ref,
@@ -3530,7 +3558,7 @@ export function createPluginStore(options: PluginStoreOptions) {
           toolName,
           args,
         );
-        await recordAuditEvent(auditStore, {
+        await recordOutcomeAudit({
           eventType: result.isError ? "mcp.call_failed" : "mcp.call_succeeded",
           targetType: "mcp_tool",
           targetId: input.ref,
@@ -3547,7 +3575,7 @@ export function createPluginStore(options: PluginStoreOptions) {
          * that the failure class now exists in the trail, which is enough to distinguish connection,
          * policy and transport failures without retaining vendor text that may contain private data.
          */
-        await recordAuditEvent(auditStore, {
+        await recordOutcomeAudit({
           eventType: "mcp.call_failed",
           targetType: "mcp_tool",
           targetId: input.ref,
@@ -3565,6 +3593,10 @@ export function createPluginStore(options: PluginStoreOptions) {
       }
     },
   };
+  options.vendorDispatcherReady?.((input) =>
+    store.callTool({ ...input, [vendorDispatch]: true } as typeof input),
+  );
+  return store;
 }
 
 /**

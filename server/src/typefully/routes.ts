@@ -3,12 +3,18 @@ import type { Context, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import type { AppVariables } from "../auth/guards";
 import { checkNavigationTarget } from "../computer/target";
+import { readBoundedJson } from "../http/bounded-json";
 import { ConnectionRequiredError, PluginRefusedError } from "../plugins/store";
 import { draftSummary } from "./document";
+import {
+  type MediaUploadDependencies,
+  uploadPresignedMedia,
+} from "./media-upload";
 import {
   BotNotAttachedError,
   DraftNotFoundError,
   GrantRequiredError,
+  ReconciliationRequiredError,
   SyncInProgressError,
   type TypefullyDraft,
   type TypefullyStore,
@@ -18,7 +24,6 @@ import {
 const MAX_JSON_BYTES = 1_000_000;
 const MAX_MEDIA_BYTES = 25_000_000;
 const MAX_ERROR_CHARS = 500;
-const MEDIA_UPLOAD_TIMEOUT_MS = 30_000;
 const MAX_MULTIPART_BYTES = MAX_MEDIA_BYTES + 1_000_000;
 const ALLOWED_MEDIA = new Set([
   "image/jpeg",
@@ -124,6 +129,16 @@ function errorResponse(
   if (error instanceof SyncInProgressError) {
     return context.json({ code: error.code }, 409);
   }
+  if (error instanceof ReconciliationRequiredError) {
+    return context.json(
+      {
+        code: error.code,
+        draftId: error.draftId,
+        message: safeError(error),
+      },
+      409,
+    );
+  }
   if (error instanceof ConnectionRequiredError) {
     return context.json(
       {
@@ -150,9 +165,7 @@ function errorResponse(
 async function jsonBody(context: {
   req: { raw: Request; json(): Promise<unknown> };
 }) {
-  const declared = Number(context.req.raw.headers.get("content-length") ?? 0);
-  if (declared > MAX_JSON_BYTES) throw new Error("Request body is too large.");
-  const body = await context.req.json();
+  const body = await readBoundedJson(context.req.raw, MAX_JSON_BYTES);
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     throw new Error("A JSON object is required.");
   }
@@ -223,18 +236,12 @@ function remoteMediaTarget(text: string): { id: string; uploadUrl: string } {
   return { id: String(id), uploadUrl: target.url };
 }
 
-async function uploadMediaBytes(file: File, uploadUrl: string): Promise<void> {
-  const response = await fetch(uploadUrl, {
-    method: "PUT",
-    headers: { "content-type": file.type },
-    body: file,
-    redirect: "manual",
-    signal: AbortSignal.timeout(MEDIA_UPLOAD_TIMEOUT_MS),
-  });
-  await response.body?.cancel().catch(() => {});
-  if (!response.ok) {
-    throw new Error(`Typefully media upload failed (${response.status}).`);
-  }
+async function uploadMediaBytes(
+  file: File,
+  uploadUrl: string,
+  dependencies?: MediaUploadDependencies,
+): Promise<void> {
+  await uploadPresignedMedia(file, uploadUrl, dependencies);
 }
 
 async function boundedFormData(request: Request): Promise<FormData> {
@@ -281,6 +288,7 @@ async function boundedFormData(request: Request): Promise<FormData> {
 export function createTypefullyRoutes(
   store: TypefullyStore,
   requireUser: MiddlewareHandler<{ Variables: AppVariables }>,
+  options: { mediaUpload?: MediaUploadDependencies } = {},
 ) {
   const routes = new Hono<{ Variables: AppVariables }>();
   routes.use("*", requireUser);
@@ -423,6 +431,31 @@ export function createTypefullyRoutes(
     }
   });
 
+  routes.post("/drafts/:id/reconcile", async (context) => {
+    const draftId = context.req.param("id");
+    try {
+      const body = await jsonBody(context);
+      if (
+        !Number.isSafeInteger(body.expectedVersion) ||
+        typeof body.remoteDraftId !== "string"
+      ) {
+        throw new Error("expectedVersion and remoteDraftId are required.");
+      }
+      const draft = await store.reconcileUncertainCreate({
+        draftId,
+        actorId: context.var.actor.id,
+        expectedVersion: body.expectedVersion as number,
+        remoteDraftId: body.remoteDraftId,
+      });
+      return context.json({
+        draft: summary(draft),
+        remote: remoteState(draft),
+      });
+    } catch (error) {
+      return errorResponse(context, error, draftId);
+    }
+  });
+
   routes.post("/drafts/:id/media", async (context) => {
     try {
       const form = await boundedFormData(context.req.raw);
@@ -502,7 +535,7 @@ export function createTypefullyRoutes(
           );
         }
         const target = remoteMediaTarget(remote.text);
-        await uploadMediaBytes(file, target.uploadUrl);
+        await uploadMediaBytes(file, target.uploadUrl, options.mediaUpload);
         const confirmedMedia = { ...media, remoteId: target.id };
         const confirmed = await store.saveDraft({
           draftId: saved.id,

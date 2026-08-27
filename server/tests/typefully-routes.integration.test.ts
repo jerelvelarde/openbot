@@ -48,7 +48,7 @@ const plugin = {
     granted && agentId === botId
       ? ({ allowed: true } as const)
       : ({ allowed: false, reason: "Grant removed." } as const),
-  callTool: async () => {
+  dispatchVendor: async () => {
     throw new ConnectionRequiredError("typefully", "Typefully");
   },
 };
@@ -404,6 +404,21 @@ describe("Typefully draft routes", () => {
       version: 2,
       socialSetLabel: "OpenBot",
     });
+    await database
+      .delete(channelAgents)
+      .where(eq(channelAgents.agentId, botId));
+    const detached = await call("mcp__typefully__update_draft", {
+      draftId: createdSummary.id,
+      expectedVersion: 2,
+      document: document("Must not persist"),
+    });
+    expect(detached.isError).toBe(true);
+    expect(detached.text).not.toContain("Must not persist");
+    expect((await store.readDraft(createdSummary.id, ownerId)).version).toBe(2);
+    await database
+      .insert(channelAgents)
+      .values({ channelId, agentId: botId })
+      .onConflictDoNothing();
   });
 
   test("generic MCP audit rows never retain vendor error text", async () => {

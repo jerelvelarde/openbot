@@ -291,10 +291,16 @@ const computerGateway = computerProvider
 const sandboxedStore = createSandboxedStore(database, bootAuditStore);
 
 let pluginStore: PluginStore;
+let typefullyVendorDispatch: Parameters<
+  NonNullable<Parameters<typeof createPluginStore>[0]["vendorDispatcherReady"]>
+>[0];
 const typefullyStore = createTypefullyStore({
   database,
   auditStore: bootAuditStore,
-  plugin: () => pluginStore,
+  plugin: () => ({
+    decide: pluginStore.decide.bind(pluginStore),
+    dispatchVendor: typefullyVendorDispatch,
+  }),
 });
 pluginStore = createPluginStore({
   database,
@@ -312,6 +318,9 @@ pluginStore = createPluginStore({
    */
   redirectUri: config.publicUrl ? redirectUriFor(config.publicUrl) : undefined,
   firstPartyTool: typefullyStore.callBotTool,
+  vendorDispatcherReady: (dispatch) => {
+    typefullyVendorDispatch = dispatch;
+  },
 });
 
 void recordAuditEvent(bootAuditStore, {

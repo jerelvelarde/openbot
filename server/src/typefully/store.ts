@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { and, eq, isNull, ne, or } from "drizzle-orm";
 import {
   type AuditTransaction,
@@ -25,6 +26,9 @@ const LAST_ERROR_MAX_LENGTH = 500;
 const DEFAULT_VENDOR_ID = "typefully";
 const MAX_TYPEFULLY_DRAFT_ID = BigInt(Number.MAX_SAFE_INTEGER);
 type RemoteDraftOperation = "create_draft" | "update_draft";
+type RemoteAttemptKind = RemoteDraftOperation | "upload_media" | "remove_media";
+type RemoteAttemptState = "in_flight" | "outcome_uncertain";
+const DEFAULT_ATTEMPT_LEASE_MS = 60_000;
 
 const SENSITIVE_ERROR_FIELD =
   /\b(api[\p{P}\p{Z}\s]*key|authorization|access[\p{P}\p{Z}\s]*token|refresh[\p{P}\p{Z}\s]*token|client[\p{P}\p{Z}\s]*secret|id[\p{P}\p{Z}\s]*token|token|secret)(\s*(?:[:=]\s*)+|\s+)("(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|[^\s,;&]+)/giu;
@@ -33,12 +37,11 @@ const SENSITIVE_JSON_FIELD =
 
 type AuthorizationSurface = {
   decide(kind: PluginKind, ref: string, botId: string): Promise<PluginDecision>;
-  callTool?(input: {
+  dispatchVendor?(input: {
     ref: string;
     args: Record<string, unknown>;
     botId: string;
     actorId: string;
-    _vendorDispatch?: boolean;
   }): Promise<{ text: string; isError: boolean }>;
 };
 
@@ -62,6 +65,13 @@ export type TypefullyDraft = {
   remoteHash: string | null;
   syncStatus: DraftSyncStatus;
   lastError: string | null;
+  attemptId: string | null;
+  attemptKind: RemoteAttemptKind | null;
+  attemptState: RemoteAttemptState | null;
+  attemptVersion: number | null;
+  attemptHash: string | null;
+  attemptRemoteDraftId: string | null;
+  attemptLeaseExpiresAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
 };
@@ -141,6 +151,20 @@ export class SyncInProgressError extends Error {
   }
 }
 
+export class ReconciliationRequiredError extends Error {
+  readonly code = "reconciliation_required" as const;
+  readonly status = 409 as const;
+  constructor(readonly draftId: string) {
+    super(
+      "Typefully may have created this draft. Confirm it in Typefully and attach its draft id before retrying.",
+    );
+    this.name = "ReconciliationRequiredError";
+  }
+}
+
+class StaleRemoteAttemptError extends Error {}
+class StaleAuthorizationError extends Error {}
+
 const draftSelection = {
   id: typefullyDrafts.id,
   ownerUserId: typefullyDrafts.ownerUserId,
@@ -154,6 +178,13 @@ const draftSelection = {
   remoteHash: typefullyDrafts.remoteHash,
   syncStatus: typefullyDrafts.syncStatus,
   lastError: typefullyDrafts.lastError,
+  attemptId: typefullyDrafts.attemptId,
+  attemptKind: typefullyDrafts.attemptKind,
+  attemptState: typefullyDrafts.attemptState,
+  attemptVersion: typefullyDrafts.attemptVersion,
+  attemptHash: typefullyDrafts.attemptHash,
+  attemptRemoteDraftId: typefullyDrafts.attemptRemoteDraftId,
+  attemptLeaseExpiresAt: typefullyDrafts.attemptLeaseExpiresAt,
   createdAt: typefullyDrafts.createdAt,
   updatedAt: typefullyDrafts.updatedAt,
 };
@@ -171,16 +202,40 @@ type SelectedDraft = {
   remoteHash: string | null;
   syncStatus: string;
   lastError: string | null;
+  attemptId: string | null;
+  attemptKind: string | null;
+  attemptState: string | null;
+  attemptVersion: number | null;
+  attemptHash: string | null;
+  attemptRemoteDraftId: string | null;
+  attemptLeaseExpiresAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
 };
 
 function asDraft(row: SelectedDraft): TypefullyDraft {
   const canonical = canonicalizeDraft(row.document);
+  if (
+    row.attemptKind !== null &&
+    !["create_draft", "update_draft", "upload_media", "remove_media"].includes(
+      row.attemptKind,
+    )
+  ) {
+    throw new Error("Stored Typefully attempt kind is invalid.");
+  }
+  if (
+    row.attemptState !== null &&
+    row.attemptState !== "in_flight" &&
+    row.attemptState !== "outcome_uncertain"
+  ) {
+    throw new Error("Stored Typefully attempt state is invalid.");
+  }
   return {
     ...row,
     document: canonical.document,
     syncStatus: syncStatusSchema.parse(row.syncStatus),
+    attemptKind: row.attemptKind as RemoteAttemptKind | null,
+    attemptState: row.attemptState as RemoteAttemptState | null,
   };
 }
 
@@ -287,6 +342,33 @@ async function ownedDraft(
   return asDraft(row);
 }
 
+async function lockedOwnedDraft(
+  transaction: AuditTransaction,
+  draftId: string,
+  actorId: string,
+): Promise<TypefullyDraft> {
+  const [row] = await transaction
+    .select(draftSelection)
+    .from(typefullyDrafts)
+    .innerJoin(
+      channelMemberships,
+      and(
+        eq(channelMemberships.channelId, typefullyDrafts.channelId),
+        eq(channelMemberships.userId, actorId),
+      ),
+    )
+    .where(
+      and(
+        eq(typefullyDrafts.id, draftId),
+        eq(typefullyDrafts.ownerUserId, actorId),
+      ),
+    )
+    .limit(1)
+    .for("update", { of: typefullyDrafts });
+  if (!row) throw new DraftNotFoundError();
+  return asDraft(row);
+}
+
 async function isBotAttached(
   executor: Database | AuditTransaction,
   channelId: string,
@@ -377,11 +459,25 @@ export function createTypefullyStore(options: {
   plugin: () => AuthorizationSurface;
   auditStore: TransactionalAuditStore;
   vendor?: VendorIdentity;
+  now?: () => Date;
+  attemptLeaseMs?: number;
 }) {
   const { database, plugin, auditStore } = options;
   const serverId = serverIdFor(options.vendor);
+  const now = options.now ?? (() => new Date());
+  const attemptLeaseMs = options.attemptLeaseMs ?? DEFAULT_ATTEMPT_LEASE_MS;
   const grantRef = (operation: RemoteDraftOperation) =>
     `${serverId}/${operation}`;
+
+  const clearedAttempt = {
+    attemptId: null,
+    attemptKind: null,
+    attemptState: null,
+    attemptVersion: null,
+    attemptHash: null,
+    attemptRemoteDraftId: null,
+    attemptLeaseExpiresAt: null,
+  } as const;
 
   async function isGranted(
     operation: RemoteDraftOperation,
@@ -420,6 +516,150 @@ export function createTypefullyStore(options: {
         ? {}
         : { draftId: Number(draft.remoteDraftId) }),
     };
+  }
+
+  async function claimSyncAttempt(
+    authorized: TypefullyDraft,
+    actorId: string,
+  ): Promise<
+    | { kind: "noop"; draft: TypefullyDraft }
+    | { kind: "claimed"; draft: TypefullyDraft; attemptId: string }
+  > {
+    return database.transaction(async (transaction) => {
+      let current = await lockedOwnedDraft(transaction, authorized.id, actorId);
+      const instant = now();
+      if (current.attemptId !== null) {
+        if (current.attemptState === "outcome_uncertain") {
+          throw new ReconciliationRequiredError(current.id);
+        }
+        if (
+          current.attemptLeaseExpiresAt !== null &&
+          current.attemptLeaseExpiresAt.getTime() > instant.getTime()
+        ) {
+          throw new SyncInProgressError();
+        }
+        if (
+          current.attemptKind === "create_draft" ||
+          current.attemptKind === "upload_media"
+        ) {
+          const [uncertain] = await transaction
+            .update(typefullyDrafts)
+            .set({
+              attemptState: "outcome_uncertain",
+              syncStatus: "remote_error",
+              lastError:
+                "The previous remote operation may have completed and must be reconciled before retrying.",
+              updatedAt: instant,
+            })
+            .where(
+              and(
+                eq(typefullyDrafts.id, current.id),
+                eq(typefullyDrafts.attemptId, current.attemptId),
+              ),
+            )
+            .returning(draftSelection);
+          if (uncertain) current = asDraft(uncertain);
+          throw new ReconciliationRequiredError(current.id);
+        }
+        const [reclaimed] = await transaction
+          .update(typefullyDrafts)
+          .set(clearedAttempt)
+          .where(
+            and(
+              eq(typefullyDrafts.id, current.id),
+              eq(typefullyDrafts.attemptId, current.attemptId),
+            ),
+          )
+          .returning(draftSelection);
+        if (!reclaimed) throw new SyncInProgressError();
+        current = asDraft(reclaimed);
+      }
+      if (isCurrentRevisionConfirmed(current)) {
+        return { kind: "noop", draft: current };
+      }
+      if (
+        current.version !== authorized.version ||
+        current.contentHash !== authorized.contentHash ||
+        current.remoteDraftId !== authorized.remoteDraftId ||
+        remoteOperationFor(current) !== remoteOperationFor(authorized)
+      ) {
+        throw new StaleAuthorizationError();
+      }
+      const attemptId = randomUUID();
+      const [claimed] = await transaction
+        .update(typefullyDrafts)
+        .set({
+          attemptId,
+          attemptKind: remoteOperationFor(current),
+          attemptState: "in_flight",
+          attemptVersion: current.version,
+          attemptHash: current.contentHash,
+          attemptRemoteDraftId: current.remoteDraftId,
+          attemptLeaseExpiresAt: new Date(
+            instant.getTime() + Math.max(1, attemptLeaseMs),
+          ),
+          syncStatus: "syncing",
+          lastError: null,
+          updatedAt: instant,
+        })
+        .where(
+          and(
+            eq(typefullyDrafts.id, current.id),
+            isNull(typefullyDrafts.attemptId),
+          ),
+        )
+        .returning(draftSelection);
+      if (!claimed) throw new SyncInProgressError();
+      return { kind: "claimed", draft: asDraft(claimed), attemptId };
+    });
+  }
+
+  async function releaseAttempt(
+    draftId: string,
+    actorId: string,
+    attemptId: string,
+    syncStatus: DraftSyncStatus,
+  ) {
+    const [released] = await database
+      .update(typefullyDrafts)
+      .set({ ...clearedAttempt, syncStatus, updatedAt: now() })
+      .where(
+        and(
+          eq(typefullyDrafts.id, draftId),
+          eq(typefullyDrafts.ownerUserId, actorId),
+          eq(typefullyDrafts.attemptId, attemptId),
+        ),
+      )
+      .returning(draftSelection);
+    if (!released) throw new StaleRemoteAttemptError();
+    return asDraft(released);
+  }
+
+  async function markCreateOutcomeUncertain(
+    draftId: string,
+    actorId: string,
+    attemptId: string,
+    error: unknown,
+  ): Promise<never> {
+    const [marked] = await database
+      .update(typefullyDrafts)
+      .set({
+        attemptState: "outcome_uncertain",
+        syncStatus: "remote_error",
+        lastError: boundedError(error),
+        updatedAt: now(),
+      })
+      .where(
+        and(
+          eq(typefullyDrafts.id, draftId),
+          eq(typefullyDrafts.ownerUserId, actorId),
+          eq(typefullyDrafts.attemptId, attemptId),
+          eq(typefullyDrafts.attemptKind, "create_draft"),
+        ),
+      )
+      .returning({ id: typefullyDrafts.id });
+    if (!marked) throw new StaleRemoteAttemptError();
+    throw new ReconciliationRequiredError(draftId);
   }
 
   const store = {
@@ -475,6 +715,7 @@ export function createTypefullyStore(options: {
           actorId: input.actorId,
           expectedVersion: parsed.data.expectedVersion,
           document: parsed.data.document,
+          requiredBotId: input.botId,
         });
         return {
           text: JSON.stringify(
@@ -558,6 +799,8 @@ export function createTypefullyStore(options: {
       actorId: string;
       expectedVersion: number;
       document: unknown;
+      /** Signed callback identity; when set, mismatch and detachment are non-disclosing. */
+      requiredBotId?: string;
     }): Promise<TypefullyDraft> {
       const canonical = canonicalizeDraft(input.document);
       const visible = await ownedDraft(database, input.draftId, input.actorId);
@@ -577,7 +820,7 @@ export function createTypefullyStore(options: {
         granted = await isGranted(grantOperation, refreshed.botId);
       }
       return database.transaction(async (transaction) => {
-        const current = await ownedDraft(
+        const current = await lockedOwnedDraft(
           transaction,
           input.draftId,
           input.actorId,
@@ -592,6 +835,12 @@ export function createTypefullyStore(options: {
           current.channelId,
           current.botId,
         );
+        if (
+          input.requiredBotId !== undefined &&
+          (current.botId !== input.requiredBotId || !attached)
+        ) {
+          throw new DraftNotFoundError();
+        }
         const syncStatus: DraftSyncStatus =
           current.syncStatus === "syncing"
             ? "syncing"
@@ -714,44 +963,44 @@ export function createTypefullyStore(options: {
       draft: TypefullyDraft;
       result: { text: string; isError: boolean };
     }> {
-      const authorized = await store.authorizeRemoteOperation(input);
-      const [claimed] = await database
-        .update(typefullyDrafts)
-        .set({ syncStatus: "syncing", updatedAt: new Date() })
-        .where(
-          and(
-            eq(typefullyDrafts.id, authorized.draft.id),
-            eq(typefullyDrafts.ownerUserId, input.actorId),
-            eq(typefullyDrafts.version, authorized.draft.version),
-            eq(typefullyDrafts.contentHash, authorized.draft.contentHash),
-            ne(typefullyDrafts.syncStatus, "syncing"),
-          ),
-        )
-        .returning(draftSelection);
-      if (!claimed) {
-        const latest = await ownedDraft(database, input.draftId, input.actorId);
-        if (
-          latest.version === authorized.draft.version &&
-          latest.contentHash === authorized.draft.contentHash &&
-          latest.syncStatus === "syncing"
-        ) {
-          throw new SyncInProgressError();
+      let authorized: { draft: TypefullyDraft; ref: string } | null = null;
+      let claim:
+        | { kind: "noop"; draft: TypefullyDraft }
+        | { kind: "claimed"; draft: TypefullyDraft; attemptId: string }
+        | null = null;
+      for (let pass = 0; pass < 2; pass += 1) {
+        authorized = await store.authorizeRemoteOperation(input);
+        try {
+          claim = await claimSyncAttempt(authorized.draft, input.actorId);
+          break;
+        } catch (error) {
+          if (error instanceof StaleAuthorizationError && pass === 0) continue;
+          throw error;
         }
-        throw new VersionConflictError(latest.version, latest.contentHash);
       }
-      authorized.draft = asDraft(claimed);
-      const callTool = plugin().callTool;
+      if (!authorized || !claim) throw new SyncInProgressError();
+      if (claim.kind === "noop") {
+        return {
+          draft: claim.draft,
+          result: {
+            text: JSON.stringify({ id: claim.draft.remoteDraftId }),
+            isError: false,
+          },
+        };
+      }
+      authorized.draft = claim.draft;
+      const attemptId = claim.attemptId;
+      const dispatchVendor = plugin().dispatchVendor;
       let result: { text: string; isError: boolean };
       try {
-        if (!callTool) {
+        if (!dispatchVendor) {
           throw new Error("Typefully remote calls are unavailable.");
         }
-        result = await callTool({
+        result = await dispatchVendor({
           ref: authorized.ref,
           args: remoteArgs(authorized.draft),
           botId: authorized.draft.botId,
           actorId: input.actorId,
-          _vendorDispatch: true,
         });
       } catch (error) {
         if (
@@ -763,32 +1012,33 @@ export function createTypefullyStore(options: {
           error instanceof BotNotAttachedError ||
           (error instanceof Error && error.name === "PluginRefusedError")
         ) {
-          await database
-            .update(typefullyDrafts)
-            .set({
-              syncStatus:
-                error &&
-                typeof error === "object" &&
-                "code" in error &&
-                error.code === "connection_required"
-                  ? "connection_required"
-                  : "grant_blocked",
-              updatedAt: new Date(),
-            })
-            .where(
-              and(
-                eq(typefullyDrafts.id, authorized.draft.id),
-                eq(typefullyDrafts.ownerUserId, input.actorId),
-                eq(typefullyDrafts.syncStatus, "syncing"),
-              ),
-            );
+          await releaseAttempt(
+            authorized.draft.id,
+            input.actorId,
+            attemptId,
+            error &&
+              typeof error === "object" &&
+              "code" in error &&
+              error.code === "connection_required"
+              ? "connection_required"
+              : "grant_blocked",
+          );
           throw error;
+        }
+        if (authorized.draft.remoteDraftId === null) {
+          return await markCreateOutcomeUncertain(
+            input.draftId,
+            input.actorId,
+            attemptId,
+            error,
+          );
         }
         const draft = await store.recordRemoteFailure({
           draftId: input.draftId,
           actorId: input.actorId,
           expectedVersion: authorized.draft.version,
           expectedHash: authorized.draft.contentHash,
+          attemptId,
           error,
         });
         return {
@@ -802,6 +1052,7 @@ export function createTypefullyStore(options: {
           actorId: input.actorId,
           expectedVersion: authorized.draft.version,
           expectedHash: authorized.draft.contentHash,
+          attemptId,
           error: result.text,
         });
         return { draft, result };
@@ -817,18 +1068,12 @@ export function createTypefullyStore(options: {
           ? String(parsed.id)
           : authorized.draft.remoteDraftId;
       if (!remoteId) {
-        const failure = {
-          text: "Typefully did not return a draft id.",
-          isError: true,
-        };
-        const draft = await store.recordRemoteFailure({
-          draftId: input.draftId,
-          actorId: input.actorId,
-          expectedVersion: authorized.draft.version,
-          expectedHash: authorized.draft.contentHash,
-          error: failure.text,
-        });
-        return { draft, result: failure };
+        return await markCreateOutcomeUncertain(
+          input.draftId,
+          input.actorId,
+          attemptId,
+          "Typefully returned success without a draft id.",
+        );
       }
       try {
         const draft = await store.recordRemoteConfirmation({
@@ -837,22 +1082,31 @@ export function createTypefullyStore(options: {
           expectedVersion: authorized.draft.version,
           expectedHash: authorized.draft.contentHash,
           remoteDraftId: remoteId,
+          attemptId,
         });
         return { draft, result };
       } catch (error) {
         if (!(error instanceof InvalidRemoteDraftIdError)) throw error;
-        const failure = {
-          text: "Typefully returned an invalid draft id.",
-          isError: true,
-        };
+        if (authorized.draft.remoteDraftId === null) {
+          return await markCreateOutcomeUncertain(
+            input.draftId,
+            input.actorId,
+            attemptId,
+            error,
+          );
+        }
         const draft = await store.recordRemoteFailure({
           draftId: input.draftId,
           actorId: input.actorId,
           expectedVersion: authorized.draft.version,
           expectedHash: authorized.draft.contentHash,
-          error: failure.text,
+          attemptId,
+          error,
         });
-        return { draft, result: failure };
+        return {
+          draft,
+          result: { text: boundedError(error), isError: true },
+        };
       }
     },
 
@@ -867,14 +1121,14 @@ export function createTypefullyStore(options: {
         actorId: input.actorId,
         toolName: input.toolName,
       });
-      const callTool = plugin().callTool;
-      if (!callTool) throw new Error("Typefully remote calls are unavailable.");
-      const result = await callTool({
+      const dispatchVendor = plugin().dispatchVendor;
+      if (!dispatchVendor)
+        throw new Error("Typefully remote calls are unavailable.");
+      const result = await dispatchVendor({
         ref: `${serverId}/${input.toolName}`,
         args: input.args,
         botId: draft.botId,
         actorId: input.actorId,
-        _vendorDispatch: true,
       });
       return { draft, ...result };
     },
@@ -894,16 +1148,68 @@ export function createTypefullyStore(options: {
       return draft;
     },
 
+    async reconcileUncertainCreate(input: {
+      draftId: string;
+      actorId: string;
+      expectedVersion: number;
+      remoteDraftId: string;
+    }): Promise<TypefullyDraft> {
+      const remoteDraftId = validRemoteDraftId(input.remoteDraftId);
+      return database.transaction(async (transaction) => {
+        const current = await lockedOwnedDraft(
+          transaction,
+          input.draftId,
+          input.actorId,
+        );
+        if (current.version !== input.expectedVersion) {
+          throw new VersionConflictError(current.version, current.contentHash);
+        }
+        if (
+          current.attemptState !== "outcome_uncertain" ||
+          current.attemptKind !== "create_draft" ||
+          current.attemptVersion === null ||
+          current.attemptHash === null
+        ) {
+          throw new ReconciliationRequiredError(current.id);
+        }
+        const confirmsCurrent =
+          current.version === current.attemptVersion &&
+          current.contentHash === current.attemptHash;
+        const [row] = await transaction
+          .update(typefullyDrafts)
+          .set({
+            ...clearedAttempt,
+            remoteDraftId,
+            remoteVersion: current.attemptVersion,
+            remoteHash: current.attemptHash,
+            syncStatus: confirmsCurrent ? "synced" : "local",
+            lastError: null,
+            updatedAt: now(),
+          })
+          .where(
+            and(
+              eq(typefullyDrafts.id, current.id),
+              eq(typefullyDrafts.attemptId, current.attemptId ?? ""),
+              eq(typefullyDrafts.attemptState, "outcome_uncertain"),
+            ),
+          )
+          .returning(draftSelection);
+        if (!row) throw new ReconciliationRequiredError(current.id);
+        return asDraft(row);
+      });
+    },
+
     async recordRemoteConfirmation(input: {
       draftId: string;
       actorId: string;
       expectedVersion: number;
       expectedHash?: string;
       remoteDraftId: string;
+      attemptId?: string;
     }): Promise<TypefullyDraft> {
       const remoteDraftId = validRemoteDraftId(input.remoteDraftId);
       return database.transaction(async (transaction) => {
-        const current = await ownedDraft(
+        const current = await lockedOwnedDraft(
           transaction,
           input.draftId,
           input.actorId,
@@ -914,6 +1220,12 @@ export function createTypefullyStore(options: {
           throw new DraftNotFoundError();
         }
         const expectedHash = input.expectedHash ?? current.contentHash;
+        if (
+          input.attemptId !== undefined &&
+          current.attemptId !== input.attemptId
+        ) {
+          throw new StaleRemoteAttemptError();
+        }
         if (
           current.remoteDraftId !== null &&
           current.remoteDraftId !== remoteDraftId
@@ -933,6 +1245,7 @@ export function createTypefullyStore(options: {
         const [row] = await transaction
           .update(typefullyDrafts)
           .set({
+            ...(input.attemptId === undefined ? {} : clearedAttempt),
             remoteDraftId,
             remoteVersion: input.expectedVersion,
             remoteHash: expectedHash,
@@ -958,6 +1271,9 @@ export function createTypefullyStore(options: {
                   confirmsCurrent ? "synced" : "local",
                 ),
               ),
+              ...(input.attemptId === undefined
+                ? []
+                : [eq(typefullyDrafts.attemptId, input.attemptId)]),
             ),
           )
           .returning(draftSelection);
@@ -999,11 +1315,12 @@ export function createTypefullyStore(options: {
       actorId: string;
       expectedVersion: number;
       expectedHash?: string;
+      attemptId?: string;
       error: unknown;
     }): Promise<TypefullyDraft> {
       const lastError = boundedError(input.error);
       return database.transaction(async (transaction) => {
-        const current = await ownedDraft(
+        const current = await lockedOwnedDraft(
           transaction,
           input.draftId,
           input.actorId,
@@ -1015,6 +1332,12 @@ export function createTypefullyStore(options: {
         }
         const expectedHash = input.expectedHash ?? current.contentHash;
         if (
+          input.attemptId !== undefined &&
+          current.attemptId !== input.attemptId
+        ) {
+          throw new StaleRemoteAttemptError();
+        }
+        if (
           current.version !== input.expectedVersion ||
           current.contentHash !== expectedHash
         ) {
@@ -1022,6 +1345,7 @@ export function createTypefullyStore(options: {
           const [released] = await transaction
             .update(typefullyDrafts)
             .set({
+              ...(input.attemptId === undefined ? {} : clearedAttempt),
               syncStatus: "local",
               lastError: null,
               updatedAt: new Date(),
@@ -1033,6 +1357,9 @@ export function createTypefullyStore(options: {
                 eq(typefullyDrafts.version, current.version),
                 eq(typefullyDrafts.contentHash, current.contentHash),
                 eq(typefullyDrafts.syncStatus, "syncing"),
+                ...(input.attemptId === undefined
+                  ? []
+                  : [eq(typefullyDrafts.attemptId, input.attemptId)]),
               ),
             )
             .returning(draftSelection);
@@ -1041,6 +1368,7 @@ export function createTypefullyStore(options: {
         const [row] = await transaction
           .update(typefullyDrafts)
           .set({
+            ...(input.attemptId === undefined ? {} : clearedAttempt),
             syncStatus: "remote_error",
             lastError,
             updatedAt: new Date(),
@@ -1062,6 +1390,9 @@ export function createTypefullyStore(options: {
                 isNull(typefullyDrafts.lastError),
                 ne(typefullyDrafts.lastError, lastError),
               ),
+              ...(input.attemptId === undefined
+                ? []
+                : [eq(typefullyDrafts.attemptId, input.attemptId)]),
             ),
           )
           .returning(draftSelection);
