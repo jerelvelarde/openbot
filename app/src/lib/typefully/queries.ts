@@ -348,6 +348,7 @@ type RequestOptions = {
   body?: unknown;
   form?: FormData;
   signal?: AbortSignal;
+  normalizeErrorPayload?: (payload: unknown) => unknown;
 };
 
 export async function typefullyRequest<T>(
@@ -369,9 +370,15 @@ export async function typefullyRequest<T>(
   const payload = await response.json().catch(() => ({}));
   if (response.ok) return payload as T;
 
+  const normalizedPayload = options.normalizeErrorPayload
+    ? options.normalizeErrorPayload(payload)
+    : payload;
+
   const record =
-    payload && typeof payload === "object" && !Array.isArray(payload)
-      ? (payload as Record<string, unknown>)
+    normalizedPayload &&
+    typeof normalizedPayload === "object" &&
+    !Array.isArray(normalizedPayload)
+      ? (normalizedPayload as Record<string, unknown>)
       : {};
   const code = errorCode(record.code);
   throw new TypefullyClientError(code, {

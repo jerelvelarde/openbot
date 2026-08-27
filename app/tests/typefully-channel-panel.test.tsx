@@ -1059,9 +1059,34 @@ test("a retry cannot adopt or rekey mismatched non-2xx recovery media", async ()
     new File(["image"], "launch.png", { type: "image/png" }),
   );
   const retry = await view.findByRole("button", { name: "Retry image 1" });
+  const priorItemAlert = view.getByRole("alert").textContent;
+  const priorStatus = view.getByTestId("canvas-status").textContent;
+  const priorPreviewSource = view
+    .getByTestId("preview-media")
+    .getAttribute("src");
+  const priorAltText = (
+    view.getByRole("textbox", {
+      name: "Alt text for image 1",
+    }) as HTMLInputElement
+  ).value;
   await user.click(retry);
   await waitFor(() => expect(uploads).toBe(2));
-  expect(view.getByRole("alert").textContent).toContain("invalid response");
+  const alerts = view.getAllByRole("alert").map((alert) => alert.textContent);
+  expect(alerts).toContain(priorItemAlert);
+  expect(
+    alerts.some((alert) => alert?.includes("invalid media response")),
+  ).toBe(true);
+  expect(view.getByTestId("canvas-status").textContent).toBe(priorStatus);
+  expect(view.getByTestId("preview-media").getAttribute("src")).toBe(
+    priorPreviewSource,
+  );
+  expect(
+    (
+      view.getByRole("textbox", {
+        name: "Alt text for image 1",
+      }) as HTMLInputElement
+    ).value,
+  ).toBe(priorAltText);
   expect(view.getByRole("button", { name: "Retry image 1" })).toBeTruthy();
   expect(
     view.queryByRole("button", { name: /different-retry-media/ }),

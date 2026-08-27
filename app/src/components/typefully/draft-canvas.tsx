@@ -314,22 +314,29 @@ function EditableDraftCanvas({
       altText: "",
       remoteId: null,
     };
-    const optimistic = replaceMedia(stable.document, descriptor);
-    files.current.set(mediaId, file);
-    bindUrl(mediaId, file);
-    controller.reload(
-      optimistic,
-      stable.target.version,
-      stable.target.draftId,
-      stable.state.remote,
-    );
+    if (!existing) {
+      const optimistic = replaceMedia(stable.document, descriptor);
+      files.current.set(mediaId, file);
+      bindUrl(mediaId, file);
+      controller.reload(
+        optimistic,
+        stable.target.version,
+        stable.target.draftId,
+        stable.state.remote,
+      );
+    }
     const operation = ++mediaOperation.current;
     mediaBusyRef.current = true;
     setMediaBusy(true);
-    setMediaStates((current) => ({
-      ...current,
-      [mediaId]: { kind: "uploading", previewUrl: urls.current.get(mediaId) },
-    }));
+    if (!existing) {
+      setMediaStates((current) => ({
+        ...current,
+        [mediaId]: {
+          kind: "uploading",
+          previewUrl: urls.current.get(mediaId),
+        },
+      }));
+    }
     try {
       const result = await upload.mutateAsync({
         draftId: stable.target.draftId,
@@ -370,6 +377,17 @@ function EditableDraftCanvas({
     } catch (error) {
       const clientError =
         error instanceof TypefullyClientError ? error : undefined;
+      if (
+        existing &&
+        clientError?.code === "remote_invalid_response" &&
+        clientError.draft === undefined &&
+        clientError.media === undefined
+      ) {
+        setMediaOperationError(
+          "Typefully returned an invalid media response. Retry the upload.",
+        );
+        return;
+      }
       if (!existing && !clientError?.media) {
         controller.reload(
           stable.document,

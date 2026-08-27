@@ -87,6 +87,54 @@ function boundMediaMutationFailure(
   return error;
 }
 
+const MEDIA_ERROR_KEYS = new Set([
+  "code",
+  "message",
+  "currentVersion",
+  "currentHash",
+  "serverId",
+  "draftId",
+  "connectPath",
+  "ref",
+  "retryAt",
+  "draft",
+  "remote",
+  "media",
+]);
+
+function normalizeMediaMutationErrorPayload(
+  payload: unknown,
+  input: { draftId: string; mediaId?: string },
+): unknown {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return payload;
+  }
+  const record = payload as Record<string, unknown>;
+  const hasRecovery = ["draft", "media", "remote"].some((key) =>
+    Object.hasOwn(record, key),
+  );
+  if (!hasRecovery) return payload;
+  if (Object.keys(record).some((key) => !MEDIA_ERROR_KEYS.has(key))) {
+    throw new TypefullyClientError("remote_invalid_response");
+  }
+  const draft = draftSummary(record.draft);
+  const media = mediaDescriptor(record.media);
+  const hasRemote = Object.hasOwn(record, "remote");
+  const remote = hasRemote ? remoteDraftState(record.remote) : undefined;
+  if (
+    !Object.hasOwn(record, "draft") ||
+    !Object.hasOwn(record, "media") ||
+    !draft ||
+    !media ||
+    draft.id !== input.draftId ||
+    (input.mediaId !== undefined && media.id !== input.mediaId) ||
+    (hasRemote && !remote)
+  ) {
+    throw new TypefullyClientError("remote_invalid_response");
+  }
+  return { ...record, draft, media, ...(hasRemote ? { remote } : {}) };
+}
+
 async function convergeDraftCache(
   queryClient: QueryClient | undefined,
   draftId: string,
@@ -327,7 +375,13 @@ export function uploadMediaMutationOptions(queryClient?: QueryClient) {
       try {
         const payload = await typefullyRequest<unknown>(
           `/api/typefully/drafts/${encodeURIComponent(input.draftId)}/media`,
-          { method: "POST", form, signal: input.signal },
+          {
+            method: "POST",
+            form,
+            signal: input.signal,
+            normalizeErrorPayload: (payload) =>
+              normalizeMediaMutationErrorPayload(payload, input),
+          },
         );
         return parseMediaMutationSuccess(payload, input);
       } catch (error) {
@@ -361,6 +415,14 @@ export function uploadMediaMutationOptions(queryClient?: QueryClient) {
     onError: (error, input) => {
       if (!(error instanceof TypefullyClientError))
         return convergeDraftCache(queryClient, input.draftId);
+      if (
+        error.code === "remote_invalid_response" &&
+        error.draft === undefined &&
+        error.media === undefined &&
+        error.remote === undefined
+      ) {
+        return;
+      }
       return convergeDraftCache(
         queryClient,
         input.draftId,
