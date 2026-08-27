@@ -95,13 +95,35 @@ export function createExternalLinkStore(database: Database): ExternalLinkStore {
         input.providerTenantId,
         input.providerUserId,
       );
-      if (!existing) {
-        throw new Error("External user link was not found after insertion.");
+      if (existing && existing.openbotUserId === input.openbotUserId) {
+        return existing;
       }
-      if (existing.openbotUserId !== input.openbotUserId) {
+      if (existing) {
         throw new Error("That Slack identity is already linked.");
       }
-      return existing;
+
+      /*
+       * `onConflictDoNothing` also covers the one-OpenBot-user-per-workspace key. When that key
+       * won, the lookup above has no row because it is deliberately by provider identity; read the
+       * other key before reporting the public conflict. Each statement observes committed work, so
+       * this is also the answer after a concurrent insert has completed.
+       */
+      const [existingForUser] = await database
+        .select({ openbotUserId: externalUserLinks.openbotUserId })
+        .from(externalUserLinks)
+        .where(
+          and(
+            eq(externalUserLinks.provider, input.provider),
+            eq(externalUserLinks.providerTenantId, input.providerTenantId),
+            eq(externalUserLinks.openbotUserId, input.openbotUserId),
+          ),
+        )
+        .limit(1);
+      if (existingForUser) {
+        throw new Error("That Slack identity is already linked.");
+      }
+
+      throw new Error("External user link was not found after insertion.");
     },
   };
 }
