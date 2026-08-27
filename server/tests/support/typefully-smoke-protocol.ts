@@ -19,6 +19,19 @@ function callIdentity(value: unknown) {
   return name ? { id: call.id, name } : undefined;
 }
 
+/** Scan the complete JSON request bodies recorded at the external AG-UI boundary. */
+export function sentinelsInExternalAgentRuns(
+  runs: unknown[],
+  sentinels: string[],
+): string[] {
+  const surface = JSON.stringify(runs);
+  return [...new Set(sentinels)].filter((sentinel) => {
+    if (!sentinel) return false;
+    const encoded = JSON.stringify(sentinel);
+    return surface.includes(encoded.slice(1, -1));
+  });
+}
+
 /** Return only an actual runtime tool-result correlated to the named AG-UI call. */
 export function correlatedRuntimeToolResult(
   messages: unknown[],

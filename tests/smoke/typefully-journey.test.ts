@@ -29,7 +29,10 @@ import { TEST_POOL } from "../../server/tests/support/database";
 import { startFakeTypefullyVendor } from "../../server/tests/support/fake-typefully-vendor";
 import { settleSmokeCleanup } from "../../server/tests/support/typefully-smoke-cleanup";
 import { confirmedSmokeTypefullyAssociation } from "../../server/tests/support/typefully-smoke-isolation";
-import { correlatedRuntimeToolResult } from "../../server/tests/support/typefully-smoke-protocol";
+import {
+  correlatedRuntimeToolResult,
+  sentinelsInExternalAgentRuns,
+} from "../../server/tests/support/typefully-smoke-protocol";
 
 /**
  * The Typefully journey through a deployment that is really running.
@@ -783,15 +786,20 @@ describe.skipIf(!asked)("the running Typefully deployment journey", () => {
         transcript: protocol.agent.messages,
         componentArgs,
         audits: journeyAudits,
+        externalAgentRequests: agentEndpoint.runs,
       });
-      for (const forbidden of [
+      const forbiddenSentinels = [
         apiKey,
         altText,
         firstXBody,
         firstLinkedInBody,
         changedXBody,
         changedLinkedInBody,
-      ]) {
+      ];
+      expect(
+        sentinelsInExternalAgentRuns(agentEndpoint.runs, forbiddenSentinels),
+      ).toEqual([]);
+      for (const forbidden of forbiddenSentinels) {
         expect(boundedSurfaces).not.toContain(forbidden);
       }
       expect(componentArgs.map(({ name }) => name)).toEqual([
