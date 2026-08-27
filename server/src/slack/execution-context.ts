@@ -58,3 +58,8 @@ export function currentSlackExecution(): SlackExecution {
   }
   return execution;
 }
+
+/** Reads an execution when rendering inside a Slack run; cold Channels recovery has none. */
+export function maybeCurrentSlackExecution(): SlackExecution | null {
+  return executionStorage.getStore() ?? null;
+}

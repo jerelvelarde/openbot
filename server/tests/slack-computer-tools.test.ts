@@ -165,6 +165,9 @@ class FakeComputerGateway implements ComputerGateway {
   assistanceStatusResult: Awaited<
     ReturnType<ComputerGateway["assistanceStatus"]>
   > = "completed";
+  assistanceStatusResults?: Array<
+    Awaited<ReturnType<ComputerGateway["assistanceStatus"]>>
+  >;
   readFileResult: Awaited<ReturnType<ComputerGateway["readFile"]>> = {
     path: "reports/risk.txt",
     text: "Résumé 📊",
@@ -345,7 +348,7 @@ class FakeComputerGateway implements ComputerGateway {
     ...args: Parameters<ComputerGateway["assistanceStatus"]>
   ) {
     this.assistanceStatusCalls.push(args);
-    return this.assistanceStatusResult;
+    return this.assistanceStatusResults?.shift() ?? this.assistanceStatusResult;
   }
   async requestSecret(...args: Parameters<ComputerGateway["requestSecret"]>) {
     this.requestSecretCalls.push(args);
@@ -785,6 +788,104 @@ describe("Slack computer ChannelTools", () => {
     expect(gateway.cancelAssistanceCalls).toHaveLength(1);
   });
 
+  for (const toolName of [
+    "computer_request_help",
+    "computer_request_secret",
+  ] as const) {
+    test(`${toolName} reports a late exact completion that wins the deadline race`, async () => {
+      const gateway = new FakeComputerGateway();
+      let now = 0;
+      gateway.afterRequest = () => {
+        now = 10 * 60_000;
+      };
+      gateway.assistanceStatusResult = "completed";
+      const tools = new Map(
+        createSlackComputerTools(gateway, {
+          appUrl: "https://openbot.example",
+          encryptionKey: "slack-assistance-key",
+          now: () => now,
+        }).map((tool) => [tool.name, tool]),
+      );
+
+      const result = await inSlack(
+        () =>
+          invoke(
+            tools.get(toolName)!,
+            toolName === "computer_request_help"
+              ? { reason: "Please sign in." }
+              : { label: "one-time code", ref: "e9", snapshotId: 9 },
+            channelContext(new FileAdapter()),
+          ),
+        { channelsThreadId: "channels-thread-private" },
+      );
+
+      expect(result).toMatchObject({
+        ok: true,
+        result: expect.stringContaining(
+          toolName === "computer_request_help"
+            ? "handed control back"
+            : "you were not told what it is",
+        ),
+      });
+      expect(gateway.cancelAssistanceCalls).toEqual([]);
+    });
+  }
+
+  test("a completed request wins a Slack post failure and cancellation race", async () => {
+    const gateway = new FakeComputerGateway();
+    gateway.assistanceStatusResult = "completed";
+    const adapter = new FileAdapter();
+    adapter.postError = new Error("Slack unavailable after human completion");
+
+    const result = await inSlack(
+      () =>
+        invoke(
+          toolsWithAssistance(gateway).get("computer_request_help")!,
+          { reason: "Please sign in." },
+          channelContext(adapter),
+        ),
+      { channelsThreadId: "channels-thread-private" },
+    );
+
+    expect(result).toMatchObject({
+      ok: true,
+      result: expect.stringContaining("handed control back"),
+    });
+    expect(gateway.cancelAssistanceCalls).toEqual([]);
+  });
+
+  test("completion between the status read and conditional cancel wins the race", async () => {
+    const gateway = new FakeComputerGateway();
+    gateway.assistanceStatusResult = "pending";
+    gateway.cancelResult = {
+      cancelled: false,
+      status: "completed",
+      state: {
+        holder: "bot",
+        since: "2026-08-27T00:00:00.000Z",
+        requested: false,
+      },
+    };
+    const adapter = new FileAdapter();
+    adapter.postError = new Error("Slack unavailable during handoff");
+
+    const result = await inSlack(
+      () =>
+        invoke(
+          toolsWithAssistance(gateway).get("computer_request_help")!,
+          { reason: "Please sign in." },
+          channelContext(adapter),
+        ),
+      { channelsThreadId: "channels-thread-private" },
+    );
+
+    expect(result).toMatchObject({
+      ok: true,
+      result: expect.stringContaining("handed control back"),
+    });
+    expect(gateway.cancelAssistanceCalls).toHaveLength(1);
+  });
+
   test("a hung Slack post gets only the remainder of the original deadline", async () => {
     const gateway = new FakeComputerGateway();
     let now = 0;
@@ -819,24 +920,57 @@ describe("Slack computer ChannelTools", () => {
     expect(gateway.cancelAssistanceCalls).toEqual([]);
   });
 
-  test("a replaced exact generation never reports human completion", async () => {
-    const gateway = new FakeComputerGateway();
-    gateway.assistanceStatusResult = "superseded";
-    const result = await inSlack(
-      () =>
-        invoke(
-          toolsWithAssistance(gateway).get("computer_request_help")!,
-          { reason: "Please sign in." },
-          channelContext(new FileAdapter()),
-        ),
-      { channelsThreadId: "channels-thread-private" },
-    );
-    expect(result).toEqual({
-      ok: false,
-      reason:
-        "This exact OpenBot assistance request ended without human completion. Ask again only if help is still needed.",
+  for (const [status, expected] of [
+    [
+      "superseded",
+      {
+        ok: false,
+        reason:
+          "This exact OpenBot assistance request was replaced by a newer request and did not complete.",
+      },
+    ],
+    [
+      "cancelled",
+      {
+        ok: false,
+        reason:
+          "This exact OpenBot assistance request was already cancelled. Ask again only if help is still needed.",
+      },
+    ],
+    [
+      "expired",
+      {
+        ok: false,
+        reason:
+          "This exact OpenBot assistance request expired without completion. Ask again only if help is still needed.",
+      },
+    ],
+    [
+      "unknown",
+      {
+        ok: false,
+        assistanceMayBePending: true,
+        reason:
+          "OpenBot no longer knows the exact assistance request outcome. Check the coworker before asking again.",
+      },
+    ],
+  ] as const) {
+    test(`reports an exact ${status} generation without claiming human completion`, async () => {
+      const gateway = new FakeComputerGateway();
+      gateway.assistanceStatusResult = status;
+      const result = await inSlack(
+        () =>
+          invoke(
+            toolsWithAssistance(gateway).get("computer_request_help")!,
+            { reason: "Please sign in." },
+            channelContext(new FileAdapter()),
+          ),
+        { channelsThreadId: "channels-thread-private" },
+      );
+      expect(result).toEqual(expected);
+      expect(gateway.cancelAssistanceCalls).toEqual([]);
     });
-  });
+  }
 
   for (const lateOutcome of ["resolve", "reject"] as const) {
     test(`leaves an unknown Slack delivery untouched when posting later ${lateOutcome}s`, async () => {

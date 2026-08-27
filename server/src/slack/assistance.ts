@@ -35,6 +35,27 @@ const REQUEST_NOT_PENDING = {
   reason:
     "The OpenBot assistance request could not be created safely. Its exact request generation is no longer pending; ask again if help is still needed.",
 } as const;
+const EXACT_CANCELLED = {
+  ok: false,
+  reason:
+    "This exact OpenBot assistance request was already cancelled. Ask again only if help is still needed.",
+} as const;
+const EXACT_EXPIRED = {
+  ok: false,
+  reason:
+    "This exact OpenBot assistance request expired without completion. Ask again only if help is still needed.",
+} as const;
+const EXACT_SUPERSEDED = {
+  ok: false,
+  reason:
+    "This exact OpenBot assistance request was replaced by a newer request and did not complete.",
+} as const;
+const EXACT_UNKNOWN = {
+  ok: false,
+  assistanceMayBePending: true,
+  reason:
+    "OpenBot no longer knows the exact assistance request outcome. Check the coworker before asking again.",
+} as const;
 
 type WaitOutcome = "answered" | "cancelled" | "expired";
 type SleepOutcome = "elapsed" | "aborted";
@@ -227,22 +248,13 @@ function hasExactSecretRequest(
   );
 }
 
-function hasExactAssistanceRequest(
-  state: ControlState,
-  requestId: string,
-): boolean {
-  return (
-    hasExactHelpRequest(state, requestId) ||
-    hasExactSecretRequest(state, requestId)
-  );
-}
-
 async function cancelCommittedRequest(
   gateway: ComputerGateway,
   agentId: string,
   actor: ActionActor,
   requestId: string,
   clearedOutcome: AssistanceOutcome,
+  completedOutcome: AssistanceOutcome,
 ): Promise<AssistanceOutcome> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), COMPENSATION_TIMEOUT_MS);
@@ -252,11 +264,11 @@ async function cancelCommittedRequest(
       COMPENSATION_TIMEOUT_MS,
     );
     if (observed.kind === "value") {
-      if (observed.value === "human" || observed.value === "pending") {
-        if (observed.value === "human") return MAY_STILL_BE_PENDING;
-      } else if (observed.value !== "unknown") {
-        return clearedOutcome;
-      }
+      if (observed.value === "completed") return completedOutcome;
+      if (observed.value === "human") return MAY_STILL_BE_PENDING;
+      if (observed.value === "expired") return EXACT_EXPIRED;
+      if (observed.value === "cancelled") return EXACT_CANCELLED;
+      if (observed.value === "superseded") return EXACT_SUPERSEDED;
     }
     const cleared = await settleOperation(
       () =>
@@ -265,15 +277,12 @@ async function cancelCommittedRequest(
     );
     if (cleared.kind !== "value") return MAY_STILL_BE_PENDING;
     if (cleared.value.cancelled) return clearedOutcome;
-    if (
-      cleared.value.status === "pending" ||
-      cleared.value.status === "human"
-    ) {
-      return MAY_STILL_BE_PENDING;
-    }
-    return hasExactAssistanceRequest(cleared.value.state, requestId)
-      ? MAY_STILL_BE_PENDING
-      : clearedOutcome;
+    if (cleared.value.status === "completed") return completedOutcome;
+    if (cleared.value.status === "expired") return EXACT_EXPIRED;
+    if (cleared.value.status === "cancelled") return EXACT_CANCELLED;
+    if (cleared.value.status === "superseded") return EXACT_SUPERSEDED;
+    if (cleared.value.status === "unknown") return EXACT_UNKNOWN;
+    return MAY_STILL_BE_PENDING;
   } finally {
     clearTimeout(timer);
     controller.abort();
@@ -288,9 +297,17 @@ async function deliverCommittedRequest(
   context: ChannelToolContext,
   message: ReturnType<typeof assistanceMessage>,
   remainingMs: number,
+  completedOutcome: AssistanceOutcome,
 ): Promise<AssistanceOutcome | null> {
   if (context.signal?.aborted) {
-    return cancelCommittedRequest(gateway, agentId, actor, requestId, STOPPED);
+    return cancelCommittedRequest(
+      gateway,
+      agentId,
+      actor,
+      requestId,
+      STOPPED,
+      completedOutcome,
+    );
   }
   const posted = await settleOperation(
     () => context.thread.post(message),
@@ -307,6 +324,7 @@ async function deliverCommittedRequest(
       actor,
       requestId,
       DELIVERY_CLEARED,
+      completedOutcome,
     );
   }
   return null;
@@ -342,12 +360,6 @@ async function waitForExactAssistance(options: {
   return "expired";
 }
 
-const NOT_COMPLETED = {
-  ok: false,
-  reason:
-    "This exact OpenBot assistance request ended without human completion. Ask again only if help is still needed.",
-} as const;
-
 export async function requestSlackHelp(
   gateway: ComputerGateway,
   reason: string,
@@ -361,6 +373,11 @@ export async function requestSlackHelp(
   const url = await assistanceUrl(options, startedAt);
   if (context.signal?.aborted) return STOPPED;
   const requestId = crypto.randomUUID();
+  const answered = {
+    ok: true,
+    result:
+      "The person has finished and handed control back. Take a fresh snapshot: the page may have changed while they were driving.",
+  };
   let state: ControlState;
   try {
     state = await gateway.requestHelp(agentId, actor, reason, requestId);
@@ -371,17 +388,25 @@ export async function requestSlackHelp(
       actor,
       requestId,
       REQUEST_NOT_PENDING,
+      answered,
     );
   }
   if (!hasExactHelpRequest(state, requestId)) {
     return MAY_STILL_BE_PENDING;
   }
   if (now() >= deadline) {
-    return cancelCommittedRequest(gateway, agentId, actor, requestId, {
-      ok: true,
-      result:
-        "Nobody took control. Say what you still need rather than trying to do it yourself.",
-    });
+    return cancelCommittedRequest(
+      gateway,
+      agentId,
+      actor,
+      requestId,
+      {
+        ok: true,
+        result:
+          "Nobody took control. Say what you still need rather than trying to do it yourself.",
+      },
+      answered,
+    );
   }
   const deliveryFailure = await deliverCommittedRequest(
     gateway,
@@ -391,13 +416,9 @@ export async function requestSlackHelp(
     context,
     assistanceMessage(reason, url),
     deadline - now(),
+    answered,
   );
   if (deliveryFailure) return deliveryFailure;
-  const answered = {
-    ok: true,
-    result:
-      "The person has finished and handed control back. Take a fresh snapshot: the page may have changed while they were driving.",
-  };
   const expired = {
     ok: true,
     result:
@@ -411,25 +432,30 @@ export async function requestSlackHelp(
       now,
     });
     if (outcome === "completed") return answered;
-    if (
-      outcome === "superseded" ||
-      outcome === "cancelled" ||
-      outcome === "unknown"
-    )
-      return NOT_COMPLETED;
+    if (outcome === "superseded") return EXACT_SUPERSEDED;
+    if (outcome === "cancelled") return EXACT_CANCELLED;
+    if (outcome === "unknown") return EXACT_UNKNOWN;
     return cancelCommittedRequest(
       gateway,
       agentId,
       actor,
       requestId,
       outcome === "stopped" ? STOPPED : expired,
+      answered,
     );
   } catch {
-    return cancelCommittedRequest(gateway, agentId, actor, requestId, {
-      ok: false,
-      reason:
-        "OpenBot could not confirm the assistance result. Its request was cleared; ask again if help is still needed.",
-    });
+    return cancelCommittedRequest(
+      gateway,
+      agentId,
+      actor,
+      requestId,
+      {
+        ok: false,
+        reason:
+          "OpenBot could not confirm the assistance result. Its request was cleared; ask again if help is still needed.",
+      },
+      answered,
+    );
   }
 }
 
@@ -446,6 +472,10 @@ export async function requestSlackSecret(
   const url = await assistanceUrl(options, startedAt);
   if (context.signal?.aborted) return STOPPED;
   const requestId = crypto.randomUUID();
+  const answered = {
+    ok: true,
+    result: `The person has entered ${input.label} into the field. It was typed straight into the page and you were not told what it is.`,
+  };
   let state: ControlState;
   try {
     state = await gateway.requestSecret(agentId, actor, input, requestId);
@@ -456,16 +486,24 @@ export async function requestSlackSecret(
       actor,
       requestId,
       REQUEST_NOT_PENDING,
+      answered,
     );
   }
   if (!hasExactSecretRequest(state, requestId)) {
     return MAY_STILL_BE_PENDING;
   }
   if (now() >= deadline) {
-    return cancelCommittedRequest(gateway, agentId, actor, requestId, {
-      ok: true,
-      result: `Nobody entered ${input.label}. Do not ask for it another way.`,
-    });
+    return cancelCommittedRequest(
+      gateway,
+      agentId,
+      actor,
+      requestId,
+      {
+        ok: true,
+        result: `Nobody entered ${input.label}. Do not ask for it another way.`,
+      },
+      answered,
+    );
   }
   const deliveryFailure = await deliverCommittedRequest(
     gateway,
@@ -475,12 +513,9 @@ export async function requestSlackSecret(
     context,
     assistanceMessage(`Open OpenBot to enter ${input.label}.`, url),
     deadline - now(),
+    answered,
   );
   if (deliveryFailure) return deliveryFailure;
-  const answered = {
-    ok: true,
-    result: `The person has entered ${input.label} into the field. It was typed straight into the page and you were not told what it is.`,
-  };
   const expired = {
     ok: true,
     result: `Nobody entered ${input.label}. Do not ask for it another way.`,
@@ -493,24 +528,29 @@ export async function requestSlackSecret(
       now,
     });
     if (outcome === "completed") return answered;
-    if (
-      outcome === "superseded" ||
-      outcome === "cancelled" ||
-      outcome === "unknown"
-    )
-      return NOT_COMPLETED;
+    if (outcome === "superseded") return EXACT_SUPERSEDED;
+    if (outcome === "cancelled") return EXACT_CANCELLED;
+    if (outcome === "unknown") return EXACT_UNKNOWN;
     return cancelCommittedRequest(
       gateway,
       agentId,
       actor,
       requestId,
       outcome === "stopped" ? STOPPED : expired,
+      answered,
     );
   } catch {
-    return cancelCommittedRequest(gateway, agentId, actor, requestId, {
-      ok: false,
-      reason:
-        "OpenBot could not confirm the secret request result. Its request was cleared; ask again if it is still needed.",
-    });
+    return cancelCommittedRequest(
+      gateway,
+      agentId,
+      actor,
+      requestId,
+      {
+        ok: false,
+        reason:
+          "OpenBot could not confirm the secret request result. Its request was cleared; ask again if it is still needed.",
+      },
+      answered,
+    );
   }
 }
