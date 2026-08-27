@@ -274,6 +274,16 @@ export type ControlState = {
   reason?: string;
   /** The Bot has asked and nobody has taken over yet. */
   requested: boolean;
+  helpRequestId?: string;
+  secretWanted?: string;
+  secretRef?: string;
+  secretSnapshotId?: number;
+  secretRequestId?: string;
+};
+
+export type AssistanceCancellationResult = {
+  cancelled: boolean;
+  state: ControlState;
 };
 
 /**

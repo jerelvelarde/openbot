@@ -30,6 +30,8 @@ export type ControlState = {
    * doing, with the reason the Bot gave, written for whoever asked and rendered to whoever looked.
    */
   requestedAt?: string;
+  /** Opaque generation of the pending help request, used only for conditional cancellation. */
+  helpRequestId?: string;
   /**
    * A secret the Bot is waiting for, described by its label only.
    *
@@ -47,6 +49,13 @@ export type ControlState = {
    */
   secretRef?: string;
   secretSnapshotId?: number;
+  /** Opaque generation of the pending secret request, used only for conditional cancellation. */
+  secretRequestId?: string;
+};
+
+export type AssistanceCancellationResult = {
+  cancelled: boolean;
+  state: ControlState;
 };
 
 /** Refusal because a person is driving. Distinct from a failure, so the Bot can be told to wait. */
@@ -97,6 +106,14 @@ export function createControl(
     requested: false,
   };
 
+  const assistanceRequestId = (candidate: unknown) =>
+    typeof candidate === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      candidate,
+    )
+      ? candidate
+      : crypto.randomUUID();
+
   return {
     /**
      * The current state, as the surface polls it. A copy, so a caller cannot mutate the machine.
@@ -116,7 +133,12 @@ export function createControl(
         state.requestedAt &&
         Date.parse(now()) - Date.parse(state.requestedAt) > HELP_REQUEST_TTL_MS
       ) {
-        const { reason: _reason, requestedAt: _at, ...rest } = state;
+        const {
+          helpRequestId: _requestId,
+          reason: _reason,
+          requestedAt: _at,
+          ...rest
+        } = state;
         state = { ...rest, requested: false };
       }
       return { ...state };
@@ -128,11 +150,12 @@ export function createControl(
      * It does not take control: it says it is stuck and why, and a person decides. A Bot that could
      * hand itself to a human could also hand a human a page they never asked to see.
      */
-    requestHelp(reason: unknown): ControlState {
+    requestHelp(reason: unknown, requestId?: unknown): ControlState {
       state = {
         ...state,
         requested: true,
         requestedAt: now(),
+        helpRequestId: assistanceRequestId(requestId),
         reason:
           typeof reason === "string" && reason.trim()
             ? reason.trim()
@@ -146,6 +169,7 @@ export function createControl(
       label?: unknown;
       ref?: unknown;
       snapshotId?: unknown;
+      requestId?: unknown;
     }): ControlState {
       if (typeof input.ref !== "string" || !input.ref.trim()) {
         throw new ControlRequestError(
@@ -161,8 +185,41 @@ export function createControl(
         secretRef: input.ref.trim(),
         secretSnapshotId:
           typeof input.snapshotId === "number" ? input.snapshotId : undefined,
+        secretRequestId: assistanceRequestId(input.requestId),
       };
       return this.get();
+    },
+
+    /**
+     * Clear only the exact pending assistance generation while the Bot still owns the browser.
+     * A stale delivery timeout is therefore harmless after a newer request or human handoff.
+     */
+    cancelAssistance(requestId: string): AssistanceCancellationResult {
+      if (state.holder !== "bot") {
+        return { cancelled: false, state: this.get() };
+      }
+      if (state.helpRequestId === requestId && state.requested) {
+        const {
+          helpRequestId: _requestId,
+          reason: _reason,
+          requestedAt: _requestedAt,
+          ...rest
+        } = state;
+        state = { ...rest, requested: false };
+        return { cancelled: true, state: this.get() };
+      }
+      if (state.secretRequestId === requestId && state.secretWanted) {
+        const {
+          secretRequestId: _requestId,
+          secretWanted: _wanted,
+          secretRef: _ref,
+          secretSnapshotId: _snapshotId,
+          ...rest
+        } = state;
+        state = rest;
+        return { cancelled: true, state: this.get() };
+      }
+      return { cancelled: false, state: this.get() };
     },
 
     /**
@@ -188,6 +245,7 @@ export function createControl(
         secretWanted: undefined,
         secretRef: undefined,
         secretSnapshotId: undefined,
+        secretRequestId: undefined,
       };
     },
 
