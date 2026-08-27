@@ -4,21 +4,29 @@ import {
   type BaseEvent,
   type RunAgentInput,
 } from "@ag-ui/client";
+import { LLMock } from "@copilotkit/aimock";
 import type {
   ChannelIdentityContext,
   ChannelNode,
   IncomingTurn,
   InteractionEvent,
   PlatformAdapter,
+  StateStore,
 } from "@copilotkit/channels";
+import { MemoryStore } from "@copilotkit/channels";
 import { Observable } from "rxjs";
-import type { ActorAgentResolver } from "../src/agents/agent-resolver";
+import { z } from "zod";
+import {
+  type ActorAgentResolver,
+  createActorAgentResolver,
+} from "../src/agents/agent-resolver";
 import type { ComputerGateway } from "../src/computer/gateway";
 import type {
   ExternalThreadBinding,
   ExternalThreadStore,
 } from "../src/external/thread-store";
 import type { CoworkerRoutingService } from "../src/routing/service";
+import { createApprovalAuthorizer } from "../src/slack/approval-authorizer";
 import type { ApprovalPresentation } from "../src/slack/approval-store";
 import {
   createOpenBotSlackChannel,
@@ -26,6 +34,7 @@ import {
 } from "../src/slack/channel";
 import { configureApprovalDecisionStore } from "../src/slack/components";
 import type { SlackIdentityResult } from "../src/slack/identity-linker";
+import { SlackIngressRegistry } from "../src/slack/ingress-registry";
 
 type SharedRunState = {
   inputs: RunAgentInput[];
@@ -35,15 +44,105 @@ type SharedRunState = {
   pendingFinishes: Array<() => void>;
   requestApproval: boolean;
   approvalPresented: boolean;
+  toolCall?: { name: string; args: Record<string, unknown> };
+  toolPresented: boolean;
 };
 
 type FakeAdapterInstance = PlatformAdapter & {
   posted: ChannelNode[][];
+  stateStore?: StateStore;
   getSink(): {
     onTurn(turn: IncomingTurn): void | Promise<void>;
     onInteraction(event: InteractionEvent): void | Promise<void>;
   };
 };
+
+class ShareComputerGateway implements ComputerGateway {
+  readonly readFileCalls: Parameters<ComputerGateway["readFile"]>[] = [];
+  readFileResult: Awaited<ReturnType<ComputerGateway["readFile"]>> = {
+    path: "reports/risk.txt",
+    text: "Résumé 📊",
+    truncated: false,
+    bytes: 13,
+  };
+
+  async readFile(...args: Parameters<ComputerGateway["readFile"]>) {
+    this.readFileCalls.push(args);
+    return this.readFileResult;
+  }
+  async status(): Promise<never> {
+    throw new Error("unused");
+  }
+  async screenshot(): Promise<never> {
+    throw new Error("unused");
+  }
+  async snapshot(): Promise<never> {
+    throw new Error("unused");
+  }
+  async read(): Promise<never> {
+    throw new Error("unused");
+  }
+  async navigate(): Promise<never> {
+    throw new Error("unused");
+  }
+  async click(): Promise<never> {
+    throw new Error("unused");
+  }
+  async type(): Promise<never> {
+    throw new Error("unused");
+  }
+  async key(): Promise<never> {
+    throw new Error("unused");
+  }
+  async scroll(): Promise<never> {
+    throw new Error("unused");
+  }
+  async listFiles(): Promise<never> {
+    throw new Error("unused");
+  }
+  async runCommand(): Promise<never> {
+    throw new Error("unused");
+  }
+  async writeFile(): Promise<never> {
+    throw new Error("unused");
+  }
+  async control(): Promise<never> {
+    throw new Error("unused");
+  }
+  async requestHelp(): Promise<never> {
+    throw new Error("unused");
+  }
+  async cancelAssistance(): Promise<never> {
+    throw new Error("unused");
+  }
+  async assistanceStatus(): Promise<never> {
+    throw new Error("unused");
+  }
+  async takeControl(): Promise<never> {
+    throw new Error("unused");
+  }
+  async releaseControl(): Promise<never> {
+    throw new Error("unused");
+  }
+  async requestSecret(): Promise<never> {
+    throw new Error("unused");
+  }
+  async supplySecret(): Promise<never> {
+    throw new Error("unused");
+  }
+  async humanInput(): Promise<never> {
+    throw new Error("unused");
+  }
+  async computers(): Promise<never> {
+    throw new Error("unused");
+  }
+  async stopComputer(): Promise<never> {
+    throw new Error("unused");
+  }
+  async resetComputer(): Promise<never> {
+    throw new Error("unused");
+  }
+}
 
 type FakeAdapterConstructor = new (options: {
   platform: string;
@@ -83,6 +182,27 @@ class ReplyAgent extends AbstractAgent {
           runId: input.runId,
         });
         if (
+          this.shared.toolCall &&
+          !this.shared.toolPresented &&
+          !input.forwardedProps?.command
+        ) {
+          this.shared.toolPresented = true;
+          subscriber.next({
+            type: "TOOL_CALL_START",
+            toolCallId: "channel-tool-call-1",
+            toolCallName: this.shared.toolCall.name,
+            parentMessageId: "",
+          });
+          subscriber.next({
+            type: "TOOL_CALL_ARGS",
+            toolCallId: "channel-tool-call-1",
+            delta: JSON.stringify(this.shared.toolCall.args),
+          });
+          subscriber.next({
+            type: "TOOL_CALL_END",
+            toolCallId: "channel-tool-call-1",
+          });
+        } else if (
           this.shared.requestApproval &&
           !this.shared.approvalPresented &&
           !input.forwardedProps?.command
@@ -133,13 +253,18 @@ class ReplyAgent extends AbstractAgent {
   }
 }
 
-function identity(eventId: string, actorId: string): ChannelIdentityContext {
+function identity(
+  eventId: string,
+  actorId: string,
+  tenantId = "T1",
+  conversationId = "C1",
+): ChannelIdentityContext {
   return {
     provider: "slack",
-    tenant: { id: "T1" },
+    tenant: { id: tenantId },
     installation: { id: "I1" },
     actor: { id: actorId, kind: "human", name: actorId },
-    conversation: { id: "C1" },
+    conversation: { id: conversationId },
     trigger: "message",
     event: { id: eventId },
     raw: null,
@@ -153,21 +278,28 @@ function turn(
     actorId?: string;
     mentioned?: boolean;
     kind?: "created" | "updated" | "deleted";
+    tenantId?: string;
+    conversationId?: string;
+    conversationKey?: string;
+    logicalMessageId?: string;
   } = {},
 ) {
   const actorId = options.actorId ?? "U1";
   const kind = options.kind ?? "created";
+  const tenantId = options.tenantId ?? "T1";
+  const conversationId = options.conversationId ?? "C1";
   return {
     eventId,
-    conversationKey: "slack:T1:C1:root-1",
+    conversationKey:
+      options.conversationKey ?? `slack:${tenantId}:${conversationId}:root-1`,
     replyTarget: {},
     userText: text,
     platform: "slack",
     actor: { id: actorId, kind: "human" as const, name: actorId },
-    identityContext: identity(eventId, actorId),
+    identityContext: identity(eventId, actorId, tenantId, conversationId),
     operation: {
       kind,
-      logicalMessageId: eventId,
+      logicalMessageId: options.logicalMessageId ?? eventId,
       revisionId: `${eventId}:${kind}`,
       mentioned: options.mentioned ?? true,
     },
@@ -195,8 +327,28 @@ function actionIds(value: unknown): string[] {
   ];
 }
 
-function harness(options: { computerGateway?: ComputerGateway } = {}) {
+function harness(
+  options: {
+    computerGateway?: ComputerGateway;
+    postFileResult?: Awaited<
+      ReturnType<NonNullable<PlatformAdapter["postFile"]>>
+    >;
+    stateStore?: StateStore;
+    shared?: SharedRunState;
+    bindings?: Map<string, ExternalThreadBinding>;
+    identityLinker?: OpenBotSlackChannelDependencies["identityLinker"];
+    ingressRegistry?: SlackIngressRegistry;
+    resolver?: ActorAgentResolver;
+    agentId?: string;
+  } = {},
+) {
   const adapter = new FakeAdapter({ platform: "slack", messageEvents: true });
+  adapter.stateStore = options.stateStore;
+  const filePosts: Parameters<NonNullable<PlatformAdapter["postFile"]>>[] = [];
+  adapter.postFile = async (...args) => {
+    filePosts.push(args);
+    return options.postFileResult ?? { ok: true, fileId: "F1" };
+  };
   const createRunRenderer = adapter.createRunRenderer.bind(adapter);
   adapter.createRunRenderer = (target) => {
     const renderer = createRunRenderer(target);
@@ -217,9 +369,9 @@ function harness(options: { computerGateway?: ComputerGateway } = {}) {
     };
     return renderer;
   };
-  const bindings = new Map<string, ExternalThreadBinding>();
+  const bindings = options.bindings ?? new Map<string, ExternalThreadBinding>();
   const bindCalls: Parameters<ExternalThreadStore["bind"]>[0][] = [];
-  const shared: SharedRunState = {
+  const shared: SharedRunState = options.shared ?? {
     inputs: [],
     active: 0,
     maxActive: 0,
@@ -227,6 +379,7 @@ function harness(options: { computerGateway?: ComputerGateway } = {}) {
     pendingFinishes: [],
     requestApproval: false,
     approvalPresented: false,
+    toolPresented: false,
   };
   const target = new ReplyAgent(shared);
   const actors: string[] = [];
@@ -281,7 +434,7 @@ function harness(options: { computerGateway?: ComputerGateway } = {}) {
     async route() {
       return {
         kind: "selected",
-        agentId: "risk",
+        agentId: options.agentId ?? "risk",
         name: "Risk Analyst",
         reason: "requested",
         fallback: false,
@@ -299,13 +452,24 @@ function harness(options: { computerGateway?: ComputerGateway } = {}) {
     },
   };
   const deps: OpenBotSlackChannelDependencies = {
-    identityLinker: linker,
-    agentDeps: { routing, store, resolver },
+    identityLinker: options.identityLinker ?? linker,
+    agentDeps: { routing, store, resolver: options.resolver ?? resolver },
+    ingressRegistry: options.ingressRegistry,
     computerGateway: options.computerGateway,
   };
   const channel = createOpenBotSlackChannel(deps);
   channel.ɵruntime.addAdapter(adapter);
-  return { adapter, channel, bindings, bindCalls, shared, actors };
+  return { adapter, channel, bindings, bindCalls, shared, actors, filePosts };
+}
+
+function toolResult(shared: SharedRunState): Record<string, unknown> {
+  const message = shared.inputs
+    .flatMap(({ messages }) => messages)
+    .findLast(({ role }) => role === "tool");
+  if (message?.role !== "tool" || typeof message.content !== "string") {
+    throw new Error("expected a channel tool result");
+  }
+  return JSON.parse(message.content) as Record<string, unknown>;
 }
 
 describe("managed OpenBot Slack channel", () => {
@@ -367,6 +531,84 @@ describe("managed OpenBot Slack channel", () => {
     expect(shared.inputs).toHaveLength(1);
   });
 
+  for (const order of [
+    ["U1", "U2"],
+    ["U2", "U1"],
+  ] as const) {
+    test(`same provider event id cannot cross-pair principals (${order.join(" then ")})`, async () => {
+      const ingressRegistry = new SlackIngressRegistry();
+      const { adapter, channel, bindCalls, actors } = harness({
+        ingressRegistry,
+      });
+      await channel.ɵruntime.start();
+      const turns = {
+        U1: turn("E-collision", "first", {
+          actorId: "U1",
+          conversationId: "C1",
+          conversationKey: "slack:T1:C1:root-1",
+          logicalMessageId: "M1",
+        }),
+        U2: turn("E-collision", "second", {
+          actorId: "U2",
+          conversationId: "C2",
+          conversationKey: "slack:T1:C2:root-2",
+          logicalMessageId: "M2",
+        }),
+      };
+
+      await Promise.all(
+        order.map((actorId) => adapter.getSink().onTurn(turns[actorId])),
+      );
+
+      expect(new Set(actors)).toEqual(new Set(["u1", "u2"]));
+      expect(bindCalls).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            channelsThreadId: "slack:T1:C1:root-1",
+            providerConversationId: "C1",
+            createdByUserId: "u1",
+          }),
+          expect.objectContaining({
+            channelsThreadId: "slack:T1:C2:root-2",
+            providerConversationId: "C2",
+            createdByUserId: "u2",
+          }),
+        ]),
+      );
+    });
+  }
+
+  test("a provider/canonical principal mismatch fails before subscription, binding, or run", async () => {
+    const identityLinker: OpenBotSlackChannelDependencies["identityLinker"] = {
+      async resolve(context) {
+        return {
+          kind: "linked",
+          user: { id: "victim", name: "Victim" },
+          actor: { id: "victim", role: "user" },
+          identity: {
+            provider: "slack",
+            providerTenantId: context.tenant.id,
+            providerUserId: "DIFFERENT-SLACK-ACTOR",
+            providerEmail: null,
+          },
+        };
+      },
+    };
+    const { adapter, channel, bindCalls, shared } = harness({ identityLinker });
+    await channel.ɵruntime.start();
+
+    await expect(
+      adapter.getSink().onTurn(turn("E-mismatch", "start")),
+    ).rejects.toThrow("identity is no longer available");
+    await adapter
+      .getSink()
+      .onTurn(turn("E-after", "follow up", { mentioned: false }));
+
+    expect(bindCalls).toEqual([]);
+    expect(shared.inputs).toEqual([]);
+    expect(adapter.posted).toEqual([]);
+  });
+
   test("passes multimodal content parts and serializes overlapping thread turns", async () => {
     const { adapter, channel, shared } = harness();
     await channel.ɵruntime.start();
@@ -405,6 +647,232 @@ describe("managed OpenBot Slack channel", () => {
     expect(names).toContain("computer_navigate");
     expect(names).toContain("computer_share_file");
     expect(names).toContain("approval_card");
+  });
+
+  test("executes UTF-8 file sharing through the managed channel", async () => {
+    const gateway = new ShareComputerGateway();
+    const { adapter, channel, shared, filePosts } = harness({
+      computerGateway: gateway,
+    });
+    shared.toolCall = {
+      name: "computer_share_file",
+      args: { path: "reports/risk.txt", filename: "résumé.txt" },
+    };
+    await channel.ɵruntime.start();
+    await adapter.getSink().onTurn(turn("E-share", "share the report"));
+
+    expect(gateway.readFileCalls).toEqual([
+      ["risk", { id: "u1", userId: "u1" }, { path: "reports/risk.txt" }],
+    ]);
+    expect(filePosts).toHaveLength(1);
+    expect(filePosts[0]?.[1]).toEqual({
+      bytes: new TextEncoder().encode("Résumé 📊"),
+      filename: "résumé.txt",
+    });
+    expect(toolResult(shared)).toMatchObject({
+      ok: true,
+      shared: true,
+      filename: "résumé.txt",
+      fileId: "F1",
+    });
+  });
+
+  test("refuses truncated and adapter-rejected file shares explicitly", async () => {
+    const truncated = new ShareComputerGateway();
+    truncated.readFileResult = {
+      path: "large.txt",
+      text: "partial",
+      truncated: true,
+      bytes: 999,
+    };
+    const first = harness({ computerGateway: truncated });
+    first.shared.toolCall = {
+      name: "computer_share_file",
+      args: { path: "large.txt" },
+    };
+    await first.channel.ɵruntime.start();
+    await first.adapter.getSink().onTurn(turn("E-large", "share it"));
+    expect(first.filePosts).toEqual([]);
+    expect(toolResult(first.shared)).toMatchObject({
+      ok: false,
+      reason: expect.stringContaining("too large"),
+    });
+
+    const refused = new ShareComputerGateway();
+    const second = harness({
+      computerGateway: refused,
+      postFileResult: { ok: false, error: "Slack rejected this file type." },
+    });
+    second.shared.toolCall = {
+      name: "computer_share_file",
+      args: { path: "reports/risk.txt" },
+    };
+    await second.channel.ɵruntime.start();
+    await second.adapter.getSink().onTurn(turn("E-refused", "share it"));
+    expect(second.filePosts).toHaveLength(1);
+    expect(toolResult(second.shared)).toEqual({
+      ok: false,
+      reason: "Slack rejected this file type.",
+    });
+  });
+
+  test("shared actor resolver carries managed inputs and current grants to built-in and remote coworkers", async () => {
+    const role = "You are the same standing risk coworker in every channel.";
+    const grantActors: string[] = [];
+    const signed: string[] = [];
+    const grantedFor = (actorId: string) => async () => {
+      grantActors.push(actorId);
+      return [
+        {
+          name: "mcp__risk__lookup",
+          description: "Look up a risk record.",
+          parameters: z.object({ recordId: z.string() }),
+          ref: "risk/lookup",
+          execute: async () => actorId,
+        },
+      ];
+    };
+    const llm = new LLMock();
+    const priorBase = process.env.OPENAI_BASE_URL;
+    const priorKey = process.env.OPENAI_API_KEY;
+    const baseUrl = await llm.start();
+    process.env.OPENAI_BASE_URL = baseUrl;
+    process.env.OPENAI_API_KEY = "managed-channel-test-key";
+    llm.onMessage(/.*/, { type: "text", content: "built-in complete" });
+
+    try {
+      const builtResolver = createActorAgentResolver({
+        loadAgents: async () => [
+          {
+            id: "analyst",
+            name: "Analyst",
+            type: "built_in" as const,
+            systemPrompt: role,
+          },
+        ],
+        model: { provider: "openai", defaultModel: "gpt-5.5" },
+        resolveModelApiKey: async () => "managed-channel-test-key",
+        loadToolsForActor: grantedFor,
+        signRunForActor: (actorId) => (botId, runId) => {
+          const assertion = `signed:${actorId}:${botId}:${runId}`;
+          signed.push(assertion);
+          return assertion;
+        },
+      });
+      const built = harness({ resolver: builtResolver, agentId: "analyst" });
+      await built.channel.ɵruntime.start();
+      await built.adapter.getSink().onTurn({
+        ...turn("E-built", "ignored fallback"),
+        contentParts: [{ type: "text", text: "inspect built-in content" }],
+      });
+      await built.channel.ɵruntime.stop();
+
+      const builtRequest = llm.getRequests().at(-1)?.body as {
+        messages?: Array<{ role?: string; content?: unknown }>;
+        tools?: Array<{ function?: { name?: string } }>;
+      };
+      expect(
+        builtRequest.messages?.some(
+          ({ role: messageRole, content }) =>
+            messageRole === "system" && String(content).includes(role),
+        ),
+      ).toBe(true);
+      expect(JSON.stringify(builtRequest.messages)).toContain(
+        "inspect built-in content",
+      );
+      const builtTools = (builtRequest.tools ?? []).map(
+        (tool) => tool.function?.name,
+      );
+      expect(builtTools).toContain("mcp__risk__lookup");
+      expect(builtTools).toContain("approval_card");
+      expect(JSON.stringify(builtRequest)).not.toContain("signed:u1:analyst:");
+      expect(JSON.stringify(builtRequest)).not.toContain("providerTenantId");
+
+      const remoteInputs: RunAgentInput[] = [];
+      const remoteResolver = createActorAgentResolver({
+        loadAgents: async () => [
+          {
+            id: "risk",
+            name: "Risk",
+            type: "remote_ag_ui" as const,
+            endpoint: "https://risk.example/ag-ui",
+            standingMessage: {
+              id: "standing-role:risk",
+              role: "system" as const,
+              content: role,
+            },
+          },
+        ],
+        model: { provider: "openai", defaultModel: "gpt-5.5" },
+        resolveModelApiKey: async () => null,
+        loadToolsForActor: grantedFor,
+        signRunForActor: (actorId) => (botId, runId) => {
+          const assertion = `signed:${actorId}:${botId}:${runId}`;
+          signed.push(assertion);
+          return assertion;
+        },
+        agentFetch: async (_input, init) => {
+          const sent = JSON.parse(String(init?.body)) as RunAgentInput;
+          remoteInputs.push(sent);
+          return new Response(
+            [
+              {
+                type: "RUN_STARTED",
+                threadId: sent.threadId,
+                runId: sent.runId,
+              },
+              {
+                type: "RUN_FINISHED",
+                threadId: sent.threadId,
+                runId: sent.runId,
+              },
+            ]
+              .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+              .join(""),
+            { headers: { "content-type": "text/event-stream" } },
+          );
+        },
+      });
+      const remote = harness({ resolver: remoteResolver, agentId: "risk" });
+      await remote.channel.ɵruntime.start();
+      await remote.adapter.getSink().onTurn({
+        ...turn("E-remote", "ignored fallback"),
+        contentParts: [{ type: "text", text: "inspect remote content" }],
+      });
+      await remote.channel.ɵruntime.stop();
+
+      const sent = remoteInputs[0];
+      expect(sent?.messages[0]).toMatchObject({
+        role: "system",
+        content: role,
+      });
+      expect(JSON.stringify(sent?.messages)).toContain(
+        "inspect remote content",
+      );
+      expect(sent?.tools.map(({ name }) => name)).toEqual(
+        expect.arrayContaining(["approval_card", "mcp__risk__lookup"]),
+      );
+      expect(sent?.forwardedProps).toMatchObject({
+        openbotBotId: "risk",
+        openbotDeploymentTools: ["mcp__risk__lookup"],
+        openbotRun: expect.stringContaining("signed:u1:risk:"),
+      });
+      expect(grantActors).toEqual(["u1", "u1"]);
+      expect(signed).toEqual([
+        expect.stringContaining("signed:u1:analyst:"),
+        expect.stringContaining("signed:u1:risk:"),
+      ]);
+      for (const input of [sent]) {
+        expect(JSON.stringify(input)).not.toContain("providerTenantId");
+        expect(JSON.stringify(input)).not.toContain("channelsConversationKey");
+      }
+    } finally {
+      await llm.stop();
+      if (priorBase === undefined) delete process.env.OPENAI_BASE_URL;
+      else process.env.OPENAI_BASE_URL = priorBase;
+      if (priorKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = priorKey;
+    }
   });
 
   test("an authorized approval interaction resumes the pinned agent as the current participant", async () => {
@@ -460,5 +928,178 @@ describe("managed OpenBot Slack channel", () => {
     expect(shared.inputs.at(-1)?.forwardedProps?.command).toEqual({
       resume: { approved: true },
     });
+  });
+
+  test("cold approval recovery reauthorizes the current participant and reconstructs private execution", async () => {
+    const state = new MemoryStore();
+    const presentations = new Map<string, ApprovalPresentation>();
+    let active = true;
+    let accessible = true;
+    const bindings = new Map<string, ExternalThreadBinding>();
+    const authorizationBinding: ExternalThreadBinding = {
+      channelsThreadId: "slack:T1:C1:root-1",
+      provider: "slack",
+      providerTenantId: "T1",
+      providerConversationId: "C1",
+      providerThreadId: "slack:T1:C1:root-1",
+      agentId: "risk",
+      agentName: "Risk Analyst",
+      createdByUserId: "u1",
+      createdAt: new Date("2026-08-27T00:00:00.000Z"),
+    };
+    bindings.set(authorizationBinding.channelsThreadId, authorizationBinding);
+    const authorizer = createApprovalAuthorizer({
+      links: {
+        async find() {
+          return null;
+        },
+        async findVerifiedUserByEmail() {
+          return null;
+        },
+        async link() {
+          throw new Error("unused");
+        },
+        async resolveActiveUser(id) {
+          return active ? { id, name: `Current ${id}`, role: "user" } : null;
+        },
+      },
+      threads: {
+        async getByChannelsThreadId(id) {
+          return bindings.get(id) ?? null;
+        },
+        async getByProviderThread() {
+          return null;
+        },
+        async bind() {
+          throw new Error("unused");
+        },
+      },
+      profiles: {
+        async get() {
+          return accessible ? ({} as never) : null;
+        },
+      },
+    });
+    configureApprovalDecisionStore(
+      {
+        async present(value) {
+          presentations.set(value.presentationId, {
+            ...value,
+            createdAt: new Date(),
+          });
+        },
+        async get(id) {
+          return presentations.get(id) ?? null;
+        },
+        async begin() {
+          return "first";
+        },
+        async complete() {},
+        async cleanup() {
+          return 0;
+        },
+      },
+      { authorize: authorizer },
+    );
+    const identityLinker: OpenBotSlackChannelDependencies["identityLinker"] = {
+      async resolve(context) {
+        if (context.tenant.id !== "T1" || context.actor.id === "UNLINKED") {
+          return {
+            kind: "unlinked",
+            linkUrl: "https://openbot.test/link/slack?token=opaque",
+            identity: {
+              provider: "slack",
+              providerTenantId: context.tenant.id,
+              providerUserId: context.actor.id,
+              providerEmail: null,
+            },
+          };
+        }
+        return {
+          kind: "linked",
+          user: {
+            id: context.actor.id.toLowerCase(),
+            name: context.actor.id,
+          },
+          actor: { id: context.actor.id.toLowerCase(), role: "user" },
+          identity: {
+            provider: "slack",
+            providerTenantId: context.tenant.id,
+            providerUserId: context.actor.id,
+            providerEmail: null,
+          },
+        };
+      },
+    };
+
+    const first = harness({ stateStore: state, bindings, identityLinker });
+    first.shared.requestApproval = true;
+    await first.channel.ɵruntime.start();
+    await first.adapter.getSink().onTurn(turn("E-cold", "deploy"));
+    const approve = first.adapter.posted.flat().flatMap(actionIds)[0];
+    expect(approve).toBeDefined();
+    const providerAction = first.adapter.posted
+      .flat()
+      .find((node) => actionIds(node).includes(approve!));
+    expect(JSON.stringify(providerAction)).not.toContain("providerTenantId");
+    expect(JSON.stringify(providerAction)).not.toContain("channelsThreadId");
+    await first.channel.ɵruntime.stop();
+
+    const restarted = harness({
+      stateStore: state,
+      shared: first.shared,
+      bindings,
+      identityLinker,
+    });
+    await restarted.channel.ɵruntime.start();
+    const click = (
+      eventId: string,
+      actorId: string,
+      overrides: Partial<InteractionEvent> = {},
+    ) =>
+      restarted.adapter.getSink().onInteraction({
+        id: approve!,
+        value: {
+          approved: false,
+          providerTenantId: "provider-tampered",
+          channelsThreadId: "provider-tampered",
+        },
+        conversationKey: "slack:T1:C1:root-1",
+        replyTarget: {},
+        eventId,
+        actor: { id: actorId, kind: "human", name: actorId },
+        identityContext: identity(eventId, actorId),
+        ...overrides,
+      });
+
+    await expect(
+      click("E-wrong-conversation", "U2", {
+        conversationKey: "slack:T1:C2:root-1",
+      }),
+    ).rejects.toThrow("authorized");
+    await expect(
+      click("E-wrong-tenant", "U2", {
+        identityContext: {
+          ...identity("E-wrong-tenant", "U2"),
+          tenant: { id: "T2" },
+        },
+      }),
+    ).rejects.toThrow("authorized");
+    await expect(click("E-unlinked-click", "UNLINKED")).rejects.toThrow(
+      "authorized",
+    );
+    active = false;
+    await expect(click("E-revoked", "U2")).rejects.toThrow("authorized");
+    active = true;
+    accessible = false;
+    await expect(click("E-no-access", "U2")).rejects.toThrow("authorized");
+    accessible = true;
+
+    await click("E-authorized", "U2");
+    expect(restarted.actors.at(-1)).toBe("u2");
+    expect(restarted.shared.inputs.at(-1)?.forwardedProps?.command).toEqual({
+      resume: { approved: true },
+    });
+    await restarted.channel.ɵruntime.stop();
   });
 });

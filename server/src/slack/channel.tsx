@@ -58,6 +58,43 @@ function isNewMessage(message: { operation?: { kind?: string } }): boolean {
   return message.operation?.kind === "created";
 }
 
+function slackConversationIdentity(conversationKey: string): {
+  providerTenantId: string;
+  providerConversationId: string;
+} | null {
+  const [provider, providerTenantId, providerConversationId, threadId] =
+    conversationKey.split(":", 4);
+  if (
+    provider !== "slack" ||
+    !providerTenantId ||
+    !providerConversationId ||
+    !threadId
+  ) {
+    return null;
+  }
+  return { providerTenantId, providerConversationId };
+}
+
+function validRememberedPrincipal(
+  remembered: Parameters<SlackIngressRegistry["remember"]>[1],
+  message: Parameters<Parameters<Channel["onMention"]>[0]>[0]["message"],
+): boolean {
+  const { identityContext: context, identityResult: result } = remembered;
+  const identity = result.identity;
+  return (
+    context.provider === "slack" &&
+    context.actor.kind === "human" &&
+    context.actor.id === message.actor.id &&
+    identity.provider === "slack" &&
+    identity.providerTenantId === context.tenant.id &&
+    identity.providerUserId === context.actor.id &&
+    (result.kind === "unlinked" ||
+      (!!message.user &&
+        result.user.id === message.user.id &&
+        result.actor.id === message.user.id))
+  );
+}
+
 function executionFor(
   identityContext: ChannelIdentityContext,
   result: Extract<SlackIdentityResult, { kind: "linked" }>,
@@ -112,8 +149,18 @@ export function createOpenBotSlackChannel(
     subscribe: boolean;
   }): Promise<void> {
     if (message.actor.kind !== "human" || !isNewMessage(message)) return;
-    const remembered = ingress.take(message.eventId);
-    if (!remembered) {
+    const providerIdentity = slackConversationIdentity(thread.conversationKey);
+    if (!providerIdentity) {
+      throw new Error("Managed Slack ingress identity is no longer available.");
+    }
+    const remembered = ingress.take(message.eventId, {
+      provider: "slack",
+      ...providerIdentity,
+      providerActorId: message.actor.id,
+      applicationUserId: message.user?.id ?? null,
+      conversationKey: thread.conversationKey,
+    });
+    if (!remembered || !validRememberedPrincipal(remembered, message)) {
       throw new Error("Managed Slack ingress identity is no longer available.");
     }
     if (remembered.identityResult.kind === "unlinked") {

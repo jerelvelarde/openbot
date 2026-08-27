@@ -398,7 +398,7 @@ async function buildAgent(
    * what keeps a narrowed run from being told it holds something it was not offered.
    */
   const withTools = (tools: GrantedTool[]) =>
-    new BuiltInAgent(
+    new GovernedBuiltInAgent(
       builtInAgentConfiguration(
         agent,
         model,
@@ -407,6 +407,9 @@ async function buildAgent(
         computerGuidance,
         connectedVendors,
       ),
+      agent,
+      tools,
+      signRun,
     );
 
   const whole = withTools(granted);
@@ -554,38 +557,12 @@ function remoteAgentWithStandingRole(
           >,
         })),
       ],
-      // Who the Bot is calling back as, so the audit row names it rather than "an agent".
-      forwardedProps: {
-        ...(input.forwardedProps ?? {}),
-        openbotBotId: agent.id,
-        /*
-         * Which of those tools this deployment runs, as opposed to the surface.
-         *
-         * `tools` mixes two kinds that a name cannot tell apart: the Bot's grants, which execute
-         * here through the policy and the audit trail, and the components the browser draws. A Bot
-         * that ran the second kind through this deployment asked it to execute a chart, was told it
-         * could not, and then apologised to the person for not showing the chart that was on screen
-         * in front of them. Only this side knows which is which, so only this side can say.
-         */
-        openbotDeploymentTools: tools.map((tool) => tool.name),
-        /*
-         * This deployment's own statement of what this run is.
-         *
-         * Signed, short-lived, and naming the Bot and the person. The agent hands it back when it
-         * calls a tool, and that is where the Bot and the actor come from: its own token says which
-         * agent is calling, and this says who it is calling for. Neither is taken from the request
-         * body any more, which is what used to make the audit trail forgeable by anything holding
-         * one shared secret.
-         */
-        ...(signRun
-          ? { openbotRun: signRun(agent.id, input.runId) }
-          : /*
-             * Absent means this deployment cannot sign, so the agent is given nothing to hand back
-             * and its tool calls will be refused. That is the right direction to fail: a Bot that
-             * cannot prove whose run it is should not be spending anybody's grants.
-             */
-            {}),
-      },
+      forwardedProps: governedRunForwardedProps(
+        input,
+        agent.id,
+        tools,
+        signRun,
+      ),
     } as RunAgentInput;
   };
 
@@ -595,6 +572,66 @@ function remoteAgentWithStandingRole(
     async (input) =>
       compose(await (narrow ? narrow(input) : Promise.resolve(tools)), input),
   );
+}
+
+function governedRunForwardedProps(
+  input: RunAgentInput,
+  botId: string,
+  tools: GrantedTool[],
+  signRun?: SignRun,
+): Record<string, unknown> {
+  return {
+    ...(input.forwardedProps ?? {}),
+    // Who the Bot is calling back as, so the audit row names it rather than "an agent".
+    openbotBotId: botId,
+    // Distinguish deployment grants from ChannelTools supplied by the current surface.
+    openbotDeploymentTools: tools.map((tool) => tool.name),
+    /*
+     * Absent means this deployment cannot sign, so the agent is given nothing to hand back and its
+     * tool calls fail closed. Built-ins carry the same assertion in their private AG-UI input even
+     * though their granted tools execute locally rather than through the callback endpoint.
+     */
+    ...(signRun ? { openbotRun: signRun(botId, input.runId) } : {}),
+  };
+}
+
+/** Keep built-in and remote coworkers on the same actor-scoped AG-UI run boundary. */
+class GovernedBuiltInAgent extends BuiltInAgent {
+  private botId: string;
+  private deploymentTools: GrantedTool[];
+  private signRun?: SignRun;
+
+  constructor(
+    configuration: BuiltInAgentConfiguration,
+    agent: RegisteredBuiltInAgent,
+    tools: GrantedTool[],
+    signRun?: SignRun,
+  ) {
+    super(configuration);
+    this.botId = agent.id;
+    this.deploymentTools = tools;
+    this.signRun = signRun;
+  }
+
+  run(input: RunAgentInput): Observable<BaseEvent> {
+    return super.run({
+      ...input,
+      forwardedProps: governedRunForwardedProps(
+        input,
+        this.botId,
+        this.deploymentTools,
+        this.signRun,
+      ),
+    });
+  }
+
+  clone(): GovernedBuiltInAgent {
+    const cloned = super.clone() as GovernedBuiltInAgent;
+    cloned.botId = this.botId;
+    cloned.deploymentTools = this.deploymentTools;
+    cloned.signRun = this.signRun;
+    return cloned;
+  }
 }
 
 /**
@@ -901,8 +938,8 @@ export function mountCopilotRuntime(
   resolver: ActorAgentResolver,
   identifyUser: IdentifyUser,
   identifyActor: IdentifyActor,
-  channels: Channel[] = [],
   basePath = "/api/copilotkit",
+  channels: Channel[] = [],
 ) {
   const { intelligence } = config.runtime;
 

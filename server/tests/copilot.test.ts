@@ -7,11 +7,18 @@ import {
   buildAgents,
   builtInAgentConfiguration,
   createRequestAgents,
+  type mountCopilotRuntime,
   registeredAgentFromRow,
   resolveRuntimeAgents,
   standingRoleMessage,
 } from "../src/copilot";
 import { grantedToolGuidance } from "../src/plugins/tools";
+
+test("mountCopilotRuntime preserves the positional custom base path", () => {
+  const customBasePath: Parameters<typeof mountCopilotRuntime>[4] =
+    "/custom/copilotkit";
+  expect(customBasePath).toBe("/custom/copilotkit");
+});
 
 // Every agent row now joins its profile, so the row a coworker is built from always names it.
 const assistantRow = {
