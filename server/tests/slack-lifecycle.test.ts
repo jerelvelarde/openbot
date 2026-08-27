@@ -225,6 +225,53 @@ describe("managed Channels lifecycle", () => {
     expect(exitCodes).toEqual([1]);
   });
 
+  test("reports a prompt rejection and a concurrent timeout exactly once", async () => {
+    let triggerTimeout: (() => void) | undefined;
+    let rejectLateStop: ((error: Error) => void) | undefined;
+    const failures: Array<{ code: string; component: string }> = [];
+    const exitCodes: number[] = [];
+    const shutdown = createGracefulShutdown({
+      channels: {
+        stop: async () => {
+          throw new Error("private prompt rejection detail");
+        },
+      },
+      stopOthers: [
+        () =>
+          new Promise<void>((_resolve, reject) => {
+            rejectLateStop = reject;
+          }),
+      ],
+      exit: (code) => exitCodes.push(code),
+      reportFailure: (failure) => failures.push(failure),
+      timeoutMs: 25,
+      startTimeout: (callback) => {
+        triggerTimeout = callback;
+        return () => {};
+      },
+    });
+
+    const result = shutdown();
+    await Promise.resolve();
+    await Promise.resolve();
+    triggerTimeout?.();
+    await result;
+
+    expect(failures).toEqual([
+      { code: "shutdown_stop_failed", component: "channels" },
+      { code: "shutdown_stop_timeout", component: "background_0" },
+    ]);
+    expect(JSON.stringify(failures)).not.toContain("private prompt rejection");
+    expect(exitCodes).toEqual([1]);
+
+    rejectLateStop?.(new Error("private late rejection detail"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(failures).toHaveLength(2);
+    expect(JSON.stringify(failures)).not.toContain("private late rejection");
+    expect(exitCodes).toEqual([1]);
+  });
+
   test("a broken failure reporter cannot prevent shutdown exit", async () => {
     for (const reportFailure of [
       () => {

@@ -149,16 +149,22 @@ export function createGracefulShutdown({
     ];
     shutdown ??= (async () => {
       const tracked = stops.map(({ component, stop }) => {
-        const state = { component, settled: false };
+        const state: {
+          component: string;
+          outcome:
+            | { status: "pending" }
+            | { status: "fulfilled" }
+            | { status: "rejected"; reason: unknown };
+        } = { component, outcome: { status: "pending" } };
         const promise = Promise.resolve()
           .then(stop)
           .then(
             (value) => {
-              state.settled = true;
+              state.outcome = { status: "fulfilled" };
               return value;
             },
             (error) => {
-              state.settled = true;
+              state.outcome = { status: "rejected", reason: error };
               throw error;
             },
           );
@@ -178,7 +184,12 @@ export function createGracefulShutdown({
 
       if (outcome.kind === "timeout") {
         for (const { state } of tracked) {
-          if (!state.settled) {
+          if (state.outcome.status === "rejected") {
+            reportBestEffort(reportFailure, {
+              code: "shutdown_stop_failed",
+              component: state.component,
+            });
+          } else if (state.outcome.status === "pending") {
             reportBestEffort(reportFailure, {
               code: "shutdown_stop_timeout",
               component: state.component,
