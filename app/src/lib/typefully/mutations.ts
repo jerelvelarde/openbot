@@ -42,9 +42,13 @@ type CachedDraft = { draft: AuthoritativeDraft };
 type UploadMutationInput = {
   draftId: string;
   expectedVersion: number;
+  expectedMediaOrder: number;
+  expectedMediaCount: number;
   kind: "image" | "video";
   altText: string;
+  file: File;
   mediaId?: string;
+  signal?: AbortSignal;
 };
 
 function requestBoundUploadAuthority(
@@ -66,9 +70,8 @@ function requestBoundUploadAuthority(
     !contract.allowedVersionDeltas.includes(versionDelta) ||
     draft.id !== input.draftId ||
     (input.mediaId !== undefined && media.id !== input.mediaId) ||
-    draft.mediaCount < 1 ||
-    media.order >= draft.mediaCount ||
-    (input.mediaId === undefined && media.order !== draft.mediaCount - 1) ||
+    draft.mediaCount !== input.expectedMediaCount ||
+    media.order !== input.expectedMediaOrder ||
     media.kind !== input.kind ||
     media.altText !== input.altText ||
     (contract.requireCompleted && media.remoteId === null) ||
@@ -479,15 +482,9 @@ export function reconcileDraftMutationOptions(queryClient?: QueryClient) {
 
 export function uploadMediaMutationOptions(queryClient?: QueryClient) {
   return mutationOptions({
-    mutationFn: async (input: {
-      draftId: string;
-      expectedVersion: number;
-      kind: "image" | "video";
-      altText: string;
-      file: File;
-      mediaId?: string;
-      signal?: AbortSignal;
-    }): Promise<MediaMutationResponse> => {
+    mutationFn: async (
+      input: UploadMutationInput,
+    ): Promise<MediaMutationResponse> => {
       if (input.file.size > MAX_MEDIA_BYTES) {
         throw new Error("Typefully media must be no larger than 25 MB.");
       }

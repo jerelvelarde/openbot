@@ -1059,7 +1059,9 @@ test("a retry cannot adopt or rekey mismatched non-2xx recovery media", async ()
     new File(["image"], "launch.png", { type: "image/png" }),
   );
   const retry = await view.findByRole("button", { name: "Retry image 1" });
-  const priorItemAlert = view.getByRole("alert").textContent;
+  const priorItemAlert = view.getByText(
+    "Typefully could not confirm this change. Your local draft is preserved.",
+  ).textContent;
   const priorStatus = view.getByTestId("canvas-status").textContent;
   const priorPreviewSource = view
     .getByTestId("preview-media")
@@ -1111,13 +1113,26 @@ test("a retry cannot adopt malformed successful authority or mutate local media 
       queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
     },
   });
+  const existingMedia = {
+    id: "existing-first-media",
+    kind: "image" as const,
+    order: 0,
+    altText: "Existing first attachment",
+    remoteId: "remote-existing-first",
+  };
   queryClient.setQueryData(typefullyKeys.draft(draftId), {
-    draft: authoritativeDraft(),
+    draft: {
+      ...authoritativeDraft(),
+      document: {
+        ...authoritativeDraft().document,
+        media: [existingMedia],
+      },
+    },
   });
   const authoritativeMedia = {
     id: "authoritative-success-retry-media",
     kind: "image" as const,
-    order: 0,
+    order: 1,
     altText: "",
     remoteId: null,
   };
@@ -1138,7 +1153,7 @@ test("a retry cannot adopt malformed successful authority or mutate local media 
               title: "Production route draft",
               destinations: ["x"],
               socialSetLabel: "Route account",
-              mediaCount: 1,
+              mediaCount: 2,
               version: 2,
               syncStatus: "remote_error",
               proposalStatus: null,
@@ -1156,12 +1171,13 @@ test("a retry cannot adopt malformed successful authority or mutate local media 
             destinations: ["x"],
             socialSetLabel: "Route account",
             mediaCount: 1,
-            version: 999,
+            version: 3,
             syncStatus: "synced",
             proposalStatus: null,
           },
           media: {
             ...authoritativeMedia,
+            order: 0,
             remoteId: "untrusted-completed-media",
           },
         }),
@@ -1174,7 +1190,7 @@ test("a retry cannot adopt malformed successful authority or mutate local media 
           ...authoritativeDraft(),
           document: {
             ...authoritativeDraft().document,
-            media: [authoritativeMedia],
+            media: [existingMedia, authoritativeMedia],
           },
           version: 2,
           contentHash: "hash-2",
@@ -1195,16 +1211,18 @@ test("a retry cannot adopt malformed successful authority or mutate local media 
     type: "image/png",
   });
   await user.upload(view.getByLabelText("Add media"), selectedFile);
-  const retry = await view.findByRole("button", { name: "Retry image 1" });
+  const retry = await view.findByRole("button", { name: "Retry image 2" });
   const priorCache = queryClient.getQueryData(typefullyKeys.draft(draftId));
-  const priorItemAlert = view.getByRole("alert").textContent;
+  const priorItemAlert = view.getByText(
+    "Typefully could not confirm this change. Your local draft is preserved.",
+  ).textContent;
   const priorStatus = view.getByTestId("canvas-status").textContent;
   const priorPreviewSource = view
-    .getByTestId("preview-media")
-    .getAttribute("src");
+    .getAllByTestId("preview-media")[1]
+    ?.getAttribute("src");
   const priorAltText = (
     view.getByRole("textbox", {
-      name: "Alt text for image 1",
+      name: "Alt text for image 2",
     }) as HTMLInputElement
   ).value;
 
@@ -1215,23 +1233,25 @@ test("a retry cannot adopt malformed successful authority or mutate local media 
     priorCache,
   );
   expect(view.getByTestId("canvas-status").textContent).toBe(priorStatus);
-  expect(view.getByTestId("preview-media").getAttribute("src")).toBe(
+  expect(view.getAllByTestId("preview-media")[1]?.getAttribute("src")).toBe(
     priorPreviewSource,
   );
   expect(
     (
       view.getByRole("textbox", {
-        name: "Alt text for image 1",
+        name: "Alt text for image 2",
       }) as HTMLInputElement
     ).value,
   ).toBe(priorAltText);
+  const alerts = view.getAllByRole("alert").map((alert) => alert.textContent);
+  expect(alerts).toContain(priorItemAlert);
   expect(
-    view.getAllByRole("alert").map((alert) => alert.textContent),
-  ).toContain(priorItemAlert);
-  expect(view.getByRole("button", { name: "Retry image 1" })).toBeTruthy();
+    alerts.some((alert) => alert?.includes("invalid media response")),
+  ).toBe(true);
+  expect(view.getByRole("button", { name: "Retry image 2" })).toBeTruthy();
   expect(uploadedFiles[1]).toBe(selectedFile);
 
-  await user.click(view.getByRole("button", { name: "Retry image 1" }));
+  await user.click(view.getByRole("button", { name: "Retry image 2" }));
   await waitFor(() => expect(uploads).toBe(3));
   expect(uploadedFiles[2]).toBe(selectedFile);
 });

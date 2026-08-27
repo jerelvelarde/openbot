@@ -25,6 +25,10 @@ import {
 } from "../src/lib/typefully/queries";
 
 const realFetch = globalThis.fetch;
+const singleMediaExpectation = {
+  expectedMediaOrder: 0,
+  expectedMediaCount: 1,
+};
 
 afterEach(() => {
   globalThis.fetch = realFetch;
@@ -332,6 +336,7 @@ describe("Typefully mutation contracts", () => {
     await mutate(uploadMediaMutationOptions(), {
       draftId: "draft/1",
       expectedVersion: 2,
+      ...singleMediaExpectation,
       kind: "image",
       altText: "Product screenshot",
       file,
@@ -370,6 +375,7 @@ describe("Typefully mutation contracts", () => {
       mutate(uploadMediaMutationOptions(), {
         draftId: "d",
         expectedVersion: 1,
+        ...singleMediaExpectation,
         kind: "video",
         altText: "",
         file: oversized,
@@ -720,6 +726,7 @@ describe("Typefully mutation contracts", () => {
       await observer.mutate({
         draftId: "draft-1",
         expectedVersion: 1,
+        ...singleMediaExpectation,
         kind: "image",
         altText: "Launch",
         file: new File(["x"], "x.png", { type: "image/png" }),
@@ -802,6 +809,7 @@ describe("Typefully mutation contracts", () => {
         await observer.mutate({
           draftId: "draft-1",
           expectedVersion: 1,
+          ...singleMediaExpectation,
           kind: "image",
           altText: "Launch",
           file: new File(["x"], "x.png", { type: "image/png" }),
@@ -877,6 +885,7 @@ describe("Typefully mutation contracts", () => {
         await observer.mutate({
           draftId: "draft-1",
           expectedVersion: 1,
+          ...singleMediaExpectation,
           kind: "image",
           altText: "Raw error",
           file: new File(["x"], "x.png", { type: "image/png" }),
@@ -964,6 +973,7 @@ describe("Typefully mutation contracts", () => {
       await mutate(uploadMediaMutationOptions(), {
         draftId: "draft-1",
         expectedVersion: 1,
+        ...singleMediaExpectation,
         kind: "image",
         altText: "Envelope",
         file: new File(["x"], "x.png", { type: "image/png" }),
@@ -1013,6 +1023,7 @@ describe("Typefully mutation contracts", () => {
         mutate(uploadMediaMutationOptions(), {
           draftId: "draft-1",
           expectedVersion: 1,
+          ...singleMediaExpectation,
           kind: "image",
           altText: "Envelope",
           file: new File(["x"], "x.png", { type: "image/png" }),
@@ -1037,6 +1048,7 @@ describe("Typefully mutation contracts", () => {
         await mutate(uploadMediaMutationOptions(), {
           draftId: "draft-1",
           expectedVersion: 1,
+          ...singleMediaExpectation,
           kind: "image",
           altText: "Envelope",
           file: new File(["x"], "x.png", { type: "image/png" }),
@@ -1092,6 +1104,7 @@ describe("Typefully mutation contracts", () => {
         await mutate(uploadMediaMutationOptions(queryClient), {
           draftId: "draft-1",
           expectedVersion: 1,
+          ...singleMediaExpectation,
           kind: "image",
           altText: "Envelope",
           file: new File(["x"], "x.png", { type: "image/png" }),
@@ -1144,6 +1157,7 @@ describe("Typefully mutation contracts", () => {
         mutate(uploadMediaMutationOptions(), {
           draftId: "draft-1",
           expectedVersion: 1,
+          ...singleMediaExpectation,
           kind: "image",
           altText: "Committed refusal",
           file: new File(["x"], "x.png", { type: "image/png" }),
@@ -1285,6 +1299,7 @@ describe("Typefully mutation contracts", () => {
         await mutate(uploadMediaMutationOptions(queryClient), {
           draftId: "draft-1",
           expectedVersion: input.expectedVersion,
+          ...singleMediaExpectation,
           kind: "image",
           altText: "Envelope",
           ...(input.mediaId ? { mediaId: input.mediaId } : {}),
@@ -1371,6 +1386,7 @@ describe("Typefully mutation contracts", () => {
         mutate(uploadMediaMutationOptions(), {
           draftId: "draft-1",
           expectedVersion: input.expectedVersion,
+          ...singleMediaExpectation,
           kind: "image",
           altText: "Boundary",
           ...(input.mediaId ? { mediaId: input.mediaId } : {}),
@@ -1426,6 +1442,7 @@ describe("Typefully mutation contracts", () => {
     await observer.mutate({
       draftId: "draft-1",
       expectedVersion: 1,
+      ...singleMediaExpectation,
       kind: "image",
       altText: media.altText,
       file: new File(["x"], "x.png", { type: "image/png" }),
@@ -1466,6 +1483,7 @@ describe("Typefully mutation contracts", () => {
       mutate(uploadMediaMutationOptions(), {
         draftId: "draft-1",
         expectedVersion: 2,
+        ...singleMediaExpectation,
         mediaId: media.id,
         kind: media.kind,
         altText: media.altText,
@@ -1482,6 +1500,197 @@ describe("Typefully mutation contracts", () => {
       media,
     });
   });
+
+  test.each([
+    {
+      name: "new-upload success order",
+      status: 201,
+      draftVersion: 3,
+      mediaCount: 3,
+      order: 1,
+      remoteId: "remote-multi",
+    },
+    {
+      name: "new-upload success count",
+      status: 201,
+      draftVersion: 3,
+      mediaCount: 4,
+      order: 2,
+      remoteId: "remote-multi",
+    },
+    {
+      name: "committed new-upload order",
+      status: 502,
+      draftVersion: 2,
+      mediaCount: 3,
+      order: 1,
+      remoteId: null,
+    },
+    {
+      name: "committed new-upload count",
+      status: 502,
+      draftVersion: 2,
+      mediaCount: 4,
+      order: 2,
+      remoteId: null,
+    },
+    {
+      name: "reordered retry order",
+      status: 201,
+      draftVersion: 3,
+      mediaCount: 3,
+      order: 0,
+      remoteId: "remote-retry",
+      mediaId: "retry-second",
+    },
+    {
+      name: "reordered retry count",
+      status: 201,
+      draftVersion: 3,
+      mediaCount: 2,
+      order: 1,
+      remoteId: "remote-retry",
+      mediaId: "retry-second",
+    },
+  ] as const)(
+    "rejects response-bound self-consistency for wrong caller $name",
+    async ({ status, draftVersion, mediaCount, order, remoteId, mediaId }) => {
+      const queryClient = new QueryClient({
+        defaultOptions: { mutations: { retry: false } },
+      });
+      const original = { draft: authoritativeDraft(mediaId ? 2 : 1) };
+      queryClient.setQueryData(typefullyKeys.draft("draft-1"), original);
+      globalThis.fetch = (async () =>
+        json(
+          {
+            ...(status === 201 ? {} : { code: "remote_error" }),
+            draft: {
+              ...draftSummary(
+                draftVersion,
+                status === 201 ? "synced" : "remote_error",
+              ),
+              mediaCount,
+            },
+            media: {
+              id: mediaId ?? "new-third",
+              kind: "image",
+              order,
+              altText: "Caller bound",
+              remoteId,
+            },
+          },
+          status,
+        )) as typeof fetch;
+
+      let failure: unknown;
+      try {
+        await mutate(uploadMediaMutationOptions(queryClient), {
+          draftId: "draft-1",
+          expectedVersion: mediaId ? 2 : 1,
+          expectedMediaOrder: mediaId ? 1 : 2,
+          expectedMediaCount: 3,
+          kind: "image",
+          altText: "Caller bound",
+          file: new File(["x"], "x.png", { type: "image/png" }),
+          ...(mediaId ? { mediaId } : {}),
+        });
+      } catch (error) {
+        failure = error;
+      }
+
+      expect(failure).toMatchObject({ code: "remote_invalid_response" });
+      expect((failure as TypefullyClientError).draft).toBeUndefined();
+      expect((failure as TypefullyClientError).media).toBeUndefined();
+      expect(queryClient.getQueryData(typefullyKeys.draft("draft-1"))).toBe(
+        original,
+      );
+    },
+  );
+
+  test.each([
+    {
+      name: "multi-attachment new upload",
+      status: 201,
+      expectedVersion: 1,
+      draftVersion: 3,
+      order: 2,
+      mediaId: undefined,
+      remoteId: "remote-new-third",
+    },
+    {
+      name: "reordered retry",
+      status: 201,
+      expectedVersion: 2,
+      draftVersion: 3,
+      order: 1,
+      mediaId: "retry-second",
+      remoteId: "remote-retry-second",
+    },
+    {
+      name: "committed multi-attachment new upload",
+      status: 502,
+      expectedVersion: 1,
+      draftVersion: 2,
+      order: 2,
+      mediaId: undefined,
+      remoteId: null,
+    },
+  ] as const)(
+    "accepts exact caller-bound authority for $name",
+    async ({
+      status,
+      expectedVersion,
+      draftVersion,
+      order,
+      mediaId,
+      remoteId,
+    }) => {
+      globalThis.fetch = (async () =>
+        json(
+          {
+            ...(status === 201 ? {} : { code: "remote_error" }),
+            draft: {
+              ...draftSummary(
+                draftVersion,
+                status === 201 ? "synced" : "remote_error",
+              ),
+              mediaCount: 3,
+            },
+            media: {
+              id: mediaId ?? "new-third",
+              kind: "image",
+              order,
+              altText: "Caller bound",
+              remoteId,
+            },
+          },
+          status,
+        )) as typeof fetch;
+      const operation = mutate(uploadMediaMutationOptions(), {
+        draftId: "draft-1",
+        expectedVersion,
+        expectedMediaOrder: order,
+        expectedMediaCount: 3,
+        kind: "image",
+        altText: "Caller bound",
+        file: new File(["x"], "x.png", { type: "image/png" }),
+        ...(mediaId ? { mediaId } : {}),
+      });
+
+      if (status === 201) {
+        await expect(operation).resolves.toMatchObject({
+          draft: { version: draftVersion, mediaCount: 3 },
+          media: { id: mediaId ?? "new-third", order },
+        });
+      } else {
+        await expect(operation).rejects.toMatchObject({
+          code: "remote_error",
+          draft: { version: draftVersion, mediaCount: 3 },
+          media: { id: "new-third", order },
+        });
+      }
+    },
+  );
 
   test.each([
     {
@@ -1693,6 +1902,7 @@ describe("Typefully mutation contracts", () => {
         observer.mutate({
           draftId: "draft-1",
           expectedVersion: 1,
+          ...singleMediaExpectation,
           kind: "image",
           altText: "Launch",
           file: new File(["x"], "x.png", { type: "image/png" }),
@@ -1724,6 +1934,7 @@ describe("Typefully mutation contracts", () => {
     const pending = observer.mutate({
       draftId: "draft-1",
       expectedVersion: 2,
+      ...singleMediaExpectation,
       kind: "image",
       altText: "Completed upload",
       file: new File(["x"], "x.png", { type: "image/png" }),
@@ -1799,6 +2010,7 @@ describe("Typefully mutation contracts", () => {
       observer.mutate({
         draftId: "draft-1",
         expectedVersion: 1,
+        ...singleMediaExpectation,
         kind: "image",
         altText: media.altText,
         file: new File(["x"], "x.png", { type: "image/png" }),
@@ -1849,6 +2061,7 @@ describe("Typefully mutation contracts", () => {
       observer.mutate({
         draftId: "draft-1",
         expectedVersion: 1,
+        ...singleMediaExpectation,
         kind: "image",
         altText: placeholder.altText,
         file: new File(["x"], "x.png", { type: "image/png" }),
@@ -1881,6 +2094,7 @@ describe("Typefully mutation contracts", () => {
     const late = observer.mutate({
       draftId: "draft-1",
       expectedVersion: 1,
+      ...singleMediaExpectation,
       kind: "image",
       altText: "Late upload",
       file: new File(["x"], "x.png", { type: "image/png" }),
@@ -2282,6 +2496,7 @@ describe("Typefully mutation contracts", () => {
           observer.mutate({
             draftId,
             expectedVersion: 1,
+            ...singleMediaExpectation,
             kind: "image",
             altText: "Launch",
             file: new File(["x"], "x.png", { type: "image/png" }),
@@ -2353,6 +2568,7 @@ describe("Typefully mutation contracts", () => {
       await mutate(uploadMediaMutationOptions(), {
         draftId: "draft-1",
         expectedVersion: 1,
+        ...singleMediaExpectation,
         kind: "image",
         altText: "Retry me",
         file: new File(["x"], "x.png", { type: "image/png" }),
@@ -2374,6 +2590,7 @@ describe("Typefully mutation contracts", () => {
     await mutate(uploadMediaMutationOptions(), {
       draftId: "draft-1",
       expectedVersion: failure?.draft?.version ?? 0,
+      ...singleMediaExpectation,
       kind: "image",
       altText: "Retry me",
       file: new File(["x"], "x.png", { type: "image/png" }),

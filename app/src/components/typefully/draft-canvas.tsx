@@ -341,6 +341,10 @@ function EditableDraftCanvas({
       const result = await upload.mutateAsync({
         draftId: stable.target.draftId,
         expectedVersion: stable.target.version,
+        expectedMediaOrder: descriptor.order,
+        expectedMediaCount: existing
+          ? stable.document.media.length
+          : stable.document.media.length + 1,
         kind: descriptor.kind,
         altText: descriptor.altText,
         file,
