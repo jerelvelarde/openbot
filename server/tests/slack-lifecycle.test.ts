@@ -103,7 +103,7 @@ describe("managed Channels lifecycle", () => {
     let httpStops = 0;
     const httpStopForces: Array<boolean | undefined> = [];
     let listenerStops = 0;
-    let exits = 0;
+    const exitCodes: number[] = [];
     let markExited: (() => void) | undefined;
     const exited = new Promise<void>((resolve) => {
       markExited = resolve;
@@ -130,8 +130,8 @@ describe("managed Channels lifecycle", () => {
           listenerStops += 1;
         },
       ],
-      exit: () => {
-        exits += 1;
+      exit: (code) => {
+        exitCodes.push(code);
         markExited?.();
       },
     });
@@ -147,7 +147,7 @@ describe("managed Channels lifecycle", () => {
     expect(httpStops).toBe(1);
     expect(httpStopForces).toEqual([true]);
     expect(listenerStops).toBe(1);
-    expect(exits).toBe(1);
+    expect(exitCodes).toEqual([0]);
     expect(signals.count("SIGINT")).toBe(0);
     expect(signals.count("SIGTERM")).toBe(0);
   });
@@ -181,6 +181,77 @@ describe("managed Channels lifecycle", () => {
     }
   });
 
+  test("times out a hanging stop once and observes its late rejection", async () => {
+    let triggerTimeout: (() => void) | undefined;
+    let rejectStop: ((error: Error) => void) | undefined;
+    let stopCalls = 0;
+    const failures: Array<{ code: string; component: string }> = [];
+    const exitCodes: number[] = [];
+    const shutdown = createGracefulShutdown({
+      channels: {
+        stop: () => {
+          stopCalls += 1;
+          return new Promise<void>((_resolve, reject) => {
+            rejectStop = reject;
+          });
+        },
+      },
+      stopOthers: [],
+      exit: (code) => exitCodes.push(code),
+      reportFailure: (failure) => failures.push(failure),
+      timeoutMs: 25,
+      startTimeout: (callback) => {
+        triggerTimeout = callback;
+        return () => {};
+      },
+    });
+
+    const first = shutdown();
+    const second = shutdown();
+    expect(triggerTimeout).toBeFunction();
+    triggerTimeout?.();
+    await Promise.all([first, second]);
+
+    expect(stopCalls).toBe(1);
+    expect(failures).toEqual([
+      { code: "shutdown_stop_timeout", component: "channels" },
+    ]);
+    expect(exitCodes).toEqual([1]);
+
+    rejectStop?.(new Error("private late stop detail"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(failures).toHaveLength(1);
+    expect(exitCodes).toEqual([1]);
+  });
+
+  test("a broken failure reporter cannot prevent shutdown exit", async () => {
+    for (const reportFailure of [
+      () => {
+        throw new Error("reporter threw");
+      },
+      async () => {
+        throw new Error("reporter rejected");
+      },
+    ]) {
+      const exitCodes: number[] = [];
+      const shutdown = createGracefulShutdown({
+        channels: {
+          stop: async () => {
+            throw new Error("private stop detail");
+          },
+        },
+        stopOthers: [],
+        exit: (code) => exitCodes.push(code),
+        reportFailure,
+      });
+
+      await shutdown();
+      await Promise.resolve();
+      expect(exitCodes).toEqual([1]);
+    }
+  });
+
   test("handles a rejecting signal shutdown and still unregisters listeners", async () => {
     const listeners = new Map<string, Set<() => void>>();
     const signals = {
@@ -194,11 +265,18 @@ describe("managed Channels lifecycle", () => {
       },
     };
     const logged = spyOn(console, "error").mockImplementation(() => {});
+    const exitCodes: number[] = [];
     try {
-      registerShutdownSignals(signals, async () => {
-        throw new Error("private shutdown detail");
-      });
+      registerShutdownSignals(
+        signals,
+        async () => {
+          throw new Error("private shutdown detail");
+        },
+        undefined,
+        (code) => exitCodes.push(code),
+      );
       for (const listener of listeners.get("SIGTERM") ?? []) listener();
+      for (const listener of listeners.get("SIGINT") ?? []) listener();
       await new Promise((resolve) => setTimeout(resolve, 0));
 
       expect(listeners.get("SIGINT")?.size ?? 0).toBe(0);
@@ -210,9 +288,41 @@ describe("managed Channels lifecycle", () => {
       expect(JSON.stringify(logged.mock.calls)).not.toContain(
         "private shutdown detail",
       );
+      expect(exitCodes).toEqual([1]);
     } finally {
       logged.mockRestore();
     }
+  });
+
+  test("terminates when a signal shutdown throws before returning a promise", async () => {
+    const listeners = new Map<string, Set<() => void>>();
+    const signals = {
+      on(signal: "SIGINT" | "SIGTERM", listener: () => void) {
+        const registered = listeners.get(signal) ?? new Set();
+        registered.add(listener);
+        listeners.set(signal, registered);
+      },
+      off(signal: "SIGINT" | "SIGTERM", listener: () => void) {
+        listeners.get(signal)?.delete(listener);
+      },
+    };
+    const exitCodes: number[] = [];
+    registerShutdownSignals(
+      signals,
+      () => {
+        throw new Error("private synchronous shutdown detail");
+      },
+      () => {},
+      (code) => exitCodes.push(code),
+    );
+
+    for (const listener of listeners.get("SIGTERM") ?? []) listener();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(listeners.get("SIGINT")?.size ?? 0).toBe(0);
+    expect(listeners.get("SIGTERM")?.size ?? 0).toBe(0);
+    expect(exitCodes).toEqual([1]);
   });
 
   test("the production Bun host force-stops active WebSockets", async () => {
