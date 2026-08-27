@@ -10,6 +10,8 @@ import {
   computerNavigateContract,
   computerReadContract,
   computerReadFileContract,
+  computerRequestHelpContract,
+  computerRequestSecretContract,
   computerRunCommandContract,
   computerScrollContract,
   computerShareFileContract,
@@ -29,6 +31,11 @@ import {
   WorkspaceRefusedError,
   WorkspaceRequestError,
 } from "../computer/gateway";
+import {
+  requestSlackHelp,
+  requestSlackSecret,
+  type SlackAssistanceOptions,
+} from "./assistance";
 import { currentSlackExecution } from "./execution-context";
 
 const COMPUTER_UNAVAILABLE =
@@ -236,13 +243,14 @@ function utf8Bytes(value: string): number {
  * Computer tools for Slack turns.
  *
  * Every operation enters through ComputerGateway, preserving its policy decision and audit record.
- * Request-help and request-secret remain web-only until their Slack-native continuation flow is
- * available; exposing them here without that flow would falsely claim a human had been reached.
+ * Assistance operations are added only with a configured secure handoff; without one, exposing
+ * them would falsely claim that a person in Slack had been reached.
  */
 export function createSlackComputerTools(
   gateway: ComputerGateway,
+  assistance?: SlackAssistanceOptions,
 ): SlackComputerTool[] {
-  return [
+  const tools: SlackComputerTool[] = [
     defineChannelTool({
       ...computerNavigateContract,
       handler: ({ url }, { signal }) =>
@@ -380,6 +388,29 @@ export function createSlackComputerTools(
       handler: (input, context) => shareFile(gateway, input, context),
     }),
   ];
+  if (assistance) {
+    tools.push(
+      defineChannelTool({
+        ...computerRequestHelpContract,
+        handler: ({ reason }, context) =>
+          governed(
+            context.signal,
+            () => requestSlackHelp(gateway, reason, context, assistance),
+            { checkStoppedAfter: false },
+          ),
+      }),
+      defineChannelTool({
+        ...computerRequestSecretContract,
+        handler: (input, context) =>
+          governed(
+            context.signal,
+            () => requestSlackSecret(gateway, input, context, assistance),
+            { checkStoppedAfter: false },
+          ),
+      }),
+    );
+  }
+  return tools;
 }
 
 async function shareFile(

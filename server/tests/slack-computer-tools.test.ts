@@ -121,6 +121,10 @@ class FakeComputerGateway implements ComputerGateway {
   readonly readFileCalls: Parameters<ComputerGateway["readFile"]>[] = [];
   readonly runCommandCalls: Parameters<ComputerGateway["runCommand"]>[] = [];
   readonly writeFileCalls: Parameters<ComputerGateway["writeFile"]>[] = [];
+  readonly controlCalls: Parameters<ComputerGateway["control"]>[] = [];
+  readonly requestHelpCalls: Parameters<ComputerGateway["requestHelp"]>[] = [];
+  readonly requestSecretCalls: Parameters<ComputerGateway["requestSecret"]>[] =
+    [];
   nextError?: unknown;
   afterCall?: () => void;
   readFileResult: Awaited<ReturnType<ComputerGateway["readFile"]>> = {
@@ -249,11 +253,21 @@ class FakeComputerGateway implements ComputerGateway {
       appended: args[2].append === true,
     });
   }
-  async control(): Promise<never> {
-    throw new Error("unused");
+  async control(...args: Parameters<ComputerGateway["control"]>) {
+    this.controlCalls.push(args);
+    return {
+      holder: "bot" as const,
+      since: "2026-08-27T00:00:00.000Z",
+      requested: false,
+    };
   }
-  async requestHelp(): Promise<never> {
-    throw new Error("unused");
+  async requestHelp(...args: Parameters<ComputerGateway["requestHelp"]>) {
+    this.requestHelpCalls.push(args);
+    return {
+      holder: "bot" as const,
+      since: "2026-08-27T00:00:00.000Z",
+      requested: true,
+    };
   }
   async takeControl(): Promise<never> {
     throw new Error("unused");
@@ -261,8 +275,13 @@ class FakeComputerGateway implements ComputerGateway {
   async releaseControl(): Promise<never> {
     throw new Error("unused");
   }
-  async requestSecret(): Promise<never> {
-    throw new Error("unused");
+  async requestSecret(...args: Parameters<ComputerGateway["requestSecret"]>) {
+    this.requestSecretCalls.push(args);
+    return {
+      holder: "bot" as const,
+      since: "2026-08-27T00:00:00.000Z",
+      requested: false,
+    };
   }
   async supplySecret(): Promise<never> {
     throw new Error("unused");
@@ -284,6 +303,15 @@ class FakeComputerGateway implements ComputerGateway {
 function toolsByName(gateway: ComputerGateway) {
   return new Map(
     createSlackComputerTools(gateway).map((tool) => [tool.name, tool]),
+  );
+}
+
+function toolsWithAssistance(gateway: ComputerGateway) {
+  return new Map(
+    createSlackComputerTools(gateway, {
+      appUrl: "https://openbot.example",
+      encryptionKey: "slack-assistance-key",
+    }).map((tool) => [tool.name, tool]),
   );
 }
 
@@ -320,6 +348,63 @@ describe("Slack computer ChannelTools", () => {
     ]);
     expect(names).not.toContain("computer_request_help");
     expect(names).not.toContain("computer_request_secret");
+  });
+
+  test("adds web-parity assistance tools only when the secure handoff is configured", () => {
+    expect([...toolsWithAssistance(new FakeComputerGateway()).keys()]).toEqual([
+      ...toolsByName(new FakeComputerGateway()).keys(),
+      "computer_request_help",
+      "computer_request_secret",
+    ]);
+  });
+
+  test("posts secure help and secret handoffs without refs, cookies, or plain private ids", async () => {
+    const gateway = new FakeComputerGateway();
+    const tools = toolsWithAssistance(gateway);
+    const adapter = new FileAdapter();
+    const context = channelContext(adapter);
+
+    const [help, secret] = await inSlack(
+      async () => [
+        await invoke(
+          tools.get("computer_request_help")!,
+          { reason: "Please finish signing in." },
+          context,
+        ),
+        await invoke(
+          tools.get("computer_request_secret")!,
+          { label: "one-time code", ref: "field-ref-private", snapshotId: 9 },
+          context,
+        ),
+      ],
+      { channelsThreadId: "channels-thread-private" },
+    );
+
+    const rendered = JSON.stringify(adapter.posted);
+    expect(rendered).toContain("Please finish signing in.");
+    expect(rendered).toContain("one-time code");
+    expect(rendered).toContain("/assist?token=");
+    expect(rendered).not.toMatch(
+      /field-ref-private|session-cookie-private|channels-thread-private|provider-U999|"u1"|"risk"/,
+    );
+    expect(gateway.requestHelpCalls).toEqual([
+      ["risk", { id: "u1", userId: "u1" }, "Please finish signing in."],
+    ]);
+    expect(gateway.requestSecretCalls).toEqual([
+      [
+        "risk",
+        { id: "u1", userId: "u1" },
+        { label: "one-time code", ref: "field-ref-private", snapshotId: 9 },
+      ],
+    ]);
+    expect(help).toMatchObject({
+      ok: true,
+      result: expect.stringContaining("handed control back"),
+    });
+    expect(secret).toMatchObject({
+      ok: true,
+      result: expect.stringContaining("you were not told what it is"),
+    });
   });
 
   test("passes the pinned coworker, linked actor, parsed click input, and signal", async () => {

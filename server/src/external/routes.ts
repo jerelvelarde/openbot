@@ -1,19 +1,29 @@
 import type { Context, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
+import type { AgentProfileStore } from "../agents/profile-store";
 import { recordAuditEvent, type TransactionalAuditStore } from "../audit";
 import type { AppVariables } from "../auth/guards";
+import {
+  type AssistanceClaim,
+  readAssistanceToken,
+} from "../slack/assistance-token";
 import type { ExternalLinkCreationStore } from "./link-store";
 import { readExternalLinkToken } from "./link-token";
 import type { ExternalProviderIdentity } from "./schema-types";
 
 const INVALID_LINK_MESSAGE = "This Slack link has expired or is invalid.";
 const LINK_CONFLICT_MESSAGE = "That Slack identity is already linked.";
+const INVALID_ASSISTANCE_MESSAGE =
+  "This assistance link has expired or is invalid.";
+const ASSISTANCE_FORBIDDEN_MESSAGE =
+  "This assistance request is not available to this account.";
 
 type ExternalLinkRoutesOptions = {
   store: ExternalLinkCreationStore;
   encryptionKey: string;
   requireUser: MiddlewareHandler<{ Variables: AppVariables }>;
   auditStore: TransactionalAuditStore;
+  agentProfileStore: Pick<AgentProfileStore, "get">;
 };
 
 function tokenFrom(value: unknown): string | undefined {
@@ -33,6 +43,7 @@ export function createExternalLinkRoutes({
   encryptionKey,
   requireUser,
   auditStore,
+  agentProfileStore,
 }: ExternalLinkRoutesOptions) {
   const routes = new Hono<{ Variables: AppVariables }>();
 
@@ -87,6 +98,31 @@ export function createExternalLinkRoutes({
     }
 
     return context.json({ linked: true });
+  });
+
+  routes.get("/assistance", requireUser, async (context) => {
+    let claim: AssistanceClaim;
+    try {
+      claim = await readAssistanceToken(
+        context.req.query("token"),
+        encryptionKey,
+      );
+    } catch {
+      return context.json({ error: INVALID_ASSISTANCE_MESSAGE }, 410);
+    }
+
+    const actor = context.var.actor;
+    if (claim.openbotUserId !== actor.id) {
+      return context.json({ error: ASSISTANCE_FORBIDDEN_MESSAGE }, 403);
+    }
+
+    const profile = await agentProfileStore
+      .get({ id: actor.id, role: actor.role }, claim.agentId)
+      .catch(() => null);
+    if (!profile) {
+      return context.json({ error: ASSISTANCE_FORBIDDEN_MESSAGE }, 403);
+    }
+    return context.json({ agentId: profile.id });
   });
 
   return routes;
