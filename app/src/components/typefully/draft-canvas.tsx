@@ -11,11 +11,13 @@ import {
 } from "@/lib/typefully/mutations";
 import { nextMediaOrder } from "@/lib/typefully/preview";
 import {
+  asLocalTypefullyDraft,
   type AuthoritativeDraft,
   type CanonicalDraftDocument,
   draftQueryOptions,
   type ProposalSummary,
   TypefullyClientError,
+  typefullyKeys,
 } from "@/lib/typefully/queries";
 import { CanvasShell } from "./canvas-shell";
 import {
@@ -61,15 +63,14 @@ export function DraftCanvas({
   onDraftCreated?: (draftId: string) => void;
 }) {
   const draft = useQuery(draftQueryOptions(draftId));
-  const connections = useQuery({
-    ...connectionsQueryOptions(),
-    enabled: false,
-  });
-  const remoteConnected = connections.data
-    ? connections.data.connections.some(
-        (connection) => connection.serverId === "typefully",
-      )
-    : undefined;
+  const connections = useQuery(connectionsQueryOptions());
+  const remoteConnected =
+    connections.isSuccess &&
+    connections.data.connections.some(
+      (connection) => connection.serverId === "typefully",
+    );
+  const connectionConfirmedDisconnected =
+    connections.isSuccess && !remoteConnected;
 
   if (draft.isPending) {
     return (
@@ -90,6 +91,7 @@ export function DraftCanvas({
       draft={draft.data.draft}
       key={draft.data.draft.id}
       onDraftCreated={onDraftCreated}
+      connectionConfirmedDisconnected={connectionConfirmedDisconnected}
       remoteConnected={remoteConnected}
     />
   );
@@ -138,11 +140,13 @@ function replaceMediaIdentity(
 function EditableDraftCanvas({
   draft,
   onDraftCreated,
+  connectionConfirmedDisconnected,
   remoteConnected,
 }: {
   draft: AuthoritativeDraft;
   onDraftCreated?: (draftId: string) => void;
-  remoteConnected?: boolean;
+  connectionConfirmedDisconnected: boolean;
+  remoteConnected: boolean;
 }) {
   const queryClient = useQueryClient();
   const save = useMutation(saveDraftMutationOptions(queryClient));
@@ -297,7 +301,7 @@ function EditableDraftCanvas({
   }, [connectionDismissed, draft]);
 
   useEffect(() => {
-    if (remoteConnected !== false) return;
+    if (!connectionConfirmedDisconnected) return;
     connectionResume.current += 1;
     connectionResumeAbort.current?.abort();
     connectionResumeAbort.current = null;
@@ -310,6 +314,11 @@ function EditableDraftCanvas({
       "Typefully disconnected. Your draft remains saved in OpenBot.",
     );
     setProposal(null);
+    queryClient.setQueryData<{ draft: AuthoritativeDraft }>(
+      typefullyKeys.draft(draft.id),
+      (cached) =>
+        cached ? { draft: asLocalTypefullyDraft(cached.draft) } : cached,
+    );
     const current = controller.getSnapshot();
     controller.adoptAuthoritative(
       current.document,
@@ -317,7 +326,13 @@ function EditableDraftCanvas({
       current.target.draftId,
       "local",
     );
-  }, [controller, remoteConnected, resetPrepareProposal]);
+  }, [
+    connectionConfirmedDisconnected,
+    controller,
+    draft.id,
+    queryClient,
+    resetPrepareProposal,
+  ]);
 
   useEffect(() => {
     mounted.current = true;

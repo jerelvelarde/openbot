@@ -153,7 +153,7 @@ function autosaveLabel(
   snapshot: AutosaveSnapshot | undefined,
   draft: AuthoritativeDraft,
   mediaBusy: boolean,
-  remoteConnected?: boolean,
+  remoteConnected: boolean,
 ) {
   if (mediaBusy) return "Saving…";
   if (!snapshot) return SYNC_LABELS[draft.syncStatus];
@@ -161,7 +161,7 @@ function autosaveLabel(
     return "Saving…";
   if (snapshot.state.kind === "conflict") return "Save conflict";
   if (snapshot.state.kind === "error") return "Not saved to Typefully";
-  if (remoteConnected === false) return "Saved in OpenBot";
+  if (remoteConnected !== true) return "Saved in OpenBot";
   return snapshot.state.remote === "confirmed"
     ? "Saved to Typefully"
     : "Saved in OpenBot";
@@ -173,7 +173,7 @@ function readiness(
   snapshot: AutosaveSnapshot | undefined,
   mediaStates: Readonly<Record<string, MediaItemState>>,
   mediaBusy: boolean,
-  remoteConnected?: boolean,
+  remoteConnected: boolean,
 ) {
   if (
     document.posts.some((post) =>
@@ -190,7 +190,7 @@ function readiness(
     Object.values(mediaStates).some((state) => state.kind !== "ready")
   )
     return "Resolve media uploads before requesting approval";
-  if (remoteConnected === false)
+  if (remoteConnected !== true)
     return "Connect Typefully before requesting approval";
   if (snapshot) {
     if (snapshot.state.kind === "dirty" || snapshot.state.kind === "saving")
@@ -243,7 +243,7 @@ export type CanvasShellProps = {
   proposal?: ProposalSummary | null;
   proposalPreparing?: boolean;
   proposalError?: string | null;
-  remoteConnected?: boolean;
+  remoteConnected: boolean;
 };
 
 export function CanvasShell({

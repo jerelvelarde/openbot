@@ -2,6 +2,7 @@ import { mutationOptions, type QueryClient } from "@tanstack/react-query";
 import { client } from "@/lib/client";
 import { connectTypefully } from "@/lib/typefully/mutations";
 import {
+  asLocalTypefullyDraft,
   type AuthoritativeDraft,
   typefullyKeys,
   typefullyRequest,
@@ -111,14 +112,7 @@ export async function disconnectPersonalTypefully(queryClient: QueryClient) {
     )
       continue;
     queryClient.setQueryData(key, {
-      draft: {
-        ...cached.draft,
-        remoteDraftId: null,
-        remoteVersion: null,
-        remoteHash: null,
-        syncStatus: "local" as const,
-        lastError: null,
-      },
+      draft: asLocalTypefullyDraft(cached.draft),
     });
   }
   queryClient.removeQueries({

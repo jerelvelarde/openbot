@@ -428,6 +428,19 @@ export const typefullyKeys = {
     ["typefully", "proposal", proposalId] as const,
 };
 
+export function asLocalTypefullyDraft(
+  draft: AuthoritativeDraft,
+): AuthoritativeDraft {
+  return {
+    ...draft,
+    remoteDraftId: null,
+    remoteVersion: null,
+    remoteHash: null,
+    syncStatus: "local",
+    lastError: null,
+  };
+}
+
 export async function loadAuthoritativeDraft(
   draftId: string,
   signal?: AbortSignal,

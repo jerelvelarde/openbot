@@ -17,6 +17,7 @@ import { DetailPanel } from "../src/components/layout/detail-panel";
 import { agentKeys } from "../src/lib/agents/queries";
 import { channelKeys } from "../src/lib/channels/queries";
 import { reportComputerActivity } from "../src/lib/copilot/computer-activity";
+import { pluginKeys } from "../src/lib/plugins/queries";
 import {
   TypefullyClientError,
   typefullyKeys,
@@ -43,6 +44,14 @@ afterEach(() => {
 afterAll(() => GlobalRegistrator.unregister());
 
 const draftId = "8b1c61f1-2154-4a5d-8c9a-7c8df8f9ae53";
+
+const confirmedTypefullyConnection = {
+  serverId: "typefully",
+  authMethod: "api_key" as const,
+  scope: null,
+  accountLabel: "Route account",
+  connectedAt: "2026-08-27T08:00:00.000Z",
+};
 
 const channel = {
   id: "channel-1",
@@ -109,7 +118,18 @@ function queryView(fetchImplementation: typeof fetch) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
+  confirmTypefully(queryClient);
   return { queryClient };
+}
+
+function confirmTypefully(queryClient: QueryClient) {
+  queryClient.setQueryDefaults(pluginKeys.connections(), {
+    staleTime: Number.POSITIVE_INFINITY,
+  });
+  queryClient.setQueryData(pluginKeys.connections(), {
+    connections: [confirmedTypefullyConnection],
+    redirectUri: null,
+  });
 }
 
 test("wide detail panel becomes the main surface at the app narrow breakpoint", () => {
@@ -334,6 +354,7 @@ test("the production route preserves focus on automatic watch and backs out of a
       queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
     },
   });
+  confirmTypefully(queryClient);
   queryClient.setQueryData(channelKeys.detail(channel.id), channel);
   queryClient.setQueryData(agentKeys.detail("bot-1"), {
     id: "bot-1",
@@ -749,6 +770,7 @@ test("production draft canvas keeps editing during a delayed save and coalesces 
       queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
     },
   });
+  confirmTypefully(queryClient);
   queryClient.setQueryData(typefullyKeys.draft(draftId), {
     draft: authoritativeDraft(),
   });
@@ -868,6 +890,7 @@ test("draft media add omits an id, then retry and remove use the server-authorit
       queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
     },
   });
+  confirmTypefully(queryClient);
   queryClient.setQueryData(typefullyKeys.draft(draftId), {
     draft: authoritativeDraft(),
   });
@@ -995,6 +1018,7 @@ test("a retry cannot adopt or rekey mismatched non-2xx recovery media", async ()
       queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
     },
   });
+  confirmTypefully(queryClient);
   queryClient.setQueryData(typefullyKeys.draft(draftId), {
     draft: authoritativeDraft(),
   });
@@ -1113,6 +1137,7 @@ test("a retry cannot adopt malformed successful authority or mutate local media 
       queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
     },
   });
+  confirmTypefully(queryClient);
   const existingMedia = {
     id: "existing-first-media",
     kind: "image" as const,
@@ -1265,6 +1290,7 @@ test("media busy locks edits and an autosave error blocks media operations", asy
       queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
     },
   });
+  confirmTypefully(queryClient);
   queryClient.setQueryData(typefullyKeys.draft(draftId), {
     draft: authoritativeDraft(),
   });
@@ -1412,6 +1438,7 @@ for (const [label, uploadResult] of [
         queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
       },
     });
+    confirmTypefully(queryClient);
     queryClient.setQueryData(typefullyKeys.draft(draftId), {
       draft: authoritativeDraft(),
     });
@@ -1467,6 +1494,7 @@ test("a later successful selection clears the rollback media alert", async () =>
       queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
     },
   });
+  confirmTypefully(queryClient);
   queryClient.setQueryData(typefullyKeys.draft(draftId), {
     draft: authoritativeDraft(),
   });
@@ -1533,6 +1561,7 @@ test("production review control prepares a proposal without publishing", async (
       queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
     },
   });
+  confirmTypefully(queryClient);
   queryClient.setQueryData(typefullyKeys.draft(draftId), {
     draft: authoritativeDraft(),
   });
@@ -1650,6 +1679,7 @@ test("save as new pushes the production route onto the authoritative copied draf
       queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
     },
   });
+  confirmTypefully(queryClient);
   queryClient.setQueryData(channelKeys.detail(channel.id), channel);
   queryClient.setQueryData(agentKeys.detail("bot-1"), {
     id: "bot-1",

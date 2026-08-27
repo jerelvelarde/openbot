@@ -3,6 +3,7 @@ import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import type { CanvasShellProps } from "../src/components/typefully/canvas-shell";
+import { pluginKeys } from "../src/lib/plugins/queries";
 import { typefullyKeys } from "../src/lib/typefully/queries";
 
 let renderedShell: CanvasShellProps | undefined;
@@ -23,6 +24,21 @@ mock.module("../src/components/typefully/canvas-shell", () => ({
 
 const draftId = "8b1c61f1-2154-4a5d-8c9a-7c8df8f9ae53";
 const originalFetch = globalThis.fetch;
+
+function confirmTypefully(queryClient: QueryClient) {
+  queryClient.setQueryData(pluginKeys.connections(), {
+    connections: [
+      {
+        serverId: "typefully",
+        authMethod: "api_key",
+        scope: null,
+        accountLabel: "Route account",
+        connectedAt: "2026-08-27T08:00:00.000Z",
+      },
+    ],
+    redirectUri: null,
+  });
+}
 
 beforeAll(() => GlobalRegistrator.register());
 afterEach(() => {
@@ -70,6 +86,7 @@ test("a stale upload callback refuses exhausted order capacity without mutation"
       queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
     },
   });
+  confirmTypefully(queryClient);
   const cached = { draft: authoritative };
   queryClient.setQueryData(typefullyKeys.draft(draftId), cached);
   const fetchRequest = mock(() =>
@@ -157,6 +174,7 @@ test("a gapped layout uploads at the exact next order six", async () => {
       queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
     },
   });
+  confirmTypefully(queryClient);
   queryClient.setQueryData(typefullyKeys.draft(draftId), {
     draft: authoritative,
   });

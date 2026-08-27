@@ -41,7 +41,7 @@ test("canvas provides labelled read-only editing and preview regions", async () 
   const { CanvasShell } = await import(
     "../src/components/typefully/canvas-shell"
   );
-  const view = render(<CanvasShell draft={draft} />);
+  const view = render(<CanvasShell draft={draft} remoteConnected />);
 
   expect(view.getByRole("region", { name: "Editing" })).toBeTruthy();
   expect(view.getByRole("region", { name: "Preview" })).toBeTruthy();
@@ -56,7 +56,7 @@ test("platform and viewport tabs are keyboard reachable and switch content", asy
   const { CanvasShell } = await import(
     "../src/components/typefully/canvas-shell"
   );
-  const view = render(<CanvasShell draft={draft} />);
+  const view = render(<CanvasShell draft={draft} remoteConnected />);
   const user = userEvent.setup({ document });
 
   const x = view.getByRole("tab", { name: "X" });
@@ -115,7 +115,7 @@ test("canvas exposes local CopilotKit glass patterns and reduced-motion-safe tra
   const { CanvasShell } = await import(
     "../src/components/typefully/canvas-shell"
   );
-  const view = render(<CanvasShell draft={draft} />);
+  const view = render(<CanvasShell draft={draft} remoteConnected />);
 
   expect(view.getByTestId("typefully-canvas").className).toContain("font-sans");
   expect(view.getAllByTestId("canvas-card")[0]?.className).toContain(
@@ -151,6 +151,7 @@ test("canvas explains an empty destination instead of inventing a preview", asyn
         ...draft,
         document: { ...draft.document, destinations: [], posts: [] },
       }}
+      remoteConnected
     />,
   );
 
@@ -176,6 +177,7 @@ test("review control follows publication readiness and never offers direct publi
     const view = render(
       <CanvasShell
         draft={{ ...draft, syncStatus: syncStatus as typeof draft.syncStatus }}
+        remoteConnected
       />,
     );
     expect(view.getByTestId("publish-readiness").textContent).toContain(
@@ -193,7 +195,10 @@ test("review control follows publication readiness and never offers direct publi
   }
 
   const unconfirmed = render(
-    <CanvasShell draft={{ ...draft, remoteHash: "older-hash" }} />,
+    <CanvasShell
+      draft={{ ...draft, remoteHash: "older-hash" }}
+      remoteConnected
+    />,
   );
   expect(unconfirmed.getByTestId("publish-readiness").textContent).toContain(
     "Wait for Typefully confirmation",
@@ -202,7 +207,11 @@ test("review control follows publication readiness and never offers direct publi
   cleanup();
   const prepare = mock(() => {});
   const ready = render(
-    <CanvasShell draft={draft} onPreparePublication={prepare} />,
+    <CanvasShell
+      draft={draft}
+      onPreparePublication={prepare}
+      remoteConnected
+    />,
   );
   const control = ready.getByRole("button", { name: "Review & publish" });
   expect((control as HTMLButtonElement).disabled).toBe(false);
@@ -217,6 +226,7 @@ test("review control follows publication readiness and never offers direct publi
         missing: { kind: "failed", message: "Upload failed" },
       }}
       onPreparePublication={prepare}
+      remoteConnected
     />,
   );
   expect(
@@ -240,6 +250,7 @@ test("remote errors surface a bounded redacted authoritative detail", async () =
         syncStatus: "remote_error",
         lastError: `${secret} ${"problem ".repeat(80)}`,
       }}
+      remoteConnected
     />,
   );
   const alert = view.getByRole("alert");
@@ -278,6 +289,7 @@ test("interactive canvas renders optimistic autosave and conflict recovery witho
       autosave={snapshot}
       document={optimistic}
       draft={draft}
+      remoteConnected
       {...callbacks}
     />,
   );
@@ -305,6 +317,7 @@ test("interactive canvas renders optimistic autosave and conflict recovery witho
       document={optimistic}
       draft={draft}
       onReload={() => {}}
+      remoteConnected
       onSaveAsNew={() => {}}
       {...callbacks}
     />,
@@ -368,6 +381,7 @@ test("dirty autosave keeps local media metadata editable while remote operations
       onRetryMedia={() => {}}
       onSelectMedia={() => {}}
       onTextChange={() => {}}
+      remoteConnected
     />,
   );
 

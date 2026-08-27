@@ -443,6 +443,176 @@ test("disconnecting an active canvas clears remote authority but preserves the l
   });
 });
 
+test("a direct synced canvas confirms connections over the network and localizes when disconnected", async () => {
+  const { DraftCanvas } = await import(
+    "../src/components/typefully/draft-canvas"
+  );
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
+    },
+  });
+  queryClient.setQueryData(typefullyKeys.draft(draftId), {
+    draft: syncedDraft(),
+  });
+  const requests: string[] = [];
+  let finishConnectionCheck!: (response: Response) => void;
+  globalThis.fetch = (async (input) => {
+    requests.push(String(input));
+    if (String(input) === "/api/plugins/connections") {
+      return await new Promise<Response>((resolve) => {
+        finishConnectionCheck = resolve;
+      });
+    }
+    throw new Error(`Unexpected request: ${String(input)}`);
+  }) as typeof fetch;
+
+  const view = render(
+    <QueryClientProvider client={queryClient}>
+      <DraftCanvas draftId={draftId} />
+    </QueryClientProvider>,
+  );
+
+  await waitFor(() => expect(requests).toContain("/api/plugins/connections"));
+  await act(async () => {
+    finishConnectionCheck(
+      new Response(JSON.stringify({ connections: [], redirectUri: null }), {
+        headers: { "content-type": "application/json" },
+      }),
+    );
+  });
+  await waitFor(() =>
+    expect(view.getByTestId("canvas-status").textContent).toContain(
+      "Saved in OpenBot",
+    ),
+  );
+  expect(view.getByTestId("publish-readiness").textContent).toContain(
+    "Connect Typefully",
+  );
+  expect(
+    view
+      .getByRole("button", { name: "Review & publish" })
+      .hasAttribute("disabled"),
+  ).toBeTrue();
+  expect(
+    (view.getByRole("textbox", { name: "X post 1" }) as HTMLTextAreaElement)
+      .value,
+  ).toBe("Hello");
+  expect(queryClient.getQueryData(typefullyKeys.draft(draftId))).toMatchObject({
+    draft: {
+      remoteDraftId: null,
+      remoteVersion: null,
+      remoteHash: null,
+      syncStatus: "local",
+    },
+  });
+  expect(requests).toEqual(["/api/plugins/connections"]);
+});
+
+test("a pending or failed connection check never exposes stale remote readiness", async () => {
+  const { DraftCanvas } = await import(
+    "../src/components/typefully/draft-canvas"
+  );
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
+    },
+  });
+  queryClient.setQueryData(typefullyKeys.draft(draftId), {
+    draft: syncedDraft(),
+  });
+  let finishConnectionCheck!: (response: Response) => void;
+  globalThis.fetch = (async (input) => {
+    if (String(input) === "/api/plugins/connections") {
+      return await new Promise<Response>((resolve) => {
+        finishConnectionCheck = resolve;
+      });
+    }
+    throw new Error(`Unexpected request: ${String(input)}`);
+  }) as typeof fetch;
+  const view = render(
+    <QueryClientProvider client={queryClient}>
+      <DraftCanvas draftId={draftId} />
+    </QueryClientProvider>,
+  );
+
+  expect(view.getByTestId("canvas-status").textContent).toContain(
+    "Saved in OpenBot",
+  );
+  expect(
+    view
+      .getByRole("button", { name: "Review & publish" })
+      .hasAttribute("disabled"),
+  ).toBeTrue();
+
+  await act(async () => {
+    finishConnectionCheck(
+      new Response(JSON.stringify({ error: "offline" }), {
+        status: 503,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+  });
+  await waitFor(() =>
+    expect(queryClient.getQueryState(pluginKeys.connections())?.status).toBe(
+      "error",
+    ),
+  );
+  expect(view.getByTestId("canvas-status").textContent).toContain(
+    "Saved in OpenBot",
+  );
+  expect(
+    view
+      .getByRole("button", { name: "Review & publish" })
+      .hasAttribute("disabled"),
+  ).toBeTrue();
+});
+
+test("an authoritative connected result restores confirmed remote readiness", async () => {
+  const { DraftCanvas } = await import(
+    "../src/components/typefully/draft-canvas"
+  );
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
+    },
+  });
+  queryClient.setQueryData(typefullyKeys.draft(draftId), {
+    draft: syncedDraft(),
+  });
+  globalThis.fetch = (async (input) => {
+    if (String(input) === "/api/plugins/connections") {
+      return new Response(
+        JSON.stringify({
+          connections: [typefullyConnection],
+          redirectUri: null,
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    throw new Error(`Unexpected request: ${String(input)}`);
+  }) as typeof fetch;
+  const view = render(
+    <QueryClientProvider client={queryClient}>
+      <DraftCanvas draftId={draftId} />
+    </QueryClientProvider>,
+  );
+
+  await waitFor(() =>
+    expect(view.getByTestId("publish-readiness").textContent).toContain(
+      "Ready for approval",
+    ),
+  );
+  expect(view.getByTestId("canvas-status").textContent).toContain(
+    "Saved to Typefully",
+  );
+  expect(
+    view
+      .getByRole("button", { name: "Review & publish" })
+      .hasAttribute("disabled"),
+  ).toBeFalse();
+});
+
 test("unmounting the inline canvas aborts authority revalidation before sync", async () => {
   const { DraftCanvas } = await import(
     "../src/components/typefully/draft-canvas"
@@ -688,7 +858,7 @@ test("the draft canvas refetches authority and resumes a pending sync once", asy
       requests.filter((request) => request.endsWith("/sync")),
     ).toHaveLength(1),
   );
-  expect(requests[0]).toBe("PUT /api/plugins/connections/typefully/api-key");
+  expect(requests).toContain("PUT /api/plugins/connections/typefully/api-key");
   expect(requests).toContain("GET /api/plugins/connections");
   expect(
     requests.filter(
