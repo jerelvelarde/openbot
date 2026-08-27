@@ -9,8 +9,12 @@ import { createApp } from "./app";
 import { createAuditReader, createAuditStore, recordAuditEvent } from "./audit";
 import { startAuditRetention } from "./audit-retention";
 import { createAuth } from "./auth";
-import { DEV_ACTOR, initializeDevActorUser } from "./auth/dev-actor";
-import { createRoleRepository } from "./auth/guards";
+import {
+  createDevRequireUser,
+  DEV_ACTOR,
+  initializeDevActorUser,
+} from "./auth/dev-actor";
+import { createRequireUser, createRoleRepository } from "./auth/guards";
 import { createIdentityProviderStore } from "./auth/identity-provider-store";
 import type { OpenBotRole } from "./auth/roles";
 import {
@@ -48,6 +52,7 @@ import {
 } from "./credentials";
 import { createDatabase } from "./db/client";
 import { createExternalLinkStore } from "./external/link-store";
+import { createExternalLinkRoutes } from "./external/routes";
 import { createExternalThreadStore } from "./external/thread-store";
 import { createPeopleStore } from "./people/store";
 import { redirectUriFor } from "./plugins/oauth";
@@ -55,9 +60,18 @@ import { createPluginStore } from "./plugins/store";
 import { grantedSkills, grantedTools } from "./plugins/tools";
 import { createIntentRouter } from "./routing/classify";
 import { createModelCompleter } from "./routing/model";
+import { createCoworkerRoutingService } from "./routing/service";
 import { createApprovalAuthorizer } from "./slack/approval-authorizer";
 import { createApprovalDecisionStore } from "./slack/approval-store";
+import { createOpenBotSlackChannel } from "./slack/channel";
 import { configureApprovalDecisionStore } from "./slack/components";
+import { SlackIdentityLinker } from "./slack/identity-linker";
+import { SlackIngressRegistry } from "./slack/ingress-registry";
+import {
+  activateManagedChannels,
+  createGracefulShutdown,
+  projectSlackStatus,
+} from "./slack/status";
 import {
   createPackageStatusReader,
   loadTenantPackage,
@@ -537,6 +551,65 @@ const actorAgentResolver = createActorAgentResolver({
   }),
 });
 
+const slackRouting = createCoworkerRoutingService({
+  store: agentProfileStore,
+  router: intentRouter,
+  auditStore: bootAuditStore,
+  reachableSystems: async (agentId) => {
+    const granted = await pluginStore.listForAgent(agentId);
+    return [
+      ...new Set(
+        granted.tools.map(
+          (tool) =>
+            tool.toolName.replace(/^mcp__/, "").split("__")[0] ?? tool.toolName,
+        ),
+      ),
+    ];
+  },
+});
+const slackIngress = new SlackIngressRegistry();
+const openbotSlackChannel = createOpenBotSlackChannel({
+  identityLinker: new SlackIdentityLinker({
+    store: approvalLinkStore,
+    encryptionKey: config.keyEncryptionKey,
+    appUrl: config.appUrl,
+  }),
+  ingressRegistry: slackIngress,
+  agentDeps: {
+    routing: slackRouting,
+    store: approvalThreadStore,
+    resolver: actorAgentResolver,
+  },
+  computerGateway,
+  assistance: config.appUrl
+    ? { appUrl: config.appUrl, encryptionKey: config.keyEncryptionKey }
+    : undefined,
+});
+const copilotHandler = mountCopilotRuntime(
+  config,
+  actorAgentResolver,
+  identifyUser,
+  identifyActor,
+  "/api/copilotkit",
+  [openbotSlackChannel],
+);
+const requireExternalUser = config.singleUser
+  ? createDevRequireUser()
+  : (() => {
+      // `loadConfig` permits no-provider operation only in explicit single-user mode. Keep the
+      // invariant checked here as well, so this route can never receive an undefined auth service.
+      if (!auth)
+        throw new Error("Slack account linking requires authentication.");
+      return createRequireUser(auth, roleRepository);
+    })();
+const externalLinkRoutes = createExternalLinkRoutes({
+  store: approvalLinkStore,
+  encryptionKey: config.keyEncryptionKey,
+  requireUser: requireExternalUser,
+  auditStore: bootAuditStore,
+  agentProfileStore,
+});
+
 const app = createApp(
   config,
   auth,
@@ -550,7 +623,7 @@ const app = createApp(
   createPackageStatusReader(database),
   // The runtime call: the model, per-actor agent loading, and the two identity
   // functions are how a run is attributed to a person.
-  mountCopilotRuntime(config, actorAgentResolver, identifyUser, identifyActor),
+  copilotHandler,
   // The only path to an acting call.
   computerGateway,
   policyStore,
@@ -578,6 +651,10 @@ const app = createApp(
   intentRouter,
   // What a browsing turn's screen looked like when it finished, so the transcript can show it later.
   createPageFrameStore(database),
+  // External identity confirmation and assistance routes use the same actor and profile boundary.
+  externalLinkRoutes,
+  // A narrow public projection: never hand `/api/capabilities` the runtime snapshot itself.
+  () => projectSlackStatus(copilotHandler.channels?.status()),
 );
 
 /**
@@ -726,6 +803,19 @@ serve<SocketData>({
   },
 });
 
+const shutdown = createGracefulShutdown({
+  channels: copilotHandler.channels,
+  stopOthers: [
+    () => channelActivityListener.stop(),
+    () => policyListener.stop(),
+    () => auditRetention.stop(),
+  ],
+  exit: () => process.exit(0),
+});
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.on(signal, () => void shutdown());
+}
+
 if (config.singleUser) {
   // Loud, every boot. A server that is not checking who is asking should never be a quiet default.
   console.warn(
@@ -735,16 +825,8 @@ if (config.singleUser) {
   );
 }
 
-// Each listener holds a connection of its own for the life of the process. Released on the way out,
-// so a watch-mode restart does not leave two behind on every reload.
-for (const signal of ["SIGINT", "SIGTERM"] as const) {
-  process.on(signal, () => {
-    void Promise.allSettled([
-      channelActivityListener.stop(),
-      policyListener.stop(),
-      Promise.resolve(auditRetention.stop()),
-    ]).finally(() => process.exit(0));
-  });
-}
-
 console.info(`OpenBot server listening on http://localhost:${port}`);
+
+// Activation is allowed to settle after HTTP starts. A missing provider or gateway outage must
+// leave the setup and health surfaces reachable, with the projected status explaining why.
+await activateManagedChannels(copilotHandler.channels);
