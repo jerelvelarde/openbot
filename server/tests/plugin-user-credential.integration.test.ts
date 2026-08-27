@@ -327,10 +327,7 @@ beforeAll(async () => {
     [brokenOauthUserId, `${brokenOauthUserId}@openbot.test`],
     [listingOauthUserId, `${listingOauthUserId}@openbot.test`],
     [listingApiKeyUserId, `${listingApiKeyUserId}@openbot.test`],
-    [
-      noScopeListingOauthUserId,
-      `${noScopeListingOauthUserId}@openbot.test`,
-    ],
+    [noScopeListingOauthUserId, `${noScopeListingOauthUserId}@openbot.test`],
     [mismatchedCatalogueUserId, `${mismatchedCatalogueUserId}@openbot.test`],
   ]) {
     await database
