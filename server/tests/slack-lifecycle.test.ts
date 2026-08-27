@@ -159,7 +159,7 @@ describe("managed Channels lifecycle", () => {
       const shutdown = createGracefulShutdown({
         channels: {
           stop: async () => {
-            throw new Error("xoxb-secret-token");
+            throw new Error("private stop detail");
           },
         },
         stopOthers: [async () => {}],
@@ -174,7 +174,7 @@ describe("managed Channels lifecycle", () => {
         component: "channels",
       });
       expect(JSON.stringify(logged.mock.calls)).not.toContain(
-        "xoxb-secret-token",
+        "private stop detail",
       );
     } finally {
       logged.mockRestore();

@@ -491,7 +491,7 @@ describe("CoworkerRoutingService", () => {
   test("fails safely when coworker reachability cannot be loaded", async () => {
     const { service, modelCalls } = makeService({
       reachableSystems: async () => {
-        throw new Error("postgres://admin:secret@private-db/routing");
+        throw new Error("private reachability detail");
       },
     });
 
