@@ -121,9 +121,10 @@ describe("recording which coworker a message went to", () => {
     });
 
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({
+    expect(await response.json()).toEqual({
       agentId: "risk-analyst",
       name: "Risk Analyst",
+      reason: "named by the person asking",
       viaMention: true,
       fallback: false,
     });
