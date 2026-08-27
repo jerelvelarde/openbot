@@ -20,11 +20,13 @@ function execution(id: string): SlackExecution {
 describe("private Slack execution context", () => {
   test("survives await and microtask boundaries", async () => {
     const value = execution("alice");
+    let current: SlackExecution | undefined;
     await runWithSlackExecution(value, async () => {
       await Promise.resolve();
-      expect(currentSlackExecution()).toBe(value);
+      current = currentSlackExecution();
+      expect(current).toMatchObject(value);
       await new Promise<void>((resolve) => queueMicrotask(resolve));
-      expect(currentSlackExecution()).toBe(value);
+      expect(currentSlackExecution()).toBe(current);
     });
   });
 
@@ -53,6 +55,45 @@ describe("private Slack execution context", () => {
       });
       expect(currentSlackExecution().actor.id).toBe("alice");
     });
+  });
+
+  test("protects identity fields while leaving later routing fields writable", () => {
+    const value = execution("alice");
+    runWithSlackExecution(value, () => {
+      const current = currentSlackExecution();
+      expect(Reflect.set(current, "provider", "discord")).toBe(false);
+      expect(Reflect.set(current, "providerTenantId", "other-tenant")).toBe(
+        false,
+      );
+      expect(
+        Reflect.set(current, "providerConversationId", "other-conversation"),
+      ).toBe(false);
+      expect(Reflect.set(current, "providerThreadId", "other-thread")).toBe(
+        false,
+      );
+      expect(Reflect.set(current, "messageText", "different message")).toBe(
+        false,
+      );
+      expect(Reflect.set(current.actor, "id", "mallory")).toBe(false);
+      expect(Reflect.set(current.applicationUser, "name", "Mallory")).toBe(
+        false,
+      );
+      current.channelsThreadId = "channels-thread";
+      current.agentId = "agent-1";
+
+      expect(currentSlackExecution()).toMatchObject({
+        provider: "slack",
+        actor: { id: "alice" },
+        applicationUser: { name: "alice" },
+        providerTenantId: "T1",
+        providerConversationId: "C1",
+        providerThreadId: "thread-1",
+        messageText: "hello",
+        channelsThreadId: "channels-thread",
+        agentId: "agent-1",
+      });
+    });
+    expect(value.channelsThreadId).toBeUndefined();
   });
 
   test("requires a private context outside Slack execution", () => {

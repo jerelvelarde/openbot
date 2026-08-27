@@ -1,9 +1,6 @@
 import type { ChannelIdentityContext } from "@copilotkit/channels";
 import type { AgentActor } from "../agents/profile-types";
-import type {
-  ExternalLinkStore,
-  SlackActiveUserLinkStore,
-} from "../external/link-store";
+import type { ExternalLinkAuthorizationStore } from "../external/link-store";
 import { mintExternalLinkToken } from "../external/link-token";
 import type {
   ExternalProviderIdentity,
@@ -24,35 +21,56 @@ export type SlackIdentityResult =
     };
 
 export type SlackIdentityLinkerOptions = {
-  store: ExternalLinkStore & SlackActiveUserLinkStore;
+  store: ExternalLinkAuthorizationStore;
   encryptionKey: string;
   appUrl: string | undefined;
 };
 
 const APP_URL_ERROR = "Slack link setup requires an absolute OPENBOT_APP_URL.";
 const LINK_CONFLICT_ERROR = "That Slack identity is already linked.";
+const IDENTITY_ERROR = "Slack identity requires a known tenant and actor id.";
 
-function adapterEmail(context: ChannelIdentityContext): Promise<string | null> {
-  return Promise.resolve(context.lookupProfile?.()).then((profile) => {
+function canonicalId(value: string): string | null {
+  const normalized = value.trim();
+  return normalized && normalized.toLowerCase() !== "unknown"
+    ? normalized
+    : null;
+}
+
+async function adapterEmail(
+  context: ChannelIdentityContext,
+  actorId: string,
+): Promise<string | null> {
+  try {
+    const profile = await context.lookupProfile?.();
+    if (profile?.kind !== "human" || canonicalId(profile.id) !== actorId) {
+      return null;
+    }
     const email = profile?.email?.trim().toLowerCase();
     return email || null;
-  });
+  } catch {
+    // Profile enrichment is optional; a failed lookup must only disable auto-linking.
+    return null;
+  }
 }
 
 function identityFor(
   context: ChannelIdentityContext,
   providerEmail: string | null,
 ): ExternalProviderIdentity {
-  if (context.provider !== "slack") {
-    throw new Error("Slack identity requires a Slack provider.");
-  }
-  if (context.actor.kind !== "human") {
-    throw new Error("Slack identity requires a human actor.");
-  }
+  const tenantId = canonicalId(context.tenant.id);
+  const actorId = canonicalId(context.actor.id);
+  if (
+    context.provider !== "slack" ||
+    context.actor.kind !== "human" ||
+    !tenantId ||
+    !actorId
+  )
+    throw new Error(IDENTITY_ERROR);
   return {
     provider: "slack",
-    providerTenantId: context.tenant.id,
-    providerUserId: context.actor.id,
+    providerTenantId: tenantId,
+    providerUserId: actorId,
     providerEmail,
   };
 }
@@ -72,7 +90,17 @@ function linkedResult(
 function configuredAppUrl(appUrl: string | undefined): URL {
   try {
     const url = new URL(appUrl ?? "");
-    if (url.protocol !== "http:" && url.protocol !== "https:")
+    const hostname = url.hostname.toLowerCase();
+    const loopback =
+      hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      hostname === "::1" ||
+      hostname === "[::1]";
+    if (
+      url.username ||
+      url.password ||
+      (url.protocol !== "https:" && !(url.protocol === "http:" && loopback))
+    )
       throw new Error();
     return url;
   } catch {
@@ -102,7 +130,10 @@ export class SlackIdentityLinker {
       return this.unlinked(existing);
     }
 
-    const profileEmail = await adapterEmail(context);
+    const profileEmail = await adapterEmail(
+      context,
+      baseIdentity.providerUserId,
+    );
     const identity = { ...baseIdentity, providerEmail: profileEmail };
     if (!profileEmail) return this.unlinked(identity);
 
