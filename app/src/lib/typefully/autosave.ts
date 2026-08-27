@@ -105,16 +105,17 @@ export function createAutosaveController(options: AutosaveOptions) {
     if (state.kind === "error") return ["retry"];
     return [];
   };
-  const snapshot = (): AutosaveSnapshot => ({
+  const buildSnapshot = (): AutosaveSnapshot => ({
     document,
     state,
     target: { draftId: targetDraftId, version },
     createdDraft,
     actions: actions(),
   });
+  let currentSnapshot = buildSnapshot();
   const emit = () => {
-    const current = snapshot();
-    for (const listener of listeners) listener(current);
+    currentSnapshot = buildSnapshot();
+    for (const listener of listeners) listener(currentSnapshot);
   };
   const clearTimer = () => {
     if (timer !== undefined) scheduler.clearTimeout(timer);
@@ -140,6 +141,7 @@ export function createAutosaveController(options: AutosaveOptions) {
     pendingImmediate = false;
     state = { kind: "saving", baseVersion };
     emit();
+    if (disposed || activeSave !== abort || abort.signal.aborted) return;
     let operation: Promise<SaveDraftResult>;
     try {
       operation = options.save({
@@ -271,7 +273,7 @@ export function createAutosaveController(options: AutosaveOptions) {
   };
 
   return {
-    getSnapshot: snapshot,
+    getSnapshot: () => currentSnapshot,
     subscribe(listener: (snapshot: AutosaveSnapshot) => void) {
       listeners.add(listener);
       return () => listeners.delete(listener);

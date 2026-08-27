@@ -87,6 +87,84 @@ const newDraftResult = {
 };
 
 describe("Typefully autosave controller", () => {
+  test("keeps snapshots stable between subscribed state transitions", () => {
+    const timer = clock();
+    const controller = createAutosaveController({
+      initialDraftId: "draft-current",
+      initialDocument: base,
+      initialVersion: 1,
+      scheduler: timer.scheduler,
+      save: async () => saved(2),
+    });
+    const initial = controller.getSnapshot();
+    expect(controller.getSnapshot()).toBe(initial);
+
+    const observed: Array<ReturnType<typeof controller.getSnapshot>> = [];
+    controller.subscribe((next) => {
+      expect(next).toBe(controller.getSnapshot());
+      expect(controller.getSnapshot()).toBe(next);
+      observed.push(next);
+    });
+    controller.textChanged(edited("transition"));
+
+    expect(observed).toHaveLength(1);
+    expect(observed[0]).not.toBe(initial);
+    expect(observed[0]).toMatchObject({
+      document: edited("transition"),
+      state: { kind: "dirty", baseVersion: 1 },
+    });
+    expect(controller.getSnapshot()).toBe(observed[0]);
+  });
+
+  test("does not call save after a saving subscriber reloads", () => {
+    const timer = clock();
+    let calls = 0;
+    const controller = createAutosaveController({
+      initialDraftId: "draft-current",
+      initialDocument: base,
+      initialVersion: 1,
+      scheduler: timer.scheduler,
+      save: async () => {
+        calls += 1;
+        return saved(2);
+      },
+    });
+    controller.subscribe(({ state }) => {
+      if (state.kind === "saving") controller.reload(base, 7, "reloaded");
+    });
+
+    controller.mediaSettled(edited("obsolete"));
+
+    expect(calls).toBe(0);
+    expect(controller.getSnapshot()).toMatchObject({
+      document: base,
+      target: { draftId: "reloaded", version: 7 },
+      state: { kind: "idle", version: 7 },
+    });
+  });
+
+  test("does not call save after a saving subscriber disposes", () => {
+    const timer = clock();
+    let calls = 0;
+    const controller = createAutosaveController({
+      initialDraftId: "draft-current",
+      initialDocument: base,
+      initialVersion: 1,
+      scheduler: timer.scheduler,
+      save: async () => {
+        calls += 1;
+        return saved(2);
+      },
+    });
+    controller.subscribe(({ state }) => {
+      if (state.kind === "saving") controller.dispose();
+    });
+
+    controller.mediaSettled(edited("obsolete"));
+
+    expect(calls).toBe(0);
+  });
+
   test("debounces a burst of text edits into one save after 600 ms", async () => {
     const timer = clock();
     const calls: unknown[] = [];
