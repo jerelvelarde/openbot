@@ -407,6 +407,27 @@ describe("Slack computer ChannelTools", () => {
     });
   });
 
+  test("validates the secure handoff before creating a help request", async () => {
+    const gateway = new FakeComputerGateway();
+    const tool = createSlackComputerTools(gateway, {
+      appUrl: "http://not-loopback.example",
+      encryptionKey: "slack-assistance-key",
+    }).find((candidate) => candidate.name === "computer_request_help")!;
+
+    const result = await inSlack(
+      () =>
+        invoke(
+          tool,
+          { reason: "Please sign in." },
+          channelContext(new FileAdapter()),
+        ),
+      { channelsThreadId: "channels-thread-private" },
+    );
+
+    expect(gateway.requestHelpCalls).toEqual([]);
+    expect(result).toEqual(UNAVAILABLE);
+  });
+
   test("passes the pinned coworker, linked actor, parsed click input, and signal", async () => {
     const gateway = new FakeComputerGateway();
     const tools = toolsByName(gateway);
