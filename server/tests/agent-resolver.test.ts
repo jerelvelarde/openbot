@@ -44,8 +44,19 @@ describe("actor-scoped agent resolver", () => {
       resolveModelApiKey: async () => "openai-secret",
     });
 
-    await expect(
-      resolver.resolveAgentForActor({ id: "u1", role: "user" }, "private-risk"),
-    ).rejects.toThrow("Coworker private-risk is unavailable to this user.");
+    let rejection: unknown;
+    try {
+      await resolver.resolveAgentForActor(
+        { id: "u1", role: "user" },
+        "private-risk",
+      );
+    } catch (error) {
+      rejection = error;
+    }
+
+    expect(rejection).toBeInstanceOf(Error);
+    expect((rejection as Error).message).toBe(
+      "Coworker private-risk is unavailable to this user.",
+    );
   });
 });
