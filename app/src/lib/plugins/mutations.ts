@@ -1,5 +1,8 @@
 import { mutationOptions, type QueryClient } from "@tanstack/react-query";
 import { client } from "@/lib/client";
+import { connectTypefully } from "@/lib/typefully/mutations";
+import { typefullyRequest } from "@/lib/typefully/queries";
+import type { PluginConnection } from "./queries";
 import { pluginKeys } from "./queries";
 
 /**
@@ -61,6 +64,31 @@ const FALLBACK = "That did not work.";
  */
 export function invalidatePlugins(queryClient: QueryClient) {
   return queryClient.invalidateQueries({ queryKey: pluginKeys.all });
+}
+
+/**
+ * Connect a personal Typefully key without putting the secret in React Query's mutation cache.
+ */
+export async function connectPersonalTypefully(
+  queryClient: QueryClient,
+  apiKey: string,
+  signal?: AbortSignal,
+): Promise<PluginConnection> {
+  const result = await connectTypefully(apiKey, signal);
+  const connection: PluginConnection = {
+    ...result.connection,
+    scope: null,
+  };
+  await queryClient.invalidateQueries({ queryKey: pluginKeys.connections() });
+  return connection;
+}
+
+/** Disconnect only the signed-in person's key; local drafts are untouched. */
+export async function disconnectPersonalTypefully(queryClient: QueryClient) {
+  await typefullyRequest("/api/plugins/connections/typefully", {
+    method: "DELETE",
+  });
+  await queryClient.invalidateQueries({ queryKey: pluginKeys.connections() });
 }
 
 /**

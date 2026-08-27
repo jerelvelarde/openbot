@@ -426,13 +426,19 @@ export function saveDraftMutationOptions(queryClient?: QueryClient) {
   });
 }
 
+export function syncTypefullyDraft(input: {
+  draftId: string;
+  signal?: AbortSignal;
+}): Promise<DraftMutationResponse> {
+  return typefullyRequest<DraftMutationResponse>(
+    `/api/typefully/drafts/${encodeURIComponent(input.draftId)}/sync`,
+    { method: "POST", signal: input.signal },
+  );
+}
+
 export function syncDraftMutationOptions(queryClient?: QueryClient) {
   return mutationOptions({
-    mutationFn: (input: { draftId: string; signal?: AbortSignal }) =>
-      typefullyRequest<DraftMutationResponse>(
-        `/api/typefully/drafts/${encodeURIComponent(input.draftId)}/sync`,
-        { method: "POST", signal: input.signal },
-      ),
+    mutationFn: syncTypefullyDraft,
     onSuccess: (result, input) =>
       convergeDraftCache(queryClient, input.draftId, result),
     onError: (error, input) => {
@@ -670,21 +676,24 @@ function preparedProposal(value: unknown): PrepareProposalResponse {
   };
 }
 
+export function prepareTypefullyPublication(input: {
+  draftId: string;
+  expectedVersion: number;
+  signal?: AbortSignal;
+}): Promise<PrepareProposalResponse> {
+  return typefullyRequest<unknown>(
+    `/api/typefully/drafts/${encodeURIComponent(input.draftId)}/proposals`,
+    {
+      method: "POST",
+      body: { expectedVersion: input.expectedVersion },
+      signal: input.signal,
+    },
+  ).then(preparedProposal);
+}
+
 export function prepareProposalMutationOptions(queryClient?: QueryClient) {
   return mutationOptions({
-    mutationFn: (input: {
-      draftId: string;
-      expectedVersion: number;
-      signal?: AbortSignal;
-    }): Promise<PrepareProposalResponse> =>
-      typefullyRequest<unknown>(
-        `/api/typefully/drafts/${encodeURIComponent(input.draftId)}/proposals`,
-        {
-          method: "POST",
-          body: { expectedVersion: input.expectedVersion },
-          signal: input.signal,
-        },
-      ).then(preparedProposal),
+    mutationFn: prepareTypefullyPublication,
     onSuccess: async (result, input) => {
       if (!queryClient) return;
       await Promise.all([

@@ -17,6 +17,11 @@ import {
   TypefullyClientError,
 } from "@/lib/typefully/queries";
 import { CanvasShell } from "./canvas-shell";
+import {
+  ConnectTypefully,
+  type PendingTypefullyOperation,
+  resumeTypefullyAfterConnection,
+} from "./connect-typefully";
 import type { MediaItemState } from "./media-editor";
 
 function DraftRefusal({ error }: { error: unknown }) {
@@ -145,8 +150,23 @@ function EditableDraftCanvas({
   const [mediaOperationError, setMediaOperationError] = useState<string | null>(
     null,
   );
+  const [pendingConnection, setPendingConnection] =
+    useState<PendingTypefullyOperation | null>(() =>
+      draft.syncStatus === "connection_required"
+        ? draft.document.scheduleAt
+          ? {
+              kind: "schedule",
+              draftId: draft.id,
+              expectedVersion: draft.version,
+            }
+          : { kind: "sync", draftId: draft.id }
+        : null,
+    );
+  const [connectionDismissed, setConnectionDismissed] = useState(false);
+  const [connectionNotice, setConnectionNotice] = useState<string | null>(null);
   const mediaBusyRef = useRef(false);
   const mediaOperation = useRef(0);
+  const connectionResume = useRef(0);
   const routedDraft = useRef<string | null>(null);
   const files = useRef(new Map<string, File>());
   const urls = useRef(new Map<string, string>());
@@ -238,6 +258,26 @@ function EditableDraftCanvas({
     if (!settled || snapshot.target.version !== proposal.version)
       setProposal(null);
   }, [proposal, snapshot.state.kind, snapshot.target.version]);
+
+  useEffect(() => {
+    if (draft.syncStatus !== "connection_required") {
+      setPendingConnection(null);
+      setConnectionDismissed(false);
+      return;
+    }
+    if (connectionDismissed) return;
+    setPendingConnection(
+      (current) =>
+        current ??
+        (draft.document.scheduleAt
+          ? {
+              kind: "schedule",
+              draftId: draft.id,
+              expectedVersion: draft.version,
+            }
+          : { kind: "sync", draftId: draft.id }),
+    );
+  }, [connectionDismissed, draft]);
 
   useEffect(
     () => () => {
@@ -601,48 +641,130 @@ function EditableDraftCanvas({
         expectedVersion: current.target.version,
       });
       setProposal(result.proposal);
-    } catch {
+    } catch (error) {
+      if (
+        error instanceof TypefullyClientError &&
+        error.code === "connection_required"
+      ) {
+        setConnectionDismissed(false);
+        setPendingConnection({
+          kind: "prepare_publication",
+          draftId: current.target.draftId,
+          expectedVersion: current.target.version,
+        });
+      }
       // The mutation exposes a bounded client error below; it never publishes.
     }
   };
 
-  return (
-    <CanvasShell
-      autosave={snapshot}
-      document={snapshot.document}
-      draft={draft}
-      localMediaUrls={localMediaUrls}
-      mediaBusy={mediaBusy}
-      mediaOperationError={mediaOperationError}
-      mediaStates={mediaStates}
-      onMediaReorder={(next) => {
-        if (!mediaBusyRef.current) controller.textChanged(next);
-      }}
-      onMediaTextChange={(next) => {
-        if (!mediaBusyRef.current) controller.textChanged(next);
-      }}
-      onDismissMediaOperationError={() => setMediaOperationError(null)}
-      onReload={() => void reload()}
-      onRemoveMedia={(mediaId) => void removeMedia(mediaId)}
-      onRetryMedia={retryMedia}
-      onRetrySave={controller.retry}
-      onSaveAsNew={() => {
-        void controller.saveAsNewDraft();
-      }}
-      onSelectMedia={(selected) => void selectMedia(selected)}
-      onTextChange={(next) => {
-        if (!mediaBusyRef.current) controller.textChanged(next);
-      }}
-      onPreparePublication={() => void preparePublication()}
-      proposal={proposal}
-      proposalError={
-        prepareProposal.error instanceof TypefullyClientError
-          ? prepareProposal.error.message
-          : prepareProposal.error
-            ? "This review could not be prepared. Try again."
-            : null
+  const resumeAfterConnection = async () => {
+    const pending = pendingConnection;
+    if (!pending) return;
+    const operation = ++connectionResume.current;
+    setConnectionNotice("Rechecking the draft and Typefully access…");
+    try {
+      const result = await resumeTypefullyAfterConnection(queryClient, pending);
+      if (connectionResume.current !== operation) return;
+      setPendingConnection(null);
+      setConnectionDismissed(true);
+      if (result.outcome === "stale") {
+        setConnectionNotice(
+          `The draft changed to version ${result.currentVersion}. Review it before retrying ${result.operation.replaceAll("_", " ")}.`,
+        );
+        await reload();
+        return;
       }
-      proposalPreparing={prepareProposal.isPending}
-    />
+      setConnectionNotice(
+        "Typefully connected and the draft operation resumed.",
+      );
+      await reload();
+    } catch {
+      if (connectionResume.current !== operation) return;
+      setConnectionNotice(
+        "Typefully connected, but this draft operation could not resume. Review the draft and try again.",
+      );
+      setPendingConnection(null);
+      setConnectionDismissed(true);
+    }
+  };
+
+  return (
+    <div className="space-y-2">
+      {pendingConnection ? (
+        <section
+          aria-label="Connect Typefully to resume"
+          className="rounded-[8px] border-2 border-border bg-card/50 p-4"
+        >
+          <ConnectTypefully
+            connection={null}
+            onCancel={() => {
+              connectionResume.current += 1;
+              setPendingConnection(null);
+              setConnectionDismissed(true);
+              setConnectionNotice(
+                "Connection cancelled. Your draft remains saved in OpenBot.",
+              );
+            }}
+            onConnected={() => resumeAfterConnection()}
+          />
+        </section>
+      ) : connectionNotice ? (
+        <div
+          className="flex items-center justify-between gap-3 rounded-[8px] border border-border bg-card px-4 py-3 text-sm"
+          role="status"
+        >
+          <span>{connectionNotice}</span>
+          {draft.syncStatus === "connection_required" ? (
+            <button
+              className="shrink-0 rounded-[4px] border border-border px-2 py-1 text-xs"
+              onClick={() => {
+                setConnectionDismissed(false);
+                setConnectionNotice(null);
+              }}
+              type="button"
+            >
+              Connect Typefully
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+      <CanvasShell
+        autosave={snapshot}
+        document={snapshot.document}
+        draft={draft}
+        localMediaUrls={localMediaUrls}
+        mediaBusy={mediaBusy}
+        mediaOperationError={mediaOperationError}
+        mediaStates={mediaStates}
+        onMediaReorder={(next) => {
+          if (!mediaBusyRef.current) controller.textChanged(next);
+        }}
+        onMediaTextChange={(next) => {
+          if (!mediaBusyRef.current) controller.textChanged(next);
+        }}
+        onDismissMediaOperationError={() => setMediaOperationError(null)}
+        onReload={() => void reload()}
+        onRemoveMedia={(mediaId) => void removeMedia(mediaId)}
+        onRetryMedia={retryMedia}
+        onRetrySave={controller.retry}
+        onSaveAsNew={() => {
+          void controller.saveAsNewDraft();
+        }}
+        onSelectMedia={(selected) => void selectMedia(selected)}
+        onTextChange={(next) => {
+          if (!mediaBusyRef.current) controller.textChanged(next);
+        }}
+        onPreparePublication={() => void preparePublication()}
+        proposal={proposal}
+        proposalError={
+          prepareProposal.error instanceof TypefullyClientError
+            ? prepareProposal.error.message
+            : prepareProposal.error
+              ? "This review could not be prepared. Try again."
+              : null
+        }
+        proposalPreparing={prepareProposal.isPending}
+      />
+    </div>
   );
 }

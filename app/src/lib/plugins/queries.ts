@@ -141,8 +141,10 @@ export const pluginKeys = {
 /** One account this person has connected, from their own point of view. */
 export type PluginConnection = {
   serverId: string;
+  authMethod: "oauth" | "api_key";
   /** What the vendor actually granted, which is not always what was asked for. */
-  scope: string;
+  scope: string | null;
+  accountLabel: string | null;
   connectedAt: string;
 };
 
@@ -150,6 +152,55 @@ export type PluginConnections = {
   connections: PluginConnection[];
   redirectUri: string | null;
 };
+
+function boundedString(value: unknown, limit: number): string | undefined {
+  return typeof value === "string" && Array.from(value).length <= limit
+    ? value
+    : undefined;
+}
+
+function normalizeConnections(value: unknown): PluginConnections {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Your connected accounts could not be loaded.");
+  }
+  const record = value as Record<string, unknown>;
+  if (!Array.isArray(record.connections)) {
+    throw new Error("Your connected accounts could not be loaded.");
+  }
+  const connections = record.connections.map((item): PluginConnection => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error("Your connected accounts could not be loaded.");
+    }
+    const connection = item as Record<string, unknown>;
+    const serverId = boundedString(connection.serverId, 120);
+    const connectedAt = boundedString(connection.connectedAt, 80);
+    const authMethod = connection.authMethod;
+    const scope =
+      connection.scope === null ? null : boundedString(connection.scope, 2_000);
+    const accountLabel =
+      connection.accountLabel === null
+        ? null
+        : boundedString(connection.accountLabel, 160);
+    if (
+      !serverId ||
+      !connectedAt ||
+      (authMethod !== "oauth" && authMethod !== "api_key") ||
+      scope === undefined ||
+      accountLabel === undefined ||
+      (authMethod === "oauth" && scope === null) ||
+      (authMethod === "api_key" && scope !== null)
+    ) {
+      throw new Error("Your connected accounts could not be loaded.");
+    }
+    return { serverId, authMethod, scope, accountLabel, connectedAt };
+  });
+  const redirectUri =
+    record.redirectUri === null ? null : boundedString(record.redirectUri, 500);
+  if (redirectUri === undefined) {
+    throw new Error("Your connected accounts could not be loaded.");
+  }
+  return { connections, redirectUri };
+}
 
 /**
  * The signed-in person's own connections.
@@ -164,7 +215,7 @@ export function connectionsQueryOptions() {
       const response = await client("/api/plugins/connections", {
         fallback: "Your connected accounts could not be loaded.",
       });
-      return response.json();
+      return normalizeConnections(await response.json());
     },
   });
 }
