@@ -16,6 +16,7 @@ import {
   uploadMediaMutationOptions,
 } from "../src/lib/typefully/mutations";
 import {
+  type AuthoritativeDraft,
   type CanonicalDraftDocument,
   draftQueryOptions,
   proposalQueryOptions,
@@ -47,6 +48,24 @@ const draftSummary = (version: number, syncStatus = "synced" as const) => ({
   version,
   syncStatus,
   proposalStatus: null,
+});
+
+const authoritativeDraft = (
+  version: number,
+  overrides: Partial<AuthoritativeDraft> = {},
+): AuthoritativeDraft => ({
+  id: "draft-1",
+  document,
+  version,
+  contentHash: `hash-${version}`,
+  remoteDraftId: `remote-${version}`,
+  remoteVersion: version,
+  remoteHash: `remote-hash-${version}`,
+  syncStatus: "synced",
+  lastError: null,
+  createdAt: "2026-08-27T00:00:00.000Z",
+  updatedAt: "2026-08-27T00:00:00.000Z",
+  ...overrides,
 });
 
 function json(body: unknown, status = 200) {
@@ -90,6 +109,12 @@ describe("Typefully query contracts", () => {
       "proposal",
       "proposal/one",
     ]);
+    expect(typefullyKeys.proposalSummary("proposal/one")).toEqual([
+      "typefully",
+      "proposal-summary",
+      "proposal/one",
+    ]);
+    expect(typefullyKeys.lists()).toEqual(["typefully", "list"]);
 
     await draftQueryOptions("draft/one").queryFn?.({} as never);
     await proposalQueryOptions("proposal/one").queryFn?.({} as never);
@@ -403,6 +428,108 @@ describe("Typefully mutation contracts", () => {
     expect(JSON.stringify(result)).not.toContain("contentHash");
   });
 
+  test("preparing a proposal invalidates draft, summary, and list caches without replacing the full proposal", async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    const summary = {
+      id: "proposal-1",
+      draftId: "draft-1",
+      version: 3,
+      destinations: ["x"] as const,
+      expiresAt: "2026-08-28T00:00:00.000Z",
+      status: "pending" as const,
+    };
+    const fullProposal = {
+      ...summary,
+      snapshot: document,
+      contentHash: "full-content-hash",
+      decidedAt: null,
+      completedAt: null,
+      vendorResultId: null,
+      publishedUrl: null,
+      failureDetail: null,
+    };
+    queryClient.setQueryData(typefullyKeys.draft("draft-1"), {
+      draft: authoritativeDraft(3),
+    });
+    queryClient.setQueryData(typefullyKeys.proposalSummary("proposal-1"), {
+      proposal: { ...summary, status: "expired" },
+    });
+    queryClient.setQueryData(typefullyKeys.proposal("proposal-1"), {
+      proposal: fullProposal,
+    });
+    queryClient.setQueryData(
+      [...typefullyKeys.lists(), "drafts"],
+      [draftSummary(3)],
+    );
+    globalThis.fetch = (async () =>
+      json({ proposal: summary }, 201)) as typeof fetch;
+
+    const observer = new MutationObserver(
+      queryClient,
+      prepareProposalMutationOptions(queryClient),
+    );
+    await observer.mutate({ draftId: "draft-1", expectedVersion: 3 });
+
+    expect(
+      queryClient.getQueryState(typefullyKeys.draft("draft-1"))?.isInvalidated,
+    ).toBe(true);
+    expect(
+      queryClient.getQueryState(typefullyKeys.proposalSummary("proposal-1"))
+        ?.isInvalidated,
+    ).toBe(true);
+    expect(
+      queryClient.getQueryState([...typefullyKeys.lists(), "drafts"])
+        ?.isInvalidated,
+    ).toBe(true);
+    expect(
+      queryClient.getQueryData(typefullyKeys.proposal("proposal-1")),
+    ).toEqual({ proposal: fullProposal });
+  });
+
+  test("proposal actions immediately converge their exact proposal cache", async () => {
+    const actions = [
+      ["publish", publishProposalMutationOptions, "published"],
+      ["reconcile", reconcileProposalMutationOptions, "published"],
+      ["decline", declineProposalMutationOptions, "declined"],
+    ] as const;
+    for (const [action, options, status] of actions) {
+      const queryClient = new QueryClient({
+        defaultOptions: { mutations: { retry: false } },
+      });
+      const proposal = {
+        id: `proposal-${action}`,
+        draftId: "draft-1",
+        version: 3,
+        destinations: ["x"] as const,
+        expiresAt: "2026-08-28T00:00:00.000Z",
+        status,
+        snapshot: document,
+        contentHash: "content-hash",
+        decidedAt: "2026-08-27T01:00:00.000Z",
+        completedAt: status === "published" ? "2026-08-27T01:00:01.000Z" : null,
+        vendorResultId: status === "published" ? "vendor-1" : null,
+        publishedUrl:
+          status === "published" ? "https://example.com/post" : null,
+        failureDetail: null,
+      };
+      queryClient.setQueryData(typefullyKeys.proposal(proposal.id), {
+        proposal: { ...proposal, status: "pending" },
+      });
+      globalThis.fetch = (async () => json({ proposal })) as typeof fetch;
+      const observer = new MutationObserver(queryClient, options(queryClient));
+
+      await observer.mutate({ proposalId: proposal.id });
+
+      expect(
+        queryClient.getQueryData(typefullyKeys.proposal(proposal.id)),
+      ).toEqual({
+        proposal,
+      });
+    }
+  });
+
   test("rejects an invalid or unbounded proposal summary", async () => {
     const valid = {
       id: "proposal-1",
@@ -499,6 +626,189 @@ describe("Typefully mutation contracts", () => {
     expect(
       queryClient.getQueryState(typefullyKeys.draft("draft-1"))?.isInvalidated,
     ).toBe(true);
+  });
+
+  test("late draft success cannot replace a newer authoritative cache generation", async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    queryClient.setQueryData(typefullyKeys.draft("draft-1"), {
+      draft: authoritativeDraft(1),
+    });
+    let finishRequest: ((response: Response) => void) | undefined;
+    globalThis.fetch = (() =>
+      new Promise<Response>((resolve) => {
+        finishRequest = resolve;
+      })) as typeof fetch;
+    const observer = new MutationObserver(
+      queryClient,
+      saveDraftMutationOptions(queryClient),
+    );
+    const late = observer.mutate({
+      draftId: "draft-1",
+      expectedVersion: 1,
+      document: { ...document, title: "Late response" },
+    });
+    while (!finishRequest) await Promise.resolve();
+    const newerDocument = { ...document, title: "Newer authoritative" };
+    queryClient.setQueryData(typefullyKeys.draft("draft-1"), {
+      draft: authoritativeDraft(3, { document: newerDocument }),
+    });
+    finishRequest?.(json({ draft: draftSummary(2) }));
+    await late;
+
+    expect(
+      queryClient.getQueryData(typefullyKeys.draft("draft-1")),
+    ).toMatchObject({
+      draft: {
+        version: 3,
+        document: newerDocument,
+        syncStatus: "synced",
+        remoteVersion: 3,
+      },
+    });
+    expect(
+      queryClient.getQueryState(typefullyKeys.draft("draft-1"))?.isInvalidated,
+    ).toBe(true);
+  });
+
+  test("late draft failure cannot replace a newer authoritative cache generation", async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    queryClient.setQueryData(typefullyKeys.draft("draft-1"), {
+      draft: authoritativeDraft(1),
+    });
+    let finishRequest: ((response: Response) => void) | undefined;
+    globalThis.fetch = (() =>
+      new Promise<Response>((resolve) => {
+        finishRequest = resolve;
+      })) as typeof fetch;
+    const observer = new MutationObserver(
+      queryClient,
+      saveDraftMutationOptions(queryClient),
+    );
+    const late = observer.mutate({
+      draftId: "draft-1",
+      expectedVersion: 1,
+      document: { ...document, title: "Failed response" },
+    });
+    while (!finishRequest) await Promise.resolve();
+    const newerDocument = { ...document, title: "Newer authoritative" };
+    queryClient.setQueryData(typefullyKeys.draft("draft-1"), {
+      draft: authoritativeDraft(4, { document: newerDocument }),
+    });
+    finishRequest?.(
+      json(
+        {
+          code: "remote_error",
+          draft: draftSummary(2, "remote_error"),
+          remote: {
+            state: "remote_error",
+            remoteDraftId: "stale-remote",
+            confirmedVersion: 1,
+            confirmedHash: "stale-hash",
+          },
+        },
+        502,
+      ),
+    );
+    await expect(late).rejects.toBeInstanceOf(TypefullyClientError);
+
+    expect(
+      queryClient.getQueryData(typefullyKeys.draft("draft-1")),
+    ).toMatchObject({
+      draft: {
+        version: 4,
+        document: newerDocument,
+        syncStatus: "synced",
+        remoteVersion: 4,
+      },
+    });
+  });
+
+  test("late equal-version failure cannot downgrade confirmed cache state or remote metadata", async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    queryClient.setQueryData(typefullyKeys.draft("draft-1"), {
+      draft: authoritativeDraft(1),
+    });
+    let finishRequest: ((response: Response) => void) | undefined;
+    globalThis.fetch = (() =>
+      new Promise<Response>((resolve) => {
+        finishRequest = resolve;
+      })) as typeof fetch;
+    const observer = new MutationObserver(
+      queryClient,
+      saveDraftMutationOptions(queryClient),
+    );
+    const late = observer.mutate({
+      draftId: "draft-1",
+      expectedVersion: 1,
+      document: { ...document, title: "Failed response" },
+    });
+    while (!finishRequest) await Promise.resolve();
+    const confirmedDocument = { ...document, title: "Confirmed elsewhere" };
+    queryClient.setQueryData(typefullyKeys.draft("draft-1"), {
+      draft: authoritativeDraft(2, { document: confirmedDocument }),
+    });
+    finishRequest?.(
+      json(
+        {
+          code: "remote_error",
+          draft: draftSummary(2, "remote_error"),
+          remote: {
+            state: "remote_error",
+            remoteDraftId: "stale-remote",
+            confirmedVersion: 1,
+            confirmedHash: "stale-hash",
+          },
+        },
+        502,
+      ),
+    );
+    await expect(late).rejects.toBeInstanceOf(TypefullyClientError);
+
+    expect(
+      queryClient.getQueryData(typefullyKeys.draft("draft-1")),
+    ).toMatchObject({
+      draft: {
+        version: 2,
+        document: confirmedDocument,
+        syncStatus: "synced",
+        remoteDraftId: "remote-2",
+        remoteVersion: 2,
+        remoteHash: "remote-hash-2",
+      },
+    });
+  });
+
+  test("does not replace the document when a result skips the expected generation", async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    queryClient.setQueryData(typefullyKeys.draft("draft-1"), {
+      draft: authoritativeDraft(1),
+    });
+    globalThis.fetch = (async () =>
+      json({ draft: draftSummary(4) })) as typeof fetch;
+    const observer = new MutationObserver(
+      queryClient,
+      saveDraftMutationOptions(queryClient),
+    );
+
+    await observer.mutate({
+      draftId: "draft-1",
+      expectedVersion: 1,
+      document: { ...document, title: "Uncorrelated result" },
+    });
+
+    expect(
+      queryClient.getQueryData(typefullyKeys.draft("draft-1")),
+    ).toMatchObject({
+      draft: { version: 4, document },
+    });
   });
 
   test("invalidates and refetches media errors without a draft summary", async () => {
@@ -681,6 +991,18 @@ describe("Typefully mutation contracts", () => {
       expect((error as Error).message).toBe(
         "This draft changed elsewhere. Review the latest version before saving again.",
       );
+    }
+  });
+
+  test("rejects inherited and prototype-shaped error codes", async () => {
+    for (const code of ["constructor", "toString", "__proto__"]) {
+      globalThis.fetch = (async () => json({ code }, 400)) as typeof fetch;
+      await expect(
+        mutate(syncDraftMutationOptions(), { draftId: "draft-1" }),
+      ).rejects.toMatchObject({
+        code: "invalid_request",
+        message: "That Typefully request could not be completed.",
+      });
     }
   });
 });

@@ -174,10 +174,15 @@ function boundedString(value: unknown, limit: number): string | undefined {
 
 function errorCode(value: unknown): TypefullyErrorCode {
   if (typeof value !== "string") return "invalid_request";
-  return value in ERROR_MESSAGES || value === "invalid_request"
+  return ERROR_CODES.has(value)
     ? (value as TypefullyErrorCode)
     : "invalid_request";
 }
+
+const ERROR_CODES = new Set<string>([
+  ...Object.keys(ERROR_MESSAGES),
+  "invalid_request",
+]);
 
 const SYNC_STATUSES = new Set<DraftSyncStatus>([
   "local",
@@ -380,7 +385,10 @@ export async function typefullyRequest<T>(
 
 export const typefullyKeys = {
   all: ["typefully"] as const,
+  lists: () => ["typefully", "list"] as const,
   draft: (draftId: string) => ["typefully", "draft", draftId] as const,
+  proposalSummary: (proposalId: string) =>
+    ["typefully", "proposal-summary", proposalId] as const,
   proposal: (proposalId: string) =>
     ["typefully", "proposal", proposalId] as const,
 };

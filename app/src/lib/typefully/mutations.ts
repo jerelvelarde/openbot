@@ -39,23 +39,39 @@ async function convergeDraftCache(
   queryClient: QueryClient | undefined,
   draftId: string,
   result?: DraftMutationResponse | TypefullyClientError,
+  expectedVersion?: number,
   updateDocument?: (document: CanonicalDraftDocument) => CanonicalDraftDocument,
 ) {
   if (!queryClient) return;
   const key = typefullyKeys.draft(draftId);
-  if (result?.draft) {
+  const resultDraft = result?.draft;
+  if (resultDraft) {
     queryClient.setQueryData<CachedDraft>(key, (current) => {
       if (!current) return current;
+      const incomingVersion = resultDraft.version;
+      if (incomingVersion < current.draft.version) return current;
       const remote = "remote" in result ? result.remote : undefined;
+      const equalVersionFailure =
+        result instanceof TypefullyClientError &&
+        incomingVersion === current.draft.version;
+      const preserveConfirmedStatus =
+        equalVersionFailure && current.draft.syncStatus === "synced";
+      const replaceDocument =
+        updateDocument !== undefined &&
+        expectedVersion !== undefined &&
+        current.draft.version === expectedVersion &&
+        incomingVersion === expectedVersion + 1;
       return {
         draft: {
           ...current.draft,
-          document: updateDocument
+          document: replaceDocument
             ? updateDocument(current.draft.document)
             : current.draft.document,
-          version: result.draft?.version ?? current.draft.version,
-          syncStatus: result.draft?.syncStatus ?? current.draft.syncStatus,
-          ...(remote
+          version: incomingVersion,
+          syncStatus: preserveConfirmedStatus
+            ? current.draft.syncStatus
+            : resultDraft.syncStatus,
+          ...(remote && !equalVersionFailure
             ? {
                 remoteDraftId: remote.remoteDraftId,
                 remoteVersion: remote.confirmedVersion,
@@ -66,7 +82,11 @@ async function convergeDraftCache(
       };
     });
   }
-  await queryClient.invalidateQueries({ queryKey: key, exact: true });
+  await queryClient.invalidateQueries({
+    queryKey: key,
+    exact: true,
+    refetchType: "all",
+  });
 }
 
 export function createDraftMutationOptions() {
@@ -113,6 +133,7 @@ export function saveDraftMutationOptions(queryClient?: QueryClient) {
         queryClient,
         input.draftId,
         result,
+        input.expectedVersion,
         () => input.document,
       ),
     onError: (error, input) => {
@@ -121,6 +142,7 @@ export function saveDraftMutationOptions(queryClient?: QueryClient) {
           queryClient,
           input.draftId,
           error,
+          input.expectedVersion,
           () => input.document,
         );
       }
@@ -164,10 +186,20 @@ export function reconcileDraftMutationOptions(queryClient?: QueryClient) {
         },
       ),
     onSuccess: (result, input) =>
-      convergeDraftCache(queryClient, input.draftId, result),
+      convergeDraftCache(
+        queryClient,
+        input.draftId,
+        result,
+        input.expectedVersion,
+      ),
     onError: (error, input) => {
       if (error instanceof TypefullyClientError)
-        return convergeDraftCache(queryClient, input.draftId, error);
+        return convergeDraftCache(
+          queryClient,
+          input.draftId,
+          error,
+          input.expectedVersion,
+        );
     },
   });
 }
@@ -211,15 +243,23 @@ export function uploadMediaMutationOptions(queryClient?: QueryClient) {
       );
     },
     onSuccess: (result, input) =>
-      convergeDraftCache(queryClient, input.draftId, result, (document) => ({
-        ...document,
-        media: result.media
-          ? [
-              ...document.media.filter((item) => item.id !== result.media?.id),
-              result.media,
-            ].sort((left, right) => left.order - right.order)
-          : document.media,
-      })),
+      convergeDraftCache(
+        queryClient,
+        input.draftId,
+        result,
+        input.expectedVersion,
+        (document) => ({
+          ...document,
+          media: result.media
+            ? [
+                ...document.media.filter(
+                  (item) => item.id !== result.media?.id,
+                ),
+                result.media,
+              ].sort((left, right) => left.order - right.order)
+            : document.media,
+        }),
+      ),
     onError: (error, input) => {
       if (!(error instanceof TypefullyClientError))
         return convergeDraftCache(queryClient, input.draftId);
@@ -227,6 +267,7 @@ export function uploadMediaMutationOptions(queryClient?: QueryClient) {
         queryClient,
         input.draftId,
         error,
+        input.expectedVersion,
         (document) => ({
           ...document,
           media: error.media
@@ -258,13 +299,24 @@ export function deleteMediaMutationOptions(queryClient?: QueryClient) {
         },
       ),
     onSuccess: (result, input) =>
-      convergeDraftCache(queryClient, input.draftId, result, (document) => ({
-        ...document,
-        media: document.media.filter((item) => item.id !== input.mediaId),
-      })),
+      convergeDraftCache(
+        queryClient,
+        input.draftId,
+        result,
+        input.expectedVersion,
+        (document) => ({
+          ...document,
+          media: document.media.filter((item) => item.id !== input.mediaId),
+        }),
+      ),
     onError: (error, input) => {
       if (error instanceof TypefullyClientError)
-        return convergeDraftCache(queryClient, input.draftId, error);
+        return convergeDraftCache(
+          queryClient,
+          input.draftId,
+          error,
+          input.expectedVersion,
+        );
       return convergeDraftCache(queryClient, input.draftId);
     },
   });
@@ -328,7 +380,7 @@ function preparedProposal(value: unknown): PrepareProposalResponse {
   };
 }
 
-export function prepareProposalMutationOptions() {
+export function prepareProposalMutationOptions(queryClient?: QueryClient) {
   return mutationOptions({
     mutationFn: (input: {
       draftId: string;
@@ -343,10 +395,32 @@ export function prepareProposalMutationOptions() {
           signal: input.signal,
         },
       ).then(preparedProposal),
+    onSuccess: async (result, input) => {
+      if (!queryClient) return;
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: typefullyKeys.draft(input.draftId),
+          exact: true,
+          refetchType: "all",
+        }),
+        queryClient.invalidateQueries({
+          queryKey: typefullyKeys.proposalSummary(result.proposal.id),
+          exact: true,
+          refetchType: "all",
+        }),
+        queryClient.invalidateQueries({
+          queryKey: typefullyKeys.lists(),
+          refetchType: "all",
+        }),
+      ]);
+    },
   });
 }
 
-function proposalAction(action: "publish" | "reconcile" | "decline") {
+function proposalAction(
+  action: "publish" | "reconcile" | "decline",
+  queryClient?: QueryClient,
+) {
   return mutationOptions({
     mutationFn: (input: {
       proposalId: string;
@@ -356,13 +430,39 @@ function proposalAction(action: "publish" | "reconcile" | "decline") {
         `/api/typefully/proposals/${encodeURIComponent(input.proposalId)}/${action}`,
         { method: "POST", signal: input.signal },
       ),
+    onSuccess: async (result, input) => {
+      if (!queryClient) return;
+      queryClient.setQueryData(
+        typefullyKeys.proposal(input.proposalId),
+        result,
+      );
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: typefullyKeys.proposalSummary(input.proposalId),
+          exact: true,
+          refetchType: "all",
+        }),
+        queryClient.invalidateQueries({
+          queryKey: typefullyKeys.lists(),
+          refetchType: "all",
+        }),
+      ]);
+    },
+    onError: (_error, input) =>
+      queryClient?.invalidateQueries({
+        queryKey: typefullyKeys.proposal(input.proposalId),
+        exact: true,
+        refetchType: "all",
+      }),
   });
 }
 
-export const publishProposalMutationOptions = () => proposalAction("publish");
-export const reconcileProposalMutationOptions = () =>
-  proposalAction("reconcile");
-export const declineProposalMutationOptions = () => proposalAction("decline");
+export const publishProposalMutationOptions = (queryClient?: QueryClient) =>
+  proposalAction("publish", queryClient);
+export const reconcileProposalMutationOptions = (queryClient?: QueryClient) =>
+  proposalAction("reconcile", queryClient);
+export const declineProposalMutationOptions = (queryClient?: QueryClient) =>
+  proposalAction("decline", queryClient);
 
 export async function connectTypefully(
   apiKey: string,
