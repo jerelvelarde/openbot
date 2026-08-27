@@ -2,10 +2,13 @@ import { describe, expect, test } from "bun:test";
 import type { MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import { createApp } from "../src/app";
-import type { AuditEventInput, AuditStore } from "../src/audit";
+import type { AuditEventInput, TransactionalAuditStore } from "../src/audit";
 import type { AppVariables } from "../src/auth/guards";
 import { loadConfig } from "../src/config";
-import type { ExternalLinkStore } from "../src/external/link-store";
+import type {
+  ExternalLinkCreationStore,
+  ExternalLinkStore,
+} from "../src/external/link-store";
 import { mintExternalLinkToken } from "../src/external/link-token";
 import { createExternalLinkRoutes } from "../src/external/routes";
 import { testEnvironment } from "./support/environment";
@@ -49,8 +52,8 @@ function linkFor(openbotUserId: string) {
 }
 
 function fakeStore(
-  overrides: Partial<ExternalLinkStore> = {},
-): ExternalLinkStore & { links: ReturnType<typeof linkFor>[] } {
+  overrides: Partial<ExternalLinkCreationStore> = {},
+): ExternalLinkCreationStore & { links: ReturnType<typeof linkFor>[] } {
   const links: ReturnType<typeof linkFor>[] = [];
   async function linkWithStatus(
     input: Parameters<ExternalLinkStore["link"]>[0],
@@ -69,6 +72,25 @@ function fakeStore(
     links.push(link);
     return { link, created: true };
   }
+  async function linkWithStatusAndAudit(
+    input: Parameters<ExternalLinkStore["link"]>[0],
+    recordAudit: () => Promise<void>,
+  ) {
+    const found = links.find(
+      (link) =>
+        link.provider === input.provider &&
+        link.providerTenantId === input.providerTenantId &&
+        link.providerUserId === input.providerUserId,
+    );
+    if (found?.openbotUserId === input.openbotUserId) {
+      return { link: found, created: false };
+    }
+    if (found) throw new Error(CONFLICT);
+    const link = linkFor(input.openbotUserId);
+    await recordAudit();
+    links.push(link);
+    return { link, created: true };
+  }
   return Object.assign(
     {
       links,
@@ -79,10 +101,11 @@ function fakeStore(
         return null;
       },
       linkWithStatus,
+      linkWithStatusAndAudit,
       async link(input) {
         return (await linkWithStatus(input)).link;
       },
-    } satisfies ExternalLinkStore,
+    } satisfies ExternalLinkCreationStore,
     overrides,
   );
 }
@@ -91,10 +114,11 @@ function appFor(
   store = fakeStore(),
   requireUser = authenticatedAs(),
   rows: AuditEventInput[] = [],
-) {
-  const auditStore: AuditStore = {
+  auditStore: TransactionalAuditStore = {
     insert: async (event) => void rows.push(event),
-  };
+    inTransaction: () => ({ insert: async (event) => void rows.push(event) }),
+  },
+) {
   const app = new Hono<{ Variables: AppVariables }>();
   app.route(
     "/api/external-links",
@@ -107,6 +131,12 @@ function appFor(
   );
   return { app, rows, store };
 }
+
+const baseStore: ExternalLinkStore = {
+  find: async () => null,
+  findVerifiedUserByEmail: async () => null,
+  link: async (input) => linkFor(input.openbotUserId),
+};
 
 function requestToken(token: string) {
   return `?token=${encodeURIComponent(token)}`;
@@ -198,6 +228,42 @@ describe("external Slack link confirmation routes", () => {
     expect(rows).toHaveLength(1);
   });
 
+  test("rolls back an unauditable creation so a successful retry writes exactly one audit event", async () => {
+    const rows: AuditEventInput[] = [];
+    let failuresRemaining = 1;
+    const auditStore: TransactionalAuditStore = {
+      insert: async (event) => {
+        if (failuresRemaining > 0) {
+          failuresRemaining -= 1;
+          throw new Error("audit table unavailable");
+        }
+        rows.push(event);
+      },
+      inTransaction: () => auditStore,
+    };
+    const { app, store } = appFor(
+      fakeStore(),
+      authenticatedAs(),
+      rows,
+      auditStore,
+    );
+    const token = await liveToken();
+    const request = () =>
+      app.request("http://openbot.test/api/external-links/slack", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token }),
+      });
+
+    expect((await request()).status).toBe(500);
+    expect(store.links).toEqual([]);
+
+    expect((await request()).status).toBe(200);
+    expect((await request()).status).toBe(200);
+    expect(store.links).toEqual([linkFor(actor.id)]);
+    expect(rows).toHaveLength(1);
+  });
+
   test("POST refuses a replay for another actor without reassigning the link", async () => {
     const { app, store, rows } = appFor();
     const token = await liveToken();
@@ -274,7 +340,10 @@ describe("external Slack link confirmation routes", () => {
       store: fakeStore(),
       encryptionKey: KEY,
       requireUser: authenticatedAs(),
-      auditStore: { insert: async () => undefined },
+      auditStore: {
+        insert: async () => undefined,
+        inTransaction: () => ({ insert: async () => undefined }),
+      },
     });
     const app = createApp(
       loadConfig(testEnvironment()),
@@ -289,5 +358,11 @@ describe("external Slack link confirmation routes", () => {
     );
 
     expect(response.status).toBe(200);
+  });
+
+  test("keeps the base external link store usable without confirmation-only methods", async () => {
+    await expect(
+      baseStore.link({ ...identity, openbotUserId: actor.id }),
+    ).resolves.toEqual(linkFor(actor.id));
   });
 });

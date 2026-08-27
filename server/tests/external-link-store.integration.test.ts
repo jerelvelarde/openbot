@@ -162,6 +162,34 @@ describe("external user links", () => {
     ]);
   });
 
+  test("rolls back a new link when its atomic audit write fails", async () => {
+    const openbotUserId = userId("audit_rollback");
+    const teamId = `T${suite}`;
+    await createUser({
+      id: openbotUserId,
+      email: email("audit_rollback"),
+      name: "Audit rollback person",
+    });
+    const input = {
+      provider: "slack" as const,
+      providerTenantId: teamId,
+      providerUserId: "U459",
+      openbotUserId,
+      providerEmail: "person@example.com",
+    };
+
+    await expect(
+      store.linkWithStatusAndAudit(input, async () => {
+        throw new Error("audit table unavailable");
+      }),
+    ).rejects.toThrow("audit table unavailable");
+    await expect(store.find("slack", teamId, "U459")).resolves.toBeNull();
+
+    await expect(
+      store.linkWithStatusAndAudit(input, async () => undefined),
+    ).resolves.toMatchObject({ created: true, link: input });
+  });
+
   test("never silently reassigns an existing provider identity to another user", async () => {
     const firstUserId = userId("first");
     const secondUserId = userId("second");

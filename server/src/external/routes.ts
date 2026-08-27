@@ -1,8 +1,8 @@
 import type { Context, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
-import { type AuditStore, recordAuditEvent } from "../audit";
+import { recordAuditEvent, type TransactionalAuditStore } from "../audit";
 import type { AppVariables } from "../auth/guards";
-import type { ExternalLinkResult, ExternalLinkStore } from "./link-store";
+import type { ExternalLinkCreationStore } from "./link-store";
 import { readExternalLinkToken } from "./link-token";
 import type { ExternalProviderIdentity } from "./schema-types";
 
@@ -10,10 +10,10 @@ const INVALID_LINK_MESSAGE = "This Slack link has expired or is invalid.";
 const LINK_CONFLICT_MESSAGE = "That Slack identity is already linked.";
 
 type ExternalLinkRoutesOptions = {
-  store: ExternalLinkStore;
+  store: ExternalLinkCreationStore;
   encryptionKey: string;
   requireUser: MiddlewareHandler<{ Variables: AppVariables }>;
-  auditStore: AuditStore;
+  auditStore: TransactionalAuditStore;
 };
 
 function tokenFrom(value: unknown): string | undefined {
@@ -62,12 +62,23 @@ export function createExternalLinkRoutes({
     }
 
     const actor = context.var.actor;
-    let linked: ExternalLinkResult;
     try {
-      linked = await store.linkWithStatus({
-        ...claim,
-        openbotUserId: actor.id,
-      });
+      await store.linkWithStatusAndAudit(
+        { ...claim, openbotUserId: actor.id },
+        async (transaction) => {
+          await recordAuditEvent(auditStore.inTransaction(transaction), {
+            eventType: "external_identity.linked",
+            targetType: "user",
+            targetId: actor.id,
+            actorUserId: actor.id,
+            payload: {
+              provider: claim.provider,
+              providerTenantId: claim.providerTenantId,
+              providerUserId: claim.providerUserId,
+            },
+          });
+        },
+      );
     } catch (error) {
       if (error instanceof Error && error.message === LINK_CONFLICT_MESSAGE) {
         return context.json({ error: LINK_CONFLICT_MESSAGE }, 409);
@@ -75,19 +86,6 @@ export function createExternalLinkRoutes({
       throw error;
     }
 
-    if (linked.created) {
-      await recordAuditEvent(auditStore, {
-        eventType: "external_identity.linked",
-        targetType: "user",
-        targetId: actor.id,
-        actorUserId: actor.id,
-        payload: {
-          provider: claim.provider,
-          providerTenantId: claim.providerTenantId,
-          providerUserId: claim.providerUserId,
-        },
-      });
-    }
     return context.json({ linked: true });
   });
 
