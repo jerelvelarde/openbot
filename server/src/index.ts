@@ -1,8 +1,9 @@
 import { serve } from "bun";
+import { COMPUTER_GUIDANCE } from "../../shared/bot-prompt";
+import { createActorAgentResolver } from "./agents/agent-resolver";
 import { mintRunAssertion } from "./agents/callback-token";
 import { createAgentFetch } from "./agents/endpoint";
 import { createAgentProfileStore } from "./agents/profile-store";
-import { createActorAgentResolver } from "./agents/agent-resolver";
 import { createRuntimeAgentLoader } from "./agents/runtime-agents";
 import { createApp } from "./app";
 import { createAuditReader, createAuditStore, recordAuditEvent } from "./audit";
@@ -57,7 +58,6 @@ import {
   loadTenantPackage,
   synchronizeTenantPackage,
 } from "./tenant-package";
-import { COMPUTER_GUIDANCE } from "../../shared/bot-prompt";
 
 /**
  * Who is asking, for a CopilotKit request.

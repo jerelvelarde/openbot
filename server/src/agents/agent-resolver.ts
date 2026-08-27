@@ -1,10 +1,10 @@
 import type { AbstractAgent } from "@ag-ui/client";
 import type { AgentFetch, StallGuard } from "../channels/stall-guard";
 import {
-  resolveRuntimeAgents,
   type LoadAgentsForActor,
   type LoadToolsForBot,
   type RuntimeModel,
+  resolveRuntimeAgents,
   type SignRun,
   type ToolSelection,
 } from "../copilot";
@@ -42,9 +42,12 @@ export type ActorAgentResolverDependencies = {
 export function createActorAgentResolver(
   deps: ActorAgentResolverDependencies,
 ): ActorAgentResolver {
-  const resolveAgentsForActor = (actor: AgentActor) =>
+  const resolveRegisteredAgents = (
+    actor: AgentActor,
+    registered: Awaited<ReturnType<LoadAgentsForActor>>,
+  ) =>
     resolveRuntimeAgents(
-      () => deps.loadAgents(actor),
+      () => Promise.resolve(registered),
       deps.model,
       deps.resolveModelApiKey,
       deps.stallGuard,
@@ -56,11 +59,21 @@ export function createActorAgentResolver(
       deps.agentFetch,
     );
 
+  const resolveAgentsForActor = async (actor: AgentActor) =>
+    resolveRegisteredAgents(actor, await deps.loadAgents(actor));
+
   return {
     resolveAgentsForActor,
     async resolveAgentForActor(actor, agentId) {
-      const agents = await resolveAgentsForActor(actor);
-      const agent = agents[agentId];
+      const registered = await deps.loadAgents(actor);
+      if (!registered.some((agent) => agent.id === agentId)) {
+        throw new Error(`Coworker ${agentId} is unavailable to this user.`);
+      }
+
+      const agents = await resolveRegisteredAgents(actor, registered);
+      const agent = Object.hasOwn(agents, agentId)
+        ? agents[agentId]
+        : undefined;
       if (!agent) {
         throw new Error(`Coworker ${agentId} is unavailable to this user.`);
       }
