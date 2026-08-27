@@ -55,7 +55,7 @@ describe("registered Copilot agents", () => {
         undefined,
         undefined,
         async () => {
-          throw new Error("postgres://admin:secret@private/vendor-catalogue");
+          throw new Error("relation internal_vendor_catalogue does not exist");
         },
       ),
     ).rejects.toMatchObject({
