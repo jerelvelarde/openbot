@@ -597,9 +597,12 @@ function governedRunForwardedProps(
 
 /** Keep built-in and remote coworkers on the same actor-scoped AG-UI run boundary. */
 class GovernedBuiltInAgent extends BuiltInAgent {
+  private configuration: BuiltInAgentConfiguration;
+  private registeredAgent: RegisteredBuiltInAgent;
   private botId: string;
   private deploymentTools: GrantedTool[];
   private signRun?: SignRun;
+  private governedMiddlewares: Parameters<AbstractAgent["use"]> = [];
 
   constructor(
     configuration: BuiltInAgentConfiguration,
@@ -608,9 +611,16 @@ class GovernedBuiltInAgent extends BuiltInAgent {
     signRun?: SignRun,
   ) {
     super(configuration);
+    this.configuration = configuration;
+    this.registeredAgent = agent;
     this.botId = agent.id;
     this.deploymentTools = tools;
     this.signRun = signRun;
+  }
+
+  use(...middlewares: Parameters<AbstractAgent["use"]>): this {
+    this.governedMiddlewares.push(...middlewares);
+    return super.use(...middlewares);
   }
 
   run(input: RunAgentInput): Observable<BaseEvent> {
@@ -626,10 +636,15 @@ class GovernedBuiltInAgent extends BuiltInAgent {
   }
 
   clone(): GovernedBuiltInAgent {
-    const cloned = super.clone() as GovernedBuiltInAgent;
-    cloned.botId = this.botId;
-    cloned.deploymentTools = this.deploymentTools;
-    cloned.signRun = this.signRun;
+    const cloned = new GovernedBuiltInAgent(
+      this.configuration,
+      this.registeredAgent,
+      this.deploymentTools,
+      this.signRun,
+    );
+    if (this.governedMiddlewares.length > 0) {
+      cloned.use(...this.governedMiddlewares);
+    }
     return cloned;
   }
 }

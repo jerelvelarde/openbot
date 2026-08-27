@@ -11,7 +11,7 @@ import {
   OpenBotChannelAgent,
   type OpenBotChannelAgentDependencies,
 } from "./channel-agent";
-import { ApprovalCard } from "./components";
+import { ApprovalCard, configureApprovalInteractionBridge } from "./components";
 import {
   createSlackComputerTools,
   type SlackComputerTool,
@@ -24,7 +24,10 @@ import type {
   SlackIdentityLinker,
   SlackIdentityResult,
 } from "./identity-linker";
-import { SlackIngressRegistry } from "./ingress-registry";
+import {
+  providerThreadIdFromIdentity,
+  SlackIngressRegistry,
+} from "./ingress-registry";
 
 export type OpenBotSlackChannelDependencies = {
   identityLinker: Pick<SlackIdentityLinker, "resolve">;
@@ -56,23 +59,6 @@ function eventId(context: ChannelIdentityContext): string | undefined {
 
 function isNewMessage(message: { operation?: { kind?: string } }): boolean {
   return message.operation?.kind === "created";
-}
-
-function slackConversationIdentity(conversationKey: string): {
-  providerTenantId: string;
-  providerConversationId: string;
-} | null {
-  const [provider, providerTenantId, providerConversationId, threadId] =
-    conversationKey.split(":", 4);
-  if (
-    provider !== "slack" ||
-    !providerTenantId ||
-    !providerConversationId ||
-    !threadId
-  ) {
-    return null;
-  }
-  return { providerTenantId, providerConversationId };
 }
 
 function validRememberedPrincipal(
@@ -107,7 +93,7 @@ function executionFor(
     provider: "slack",
     providerTenantId: identityContext.tenant.id,
     providerConversationId: identityContext.conversation.id,
-    providerThreadId: conversationKey,
+    providerThreadId: providerThreadIdFromIdentity(identityContext),
     channelsConversationKey: conversationKey,
     messageText,
   };
@@ -118,6 +104,7 @@ export function createOpenBotSlackChannel(
   deps: OpenBotSlackChannelDependencies,
 ): Channel {
   const ingress = deps.ingressRegistry ?? new SlackIngressRegistry();
+  configureApprovalInteractionBridge(ingress);
   const tools: SlackComputerTool[] = deps.computerGateway
     ? createSlackComputerTools(deps.computerGateway, deps.assistance)
     : [];
@@ -149,16 +136,10 @@ export function createOpenBotSlackChannel(
     subscribe: boolean;
   }): Promise<void> {
     if (message.actor.kind !== "human" || !isNewMessage(message)) return;
-    const providerIdentity = slackConversationIdentity(thread.conversationKey);
-    if (!providerIdentity) {
-      throw new Error("Managed Slack ingress identity is no longer available.");
-    }
     const remembered = ingress.take(message.eventId, {
       provider: "slack",
-      ...providerIdentity,
       providerActorId: message.actor.id,
       applicationUserId: message.user?.id ?? null,
-      conversationKey: thread.conversationKey,
     });
     if (!remembered || !validRememberedPrincipal(remembered, message)) {
       throw new Error("Managed Slack ingress identity is no longer available.");

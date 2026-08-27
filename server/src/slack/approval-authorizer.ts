@@ -2,6 +2,10 @@ import type { AgentProfileStore } from "../agents/profile-store";
 import type { ExternalLinkAuthorizationStore } from "../external/link-store";
 import type { ExternalThreadStore } from "../external/thread-store";
 import type { ApprovalPresentation } from "./approval-store";
+import {
+  type LinkedSlackIngress,
+  providerThreadIdFromIdentity,
+} from "./ingress-registry";
 
 export type SlackApprovalAuthorization = {
   actor: { id: string; role: "admin" | "user" };
@@ -25,13 +29,33 @@ export function createApprovalAuthorizer(
   return async (input: {
     userId: string;
     presentation: ApprovalPresentation;
+    liveIdentity: LinkedSlackIngress | null;
   }): Promise<false | SlackApprovalAuthorization> => {
+    if (!input.liveIdentity) return false;
+    const { identityContext: live, identityResult } = input.liveIdentity;
+    if (
+      live.provider !== "slack" ||
+      live.actor.kind !== "human" ||
+      live.actor.id !== identityResult.identity.providerUserId ||
+      live.tenant.id !== identityResult.identity.providerTenantId ||
+      identityResult.user.id !== input.userId ||
+      identityResult.actor.id !== input.userId
+    ) {
+      return false;
+    }
     const active = await dependencies.links.resolveActiveUser(input.userId);
     if (!active || active.id !== input.userId) return false;
     const binding = await dependencies.threads.getByChannelsThreadId(
       input.presentation.channelsThreadId,
     );
-    if (!binding || binding.agentId !== input.presentation.agentId)
+    if (
+      !binding ||
+      binding.agentId !== input.presentation.agentId ||
+      binding.provider !== "slack" ||
+      binding.providerTenantId !== live.tenant.id ||
+      binding.providerConversationId !== live.conversation.id ||
+      binding.providerThreadId !== providerThreadIdFromIdentity(live)
+    )
       return false;
     const actor = { id: active.id, role: active.role };
     if (

@@ -14,6 +14,7 @@ import type {
   StateStore,
 } from "@copilotkit/channels";
 import { MemoryStore } from "@copilotkit/channels";
+import { BuiltInAgent } from "@copilotkit/runtime/v2";
 import { Observable } from "rxjs";
 import { z } from "zod";
 import {
@@ -51,6 +52,7 @@ type SharedRunState = {
 type FakeAdapterInstance = PlatformAdapter & {
   posted: ChannelNode[][];
   stateStore?: StateStore;
+  getCanonicalThreadId?: PlatformAdapter["getCanonicalThreadId"];
   getSink(): {
     onTurn(turn: IncomingTurn): void | Promise<void>;
     onInteraction(event: InteractionEvent): void | Promise<void>;
@@ -258,6 +260,7 @@ function identity(
   actorId: string,
   tenantId = "T1",
   conversationId = "C1",
+  providerThreadId = "provider-thread-1",
 ): ChannelIdentityContext {
   return {
     provider: "slack",
@@ -266,8 +269,21 @@ function identity(
     actor: { id: actorId, kind: "human", name: actorId },
     conversation: { id: conversationId },
     trigger: "message",
-    event: { id: eventId },
+    event: { id: eventId, threadId: providerThreadId },
     raw: null,
+  };
+}
+
+function interactionIdentity(
+  eventId: string,
+  actorId: string,
+  tenantId = "T1",
+  conversationId = "C1",
+  providerThreadId = "provider-thread-1",
+): ChannelIdentityContext {
+  return {
+    ...identity(eventId, actorId, tenantId, conversationId, providerThreadId),
+    trigger: "interaction",
   };
 }
 
@@ -282,6 +298,8 @@ function turn(
     conversationId?: string;
     conversationKey?: string;
     logicalMessageId?: string;
+    providerThreadId?: string;
+    canonicalThreadId?: string;
   } = {},
 ) {
   const actorId = options.actorId ?? "U1";
@@ -291,12 +309,20 @@ function turn(
   return {
     eventId,
     conversationKey:
-      options.conversationKey ?? `slack:${tenantId}:${conversationId}:root-1`,
-    replyTarget: {},
+      options.conversationKey ?? `opaque-conversation-${conversationId}`,
+    replyTarget: {
+      canonicalThreadId: options.canonicalThreadId ?? "canonical-thread-1",
+    },
     userText: text,
     platform: "slack",
     actor: { id: actorId, kind: "human" as const, name: actorId },
-    identityContext: identity(eventId, actorId, tenantId, conversationId),
+    identityContext: identity(
+      eventId,
+      actorId,
+      tenantId,
+      conversationId,
+      options.providerThreadId,
+    ),
     operation: {
       kind,
       logicalMessageId: options.logicalMessageId ?? eventId,
@@ -343,6 +369,18 @@ function harness(
   } = {},
 ) {
   const adapter = new FakeAdapter({ platform: "slack", messageEvents: true });
+  adapter.getCanonicalThreadId = (target) => {
+    const id = (target as { canonicalThreadId?: unknown }).canonicalThreadId;
+    if (typeof id !== "string" || !id) {
+      throw new Error("fake delivery requires a canonical thread id");
+    }
+    return id;
+  };
+  adapter.conversationStore.getOrCreate = async (
+    _conversationKey,
+    replyTarget,
+    makeAgent,
+  ) => ({ agent: makeAgent(adapter.getCanonicalThreadId!(replyTarget)) });
   adapter.stateStore = options.stateStore;
   const filePosts: Parameters<NonNullable<PlatformAdapter["postFile"]>>[] = [];
   adapter.postFile = async (...args) => {
@@ -394,7 +432,7 @@ function harness(
           linkUrl: "https://openbot.test/link/slack?token=opaque",
           identity: {
             provider: "slack",
-            providerTenantId: "T1",
+            providerTenantId: context.tenant.id,
             providerUserId,
             providerEmail: null,
           },
@@ -406,7 +444,7 @@ function harness(
         actor: { id: providerUserId.toLowerCase(), role: "user" },
         identity: {
           provider: "slack",
-          providerTenantId: "T1",
+          providerTenantId: context.tenant.id,
           providerUserId,
           providerEmail: null,
         },
@@ -496,16 +534,41 @@ describe("managed OpenBot Slack channel", () => {
       .onTurn(turn("E1", "ask Risk Analyst to review this"));
 
     expect(bindCalls[0]).toMatchObject({
-      channelsThreadId: "slack:T1:C1:root-1",
+      channelsThreadId: "canonical-thread-1",
       provider: "slack",
       providerTenantId: "T1",
       providerConversationId: "C1",
-      providerThreadId: "slack:T1:C1:root-1",
+      providerThreadId: "provider-thread-1",
       agentId: "risk",
       createdByUserId: "u1",
     });
     expect(shared.inputs).toHaveLength(1);
     expect(postedText(adapter)).toContain("review complete");
+  });
+
+  test("treats managed conversation and canonical thread ids as opaque capabilities", async () => {
+    const { adapter, channel, bindCalls } = harness();
+    await channel.ɵruntime.start();
+
+    await adapter.getSink().onTurn(
+      turn("E-opaque", "review", {
+        conversationKey: "opaque-conversation-capability-7f31",
+        canonicalThreadId: "opaque-canonical-thread-a921",
+        tenantId: "T1:attacker-looking-tenant",
+        conversationId: "C1:attacker-looking-conversation",
+        providerThreadId: "P1:attacker-looking-thread",
+      }),
+    );
+
+    expect(bindCalls[0]).toMatchObject({
+      channelsThreadId: "opaque-canonical-thread-a921",
+      providerTenantId: "T1:attacker-looking-tenant",
+      providerConversationId: "C1:attacker-looking-conversation",
+      providerThreadId: "P1:attacker-looking-thread",
+    });
+    expect(JSON.stringify(bindCalls[0])).not.toContain(
+      "opaque-conversation-capability-7f31",
+    );
   });
 
   test("subscribed replies run without mentions and recheck each participant", async () => {
@@ -545,13 +608,17 @@ describe("managed OpenBot Slack channel", () => {
         U1: turn("E-collision", "first", {
           actorId: "U1",
           conversationId: "C1",
-          conversationKey: "slack:T1:C1:root-1",
+          conversationKey: "opaque-conversation-c1",
+          canonicalThreadId: "opaque-canonical-c1",
+          providerThreadId: "provider-thread-c1",
           logicalMessageId: "M1",
         }),
         U2: turn("E-collision", "second", {
           actorId: "U2",
           conversationId: "C2",
-          conversationKey: "slack:T1:C2:root-2",
+          conversationKey: "opaque-conversation-c2",
+          canonicalThreadId: "opaque-canonical-c2",
+          providerThreadId: "provider-thread-c2",
           logicalMessageId: "M2",
         }),
       };
@@ -564,12 +631,12 @@ describe("managed OpenBot Slack channel", () => {
       expect(bindCalls).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
-            channelsThreadId: "slack:T1:C1:root-1",
+            channelsThreadId: "opaque-canonical-c1",
             providerConversationId: "C1",
             createdByUserId: "u1",
           }),
           expect.objectContaining({
-            channelsThreadId: "slack:T1:C2:root-2",
+            channelsThreadId: "opaque-canonical-c2",
             providerConversationId: "C2",
             createdByUserId: "u2",
           }),
@@ -759,7 +826,26 @@ describe("managed OpenBot Slack channel", () => {
           return assertion;
         },
       });
-      const built = harness({ resolver: builtResolver, agentId: "analyst" });
+      const originalBuilt = await builtResolver.resolveAgentForActor(
+        { id: "u1", role: "user" },
+        "analyst",
+      );
+      const clonedBuilt = originalBuilt.clone() as AbstractAgent;
+      expect(clonedBuilt).toBeInstanceOf(BuiltInAgent);
+      expect(Object.getPrototypeOf(clonedBuilt)).toBe(
+        Object.getPrototypeOf(originalBuilt),
+      );
+      const clonedResolver: ActorAgentResolver = {
+        async resolveAgentsForActor() {
+          return { analyst: clonedBuilt };
+        },
+        async resolveAgentForActor(actor, agentId) {
+          expect(actor.id).toBe("u1");
+          expect(agentId).toBe("analyst");
+          return clonedBuilt;
+        },
+      };
+      const built = harness({ resolver: clonedResolver, agentId: "analyst" });
       await built.channel.ɵruntime.start();
       await built.adapter.getSink().onTurn({
         ...turn("E-built", "ignored fallback"),
@@ -903,7 +989,7 @@ describe("managed OpenBot Slack channel", () => {
           provider: "slack",
           providerTenantId: "T1",
           providerConversationId: "C1",
-          providerThreadId: "slack:T1:C1:root-1",
+          providerThreadId: "provider-thread-1",
         }),
       },
     );
@@ -917,11 +1003,11 @@ describe("managed OpenBot Slack channel", () => {
 
     await adapter.getSink().onInteraction({
       id: approve!,
-      conversationKey: "slack:T1:C1:root-1",
-      replyTarget: {},
+      conversationKey: "opaque-conversation-C1",
+      replyTarget: { canonicalThreadId: "canonical-thread-1" },
       eventId: "E-click",
       actor: { id: "U2", kind: "human", name: "U2" },
-      identityContext: identity("E-click", "U2"),
+      identityContext: interactionIdentity("E-click", "U2"),
     });
 
     expect(actors.at(-1)).toBe("u2");
@@ -937,11 +1023,11 @@ describe("managed OpenBot Slack channel", () => {
     let accessible = true;
     const bindings = new Map<string, ExternalThreadBinding>();
     const authorizationBinding: ExternalThreadBinding = {
-      channelsThreadId: "slack:T1:C1:root-1",
+      channelsThreadId: "canonical-thread-1",
       provider: "slack",
       providerTenantId: "T1",
       providerConversationId: "C1",
-      providerThreadId: "slack:T1:C1:root-1",
+      providerThreadId: "provider-thread-1",
       agentId: "risk",
       agentName: "Risk Analyst",
       createdByUserId: "u1",
@@ -1003,7 +1089,7 @@ describe("managed OpenBot Slack channel", () => {
     );
     const identityLinker: OpenBotSlackChannelDependencies["identityLinker"] = {
       async resolve(context) {
-        if (context.tenant.id !== "T1" || context.actor.id === "UNLINKED") {
+        if (context.actor.id === "UNLINKED") {
           return {
             kind: "unlinked",
             linkUrl: "https://openbot.test/link/slack?token=opaque",
@@ -1015,17 +1101,21 @@ describe("managed OpenBot Slack channel", () => {
             },
           };
         }
+        const applicationUserId = context.actor.id.startsWith("U2")
+          ? "u2"
+          : context.actor.id.toLowerCase();
         return {
           kind: "linked",
           user: {
-            id: context.actor.id.toLowerCase(),
+            id: applicationUserId,
             name: context.actor.id,
           },
-          actor: { id: context.actor.id.toLowerCase(), role: "user" },
+          actor: { id: applicationUserId, role: "user" },
           identity: {
             provider: "slack",
             providerTenantId: context.tenant.id,
-            providerUserId: context.actor.id,
+            providerUserId:
+              context.actor.id === "U2-FOREIGN" ? "U2" : context.actor.id,
             providerEmail: null,
           },
         };
@@ -1064,25 +1154,56 @@ describe("managed OpenBot Slack channel", () => {
           providerTenantId: "provider-tampered",
           channelsThreadId: "provider-tampered",
         },
-        conversationKey: "slack:T1:C1:root-1",
-        replyTarget: {},
+        conversationKey: "opaque-conversation-C1",
+        replyTarget: { canonicalThreadId: "canonical-thread-1" },
         eventId,
         actor: { id: actorId, kind: "human", name: actorId },
-        identityContext: identity(eventId, actorId),
+        identityContext: interactionIdentity(eventId, actorId),
         ...overrides,
       });
 
     await expect(
       click("E-wrong-conversation", "U2", {
-        conversationKey: "slack:T1:C2:root-1",
+        conversationKey: "opaque-foreign-conversation",
       }),
     ).rejects.toThrow("authorized");
     await expect(
       click("E-wrong-tenant", "U2", {
         identityContext: {
-          ...identity("E-wrong-tenant", "U2"),
+          ...interactionIdentity("E-wrong-tenant", "U2"),
           tenant: { id: "T2" },
         },
+      }),
+    ).rejects.toThrow("authorized");
+    await expect(
+      click("E-wrong-provider-conversation", "U2", {
+        identityContext: interactionIdentity(
+          "E-wrong-provider-conversation",
+          "U2",
+          "T1",
+          "C9",
+        ),
+      }),
+    ).rejects.toThrow("authorized");
+    await expect(
+      click("E-wrong-provider-thread", "U2", {
+        identityContext: interactionIdentity(
+          "E-wrong-provider-thread",
+          "U2",
+          "T1",
+          "C1",
+          "provider-thread-foreign",
+        ),
+      }),
+    ).rejects.toThrow("authorized");
+    await expect(
+      click("E-wrong-provider-actor", "U2-FOREIGN", {
+        identityContext: interactionIdentity(
+          "E-wrong-provider-actor",
+          "U2-FOREIGN",
+          "T1",
+          "C1",
+        ),
       }),
     ).rejects.toThrow("authorized");
     await expect(click("E-unlinked-click", "UNLINKED")).rejects.toThrow(
