@@ -16,6 +16,7 @@ describe("Typefully publication manifest boundary", () => {
     expect(names).not.toContain("publish");
     expect(names).not.toContain("publish_now");
     expect(names).not.toContain("schedule_draft");
+    expect(names).not.toContain("reconcile_publication");
     expect(
       names.filter((name) => /publish|publication|schedule/i.test(name)),
     ).toEqual(["prepare_publication"]);
@@ -25,6 +26,7 @@ describe("Typefully publication manifest boundary", () => {
     expect(typefully?.writeTools).not.toContain("publish");
     expect(typefully?.writeTools).not.toContain("publish_now");
     expect(typefully?.writeTools).not.toContain("schedule_draft");
+    expect(typefully?.writeTools).not.toContain("reconcile_publication");
   });
 
   test("refuses local preparation and publish aliases before vendor network access", async () => {

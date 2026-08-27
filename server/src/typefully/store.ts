@@ -65,13 +65,13 @@ type AuthorizationSurface = {
     actorId: string;
   }): Promise<PluginCallResult>;
   authorizeOperation?(input: {
-    requiredGrantRef: string;
+    requiredGrantRef?: string;
     ref: string;
     botId: string;
     actorId: string;
     context: {
-      intent: "write_tool";
-      mcp: { server: string; tool: string; effect: "write" };
+      intent: "read_tool" | "write_tool";
+      mcp: { server: string; tool: string; effect: "read" | "write" };
     };
   }): Promise<{
     token: string;
@@ -87,12 +87,16 @@ type AuthorizationSurface = {
 };
 
 type PublicationPolicyAudit = {
-  operation: "prepare_publication" | "publish_now" | "human_decline";
+  operation:
+    | "prepare_publication"
+    | "publish_now"
+    | "reconcile_publication"
+    | "human_decline";
   matchedRule: string | null;
   matchedRuleId: string | null;
   source: "allow" | "deny" | "default" | "not_applicable" | "unknown";
   mode: "enforce" | "dry-run" | "unknown";
-  effect: "write" | "human_decision";
+  effect: "read" | "write" | "human_decision";
   decision:
     | "allowed"
     | "dry_run_forwarded"
@@ -423,7 +427,7 @@ function publicationPolicyAudit(
   decision: Awaited<
     ReturnType<NonNullable<AuthorizationSurface["authorizeOperation"]>>
   >["decision"],
-  operation: "prepare_publication" | "publish_now",
+  operation: "prepare_publication" | "publish_now" | "reconcile_publication",
 ): PublicationPolicyAudit {
   const source = ["allow", "deny", "default"].includes(String(decision.source))
     ? (decision.source as "allow" | "deny" | "default")
@@ -438,7 +442,7 @@ function publicationPolicyAudit(
     matchedRuleId: boundedPolicyField(decision.matchedRuleId),
     source,
     mode,
-    effect: "write",
+    effect: operation === "reconcile_publication" ? "read" : "write",
     decision:
       forwarded && decision.allowed === true
         ? "allowed"
@@ -502,6 +506,26 @@ function publicationFailurePolicyAudit(error: unknown): PublicationPolicyAudit {
     error.authorizationDecision
     ? publicationPolicyAudit(error.authorizationDecision, "publish_now")
     : UNEVALUATED_PUBLISH_POLICY_AUDIT;
+}
+
+function reconciliationFailurePolicyAudit(
+  error: unknown,
+): PublicationPolicyAudit {
+  return error instanceof OperationAuthorizationError &&
+    error.authorizationDecision
+    ? publicationPolicyAudit(
+        error.authorizationDecision,
+        "reconcile_publication",
+      )
+    : {
+        operation: "reconcile_publication",
+        matchedRule: null,
+        matchedRuleId: null,
+        source: "unknown",
+        mode: "unknown",
+        effect: "read",
+        decision: "not_evaluated",
+      };
 }
 
 function publicationVerificationFailure(error: unknown) {
@@ -808,6 +832,36 @@ export function createTypefullyStore(options: {
     };
   }
 
+  async function authorizeReconciliation(input: {
+    botId: string;
+    actorId: string;
+  }): Promise<{ token: string; policy: PublicationPolicyAudit }> {
+    const authorizationSurface = plugin();
+    if (!authorizationSurface.authorizeOperation) {
+      throw new OperationAuthorizationError("operational_auth_failure", null);
+    }
+    const authorized = await authorizationSurface.authorizeOperation({
+      ref: `${serverId}/reconcile_publication`,
+      botId: input.botId,
+      actorId: input.actorId,
+      context: {
+        intent: "read_tool",
+        mcp: {
+          server: serverId,
+          tool: "reconcile_publication",
+          effect: "read",
+        },
+      },
+    });
+    return {
+      token: authorized.token,
+      policy: publicationPolicyAudit(
+        authorized.decision,
+        "reconcile_publication",
+      ),
+    };
+  }
+
   function remotePublicationIdentity(draft: TypefullyDraft) {
     const socialSetId = Number(draft.document.socialSetId);
     const remoteDraftId = Number(draft.remoteDraftId);
@@ -836,6 +890,7 @@ export function createTypefullyStore(options: {
         | "remote_revision"
         | "preclaim_authorization"
         | "postclaim_authorization"
+        | "prewrite_authorization"
         | "claim_attachment"
         | "postclaim_attachment"
         | "postclaim_remote_revision"
@@ -928,6 +983,7 @@ export function createTypefullyStore(options: {
     actorId: string;
     stage:
       | "postclaim_authorization"
+      | "prewrite_authorization"
       | "postclaim_attachment"
       | "postclaim_remote_verification";
     failureClass: string;
@@ -1905,9 +1961,11 @@ export function createTypefullyStore(options: {
       const publicationAttemptId = claim.attemptId;
 
       // Re-resolve grant, policy and actor credential after the durable, still reversible claim.
-      let finalAuthorization: Awaited<ReturnType<typeof authorizePublication>>;
+      let postclaimAuthorization: Awaited<
+        ReturnType<typeof authorizePublication>
+      >;
       try {
-        finalAuthorization = await authorizePublication({
+        postclaimAuthorization = await authorizePublication({
           botId: proposal.botId,
           actorId: input.actorId,
           operation: "publish_now",
@@ -1927,7 +1985,7 @@ export function createTypefullyStore(options: {
       let confirmedRemote: Awaited<ReturnType<PublicationVendor["fetchDraft"]>>;
       try {
         confirmedRemote = await publicationVendor.fetchDraft({
-          token: finalAuthorization.token,
+          token: postclaimAuthorization.token,
           ...identity,
         });
       } catch (error) {
@@ -1938,7 +1996,7 @@ export function createTypefullyStore(options: {
           actorId: input.actorId,
           stage: "postclaim_remote_verification",
           failureClass,
-          policy: finalAuthorization.policy,
+          policy: postclaimAuthorization.policy,
         });
         throw error instanceof PublicationVerificationError
           ? error
@@ -1985,11 +2043,32 @@ export function createTypefullyStore(options: {
               stage: "postclaim_remote_revision",
               failureClass: "remote_changed",
               outcome: "expired",
-              policy: finalAuthorization.policy,
+              policy: postclaimAuthorization.policy,
             },
           );
         });
         throw changedProposalError();
+      }
+
+      // The verification GET may take long enough for a grant, policy or credential to change.
+      // Resolve write authority one last time after it, and use this exact token for the PATCH.
+      let finalAuthorization: Awaited<ReturnType<typeof authorizePublication>>;
+      try {
+        finalAuthorization = await authorizePublication({
+          botId: proposal.botId,
+          actorId: input.actorId,
+          operation: "publish_now",
+        });
+      } catch (error) {
+        proposal = await releasePublicationClaim({
+          proposal,
+          attemptId: publicationAttemptId,
+          actorId: input.actorId,
+          stage: "prewrite_authorization",
+          failureClass: publicationAuthorizationFailureClass(error),
+          policy: publicationFailurePolicyAudit(error),
+        });
+        throw error;
       }
 
       const marked = await database.transaction(async (transaction) => {
@@ -2209,10 +2288,52 @@ export function createTypefullyStore(options: {
         );
       }
       const draft = await ownedDraft(database, proposal.draftId, input.actorId);
-      const authorized = await authorizePublication({
-        botId: proposal.botId,
-        actorId: input.actorId,
-        operation: "publish_now",
+      let authorized: Awaited<ReturnType<typeof authorizeReconciliation>>;
+      try {
+        authorized = await authorizeReconciliation({
+          botId: proposal.botId,
+          actorId: input.actorId,
+        });
+      } catch (error) {
+        await recordAuditEvent(auditStore, {
+          eventType: "configuration.changed",
+          targetType: "typefully_publication_proposal",
+          targetId: proposal.id,
+          actorUserId: input.actorId,
+          payload: {
+            draftId: proposal.draftId,
+            botId: proposal.botId,
+            channelId: proposal.channelId,
+            version: proposal.version,
+            hash: proposal.contentHash,
+            destinations: proposal.destinations,
+            decision: "reconciliation_refused",
+            stage: "reconciliation_authorization",
+            failureClass: publicationAuthorizationFailureClass(error),
+            outcome: "unknown",
+            vendorWrite: "not_attempted",
+            policy: reconciliationFailurePolicyAudit(error),
+          },
+        });
+        throw error;
+      }
+      await recordAuditEvent(auditStore, {
+        eventType: "configuration.changed",
+        targetType: "typefully_publication_proposal",
+        targetId: proposal.id,
+        actorUserId: input.actorId,
+        payload: {
+          draftId: proposal.draftId,
+          botId: proposal.botId,
+          channelId: proposal.channelId,
+          version: proposal.version,
+          hash: proposal.contentHash,
+          destinations: proposal.destinations,
+          decision: "reconciliation_authorized",
+          outcome: "unknown",
+          vendorWrite: "not_attempted",
+          policy: authorized.policy,
+        },
       });
       const outcome = safePublicationOutcome(
         await publicationVendor.reconcileDraft({

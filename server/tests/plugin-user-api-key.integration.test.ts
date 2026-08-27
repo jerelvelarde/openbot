@@ -208,6 +208,43 @@ describe("personal Typefully API-key connections", () => {
     expect(authorized.token).toBe(currentKey);
     expect(authorized.decision).toMatchObject({ allowed: true, forward: true });
 
+    const reconciliation = await store.authorizeOperation({
+      ref: `${serverId}/reconcile_publication`,
+      botId,
+      actorId: userId,
+      context: {
+        intent: "read_tool",
+        mcp: {
+          server: serverId,
+          tool: "reconcile_publication",
+          effect: "read",
+        },
+      },
+    });
+    expect(reconciliation.token).toBe(currentKey);
+    expect(reconciliation.decision).toMatchObject({
+      allowed: true,
+      forward: true,
+    });
+
+    await expect(
+      store.authorizeOperation({
+        ref: `${serverId}/arbitrary_internal_read`,
+        botId,
+        actorId: userId,
+        context: {
+          intent: "read_tool",
+          mcp: {
+            server: serverId,
+            tool: "arbitrary_internal_read",
+            effect: "read",
+          },
+        },
+      }),
+    ).rejects.toMatchObject({
+      failureClass: "operational_auth_failure",
+    });
+
     await expect(
       store.authorizeOperation({
         requiredGrantRef: `${serverId}/publish_now`,

@@ -3445,18 +3445,20 @@ export function createPluginStore(options: PluginStoreOptions) {
 
     /**
      * Authorize a reviewed server-only operation without advertising it as a tool. The caller must
-     * still name a real advertised grant that gates the operation; only the reserved operation name
-     * is evaluated by policy. Returning the actor's live token keeps the credential check and policy
+     * normally names a real advertised grant that gates the operation; only the reserved operation
+     * name is evaluated by policy. The one grantless exception is Typefully's exact server-only
+     * reconciliation read: it can only inspect an already-ambiguous publication and cannot create a
+     * new vendor write. Returning the actor's live token keeps the credential check and policy
      * decision adjacent and leaves no generic HTTP or model-callable publish surface.
      */
     async authorizeOperation(input: {
-      requiredGrantRef: string;
+      requiredGrantRef?: string;
       ref: string;
       botId: string;
       actorId: string;
       context: {
-        intent: "write_tool";
-        mcp: { server: string; tool: string; effect: "write" };
+        intent: "read_tool" | "write_tool";
+        mcp: { server: string; tool: string; effect: "read" | "write" };
       };
     }): Promise<{
       token: string;
@@ -3464,24 +3466,34 @@ export function createPluginStore(options: PluginStoreOptions) {
     }> {
       const [serverId, ...operationParts] = input.ref.split("/");
       const operation = operationParts.join("/");
+      const isReconciliationRead =
+        serverId === "typefully" &&
+        operation === "reconcile_publication" &&
+        input.requiredGrantRef === undefined &&
+        input.context.intent === "read_tool" &&
+        input.context.mcp.effect === "read";
       if (
         !serverId ||
         !operation ||
-        input.context.intent !== "write_tool" ||
         input.context.mcp.server !== serverId ||
         input.context.mcp.tool !== operation ||
-        input.context.mcp.effect !== "write" ||
-        !input.requiredGrantRef.startsWith(`${serverId}/`)
+        (!isReconciliationRead &&
+          (input.context.intent !== "write_tool" ||
+            input.context.mcp.effect !== "write")) ||
+        (!isReconciliationRead &&
+          !input.requiredGrantRef?.startsWith(`${serverId}/`))
       ) {
         throw new OperationAuthorizationError("operational_auth_failure", null);
       }
-      const grant = await this.decide(
-        "mcp",
-        input.requiredGrantRef,
-        input.botId,
-      );
-      if (!grant.allowed) {
-        throw new OperationAuthorizationError("grant_missing", null);
+      if (!isReconciliationRead) {
+        const grant = await this.decide(
+          "mcp",
+          input.requiredGrantRef ?? "",
+          input.botId,
+        );
+        if (!grant.allowed) {
+          throw new OperationAuthorizationError("grant_missing", null);
+        }
       }
       let resolved: Awaited<ReturnType<typeof requireServer>>;
       try {

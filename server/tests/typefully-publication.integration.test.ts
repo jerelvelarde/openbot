@@ -68,13 +68,16 @@ const plugin = {
         );
       }
     }
+    const reconciliation = input.ref.endsWith("/reconcile_publication");
     return {
       token: "personal-key",
       decision: {
         allowed: true,
         forward: true,
         mode: "enforce",
-        matched: "mcp.effect == 'write'",
+        matched: reconciliation
+          ? "mcp.effect == 'read'"
+          : "mcp.effect == 'write'",
         source: "allow",
         reason: "Permitted by policy.",
       },
@@ -563,12 +566,12 @@ describe("immutable Typefully publication proposals", () => {
           decision: "reconciled",
           outcome: "published",
           policy: {
-            operation: "publish_now",
-            matchedRule: "mcp.effect == 'write'",
+            operation: "reconcile_publication",
+            matchedRule: "mcp.effect == 'read'",
             matchedRuleId: null,
             source: "allow",
             mode: "enforce",
-            effect: "write",
+            effect: "read",
             decision: "allowed",
           },
         }),
@@ -1003,26 +1006,42 @@ describe("immutable Typefully publication proposals", () => {
     });
     await realPlugin.grant("mcp", ref, botId, ownerId);
     let denyAfterVerification = false;
+    let revokeAfterVerification = false;
+    let verificationFetches = 0;
+    let realPublishOutcome: "published" | "unknown" = "published";
+    let realReconcileOutcome: "published" | "failed" | "unknown" = "unknown";
+    let realReconcileCalls = 0;
     const realStore = createTypefullyStore({
       database,
       auditStore: createAuditStore(database),
       plugin: () => realPlugin,
       publicationVendor: {
         fetchDraft: async () => {
-          if (denyAfterVerification) {
-            policy = {
-              mode: "enforce",
-              deny: ['mcp.tool == "publish_now"'],
-              allow: ["true"],
-            };
+          if (
+            (denyAfterVerification || revokeAfterVerification) &&
+            ++verificationFetches === 2
+          ) {
+            if (denyAfterVerification) {
+              policy = {
+                mode: "enforce",
+                deny: ['mcp.tool == "publish_now"'],
+                allow: ["true"],
+              };
+            }
+            if (revokeAfterVerification) {
+              await realPlugin.revoke("mcp", ref, botId, ownerId);
+            }
           }
           return { document: remoteDocument };
         },
         publishDraft: async () => {
           publishCalls += 1;
-          return { outcome: "published" as const };
+          return { outcome: realPublishOutcome };
         },
-        reconcileDraft: async () => ({ outcome: "unknown" as const }),
+        reconcileDraft: async () => {
+          realReconcileCalls += 1;
+          return { outcome: realReconcileOutcome };
+        },
       },
     });
     try {
@@ -1137,6 +1156,7 @@ describe("immutable Typefully publication proposals", () => {
       });
       publishCalls = 0;
       denyAfterVerification = true;
+      verificationFetches = 0;
       await expect(
         realStore.approveAndPublish({
           proposalId: postclaimProposal.id,
@@ -1151,7 +1171,7 @@ describe("immutable Typefully publication proposals", () => {
       expect(postclaimAudit.map(({ payload }) => payload)).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
-            stage: "postclaim_authorization",
+            stage: "prewrite_authorization",
             failureClass: "policy_denied",
             vendorWrite: "not_attempted",
             policy: expect.objectContaining({
@@ -1168,8 +1188,174 @@ describe("immutable Typefully publication proposals", () => {
         policyAudit,
         postclaimAudit,
       ]);
+
+      policy = { mode: "enforce", deny: [], allow: ["true"] };
+      denyAfterVerification = false;
+      revokeAfterVerification = true;
+      verificationFetches = 0;
+      const revokedDuringGetDraft = await syncedDraft();
+      const revokedDuringGetProposal = await realStore.prepareProposal({
+        draftId: revokedDuringGetDraft.id,
+        actorId: ownerId,
+        expectedVersion: revokedDuringGetDraft.version,
+      });
+      publishCalls = 0;
+      await expect(
+        realStore.approveAndPublish({
+          proposalId: revokedDuringGetProposal.id,
+          actorId: ownerId,
+        }),
+      ).rejects.toMatchObject({ failureClass: "grant_missing" });
+      expect(publishCalls).toBe(0);
+      expect(
+        await store.readProposal(revokedDuringGetProposal.id, ownerId),
+      ).toMatchObject({ status: "pending", vendorWriteStartedAt: null });
+      expect(
+        (await proposalAudits(revokedDuringGetProposal.id)).map(
+          ({ payload }) => payload,
+        ),
+      ).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            stage: "prewrite_authorization",
+            failureClass: "grant_missing",
+            outcome: "pending",
+            vendorWrite: "not_attempted",
+          }),
+        ]),
+      );
+      await realPlugin.grant("mcp", ref, botId, ownerId);
+
+      policy = { mode: "enforce", deny: [], allow: ["true"] };
+      denyAfterVerification = false;
+      revokeAfterVerification = false;
+      realPublishOutcome = "unknown";
+      const reconciliationDraft = await syncedDraft();
+      const reconciliationProposal = await realStore.prepareProposal({
+        draftId: reconciliationDraft.id,
+        actorId: ownerId,
+        expectedVersion: reconciliationDraft.version,
+      });
+      publishCalls = 0;
+      expect(
+        await realStore.approveAndPublish({
+          proposalId: reconciliationProposal.id,
+          actorId: ownerId,
+        }),
+      ).toMatchObject({ status: "unknown" });
+      expect(publishCalls).toBe(1);
+
+      await realPlugin.revoke("mcp", ref, botId, ownerId);
+      await database
+        .delete(channelAgents)
+        .where(
+          and(
+            eq(channelAgents.channelId, channelId),
+            eq(channelAgents.agentId, botId),
+          ),
+        );
+      policy = {
+        mode: "enforce",
+        deny: ['mcp.effect == "write"'],
+        allow: ['mcp.effect == "read"'],
+      };
+      await realPlugin.disconnectUserConnection({
+        serverId: "typefully",
+        userId: ownerId,
+        by: ownerId,
+      });
+      realReconcileCalls = 0;
+      await expect(
+        realStore.reconcileProposal({
+          proposalId: reconciliationProposal.id,
+          actorId: ownerId,
+        }),
+      ).rejects.toMatchObject({ code: "connection_required" });
+      expect(realReconcileCalls).toBe(0);
+      await realPlugin.connectUserApiKey({
+        serverId: "typefully",
+        userId: ownerId,
+        apiKey: `tf-real-publication-reconcile-${suffix}`,
+        by: ownerId,
+      });
+
+      policy = {
+        mode: "enforce",
+        deny: ['mcp.tool == "reconcile_publication"'],
+        allow: ["true"],
+      };
+      await expect(
+        realStore.reconcileProposal({
+          proposalId: reconciliationProposal.id,
+          actorId: ownerId,
+        }),
+      ).rejects.toMatchObject({ failureClass: "policy_denied" });
+      expect(realReconcileCalls).toBe(0);
+      expect(
+        await store.readProposal(reconciliationProposal.id, ownerId),
+      ).toMatchObject({ status: "unknown" });
+
+      policy = {
+        mode: "enforce",
+        deny: ['mcp.effect == "write"'],
+        allow: ['mcp.effect == "read"'],
+      };
+      await expect(
+        realStore.reconcileProposal({
+          proposalId: reconciliationProposal.id,
+          actorId: otherId,
+        }),
+      ).rejects.toMatchObject({ code: "draft_not_found" });
+      expect(realReconcileCalls).toBe(0);
+      realReconcileOutcome = "published";
+      expect(
+        await realStore.reconcileProposal({
+          proposalId: reconciliationProposal.id,
+          actorId: ownerId,
+        }),
+      ).toMatchObject({ status: "published" });
+      expect(realReconcileCalls).toBe(1);
+      expect(publishCalls).toBe(1);
+      const reconciliationAudit = await proposalAudits(
+        reconciliationProposal.id,
+      );
+      expect(reconciliationAudit.map(({ payload }) => payload)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            decision: "reconciliation_refused",
+            stage: "reconciliation_authorization",
+            outcome: "unknown",
+            policy: expect.objectContaining({
+              operation: "reconcile_publication",
+              effect: "read",
+              decision: "denied",
+            }),
+          }),
+          expect.objectContaining({
+            decision: "reconciliation_authorized",
+            policy: expect.objectContaining({
+              operation: "reconcile_publication",
+              effect: "read",
+              decision: "allowed",
+            }),
+          }),
+          expect.objectContaining({
+            decision: "reconciled",
+            outcome: "published",
+            policy: expect.objectContaining({
+              operation: "reconcile_publication",
+              effect: "read",
+            }),
+          }),
+        ]),
+      );
+      expectAuditIsSafe(reconciliationAudit);
     } finally {
       await realPlugin.revoke("mcp", ref, botId, ownerId);
+      await database
+        .insert(channelAgents)
+        .values({ channelId, agentId: botId })
+        .onConflictDoNothing();
       await database
         .delete(mcpUserCredentials)
         .where(
@@ -1333,6 +1519,154 @@ describe("immutable Typefully publication proposals", () => {
     } finally {
       failSecondPublishAuthorization = false;
     }
+  });
+
+  test("reauthorizes after the last remote GET and releases the claim if authority changes during verification", async () => {
+    let releaseVerification!: () => void;
+    let verificationStarted!: () => void;
+    const verificationBarrier = new Promise<void>((resolve) => {
+      releaseVerification = resolve;
+    });
+    const verificationSignal = new Promise<void>((resolve) => {
+      verificationStarted = resolve;
+    });
+    let authorizationCalls = 0;
+    let fetches = 0;
+    let grantAlive = true;
+    let racedPublishCalls = 0;
+    const racedPlugin = {
+      decide: plugin.decide,
+      authorizeOperation: async () => {
+        authorizationCalls += 1;
+        if (!grantAlive) {
+          throw Object.assign(new Error("Grant changed"), {
+            code: "grant_required",
+          });
+        }
+        return {
+          token: `credential-generation-${authorizationCalls}`,
+          decision: {
+            allowed: true,
+            forward: true,
+            mode: "enforce",
+            matched: "true",
+            source: "allow",
+          },
+        };
+      },
+    };
+    const racedStore = createTypefullyStore({
+      database,
+      auditStore: createAuditStore(database),
+      plugin: () => racedPlugin,
+      publicationVendor: {
+        fetchDraft: async () => {
+          fetches += 1;
+          if (fetches === 2) {
+            verificationStarted();
+            await verificationBarrier;
+          }
+          return { document: remoteDocument };
+        },
+        publishDraft: async () => {
+          racedPublishCalls += 1;
+          return { outcome: "published" as const };
+        },
+        reconcileDraft: async () => ({ outcome: "unknown" as const }),
+      },
+    });
+    const draft = await syncedDraft();
+    const proposal = await racedStore.prepareProposal({
+      draftId: draft.id,
+      actorId: ownerId,
+      expectedVersion: draft.version,
+    });
+    authorizationCalls = 0;
+    const publishing = racedStore.approveAndPublish({
+      proposalId: proposal.id,
+      actorId: ownerId,
+    });
+    await verificationSignal;
+    grantAlive = false;
+    releaseVerification();
+
+    await expect(publishing).rejects.toMatchObject({ code: "grant_required" });
+    expect(fetches).toBe(2);
+    expect(authorizationCalls).toBe(3);
+    expect(racedPublishCalls).toBe(0);
+    expect(await store.readProposal(proposal.id, ownerId)).toMatchObject({
+      status: "pending",
+      attemptId: null,
+      vendorWriteStartedAt: null,
+    });
+    const audit = await proposalAudits(proposal.id);
+    expect(audit.map(({ payload }) => payload)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          stage: "prewrite_authorization",
+          failureClass: "grant_missing",
+          outcome: "pending",
+          vendorWrite: "not_attempted",
+        }),
+      ]),
+    );
+    expectAuditIsSafe(audit);
+  });
+
+  test("uses the credential returned by the final post-verification authorization for PATCH", async () => {
+    let authorizationCalls = 0;
+    const fetchTokens: string[] = [];
+    let publishToken: string | null = null;
+    const rotatingPlugin = {
+      decide: plugin.decide,
+      authorizeOperation: async () => {
+        authorizationCalls += 1;
+        return {
+          token: `credential-generation-${authorizationCalls}`,
+          decision: {
+            allowed: true,
+            forward: true,
+            mode: "enforce",
+            matched: "true",
+            source: "allow",
+          },
+        };
+      },
+    };
+    const rotatingStore = createTypefullyStore({
+      database,
+      auditStore: createAuditStore(database),
+      plugin: () => rotatingPlugin,
+      publicationVendor: {
+        fetchDraft: async ({ token }) => {
+          fetchTokens.push(token);
+          return { document: remoteDocument };
+        },
+        publishDraft: async ({ token }) => {
+          publishToken = token;
+          return { outcome: "published" as const };
+        },
+        reconcileDraft: async () => ({ outcome: "unknown" as const }),
+      },
+    });
+    const draft = await syncedDraft();
+    const proposal = await rotatingStore.prepareProposal({
+      draftId: draft.id,
+      actorId: ownerId,
+      expectedVersion: draft.version,
+    });
+    authorizationCalls = 0;
+    expect(
+      await rotatingStore.approveAndPublish({
+        proposalId: proposal.id,
+        actorId: ownerId,
+      }),
+    ).toMatchObject({ status: "published" });
+    expect(fetchTokens).toEqual([
+      "credential-generation-1",
+      "credential-generation-2",
+    ]);
+    expect(publishToken).toBe("credential-generation-3");
   });
 
   test("records known vendor refusal as failed and audits metadata without content", async () => {
