@@ -24,18 +24,18 @@ async function expectInvalid(token: string, key = KEY, now = NOW) {
   );
 }
 
-async function sealForgedClaim(overrides: Record<string, unknown>) {
-  return seal(
-    JSON.stringify({
-      ...identity,
-      issuedAt: NOW,
-      expiresAt: NOW + EXTERNAL_LINK_TTL_MS,
-      nonce: VALID_NONCE,
-      ...overrides,
-    }),
-    KEY,
-    "external-link:v1",
-  );
+function forgedClaim(overrides: Record<string, unknown> = {}) {
+  return {
+    ...identity,
+    issuedAt: NOW,
+    expiresAt: NOW + EXTERNAL_LINK_TTL_MS,
+    nonce: VALID_NONCE,
+    ...overrides,
+  };
+}
+
+async function sealForgedClaim(overrides: Record<string, unknown> = {}) {
+  return seal(JSON.stringify(forgedClaim(overrides)), KEY, "external-link:v1");
 }
 
 describe("external Slack link tokens", () => {
@@ -87,19 +87,7 @@ describe("external Slack link tokens", () => {
   });
 
   test("requires the Slack provider binding", async () => {
-    const token = await seal(
-      JSON.stringify({
-        ...identity,
-        provider: "github",
-        issuedAt: NOW,
-        expiresAt: NOW + EXTERNAL_LINK_TTL_MS,
-        nonce: "nonce",
-      }),
-      KEY,
-      "external-link:v1",
-    );
-
-    await expectInvalid(token);
+    await expectInvalid(await sealForgedClaim({ provider: "github" }));
   });
 
   test.each([
@@ -108,56 +96,21 @@ describe("external Slack link tokens", () => {
     ["providerUserId", ""],
     ["providerUserId", "  "],
   ])("refuses an empty %s", async (field, value) => {
-    const token = await seal(
-      JSON.stringify({
-        ...identity,
-        [field]: value,
-        issuedAt: NOW,
-        expiresAt: NOW + EXTERNAL_LINK_TTL_MS,
-        nonce: "nonce",
-      }),
-      KEY,
-      "external-link:v1",
-    );
-
-    await expectInvalid(token);
+    await expectInvalid(await sealForgedClaim({ [field]: value }));
   });
 
   test.each([
-    ["issuedAt", "now"],
-    ["expiresAt", "later"],
-    ["nonce", ""],
-    ["nonce", 42],
-    ["providerEmail", 42],
-  ])("refuses a malformed %s", async (field, value) => {
-    const token = await seal(
-      JSON.stringify({
-        ...identity,
-        [field]: value,
-        issuedAt: field === "issuedAt" ? value : NOW,
-        expiresAt: field === "expiresAt" ? value : NOW + EXTERNAL_LINK_TTL_MS,
-        nonce: field === "nonce" ? value : "nonce",
-      }),
-      KEY,
-      "external-link:v1",
-    );
-
-    await expectInvalid(token);
+    ["a string issued timestamp", { issuedAt: "now" }],
+    ["a string expiry timestamp", { expiresAt: "later" }],
+    ["an empty nonce", { nonce: "" }],
+    ["a non-string nonce", { nonce: 42 }],
+    ["a non-string provider email", { providerEmail: 42 }],
+  ])("refuses a malformed claim with %s", async (_reason, overrides) => {
+    await expectInvalid(await sealForgedClaim(overrides));
   });
 
   test("refuses a claim that expires before it was issued", async () => {
-    const token = await seal(
-      JSON.stringify({
-        ...identity,
-        issuedAt: NOW,
-        expiresAt: NOW - 1,
-        nonce: VALID_NONCE,
-      }),
-      KEY,
-      "external-link:v1",
-    );
-
-    await expectInvalid(token);
+    await expectInvalid(await sealForgedClaim({ expiresAt: NOW - 1 }));
   });
 
   test.each([
@@ -189,5 +142,38 @@ describe("external Slack link tokens", () => {
     ],
   ])("refuses a forged claim with %s", async (_reason, overrides, readNow) => {
     await expectInvalid(await sealForgedClaim(overrides), KEY, readNow);
+  });
+
+  test.each(["openbotUserId", "unexpected"])(
+    "refuses a claim with an extra %s key",
+    async (key) => {
+      await expectInvalid(await sealForgedClaim({ [key]: "forged" }));
+    },
+  );
+
+  test.each([
+    "provider",
+    "providerTenantId",
+    "providerUserId",
+    "providerEmail",
+    "issuedAt",
+    "expiresAt",
+    "nonce",
+  ])("refuses a claim missing %s", async (key) => {
+    const claim: Record<string, unknown> = forgedClaim();
+    delete claim[key];
+    const token = await seal(JSON.stringify(claim), KEY, "external-link:v1");
+
+    await expectInvalid(token);
+  });
+
+  test("refuses a claim sealed for another domain label", async () => {
+    const token = await seal(
+      JSON.stringify(forgedClaim()),
+      KEY,
+      "agent-callback",
+    );
+
+    await expectInvalid(token);
   });
 });

@@ -7,6 +7,15 @@ const EXTERNAL_LINK_LABEL = "external-link:v1";
 const INVALID_LINK_MESSAGE = "This Slack link has expired or is invalid.";
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const CLAIM_KEYS = new Set([
+  "provider",
+  "providerTenantId",
+  "providerUserId",
+  "providerEmail",
+  "issuedAt",
+  "expiresAt",
+  "nonce",
+]);
 
 type ExternalLinkClaim = ExternalProviderIdentity & {
   issuedAt: number;
@@ -27,7 +36,22 @@ function isUuid(value: unknown): value is string {
 }
 
 function asClaim(value: unknown): ExternalLinkClaim | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype
+  ) {
+    return null;
+  }
+
+  const keys = Object.keys(value);
+  if (
+    keys.length !== CLAIM_KEYS.size ||
+    keys.some((key) => !CLAIM_KEYS.has(key))
+  ) {
+    return null;
+  }
 
   const claim = value as Partial<ExternalLinkClaim>;
   const { issuedAt, expiresAt } = claim;

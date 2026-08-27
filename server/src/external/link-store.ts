@@ -7,6 +7,11 @@ import type {
   ExternalUserLink,
 } from "./schema-types";
 
+export type ExternalLinkResult = {
+  link: ExternalUserLink;
+  created: boolean;
+};
+
 export type ExternalLinkStore = {
   find: (
     provider: ExternalProvider,
@@ -19,6 +24,9 @@ export type ExternalLinkStore = {
   link: (
     input: ExternalProviderIdentity & { openbotUserId: string },
   ) => Promise<ExternalUserLink>;
+  linkWithStatus: (
+    input: ExternalProviderIdentity & { openbotUserId: string },
+  ) => Promise<ExternalLinkResult>;
 };
 
 function normalizeEmail(email: string): string {
@@ -57,73 +65,83 @@ export function createExternalLinkStore(database: Database): ExternalLinkStore {
     return row ? asLink(row) : null;
   }
 
-  return {
-    find,
+  async function findVerifiedUserByEmail(email: string) {
+    const rows = await database
+      .select({
+        id: users.id,
+        // User names predate the not-null requirement but callers need a stable display value.
+        name: sql<string>`coalesce(${users.name}, '')`,
+      })
+      .from(users)
+      .leftJoin(
+        revokedAccess,
+        eq(revokedAccess.email, sql`lower(${users.email})`),
+      )
+      .where(
+        and(
+          eq(sql`lower(${users.email})`, normalizeEmail(email)),
+          eq(users.emailVerified, true),
+          isNull(revokedAccess.email),
+        ),
+      )
+      .limit(2);
 
-    async findVerifiedUserByEmail(email) {
-      const rows = await database
-        .select({
-          id: users.id,
-          // User names predate the not-null requirement but callers need a stable display value.
-          name: sql<string>`coalesce(${users.name}, '')`,
-        })
-        .from(users)
-        .leftJoin(
-          revokedAccess,
-          eq(revokedAccess.email, sql`lower(${users.email})`),
-        )
-        .where(
-          and(
-            eq(sql`lower(${users.email})`, normalizeEmail(email)),
-            eq(users.emailVerified, true),
-            isNull(revokedAccess.email),
-          ),
-        )
-        .limit(2);
+    return rows.length === 1 ? rows[0] : null;
+  }
 
-      return rows.length === 1 ? rows[0] : null;
-    },
+  async function linkWithStatus(
+    input: ExternalProviderIdentity & { openbotUserId: string },
+  ): Promise<ExternalLinkResult> {
+    const [inserted] = await database
+      .insert(externalUserLinks)
+      .values(input)
+      .onConflictDoNothing()
+      .returning();
+    if (inserted) {
+      return { link: asLink(inserted), created: true };
+    }
 
-    async link(input) {
-      await database
-        .insert(externalUserLinks)
-        .values(input)
-        .onConflictDoNothing();
+    const existing = await find(
+      input.provider,
+      input.providerTenantId,
+      input.providerUserId,
+    );
+    if (existing && existing.openbotUserId === input.openbotUserId) {
+      return { link: existing, created: false };
+    }
+    if (existing) {
+      throw new Error("That Slack identity is already linked.");
+    }
 
-      const existing = await find(
-        input.provider,
-        input.providerTenantId,
-        input.providerUserId,
-      );
-      if (existing && existing.openbotUserId === input.openbotUserId) {
-        return existing;
-      }
-      if (existing) {
-        throw new Error("That Slack identity is already linked.");
-      }
+    /*
+     * `onConflictDoNothing` also covers the one-OpenBot-user-per-workspace key. When that key
+     * won, the lookup above has no row because it is deliberately by provider identity; read the
+     * other key before reporting the public conflict. Each statement observes committed work, so
+     * this is also the answer after a concurrent insert has completed.
+     */
+    const [existingForUser] = await database
+      .select({ openbotUserId: externalUserLinks.openbotUserId })
+      .from(externalUserLinks)
+      .where(
+        and(
+          eq(externalUserLinks.provider, input.provider),
+          eq(externalUserLinks.providerTenantId, input.providerTenantId),
+          eq(externalUserLinks.openbotUserId, input.openbotUserId),
+        ),
+      )
+      .limit(1);
+    if (existingForUser) {
+      throw new Error("That Slack identity is already linked.");
+    }
 
-      /*
-       * `onConflictDoNothing` also covers the one-OpenBot-user-per-workspace key. When that key
-       * won, the lookup above has no row because it is deliberately by provider identity; read the
-       * other key before reporting the public conflict. Each statement observes committed work, so
-       * this is also the answer after a concurrent insert has completed.
-       */
-      const [existingForUser] = await database
-        .select({ openbotUserId: externalUserLinks.openbotUserId })
-        .from(externalUserLinks)
-        .where(
-          and(
-            eq(externalUserLinks.provider, input.provider),
-            eq(externalUserLinks.providerTenantId, input.providerTenantId),
-            eq(externalUserLinks.openbotUserId, input.openbotUserId),
-          ),
-        )
-        .limit(1);
-      if (existingForUser) {
-        throw new Error("That Slack identity is already linked.");
-      }
+    throw new Error("External user link was not found after insertion.");
+  }
 
-      throw new Error("External user link was not found after insertion.");
-    },
-  };
+  async function link(
+    input: ExternalProviderIdentity & { openbotUserId: string },
+  ): Promise<ExternalUserLink> {
+    return (await linkWithStatus(input)).link;
+  }
+
+  return { find, findVerifiedUserByEmail, link, linkWithStatus };
 }

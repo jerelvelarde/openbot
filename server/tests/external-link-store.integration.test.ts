@@ -110,6 +110,58 @@ describe("external user links", () => {
     expect(repeated).toEqual(linked);
   });
 
+  test("reports whether this call created an external link without changing link compatibility", async () => {
+    const openbotUserId = userId("creation_status");
+    const teamId = `T${suite}`;
+    await createUser({
+      id: openbotUserId,
+      email: email("creation_status"),
+      name: "Creation status person",
+    });
+    const input = {
+      provider: "slack" as const,
+      providerTenantId: teamId,
+      providerUserId: "U457",
+      openbotUserId,
+      providerEmail: "person@example.com",
+    };
+
+    const first = await store.linkWithStatus(input);
+    const repeated = await store.linkWithStatus(input);
+
+    expect(first).toMatchObject({ created: true, link: input });
+    expect(repeated).toEqual({ link: first.link, created: false });
+    await expect(store.link(input)).resolves.toEqual(first.link);
+  });
+
+  test("reports exactly one creator when identical confirmations race", async () => {
+    const openbotUserId = userId("creation_status_race");
+    const teamId = `T${suite}`;
+    await createUser({
+      id: openbotUserId,
+      email: email("creation_status_race"),
+      name: "Creation status race person",
+    });
+    const input = {
+      provider: "slack" as const,
+      providerTenantId: teamId,
+      providerUserId: "U458",
+      openbotUserId,
+      providerEmail: "person@example.com",
+    };
+
+    const results = await Promise.all([
+      store.linkWithStatus(input),
+      store.linkWithStatus(input),
+    ]);
+
+    expect(results.filter((result) => result.created)).toHaveLength(1);
+    expect(results.map((result) => result.link)).toEqual([
+      results[0]?.link,
+      results[0]?.link,
+    ]);
+  });
+
   test("never silently reassigns an existing provider identity to another user", async () => {
     const firstUserId = userId("first");
     const secondUserId = userId("second");

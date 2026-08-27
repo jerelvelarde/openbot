@@ -318,6 +318,7 @@ export const auditEventTypes = [
    */
   "identity_provider.registered",
   "identity_provider.removed",
+  "external_identity.linked",
   /*
    * What a Bot is and what it may reach.
    *

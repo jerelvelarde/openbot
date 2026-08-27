@@ -52,6 +52,23 @@ function fakeStore(
   overrides: Partial<ExternalLinkStore> = {},
 ): ExternalLinkStore & { links: ReturnType<typeof linkFor>[] } {
   const links: ReturnType<typeof linkFor>[] = [];
+  async function linkWithStatus(
+    input: Parameters<ExternalLinkStore["link"]>[0],
+  ) {
+    const found = links.find(
+      (link) =>
+        link.provider === input.provider &&
+        link.providerTenantId === input.providerTenantId &&
+        link.providerUserId === input.providerUserId,
+    );
+    if (found?.openbotUserId === input.openbotUserId) {
+      return { link: found, created: false };
+    }
+    if (found) throw new Error(CONFLICT);
+    const link = linkFor(input.openbotUserId);
+    links.push(link);
+    return { link, created: true };
+  }
   return Object.assign(
     {
       links,
@@ -61,18 +78,9 @@ function fakeStore(
       async findVerifiedUserByEmail() {
         return null;
       },
+      linkWithStatus,
       async link(input) {
-        const found = links.find(
-          (link) =>
-            link.provider === input.provider &&
-            link.providerTenantId === input.providerTenantId &&
-            link.providerUserId === input.providerUserId,
-        );
-        if (found?.openbotUserId === input.openbotUserId) return found;
-        if (found) throw new Error(CONFLICT);
-        const link = linkFor(input.openbotUserId);
-        links.push(link);
-        return link;
+        return (await linkWithStatus(input)).link;
       },
     } satisfies ExternalLinkStore,
     overrides,
@@ -169,8 +177,8 @@ describe("external Slack link confirmation routes", () => {
     ]);
   });
 
-  test("POST is idempotent for the same actor when the store is idempotent", async () => {
-    const { app, store } = appFor();
+  test("POST is idempotent without duplicating audit when the store returns an existing same-actor link", async () => {
+    const { app, store, rows } = appFor();
     const token = await liveToken();
 
     for (let call = 0; call < 2; call += 1) {
@@ -187,6 +195,7 @@ describe("external Slack link confirmation routes", () => {
     }
 
     expect(store.links).toEqual([linkFor(actor.id)]);
+    expect(rows).toHaveLength(1);
   });
 
   test("POST refuses a replay for another actor without reassigning the link", async () => {
@@ -234,6 +243,29 @@ describe("external Slack link confirmation routes", () => {
     expect(get.status).toBe(401);
     expect(post.status).toBe(401);
     expect(store.links).toEqual([]);
+  });
+
+  test("POST maps missing, malformed, and expired tokens to the same public refusal", async () => {
+    const { app } = appFor();
+    const expired = await mintExternalLinkToken(identity, KEY, NOW);
+    const requests = [
+      {},
+      { body: "{not-json" },
+      { body: JSON.stringify({ token: expired }) },
+    ];
+
+    for (const request of requests) {
+      const response = await app.request(
+        "http://openbot.test/api/external-links/slack",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          ...request,
+        },
+      );
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: INVALID });
+    }
   });
 
   test("createApp mounts the optional external link routes under its authenticated API prefix", async () => {
