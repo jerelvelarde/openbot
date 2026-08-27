@@ -32,6 +32,7 @@ export function DetailPanel({
   title,
   detail,
   detailWidth = DEFAULT_DETAIL_WIDTH,
+  collapseAtNarrow = false,
   children,
 }: {
   open: boolean;
@@ -41,17 +42,33 @@ export function DetailPanel({
   detail?: ReactNode;
   /** Open width of the detail pane, in pixels. */
   detailWidth?: number;
+  /** On the app's narrow layout, let a large detail replace the main surface instead of squeezing it. */
+  collapseAtNarrow?: boolean;
   children: ReactNode;
 }) {
   // Reduced motion keeps the fade, which explains the change, and drops the movement.
   const shouldReduceMotion = useReducedMotion();
 
   return (
-    <div className="flex h-full min-h-0">
-      <div className="flex flex-1 min-w-0 flex-col">{children}</div>
+    <div
+      className="flex h-full min-h-0"
+      data-detail-width={detailWidth}
+      data-testid="detail-panel"
+    >
+      <div
+        className={`flex flex-1 min-w-0 flex-col ${
+          collapseAtNarrow && open ? "max-md:hidden" : ""
+        }`}
+        data-testid="detail-panel-main"
+      >
+        {children}
+      </div>
       <motion.div
         animate={{ width: open ? detailWidth : 0 }}
-        className="shrink-0 overflow-hidden"
+        className={`shrink-0 overflow-hidden ${
+          collapseAtNarrow && open ? "max-md:!w-full max-md:flex-1" : ""
+        }`}
+        data-testid="detail-panel-pane"
         // No entry animation on first paint: URL-opened panels should appear as initial state.
         initial={false}
         transition={{
@@ -60,7 +77,9 @@ export function DetailPanel({
         }}
       >
         <div
-          className="flex h-full flex-col bg-sidebar border-l border-border"
+          className={`flex h-full flex-col bg-sidebar border-l border-border ${
+            collapseAtNarrow && open ? "max-md:!w-full" : ""
+          }`}
           style={{ width: detailWidth }}
         >
           {/* Rendered for the whole animation, so the way out is available immediately. */}
@@ -69,7 +88,12 @@ export function DetailPanel({
               {title}
             </div>
             <div className="flex flex-row gap-1.5">
-              <Button onClick={onClose} variant="ghost" size="icon">
+              <Button
+                aria-label="Close detail panel"
+                onClick={onClose}
+                variant="ghost"
+                size="icon"
+              >
                 <IconX className="size-4.5" />
               </Button>
             </div>

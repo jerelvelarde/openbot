@@ -17,6 +17,7 @@ import { ActivityLog } from "@/components/computer/activity-log";
 import { ComputerView } from "@/components/computer/computer-view";
 import { useNeedsYou } from "@/components/computer/needs-you";
 import { DetailPanel } from "@/components/layout/detail-panel";
+import { DraftCanvas } from "@/components/typefully/draft-canvas";
 import { Button } from "@/components/ui/button";
 import { markChannelReadMutationOptions } from "@/lib/channels/mutations";
 import {
@@ -92,6 +93,49 @@ const HEADING_ENTRANCE_OFFSET = "translateY(4px)";
 
 /** Shared detail pane width for the live screen view. */
 const SCREEN_PANEL_WIDTH = 400;
+const DRAFT_PANEL_WIDTH = 720;
+
+/** Keeps route-derived layout decisions deterministic and covered without viewport guessing. */
+export function channelDetailPresentation(
+  search: ChannelSearch,
+  agentId: string | undefined,
+): {
+  kind: "draft" | "settings" | "watch" | null;
+  open: boolean;
+  width: number | undefined;
+  collapseAtNarrow: boolean;
+} {
+  if (search.draft !== undefined) {
+    return {
+      kind: "draft",
+      open: true,
+      width: DRAFT_PANEL_WIDTH,
+      collapseAtNarrow: true,
+    };
+  }
+  if (search.watch === true && agentId !== undefined) {
+    return {
+      kind: "watch",
+      open: true,
+      width: SCREEN_PANEL_WIDTH,
+      collapseAtNarrow: false,
+    };
+  }
+  if (search.settings === true && agentId !== undefined) {
+    return {
+      kind: "settings",
+      open: true,
+      width: undefined,
+      collapseAtNarrow: false,
+    };
+  }
+  return {
+    kind: null,
+    open: false,
+    width: undefined,
+    collapseAtNarrow: false,
+  };
+}
 
 export const Route = createFileRoute("/_authed/_app/channel/$channelId")({
   validateSearch: validateChannelSearch,
@@ -140,6 +184,10 @@ function RouteComponent() {
   const agentId = channel.data?.agentIds[0];
   /** Only polled while the screen is closed; the screen panel polls control itself. */
   const needsYou = useNeedsYou(agentId, !isWatching);
+  const detailPresentation = channelDetailPresentation(
+    { draft, settings, watch },
+    agentId,
+  );
 
   const queryClient = useQueryClient();
   const markRead = useMutation(markChannelReadMutationOptions(queryClient));
@@ -196,7 +244,7 @@ function RouteComponent() {
   }, [agentId, navigate]);
 
   // Draft, settings and watch share one pane; opening either control clears both alternatives.
-  const show = (next: "settings" | "watch" | null) => {
+  const show = (next: ChannelPane) => {
     // Dismissal applies only to the current browser-activity run.
     if (next !== "watch" && isWatching)
       dismissedEpoch.current = runEpoch.current;
@@ -207,11 +255,19 @@ function RouteComponent() {
 
   return (
     <DetailPanel
+      collapseAtNarrow={detailPresentation.collapseAtNarrow}
       onClose={() => show(null)}
-      open={(isSettingsOpen || isWatching) && agentId !== undefined}
-      detailWidth={isWatching ? SCREEN_PANEL_WIDTH : undefined}
+      open={detailPresentation.open}
+      detailWidth={detailPresentation.width}
+      title={
+        detailPresentation.kind === "draft" ? (
+          <span className="truncate text-sm font-medium">Typefully draft</span>
+        ) : undefined
+      }
       detail={
-        agentId === undefined ? null : isWatching ? (
+        draft !== undefined ? (
+          <DraftCanvas draftId={draft} />
+        ) : agentId === undefined ? null : isWatching ? (
           // Manual watch remains active even when there is no current browser action.
           <ComputerViewPanel agentId={agentId} name={channel?.data?.name} />
         ) : (
