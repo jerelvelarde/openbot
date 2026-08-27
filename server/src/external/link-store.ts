@@ -1,4 +1,5 @@
 import { and, eq, isNull, sql } from "drizzle-orm";
+import type { AuditTransaction } from "../audit";
 import type { Database } from "../db/client";
 import { externalUserLinks, revokedAccess, users } from "../db/schema";
 import type {
@@ -24,8 +25,15 @@ export type ExternalLinkStore = {
   link: (
     input: ExternalProviderIdentity & { openbotUserId: string },
   ) => Promise<ExternalUserLink>;
+};
+
+export type ExternalLinkCreationStore = ExternalLinkStore & {
   linkWithStatus: (
     input: ExternalProviderIdentity & { openbotUserId: string },
+  ) => Promise<ExternalLinkResult>;
+  linkWithStatusAndAudit: (
+    input: ExternalProviderIdentity & { openbotUserId: string },
+    recordAudit: (transaction: AuditTransaction) => Promise<void>,
   ) => Promise<ExternalLinkResult>;
 };
 
@@ -45,7 +53,9 @@ function asLink(row: typeof externalUserLinks.$inferSelect): ExternalUserLink {
   };
 }
 
-export function createExternalLinkStore(database: Database): ExternalLinkStore {
+export function createExternalLinkStore(
+  database: Database,
+): ExternalLinkCreationStore {
   async function find(
     provider: ExternalProvider,
     tenantId: string,
@@ -89,10 +99,11 @@ export function createExternalLinkStore(database: Database): ExternalLinkStore {
     return rows.length === 1 ? rows[0] : null;
   }
 
-  async function linkWithStatus(
+  async function linkWithStatusWithin(
+    transaction: AuditTransaction,
     input: ExternalProviderIdentity & { openbotUserId: string },
   ): Promise<ExternalLinkResult> {
-    const [inserted] = await database
+    const [inserted] = await transaction
       .insert(externalUserLinks)
       .values(input)
       .onConflictDoNothing()
@@ -101,11 +112,18 @@ export function createExternalLinkStore(database: Database): ExternalLinkStore {
       return { link: asLink(inserted), created: true };
     }
 
-    const existing = await find(
-      input.provider,
-      input.providerTenantId,
-      input.providerUserId,
-    );
+    const [row] = await transaction
+      .select()
+      .from(externalUserLinks)
+      .where(
+        and(
+          eq(externalUserLinks.provider, input.provider),
+          eq(externalUserLinks.providerTenantId, input.providerTenantId),
+          eq(externalUserLinks.providerUserId, input.providerUserId),
+        ),
+      )
+      .limit(1);
+    const existing = row ? asLink(row) : null;
     if (existing && existing.openbotUserId === input.openbotUserId) {
       return { link: existing, created: false };
     }
@@ -119,7 +137,7 @@ export function createExternalLinkStore(database: Database): ExternalLinkStore {
      * other key before reporting the public conflict. Each statement observes committed work, so
      * this is also the answer after a concurrent insert has completed.
      */
-    const [existingForUser] = await database
+    const [existingForUser] = await transaction
       .select({ openbotUserId: externalUserLinks.openbotUserId })
       .from(externalUserLinks)
       .where(
@@ -137,11 +155,36 @@ export function createExternalLinkStore(database: Database): ExternalLinkStore {
     throw new Error("External user link was not found after insertion.");
   }
 
+  async function linkWithStatus(
+    input: ExternalProviderIdentity & { openbotUserId: string },
+  ): Promise<ExternalLinkResult> {
+    return database.transaction((transaction) =>
+      linkWithStatusWithin(transaction, input),
+    );
+  }
+
+  async function linkWithStatusAndAudit(
+    input: ExternalProviderIdentity & { openbotUserId: string },
+    recordAudit: (transaction: AuditTransaction) => Promise<void>,
+  ): Promise<ExternalLinkResult> {
+    return database.transaction(async (transaction) => {
+      const result = await linkWithStatusWithin(transaction, input);
+      if (result.created) await recordAudit(transaction);
+      return result;
+    });
+  }
+
   async function link(
     input: ExternalProviderIdentity & { openbotUserId: string },
   ): Promise<ExternalUserLink> {
     return (await linkWithStatus(input)).link;
   }
 
-  return { find, findVerifiedUserByEmail, link, linkWithStatus };
+  return {
+    find,
+    findVerifiedUserByEmail,
+    link,
+    linkWithStatus,
+    linkWithStatusAndAudit,
+  };
 }

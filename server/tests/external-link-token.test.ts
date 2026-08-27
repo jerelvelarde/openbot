@@ -45,6 +45,20 @@ describe("external Slack link tokens", () => {
     expect(await readExternalLinkToken(token, KEY, NOW)).toEqual(identity);
   });
 
+  test("mints a structurally wider identity as the exact approved claim shape", async () => {
+    const identityWithDisplayName = {
+      ...identity,
+      displayName: "Slack Person",
+    };
+    const token = await mintExternalLinkToken(
+      identityWithDisplayName,
+      KEY,
+      NOW,
+    );
+
+    expect(await readExternalLinkToken(token, KEY, NOW)).toEqual(identity);
+  });
+
   test("expires after its ten minute TTL", async () => {
     const token = await mintExternalLinkToken(identity, KEY, NOW);
 

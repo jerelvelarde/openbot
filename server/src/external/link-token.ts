@@ -80,7 +80,10 @@ export async function mintExternalLinkToken(
 ): Promise<string> {
   return seal(
     JSON.stringify({
-      ...identity,
+      provider: identity.provider,
+      providerTenantId: identity.providerTenantId,
+      providerUserId: identity.providerUserId,
+      providerEmail: identity.providerEmail,
       issuedAt: now,
       expiresAt: now + EXTERNAL_LINK_TTL_MS,
       nonce: crypto.randomUUID(),
