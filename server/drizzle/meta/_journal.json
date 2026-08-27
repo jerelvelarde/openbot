@@ -162,6 +162,13 @@
       "when": 1787825391885,
       "tag": "0023_immutable_external_threads",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1787833508227,
+      "tag": "0024_cold_vermin",
+      "breakpoints": true
     }
   ]
 }

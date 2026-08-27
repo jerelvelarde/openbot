@@ -38,6 +38,16 @@ const UNAVAILABLE = {
   reason: "The assistant's computer could not be reached.",
 };
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 type UploadArgs = Parameters<NonNullable<PlatformAdapter["postFile"]>>[1];
 type UploadResult = Awaited<
   ReturnType<NonNullable<PlatformAdapter["postFile"]>>
@@ -49,10 +59,12 @@ class FileAdapter extends FakeAdapter {
   afterUpload?: () => void;
   beforePost?: () => void;
   postError?: unknown;
+  postGate?: Promise<void>;
 
   override async post(...args: Parameters<PlatformAdapter["post"]>) {
     this.beforePost?.();
     if (this.postError !== undefined) throw this.postError;
+    await this.postGate;
     return super.post(...args);
   }
 
@@ -136,10 +148,17 @@ class FakeComputerGateway implements ComputerGateway {
   readonly releaseControlCalls: Parameters<
     ComputerGateway["releaseControl"]
   >[] = [];
+  readonly cancelAssistanceCalls: Parameters<
+    ComputerGateway["cancelAssistance"]
+  >[] = [];
   nextError?: unknown;
   afterCall?: () => void;
   afterRequest?: () => void;
+  requestError?: unknown;
+  requestIdentityMismatch = false;
   releaseError?: unknown;
+  cancelError?: unknown;
+  cancelResult?: Awaited<ReturnType<ComputerGateway["cancelAssistance"]>>;
   readFileResult: Awaited<ReturnType<ComputerGateway["readFile"]>> = {
     path: "reports/risk.txt",
     text: "Résumé 📊",
@@ -277,10 +296,14 @@ class FakeComputerGateway implements ComputerGateway {
   async requestHelp(...args: Parameters<ComputerGateway["requestHelp"]>) {
     this.requestHelpCalls.push(args);
     this.afterRequest?.();
+    if (this.requestError !== undefined) throw this.requestError;
     return {
       holder: "bot" as const,
       since: "2026-08-27T00:00:00.000Z",
       requested: true,
+      helpRequestId: this.requestIdentityMismatch
+        ? crypto.randomUUID()
+        : args[3],
     };
   }
   async takeControl(): Promise<never> {
@@ -295,13 +318,34 @@ class FakeComputerGateway implements ComputerGateway {
       requested: false,
     };
   }
+  async cancelAssistance(
+    ...args: Parameters<ComputerGateway["cancelAssistance"]>
+  ) {
+    this.cancelAssistanceCalls.push(args);
+    if (this.cancelError !== undefined) throw this.cancelError;
+    return (
+      this.cancelResult ?? {
+        cancelled: true,
+        state: {
+          holder: "bot" as const,
+          since: "2026-08-27T00:00:00.000Z",
+          requested: false,
+        },
+      }
+    );
+  }
   async requestSecret(...args: Parameters<ComputerGateway["requestSecret"]>) {
     this.requestSecretCalls.push(args);
     this.afterRequest?.();
+    if (this.requestError !== undefined) throw this.requestError;
     return {
       holder: "bot" as const,
       since: "2026-08-27T00:00:00.000Z",
       requested: false,
+      secretWanted: args[2].label,
+      secretRequestId: this.requestIdentityMismatch
+        ? crypto.randomUUID()
+        : args[3],
     };
   }
   async supplySecret(): Promise<never> {
@@ -408,16 +452,27 @@ describe("Slack computer ChannelTools", () => {
     expect(rendered).not.toMatch(
       /field-ref-private|session-cookie-private|channels-thread-private|provider-U999|"u1"|"risk"/,
     );
-    expect(gateway.requestHelpCalls).toEqual([
-      ["risk", { id: "u1", userId: "u1" }, "Please finish signing in."],
+    expect(gateway.requestHelpCalls).toHaveLength(1);
+    expect(gateway.requestHelpCalls[0]?.slice(0, 3)).toEqual([
+      "risk",
+      { id: "u1", userId: "u1" },
+      "Please finish signing in.",
     ]);
-    expect(gateway.requestSecretCalls).toEqual([
-      [
-        "risk",
-        { id: "u1", userId: "u1" },
-        { label: "one-time code", ref: "field-ref-private", snapshotId: 9 },
-      ],
+    expect(gateway.requestSecretCalls).toHaveLength(1);
+    expect(gateway.requestSecretCalls[0]?.slice(0, 3)).toEqual([
+      "risk",
+      { id: "u1", userId: "u1" },
+      { label: "one-time code", ref: "field-ref-private", snapshotId: 9 },
     ]);
+    for (const requestId of [
+      gateway.requestHelpCalls[0]?.[3],
+      gateway.requestSecretCalls[0]?.[3],
+    ]) {
+      expect(requestId).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+      );
+      expect(rendered).not.toContain(requestId as string);
+    }
     expect(help).toMatchObject({
       ok: true,
       result: expect.stringContaining("handed control back"),
@@ -475,6 +530,7 @@ describe("Slack computer ChannelTools", () => {
       expect(result).toEqual(STOPPED);
       expect(gateway.requestHelpCalls).toEqual([]);
       expect(gateway.requestSecretCalls).toEqual([]);
+      expect(gateway.cancelAssistanceCalls).toEqual([]);
       expect(gateway.releaseControlCalls).toEqual([]);
     });
 
@@ -492,13 +548,75 @@ describe("Slack computer ChannelTools", () => {
         { channelsThreadId: "channels-thread-private" },
       );
 
-      expect(gateway.releaseControlCalls).toEqual([
-        ["risk", { id: "u1", userId: "u1" }],
+      const requestCall =
+        toolName === "computer_request_help"
+          ? gateway.requestHelpCalls[0]
+          : gateway.requestSecretCalls[0];
+      const requestId = requestCall?.at(-1);
+      expect(requestId).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+      );
+      expect(gateway.cancelAssistanceCalls).toEqual([
+        ["risk", { id: "u1", userId: "u1" }, requestId, expect.anything()],
       ]);
+      expect(gateway.releaseControlCalls).toEqual([]);
       expect(result).toEqual({
         ok: false,
         reason:
           "The Slack handoff could not be delivered. Its OpenBot assistance request was cleared; ask again if help is still needed.",
+      });
+    });
+
+    test(`${toolName} conditionally clears a possibly-committed request failure`, async () => {
+      const gateway = new FakeComputerGateway();
+      gateway.requestError = new Error("audit failed after transport commit");
+
+      const result = await inSlack(
+        () =>
+          invoke(
+            toolsWithAssistance(gateway).get(toolName)!,
+            args,
+            channelContext(new FileAdapter()),
+          ),
+        { channelsThreadId: "channels-thread-private" },
+      );
+
+      const requestId = (
+        toolName === "computer_request_help"
+          ? gateway.requestHelpCalls[0]
+          : gateway.requestSecretCalls[0]
+      )?.at(-1);
+      expect(gateway.cancelAssistanceCalls[0]?.[2]).toBe(requestId);
+      expect(gateway.releaseControlCalls).toEqual([]);
+      expect(result).toEqual({
+        ok: false,
+        reason:
+          "The OpenBot assistance request could not be created safely. Its exact request generation is no longer pending; ask again if help is still needed.",
+      });
+    });
+
+    test(`${toolName} refuses delivery when the computer does not confirm its request identity`, async () => {
+      const gateway = new FakeComputerGateway();
+      gateway.requestIdentityMismatch = true;
+      const adapter = new FileAdapter();
+
+      const result = await inSlack(
+        () =>
+          invoke(
+            toolsWithAssistance(gateway).get(toolName)!,
+            args,
+            channelContext(adapter),
+          ),
+        { channelsThreadId: "channels-thread-private" },
+      );
+
+      expect(adapter.posted).toEqual([]);
+      expect(gateway.cancelAssistanceCalls).toEqual([]);
+      expect(result).toEqual({
+        ok: false,
+        assistanceMayBePending: true,
+        reason:
+          "The Slack assistance flow could not be completed, and its OpenBot assistance request may still be pending. Open the coworker directly to clear it before asking again.",
       });
     });
 
@@ -518,33 +636,21 @@ describe("Slack computer ChannelTools", () => {
       );
 
       expect(adapter.posted).toEqual([]);
-      expect(gateway.releaseControlCalls).toHaveLength(1);
-      expect(result).toEqual(STOPPED);
-    });
-
-    test(`${toolName} compensates when Stop races Slack post commit`, async () => {
-      const gateway = new FakeComputerGateway();
-      const controller = new AbortController();
-      const adapter = new FileAdapter();
-      adapter.beforePost = () => controller.abort();
-      const result = await inSlack(
-        () =>
-          invoke(
-            toolsWithAssistance(gateway).get(toolName)!,
-            args,
-            channelContext(adapter, controller.signal),
-          ),
-        { channelsThreadId: "channels-thread-private" },
+      expect(gateway.cancelAssistanceCalls).toHaveLength(1);
+      expect(gateway.cancelAssistanceCalls[0]?.[2]).toBe(
+        (toolName === "computer_request_help"
+          ? gateway.requestHelpCalls[0]
+          : gateway.requestSecretCalls[0]
+        )?.at(-1),
       );
-
-      expect(gateway.releaseControlCalls).toHaveLength(1);
+      expect(gateway.releaseControlCalls).toEqual([]);
       expect(result).toEqual(STOPPED);
     });
   }
 
   test("reports a possibly-live request when Slack delivery and compensation both fail", async () => {
     const gateway = new FakeComputerGateway();
-    gateway.releaseError = new Error("computer unavailable");
+    gateway.cancelError = new Error("computer unavailable");
     const adapter = new FileAdapter();
     adapter.postError = new Error("Slack unavailable");
 
@@ -565,6 +671,83 @@ describe("Slack computer ChannelTools", () => {
         "The Slack assistance flow could not be completed, and its OpenBot assistance request may still be pending. Open the coworker directly to clear it before asking again.",
     });
   });
+
+  test("does not report cleanup when cancellation still returns the exact request", async () => {
+    const gateway = new FakeComputerGateway();
+    const adapter = new FileAdapter();
+    adapter.postError = new Error("Slack unavailable");
+    gateway.cancelResult = {
+      cancelled: false,
+      state: {
+        holder: "bot",
+        since: "2026-08-27T00:00:00.000Z",
+        requested: true,
+        helpRequestId: "filled-after-request",
+      },
+    };
+    gateway.cancelAssistance = async (...args) => {
+      gateway.cancelAssistanceCalls.push(args);
+      return {
+        ...gateway.cancelResult!,
+        state: { ...gateway.cancelResult!.state, helpRequestId: args[2] },
+      };
+    };
+
+    const result = await inSlack(
+      () =>
+        invoke(
+          toolsWithAssistance(gateway).get("computer_request_help")!,
+          { reason: "Please sign in." },
+          channelContext(adapter),
+        ),
+      { channelsThreadId: "channels-thread-private" },
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      assistanceMayBePending: true,
+      reason:
+        "The Slack assistance flow could not be completed, and its OpenBot assistance request may still be pending. Open the coworker directly to clear it before asking again.",
+    });
+  });
+
+  for (const lateOutcome of ["resolve", "reject"] as const) {
+    test(`leaves an unknown Slack delivery untouched when posting later ${lateOutcome}s`, async () => {
+      const gateway = new FakeComputerGateway();
+      const controller = new AbortController();
+      const gate = deferred<void>();
+      const adapter = new FileAdapter();
+      adapter.postGate = gate.promise;
+      adapter.beforePost = () => controller.abort();
+
+      const result = await inSlack(
+        () =>
+          invoke(
+            toolsWithAssistance(gateway).get("computer_request_help")!,
+            { reason: "Please sign in." },
+            channelContext(adapter, controller.signal),
+          ),
+        { channelsThreadId: "channels-thread-private" },
+      );
+
+      expect(result).toEqual({
+        ok: false,
+        deliveryMayBePending: true,
+        assistanceMayBePending: true,
+        reason:
+          "Slack may still deliver the secure assistance link, and its OpenBot request is still pending. Do not send another request until this one is checked.",
+      });
+      expect(gateway.cancelAssistanceCalls).toEqual([]);
+      expect(gateway.releaseControlCalls).toEqual([]);
+
+      if (lateOutcome === "resolve") gate.resolve();
+      else gate.reject(new Error("late Slack rejection"));
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(adapter.posted.length).toBe(lateOutcome === "resolve" ? 1 : 0);
+      expect(gateway.cancelAssistanceCalls).toEqual([]);
+    });
+  }
 
   test("passes the pinned coworker, linked actor, parsed click input, and signal", async () => {
     const gateway = new FakeComputerGateway();

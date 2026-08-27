@@ -465,6 +465,14 @@ export const auditEvents = pgTable(
   ],
 );
 
+/** One durable winner for the two actions rendered by an approval presentation. */
+export const approvalDecisions = pgTable("approval_decisions", {
+  presentationId: uuid("presentation_id").primaryKey(),
+  actionId: text("action_id").notNull(),
+  approved: boolean("approved").notNull(),
+  createdAt: createdAt(),
+});
+
 export const intelligenceChannelMappings = pgTable(
   "intelligence_channel_mappings",
   {

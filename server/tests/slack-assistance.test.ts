@@ -15,7 +15,10 @@ import {
   mintAssistanceToken,
   readAssistanceToken,
 } from "../src/slack/assistance-token";
-import { ApprovalCard } from "../src/slack/components";
+import {
+  ApprovalCard,
+  configureApprovalDecisionStore,
+} from "../src/slack/components";
 
 const KEY = "slack-assistance-test-key";
 const NOW = 1_700_000_000_000;
@@ -247,17 +250,22 @@ test("approval buttons resume the originating thread with a boolean decision", a
   };
   const actionNodes = actions.props.children as Array<{
     key?: string | number;
-    props: { onClick: (context: unknown) => Promise<void> };
+    props: {
+      onClick: (context: unknown) => Promise<void>;
+      value: { presentationId: string; approved: boolean };
+    };
   }>;
   const decisions: unknown[] = [];
-  const context = {
-    thread: {
-      resume: async (decision: unknown) => void decisions.push(decision),
-    },
-  };
+  configureApprovalDecisionStore({ claim: async () => true });
 
-  await actions.props.children[0]?.props.onClick(context);
-  await actions.props.children[1]?.props.onClick(context);
+  for (const [index, node] of actionNodes.entries()) {
+    await node.props.onClick({
+      action: { id: `action-${index}`, value: node.props.value },
+      thread: {
+        resume: async (decision: unknown) => void decisions.push(decision),
+      },
+    });
+  }
 
   expect(message.props.children[0]?.props.children).toBe(
     "Deploy this release?",
