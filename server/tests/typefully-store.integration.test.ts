@@ -883,6 +883,41 @@ describe("owned local Typefully drafts", () => {
     ).toBeGreaterThanOrEqual(7);
   });
 
+  test("redacts JSON credential fields including escaped string content", async () => {
+    const created = await createOwnedDraft();
+    const escapedSecret = 'prefix"quoted-secret\\tail';
+    const failed = await store.recordRemoteFailure({
+      draftId: created.id,
+      actorId: ownerId,
+      expectedVersion: 1,
+      error: JSON.stringify({
+        access_token: "access-json-secret",
+        apiKey: "api-json-secret",
+        CLIENT_SECRET: "client-json-secret",
+        Id_Token: "id-json-secret",
+        refresh_token: escapedSecret,
+        token: 8675309,
+        note: "ordinary prose remains readable",
+      }),
+    });
+
+    for (const secretFragment of [
+      "access-json-secret",
+      "api-json-secret",
+      "client-json-secret",
+      "id-json-secret",
+      "quoted-secret",
+      "tail",
+      "8675309",
+    ]) {
+      expect(failed.lastError).not.toContain(secretFragment);
+    }
+    expect(failed.lastError).toContain("ordinary prose remains readable");
+    expect(
+      failed.lastError?.match(/\[redacted\]/g)?.length,
+    ).toBeGreaterThanOrEqual(6);
+  });
+
   test("holds membership and attachment references through committing local mutations", async () => {
     const created = await createOwnedDraft();
     const entered = deferred();

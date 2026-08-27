@@ -26,6 +26,8 @@ type RemoteDraftOperation = "create_draft" | "update_draft";
 
 const SENSITIVE_ERROR_FIELD =
   /\b(api[\p{P}\p{Z}\s]*key|authorization|access[\p{P}\p{Z}\s]*token|refresh[\p{P}\p{Z}\s]*token|client[\p{P}\p{Z}\s]*secret|id[\p{P}\p{Z}\s]*token|token|secret)(\s*(?:[:=]\s*)+|\s+)("[^"]*"|'[^']*'|[^\s,;&]+)/giu;
+const SENSITIVE_JSON_FIELD =
+  /(["'])(api[\p{P}\p{Z}\s]*key|authorization|access[\p{P}\p{Z}\s]*token|refresh[\p{P}\p{Z}\s]*token|client[\p{P}\p{Z}\s]*secret|id[\p{P}\p{Z}\s]*token|token|secret)\1(\s*:\s*)("(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|[^\s,}\]]+)/giu;
 
 type AuthorizationSurface = {
   decide(kind: PluginKind, ref: string, botId: string): Promise<PluginDecision>;
@@ -194,6 +196,25 @@ function redactSensitiveErrorFields(value: string): string {
   );
 }
 
+function redactSensitiveJsonFields(value: string): string {
+  return value.replace(
+    SENSITIVE_JSON_FIELD,
+    (
+      _match,
+      keyQuote: string,
+      label: string,
+      separator: string,
+      sensitiveValue: string,
+    ) => {
+      const valueQuote =
+        sensitiveValue.startsWith('"') || sensitiveValue.startsWith("'")
+          ? sensitiveValue[0]
+          : '"';
+      return `${keyQuote}${label}${keyQuote}${separator}${valueQuote}[redacted]${valueQuote}`;
+    },
+  );
+}
+
 function boundedError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   const normalized = message
@@ -201,7 +222,9 @@ function boundedError(error: unknown): string {
     .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ")
     .replace(/\bBearer\s+[^\s,;&]+/giu, "Bearer [redacted]")
     .replace(/\s+/g, " ");
-  const redacted = redactSensitiveErrorFields(normalized)
+  const redacted = redactSensitiveErrorFields(
+    redactSensitiveJsonFields(normalized),
+  )
     .replace(/\s+/g, " ")
     .trim();
   const safe = Array.from(redacted).slice(0, LAST_ERROR_MAX_LENGTH).join("");
