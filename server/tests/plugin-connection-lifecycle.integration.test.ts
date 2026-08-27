@@ -36,8 +36,11 @@ const disconnectAuditUser = `lifecycle-disconnect-audit-${suite}`;
 const retireAuditUser = `lifecycle-retire-audit-${suite}`;
 const offboardingRaceUser = `lifecycle-offboarding-race-${suite}`;
 const removalRaceUser = `lifecycle-removal-race-${suite}`;
+const removalOffboardingRaceUser = `lifecycle-removal-offboard-${suite}`;
 const removalAuditServer = `lifecycle-removal-audit-${suite}`;
 const removalRaceServer = `lifecycle-removal-race-${suite}`;
+const removalOffboardingServer = `lifecycle-removal-offboard-${suite}`;
+const offboardingOtherServer = `lifecycle-offboard-other-${suite}`;
 const oauthAuditServer = `lifecycle-oauth-audit-${suite}`;
 const userIds = [
   connectAuditUser,
@@ -46,6 +49,7 @@ const userIds = [
   retireAuditUser,
   offboardingRaceUser,
   removalRaceUser,
+  removalOffboardingRaceUser,
 ];
 const baseAuditStore = createAuditStore(database);
 const baseCredentials = createCredentialStore(database);
@@ -57,6 +61,23 @@ function deferred<T>() {
     resolve = next;
   });
   return { promise, resolve };
+}
+
+async function reachedWithin(
+  promise: Promise<unknown>,
+  timeoutMs: number,
+): Promise<boolean> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then(() => true),
+      new Promise<boolean>((resolve) => {
+        timeout = setTimeout(() => resolve(false), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
 }
 
 function auditStoreFailingOn(
@@ -179,7 +200,9 @@ afterAll(async () => {
     .where(
       inArray(mcpServers.id, [
         oauthAuditServer,
+        offboardingOtherServer,
         removalAuditServer,
+        removalOffboardingServer,
         removalRaceServer,
       ]),
     );
@@ -464,5 +487,157 @@ describe("connection lifecycle races", () => {
     ).toEqual([]);
     expect(await associationsFor(removalRaceUser)).toEqual([]);
     expect(await livePersonalCredentials(removalRaceUser)).toEqual([]);
+  });
+
+  test("server removal racing offboarding retires the user's other servers without rollback", async () => {
+    await database.insert(mcpServers).values([
+      {
+        id: removalOffboardingServer,
+        title: "Removal and offboarding race",
+        vendor: "test",
+        url: "https://example.invalid/mcp",
+        provenance: "custom",
+      },
+      {
+        id: offboardingOtherServer,
+        title: "Other offboarding server",
+        vendor: "test",
+        url: "https://example.invalid/mcp",
+        provenance: "custom",
+      },
+    ]);
+    const grants = await database
+      .insert(credentials)
+      .values([
+        {
+          kind: "mcp_user_token" as const,
+          provider: removalOffboardingServer,
+          keyId: removalOffboardingRaceUser,
+          encryptedValue: "shared-removal-token",
+          metadata: {},
+        },
+        {
+          kind: "mcp_user_token" as const,
+          provider: offboardingOtherServer,
+          keyId: removalOffboardingRaceUser,
+          encryptedValue: "other-server-token",
+          metadata: {},
+        },
+      ])
+      .returning({ id: credentials.id, provider: credentials.provider });
+    const shared = grants.find(
+      (credential) => credential.provider === removalOffboardingServer,
+    );
+    const other = grants.find(
+      (credential) => credential.provider === offboardingOtherServer,
+    );
+    if (!shared || !other) throw new Error("race credentials were not created");
+    await database.insert(mcpUserCredentials).values([
+      {
+        serverId: removalOffboardingServer,
+        userId: removalOffboardingRaceUser,
+        credentialId: shared.id,
+        authMethod: "oauth",
+        scope: "read",
+      },
+      {
+        serverId: offboardingOtherServer,
+        userId: removalOffboardingRaceUser,
+        credentialId: other.id,
+        authMethod: "oauth",
+        scope: "read",
+      },
+    ]);
+    await database.insert(revokedAccess).values({
+      email: `${removalOffboardingRaceUser}@openbot.test`,
+      revokedBy: "admin@openbot.test",
+    });
+
+    const bothRevokesEntered = deferred<void>();
+    const releaseRevokes = deferred<void>();
+    let sharedRevokeAttempts = 0;
+    const racingCredentials = {
+      ...baseCredentials,
+      revoke: async (id: string, executor?: CredentialExecutor) => {
+        if (id === shared.id) {
+          sharedRevokeAttempts += 1;
+          if (sharedRevokeAttempts === 2) bothRevokesEntered.resolve();
+          await releaseRevokes.promise;
+        }
+        return baseCredentials.revoke(id, executor);
+      },
+    };
+    const store = pluginStore({ credentialStore: racingCredentials });
+    const removal = store.removeServer(
+      removalOffboardingServer,
+      "admin@openbot.test",
+    );
+    const offboarding = store.retireConnectionsFor(
+      removalOffboardingRaceUser,
+      "admin@openbot.test",
+    );
+    const bothReachedSharedRevoke = await reachedWithin(
+      bothRevokesEntered.promise,
+      3_000,
+    );
+    releaseRevokes.resolve();
+
+    const results = await Promise.allSettled([removal, offboarding]);
+    expect(bothReachedSharedRevoke).toBe(true);
+    expect(results).toEqual([
+      expect.objectContaining({ status: "fulfilled" }),
+      expect.objectContaining({ status: "fulfilled" }),
+    ]);
+    expect(
+      await database
+        .select({ id: mcpServers.id })
+        .from(mcpServers)
+        .where(eq(mcpServers.id, removalOffboardingServer)),
+    ).toEqual([]);
+    expect(await associationsFor(removalOffboardingRaceUser)).toEqual([]);
+    expect(await livePersonalCredentials(removalOffboardingRaceUser)).toEqual(
+      [],
+    );
+
+    const accountTrail = await database
+      .select({
+        server: auditEvents.targetId,
+        owner: sql<string>`payload ->> 'owner'`,
+        reason: sql<string>`payload ->> 'reason'`,
+      })
+      .from(auditEvents)
+      .where(
+        and(
+          eq(auditEvents.eventType, "mcp.account_disconnected"),
+          inArray(auditEvents.targetId, [
+            removalOffboardingServer,
+            offboardingOtherServer,
+          ]),
+        ),
+      );
+    expect(accountTrail).toHaveLength(2);
+    expect(
+      accountTrail.filter(
+        (event) =>
+          event.server === removalOffboardingServer &&
+          event.owner === removalOffboardingRaceUser,
+      ),
+    ).toHaveLength(1);
+    expect(accountTrail).toContainEqual({
+      server: offboardingOtherServer,
+      owner: removalOffboardingRaceUser,
+      reason: "person_removed",
+    });
+    expect(
+      await database
+        .select({ id: auditEvents.id })
+        .from(auditEvents)
+        .where(
+          and(
+            eq(auditEvents.eventType, "configuration.changed"),
+            eq(auditEvents.targetId, removalOffboardingServer),
+          ),
+        ),
+    ).toHaveLength(1);
   });
 });

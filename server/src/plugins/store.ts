@@ -1241,6 +1241,48 @@ export function createPluginStore(options: PluginStoreOptions) {
       );
   }
 
+  async function revokePersonalCredentialIfLive(
+    transaction: Transaction,
+    credential: {
+      id: string;
+      kind: "mcp_user_token" | "mcp_user_api_key";
+      provider: string;
+      keyId: string;
+    },
+  ): Promise<boolean> {
+    try {
+      await credentials.revoke(credential.id, transaction);
+      return true;
+    } catch (error) {
+      /*
+       * Server removal and offboarding intentionally take different lifecycle locks: one operation
+       * spans every owner of a server, while the other spans every server of an owner. This
+       * credential is their only shared strict write; concurrent association deletes are naturally
+       * idempotent. If the competing transaction revoked the exact row first, losing that race is
+       * already the requested end state and must not roll back unrelated retirement work. Missing,
+       * still-live, or identity-mismatched rows remain hard failures.
+       */
+      const [current] = await transaction
+        .select({
+          kind: credentialRows.kind,
+          provider: credentialRows.provider,
+          keyId: credentialRows.keyId,
+          revokedAt: credentialRows.revokedAt,
+        })
+        .from(credentialRows)
+        .where(eq(credentialRows.id, credential.id));
+      if (
+        current?.revokedAt &&
+        current.kind === credential.kind &&
+        current.provider === credential.provider &&
+        current.keyId === credential.keyId
+      ) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
   /**
    * Point one person's connection at a new refresh token, revoking the one it replaces.
    *
@@ -2057,7 +2099,12 @@ export function createPluginStore(options: PluginStoreOptions) {
         }
 
         const held = await transaction
-          .select({ id: credentialRows.id, keyId: credentialRows.keyId })
+          .select({
+            id: credentialRows.id,
+            kind: credentialRows.kind,
+            provider: credentialRows.provider,
+            keyId: credentialRows.keyId,
+          })
           .from(credentialRows)
           .where(
             and(
@@ -2071,7 +2118,22 @@ export function createPluginStore(options: PluginStoreOptions) {
           )
           .orderBy(asc(credentialRows.keyId));
         for (const grant of held) {
-          await credentials.revoke(grant.id, transaction);
+          if (
+            grant.kind !== "mcp_user_token" &&
+            grant.kind !== "mcp_user_api_key"
+          ) {
+            throw new PluginRefusedError(
+              "The server's personal credential has an unexpected kind.",
+              null,
+            );
+          }
+          const revoked = await revokePersonalCredentialIfLive(transaction, {
+            id: grant.id,
+            kind: grant.kind,
+            provider: grant.provider,
+            keyId: grant.keyId,
+          });
+          if (!revoked) continue;
           await recordAuditEvent(transactionalAudit, {
             eventType: "mcp.account_disconnected",
             targetType: "mcp_server",
@@ -3182,7 +3244,9 @@ export function createPluginStore(options: PluginStoreOptions) {
           const owned = await transaction
             .select({
               id: credentialRows.id,
+              kind: credentialRows.kind,
               provider: credentialRows.provider,
+              keyId: credentialRows.keyId,
               revokedAt: credentialRows.revokedAt,
             })
             .from(credentialRows)
@@ -3200,7 +3264,22 @@ export function createPluginStore(options: PluginStoreOptions) {
           for (const credential of owned) {
             // Already revoked is not a failure. Retiring twice is legitimately idempotent.
             if (credential.revokedAt) continue;
-            await credentials.revoke(credential.id, transaction);
+            if (
+              credential.kind !== "mcp_user_token" &&
+              credential.kind !== "mcp_user_api_key"
+            ) {
+              throw new PluginRefusedError(
+                "The person's credential has an unexpected kind.",
+                null,
+              );
+            }
+            const revoked = await revokePersonalCredentialIfLive(transaction, {
+              id: credential.id,
+              kind: credential.kind,
+              provider: credential.provider,
+              keyId: credential.keyId,
+            });
+            if (!revoked) continue;
             retired.push({ id: credential.id, provider: credential.provider });
             await recordAuditEvent(transactionalAudit, {
               eventType: "mcp.account_disconnected",
