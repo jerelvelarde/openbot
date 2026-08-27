@@ -1,0 +1,703 @@
+import { describe, expect, test } from "bun:test";
+import {
+  ActionRegistry,
+  type ChannelTool,
+  type ChannelToolContext,
+  defineChannelTool,
+  FakeAdapter,
+  InMemoryActionStore,
+  MemoryStore,
+  type PlatformAdapter,
+  parseToolArgs,
+  Thread,
+  type ThreadDeps,
+} from "@copilotkit/channels";
+import {
+  ActionRefusedError,
+  type ComputerGateway,
+  ComputerUnavailableError,
+  HumanHasControlError,
+  StaleSnapshotError,
+} from "../src/computer/gateway";
+import {
+  createSlackComputerTools,
+  type SlackComputerTool,
+} from "../src/slack/computer-tools";
+import {
+  runWithSlackExecution,
+  type SlackExecution,
+} from "../src/slack/execution-context";
+
+const STOPPED = { ok: false, stopped: true, reason: "Stopped." };
+const UNAVAILABLE = {
+  ok: false,
+  reason: "The assistant's computer could not be reached.",
+};
+
+type UploadArgs = Parameters<NonNullable<PlatformAdapter["postFile"]>>[1];
+type UploadResult = Awaited<
+  ReturnType<NonNullable<PlatformAdapter["postFile"]>>
+>;
+
+class FileAdapter extends FakeAdapter {
+  readonly uploads: UploadArgs[] = [];
+  result: UploadResult = { ok: true, fileId: "slack-file-1" };
+  afterUpload?: () => void;
+
+  async postFile(
+    _target: Parameters<NonNullable<PlatformAdapter["postFile"]>>[0],
+    args: UploadArgs,
+  ): Promise<UploadResult> {
+    this.uploads.push(args);
+    this.afterUpload?.();
+    return this.result;
+  }
+}
+
+function channelContext(
+  adapter: FileAdapter,
+  signal?: AbortSignal,
+): ChannelToolContext {
+  const actor = { id: "provider-U999", kind: "human" } as const;
+  const user = { id: "u1", name: "OpenBot User" };
+  const deps: ThreadDeps = {
+    adapter,
+    platform: "slack",
+    replyTarget: { channelId: "C1", threadTs: "1.2" },
+    conversationKey: "slack:T1:C1:1.2",
+    channelName: "openbot",
+    threadId: "channels-thread-1",
+    registry: new ActionRegistry({ store: new InMemoryActionStore() }),
+    agentFactory(id) {
+      throw new Error(`Agent ${id} is not used by this test.`);
+    },
+    tools: new Map(),
+    toolDescriptors: [],
+    context: [],
+    registerWaiter() {},
+    interruptHandlers: new Map(),
+    state: new MemoryStore(),
+    user,
+    actor,
+  };
+  return {
+    thread: new Thread(deps),
+    user,
+    actor,
+    signal,
+    platform: "slack",
+  };
+}
+
+function execution(overrides: Partial<SlackExecution> = {}): SlackExecution {
+  return {
+    actor: { id: "u1", role: "user" },
+    applicationUser: { id: "u1", name: "OpenBot User" },
+    provider: "slack",
+    providerTenantId: "T1",
+    providerConversationId: "C1",
+    providerThreadId: "1.2",
+    messageText: "Use the computer.",
+    agentId: "risk",
+    ...overrides,
+  };
+}
+
+class FakeComputerGateway implements ComputerGateway {
+  declare readonly provider: ComputerGateway["provider"];
+
+  readonly navigateCalls: Parameters<ComputerGateway["navigate"]>[] = [];
+  readonly snapshotCalls: Parameters<ComputerGateway["snapshot"]>[] = [];
+  readonly readCalls: Parameters<ComputerGateway["read"]>[] = [];
+  readonly clickCalls: Parameters<ComputerGateway["click"]>[] = [];
+  readonly typeCalls: Parameters<ComputerGateway["type"]>[] = [];
+  readonly keyCalls: Parameters<ComputerGateway["key"]>[] = [];
+  readonly scrollCalls: Parameters<ComputerGateway["scroll"]>[] = [];
+  readonly listFilesCalls: Parameters<ComputerGateway["listFiles"]>[] = [];
+  readonly readFileCalls: Parameters<ComputerGateway["readFile"]>[] = [];
+  readonly runCommandCalls: Parameters<ComputerGateway["runCommand"]>[] = [];
+  readonly writeFileCalls: Parameters<ComputerGateway["writeFile"]>[] = [];
+  nextError?: unknown;
+  afterCall?: () => void;
+  readFileResult: Awaited<ReturnType<ComputerGateway["readFile"]>> = {
+    path: "reports/risk.txt",
+    text: "Résumé 📊",
+    truncated: false,
+    bytes: 13,
+  };
+
+  private answer<T>(result: T): T {
+    if (this.nextError !== undefined) {
+      const error = this.nextError;
+      this.nextError = undefined;
+      throw error;
+    }
+    this.afterCall?.();
+    return result;
+  }
+
+  async locate(): Promise<never> {
+    throw new Error("unused");
+  }
+  async status(): Promise<never> {
+    throw new Error("unused");
+  }
+  async screenshot(): Promise<never> {
+    throw new Error("unused");
+  }
+  async snapshot(...args: Parameters<ComputerGateway["snapshot"]>) {
+    this.snapshotCalls.push(args);
+    return this.answer({
+      snapshotId: 9,
+      url: "https://example.com",
+      title: "Example",
+      elements: [],
+      truncated: false,
+    });
+  }
+  async read(...args: Parameters<ComputerGateway["read"]>) {
+    this.readCalls.push(args);
+    return this.answer({
+      url: "https://example.com",
+      title: "Example",
+      text: "Page text",
+      truncated: false,
+    });
+  }
+  async navigate(...args: Parameters<ComputerGateway["navigate"]>) {
+    this.navigateCalls.push(args);
+    return this.answer({
+      url: args[2],
+      title: "Example",
+      text: "Page text",
+      truncated: false,
+      elapsedMs: 4,
+    });
+  }
+  async click(...args: Parameters<ComputerGateway["click"]>) {
+    this.clickCalls.push(args);
+    return this.answer({
+      action: "click" as const,
+      ref: args[2].ref,
+      url: "https://example.com",
+      elapsedMs: 2,
+    });
+  }
+  async type(...args: Parameters<ComputerGateway["type"]>) {
+    this.typeCalls.push(args);
+    return this.answer({
+      action: "type" as const,
+      ref: args[2].ref,
+      characters: args[2].text.length,
+      submitted: args[2].submit,
+      url: "https://example.com",
+      elapsedMs: 2,
+    });
+  }
+  async key(...args: Parameters<ComputerGateway["key"]>) {
+    this.keyCalls.push(args);
+    return this.answer({
+      action: "key" as const,
+      ref: args[2].ref,
+      key: args[2].key,
+      url: "https://example.com",
+      elapsedMs: 2,
+    });
+  }
+  async scroll(...args: Parameters<ComputerGateway["scroll"]>) {
+    this.scrollCalls.push(args);
+    return this.answer({
+      action: "scroll" as const,
+      deltaY: args[2].deltaY,
+      url: "https://example.com",
+      elapsedMs: 2,
+    });
+  }
+  async readFile(...args: Parameters<ComputerGateway["readFile"]>) {
+    this.readFileCalls.push(args);
+    return this.answer(this.readFileResult);
+  }
+  async listFiles(...args: Parameters<ComputerGateway["listFiles"]>) {
+    this.listFilesCalls.push(args);
+    return this.answer({
+      path: args[2].path ?? ".",
+      entries: [{ path: "reports/risk.txt", kind: "file" as const, bytes: 13 }],
+      truncated: false,
+    });
+  }
+  async runCommand(...args: Parameters<ComputerGateway["runCommand"]>) {
+    this.runCommandCalls.push(args);
+    return this.answer({
+      command: args[2].command,
+      exitCode: 0,
+      stdout: "done\n",
+      stderr: "",
+      truncated: false,
+      timedOut: false,
+      elapsedMs: 5,
+    });
+  }
+  async writeFile(...args: Parameters<ComputerGateway["writeFile"]>) {
+    this.writeFileCalls.push(args);
+    return this.answer({
+      path: args[2].path,
+      bytes: new TextEncoder().encode(args[2].contents).byteLength,
+      appended: args[2].append === true,
+    });
+  }
+  async control(): Promise<never> {
+    throw new Error("unused");
+  }
+  async requestHelp(): Promise<never> {
+    throw new Error("unused");
+  }
+  async takeControl(): Promise<never> {
+    throw new Error("unused");
+  }
+  async releaseControl(): Promise<never> {
+    throw new Error("unused");
+  }
+  async requestSecret(): Promise<never> {
+    throw new Error("unused");
+  }
+  async supplySecret(): Promise<never> {
+    throw new Error("unused");
+  }
+  async humanInput(): Promise<never> {
+    throw new Error("unused");
+  }
+  async computers(): Promise<never> {
+    throw new Error("unused");
+  }
+  async stopComputer(): Promise<never> {
+    throw new Error("unused");
+  }
+  async resetComputer(): Promise<never> {
+    throw new Error("unused");
+  }
+}
+
+function toolsByName(gateway: ComputerGateway) {
+  return new Map(
+    createSlackComputerTools(gateway).map((tool) => [tool.name, tool]),
+  );
+}
+
+async function invoke(
+  tool: SlackComputerTool | ChannelTool,
+  args: unknown,
+  context: ChannelToolContext,
+) {
+  const parsed = await parseToolArgs(tool.parameters, args);
+  if (!parsed.ok) throw new Error(parsed.error);
+  return tool.handler(parsed.value, context);
+}
+
+function inSlack<T>(run: () => T, overrides: Partial<SlackExecution> = {}): T {
+  return runWithSlackExecution(execution(overrides), run);
+}
+
+describe("Slack computer ChannelTools", () => {
+  test("exposes every non-assistance web operation and Slack file sharing", () => {
+    const names = [...toolsByName(new FakeComputerGateway()).keys()];
+    expect(names).toEqual([
+      "computer_navigate",
+      "computer_read",
+      "computer_snapshot",
+      "computer_type",
+      "computer_click",
+      "computer_key",
+      "computer_list_files",
+      "computer_read_file",
+      "computer_run_command",
+      "computer_write_file",
+      "computer_scroll",
+      "computer_share_file",
+    ]);
+    expect(names).not.toContain("computer_request_help");
+    expect(names).not.toContain("computer_request_secret");
+  });
+
+  test("passes the pinned coworker, linked actor, parsed click input, and signal", async () => {
+    const gateway = new FakeComputerGateway();
+    const tools = toolsByName(gateway);
+    const signal = new AbortController().signal;
+
+    const result = await inSlack(() =>
+      invoke(
+        tools.get("computer_click")!,
+        { ref: "e4", snapshotId: 9, ignored: "removed by Zod" },
+        channelContext(new FileAdapter(), signal),
+      ),
+    );
+
+    expect(gateway.clickCalls).toEqual([
+      [
+        "risk",
+        { id: "u1", userId: "u1" },
+        { ref: "e4", snapshotId: 9 },
+        signal,
+      ],
+    ]);
+    expect(result).toMatchObject({ ok: true, action: "click", ref: "e4" });
+  });
+
+  test("calls each matching gateway method once with its exact current signature", async () => {
+    const gateway = new FakeComputerGateway();
+    const tools = toolsByName(gateway);
+    const adapter = new FileAdapter();
+    const signal = new AbortController().signal;
+    const context = channelContext(adapter, signal);
+    const actor = { id: "u1", userId: "u1" };
+
+    await inSlack(async () => {
+      await invoke(
+        tools.get("computer_navigate")!,
+        { url: "https://example.com" },
+        context,
+      );
+      await invoke(tools.get("computer_read")!, {}, context);
+      await invoke(tools.get("computer_snapshot")!, {}, context);
+      await invoke(
+        tools.get("computer_type")!,
+        { ref: "e2", snapshotId: 9, text: "hello", submit: true },
+        context,
+      );
+      await invoke(
+        tools.get("computer_key")!,
+        { key: "Enter", ref: "e2", snapshotId: 9 },
+        context,
+      );
+      await invoke(tools.get("computer_scroll")!, { deltaY: -300 }, context);
+      await invoke(
+        tools.get("computer_list_files")!,
+        { path: "reports" },
+        context,
+      );
+      await invoke(
+        tools.get("computer_read_file")!,
+        { path: "reports/risk.txt" },
+        context,
+      );
+      await invoke(
+        tools.get("computer_run_command")!,
+        { command: "wc -l risk.txt" },
+        context,
+      );
+      await invoke(
+        tools.get("computer_write_file")!,
+        { path: "notes.txt", contents: "hello", append: true },
+        context,
+      );
+    });
+
+    expect(gateway.navigateCalls).toEqual([
+      ["risk", actor, "https://example.com"],
+    ]);
+    expect(gateway.readCalls).toEqual([["risk"]]);
+    expect(gateway.snapshotCalls).toEqual([["risk"]]);
+    expect(gateway.typeCalls).toEqual([
+      [
+        "risk",
+        actor,
+        { ref: "e2", snapshotId: 9, text: "hello", submit: true },
+        signal,
+      ],
+    ]);
+    expect(gateway.keyCalls).toEqual([
+      ["risk", actor, { key: "Enter", ref: "e2", snapshotId: 9 }, signal],
+    ]);
+    expect(gateway.scrollCalls).toEqual([["risk", actor, { deltaY: -300 }]]);
+    expect(gateway.listFilesCalls).toEqual([
+      ["risk", actor, { path: "reports" }],
+    ]);
+    expect(gateway.readFileCalls).toEqual([
+      ["risk", actor, { path: "reports/risk.txt" }],
+    ]);
+    expect(gateway.runCommandCalls).toEqual([
+      ["risk", actor, { command: "wc -l risk.txt" }, signal],
+    ]);
+    expect(gateway.writeFileCalls).toEqual([
+      ["risk", actor, { path: "notes.txt", contents: "hello", append: true }],
+    ]);
+  });
+
+  test("fails safely outside Slack execution without touching the gateway", async () => {
+    const gateway = new FakeComputerGateway();
+    const tool = toolsByName(gateway).get("computer_click")!;
+    const result = await invoke(
+      tool,
+      { ref: "e4", snapshotId: 9 },
+      channelContext(new FileAdapter()),
+    );
+    expect(result).toEqual(UNAVAILABLE);
+    expect(gateway.clickCalls).toHaveLength(0);
+  });
+
+  test("fails safely when no coworker is pinned without touching the gateway", async () => {
+    const gateway = new FakeComputerGateway();
+    const tool = toolsByName(gateway).get("computer_click")!;
+    const result = await inSlack(
+      () =>
+        invoke(
+          tool,
+          { ref: "e4", snapshotId: 9 },
+          channelContext(new FileAdapter()),
+        ),
+      { agentId: undefined },
+    );
+    expect(result).toEqual(UNAVAILABLE);
+    expect(gateway.clickCalls).toHaveLength(0);
+  });
+
+  test("normalizes known refusal, stale-reference, human-control, and abort conditions", async () => {
+    const gateway = new FakeComputerGateway();
+    const tool = toolsByName(gateway).get("computer_click")!;
+    const context = channelContext(new FileAdapter());
+    const cases = [
+      {
+        error: new ActionRefusedError("Blocked by policy.", "deny-payments"),
+        expected: {
+          ok: false,
+          refused: true,
+          reason: "Blocked by policy.",
+          rule: "deny-payments",
+        },
+      },
+      {
+        error: new StaleSnapshotError("Take a new snapshot."),
+        expected: {
+          ok: false,
+          staleRefs: true,
+          reason: "Take a new snapshot.",
+        },
+      },
+      {
+        error: new HumanHasControlError("A person is driving."),
+        expected: {
+          ok: false,
+          humanHasControl: true,
+          reason: "A person is driving.",
+        },
+      },
+      { error: new DOMException("cancelled", "AbortError"), expected: STOPPED },
+    ];
+
+    for (const item of cases) {
+      gateway.nextError = item.error;
+      const result = await inSlack(() =>
+        invoke(tool, { ref: "e4", snapshotId: 9 }, context),
+      );
+      expect(result).toEqual(item.expected);
+    }
+    expect(gateway.clickCalls).toHaveLength(cases.length);
+  });
+
+  test("hides unavailable and unknown error details and never retries", async () => {
+    const gateway = new FakeComputerGateway();
+    const tool = toolsByName(gateway).get("computer_click")!;
+    for (const error of [
+      new ComputerUnavailableError("host token=secret did not answer"),
+      new Error("socket token=secret internal stack detail"),
+    ]) {
+      gateway.nextError = error;
+      const result = await inSlack(() =>
+        invoke(
+          tool,
+          { ref: "e4", snapshotId: 9 },
+          channelContext(new FileAdapter()),
+        ),
+      );
+      expect(result).toEqual(UNAVAILABLE);
+      expect(JSON.stringify(result)).not.toContain("secret");
+    }
+    expect(gateway.clickCalls).toHaveLength(2);
+  });
+
+  test("checks abort before and after gateway methods without signal parameters", async () => {
+    const gateway = new FakeComputerGateway();
+    const tool = toolsByName(gateway).get("computer_navigate")!;
+    const alreadyStopped = new AbortController();
+    alreadyStopped.abort();
+    const before = await inSlack(() =>
+      invoke(
+        tool,
+        { url: "https://example.com" },
+        channelContext(new FileAdapter(), alreadyStopped.signal),
+      ),
+    );
+    expect(before).toEqual(STOPPED);
+    expect(gateway.navigateCalls).toHaveLength(0);
+
+    const stoppedAfter = new AbortController();
+    gateway.afterCall = () => stoppedAfter.abort();
+    const after = await inSlack(() =>
+      invoke(
+        tool,
+        { url: "https://example.com" },
+        channelContext(new FileAdapter(), stoppedAfter.signal),
+      ),
+    );
+    expect(after).toEqual(STOPPED);
+    expect(gateway.navigateCalls).toHaveLength(1);
+  });
+
+  test("shares complete UTF-8 text with an explicit filename and reports adapter success", async () => {
+    const gateway = new FakeComputerGateway();
+    const adapter = new FileAdapter();
+    const signal = new AbortController().signal;
+    const tool = toolsByName(gateway).get("computer_share_file")!;
+
+    const result = await inSlack(() =>
+      invoke(
+        tool,
+        { path: "reports/risk.txt", filename: "review.txt" },
+        channelContext(adapter, signal),
+      ),
+    );
+
+    expect(gateway.readFileCalls).toEqual([
+      ["risk", { id: "u1", userId: "u1" }, { path: "reports/risk.txt" }],
+    ]);
+    expect(adapter.uploads).toHaveLength(1);
+    expect(adapter.uploads[0]?.filename).toBe("review.txt");
+    expect(new TextDecoder().decode(adapter.uploads[0]?.bytes)).toBe(
+      "Résumé 📊",
+    );
+    expect(result).toEqual({
+      ok: true,
+      shared: true,
+      filename: "review.txt",
+      fileId: "slack-file-1",
+    });
+  });
+
+  test("uses only a safe basename when the shared filename is omitted", async () => {
+    const gateway = new FakeComputerGateway();
+    const adapter = new FileAdapter();
+    const result = await inSlack(() =>
+      invoke(
+        toolsByName(gateway).get("computer_share_file")!,
+        { path: "private/reports/risk.txt" },
+        channelContext(adapter),
+      ),
+    );
+    expect(adapter.uploads[0]?.filename).toBe("risk.txt");
+    expect(JSON.stringify(result)).not.toContain("private/reports");
+  });
+
+  test("refuses truncated reads and never posts incomplete file content", async () => {
+    const gateway = new FakeComputerGateway();
+    gateway.readFileResult = {
+      path: "reports/huge.txt",
+      text: "incomplete private content",
+      truncated: true,
+      bytes: 99_000_000,
+    };
+    const adapter = new FileAdapter();
+    const result = await inSlack(() =>
+      invoke(
+        toolsByName(gateway).get("computer_share_file")!,
+        { path: "reports/huge.txt" },
+        channelContext(adapter),
+      ),
+    );
+    expect(result).toEqual({
+      ok: false,
+      reason:
+        "That file is too large to read completely, so it was not shared.",
+    });
+    expect(JSON.stringify(result)).not.toContain("private content");
+    expect(adapter.uploads).toHaveLength(0);
+  });
+
+  test("returns an adapter size or type rejection exactly and never claims success", async () => {
+    const gateway = new FakeComputerGateway();
+    const adapter = new FileAdapter();
+    adapter.result = {
+      ok: false,
+      error: "Slack rejected this file type or size.",
+    };
+    const result = await inSlack(() =>
+      invoke(
+        toolsByName(gateway).get("computer_share_file")!,
+        { path: "reports/risk.txt" },
+        channelContext(adapter),
+      ),
+    );
+    expect(result).toEqual({
+      ok: false,
+      reason: "Slack rejected this file type or size.",
+    });
+    expect(result).not.toHaveProperty("shared");
+    expect(JSON.stringify(result)).not.toContain("Résumé");
+  });
+
+  test("honors abort checkpoints before upload without unsupported arguments", async () => {
+    const gateway = new FakeComputerGateway();
+    const adapter = new FileAdapter();
+    const stoppedAfterRead = new AbortController();
+    gateway.afterCall = () => stoppedAfterRead.abort();
+    const afterRead = await inSlack(() =>
+      invoke(
+        toolsByName(gateway).get("computer_share_file")!,
+        { path: "reports/risk.txt" },
+        channelContext(adapter, stoppedAfterRead.signal),
+      ),
+    );
+    expect(afterRead).toEqual(STOPPED);
+    expect(gateway.readFileCalls[0]).toHaveLength(3);
+    expect(adapter.uploads).toHaveLength(0);
+
+    gateway.afterCall = undefined;
+    const stoppedAfterUpload = new AbortController();
+    adapter.afterUpload = () => stoppedAfterUpload.abort();
+    const afterUpload = await inSlack(() =>
+      invoke(
+        toolsByName(gateway).get("computer_share_file")!,
+        { path: "reports/risk.txt" },
+        channelContext(adapter, stoppedAfterUpload.signal),
+      ),
+    );
+    expect(afterUpload).toEqual({
+      ok: true,
+      shared: true,
+      filename: "risk.txt",
+      fileId: "slack-file-1",
+    });
+    expect(adapter.uploads).toHaveLength(1);
+  });
+
+  test("revalidates a filename after removing Unicode control and format characters", async () => {
+    const gateway = new FakeComputerGateway();
+    const adapter = new FileAdapter();
+    const result = await inSlack(() =>
+      invoke(
+        toolsByName(gateway).get("computer_share_file")!,
+        { path: "reports/risk.txt", filename: `.\u0000\u202e.` },
+        channelContext(adapter),
+      ),
+    );
+    expect(adapter.uploads[0]?.filename).toBe("file.txt");
+    expect(result).toMatchObject({
+      ok: true,
+      shared: true,
+      filename: "file.txt",
+    });
+  });
+
+  test("ChannelTools use schemas that Channels can parse without compatibility casts", async () => {
+    const echo = defineChannelTool({
+      ...toolsByName(new FakeComputerGateway()).get("computer_click")!,
+      handler: ({ ref, snapshotId }) => ({ ref, snapshotId }),
+    });
+    const parsed = await parseToolArgs(echo.parameters, {
+      ref: "e8",
+      snapshotId: 3,
+    });
+    expect(parsed).toEqual({
+      ok: true,
+      value: { ref: "e8", snapshotId: 3 },
+    });
+  });
+});
