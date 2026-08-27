@@ -3,6 +3,8 @@ import {
   ControlError,
   ControlRequestError,
   createControl,
+  secretIsForThisPage,
+  secretMovedMessage,
 } from "../src/control";
 
 /**
@@ -234,9 +236,11 @@ describe("the crappy paths: secrets", () => {
         .filter((k) => /secret/i.test(k))
         .sort(),
     ).toEqual([
-      // Which of the browser's pages the field is on. A number, and the reason it is here is that a
-      // ref alone stopped being enough once the Bot began following the windows a site opens.
-      "secretActivation",
+      // Whose document the field was on, which is the only part of a secret request a person ever
+      // sees besides its label, and which page it was. Both are here because a ref alone stopped
+      // being enough once the Bot began following the windows a site opens.
+      "secretOrigin",
+      "secretPageId",
       "secretRef",
       "secretSnapshotId",
       "secretWanted",
@@ -257,35 +261,134 @@ describe("the crappy paths: secrets", () => {
    * Bot may reasonably take another snapshot of the same page while waiting. This is the one thing it
    * cannot be permissive about.
    */
-  test("a secret request remembers which page it was made for", () => {
+  test("a secret request remembers which page it was made for, and whose", () => {
     const { control } = fixture();
-    control.requestSecret({ ref: "e12", label: "API key", activation: 9 });
+    control.requestSecret({
+      ref: "e12",
+      label: "API key",
+      pageId: "p3",
+      origin: "https://example.test",
+    });
 
-    expect(control.pendingSecret()?.activation).toBe(9);
+    expect(control.pendingSecret()).toMatchObject({
+      pageId: "p3",
+      origin: "https://example.test",
+    });
+    // The origin is on the state as well as the pending record, because it is what the masked box
+    // shows the person. A prompt for a password with no address on it cannot be checked.
+    expect(control.get().secretOrigin).toBe("https://example.test");
   });
 
-  test("an activation of zero is not a page, so nothing is compared", () => {
-    // Zero is what a session that has not looked at a page yet carries, and no real activation is
-    // ever zero. Kept as a number, it would refuse every secret from a caller that never snapshotted.
+  test("a page or an origin that is not a non-empty string is dropped rather than carried as junk", () => {
     const { control } = fixture();
-    control.requestSecret({ ref: "e12", activation: 0 });
+    control.requestSecret({ ref: "e12", pageId: 3, origin: "" });
 
-    expect(control.pendingSecret()?.activation).toBeUndefined();
-  });
-
-  test("a non-numeric activation is dropped rather than carried as junk", () => {
-    const { control } = fixture();
-    control.requestSecret({ ref: "e12", activation: "9" });
-
-    expect(control.pendingSecret()?.activation).toBeUndefined();
+    expect(control.pendingSecret()?.pageId).toBeUndefined();
+    expect(control.pendingSecret()?.origin).toBeUndefined();
   });
 
   test("the page a request was for goes when the request does", () => {
     const { control } = fixture();
-    control.requestSecret({ ref: "e12", activation: 9 });
+    control.requestSecret({
+      ref: "e12",
+      pageId: "p3",
+      origin: "https://x.test",
+    });
     control.secretSupplied();
 
-    expect(control.get().secretActivation).toBeUndefined();
+    expect(control.get().secretPageId).toBeUndefined();
+    expect(control.get().secretOrigin).toBeUndefined();
+  });
+});
+
+/**
+ * Whether the browser is still on the page a pending secret names.
+ *
+ * The page, not a count of switches. Counting was the first answer and it was wrong in both
+ * directions worth caring about: it refused a secret after a window opened and closed again, when the
+ * browser was back on the page the ref names and the ref still resolved — throwing away what the
+ * person had typed and making the Bot ask afresh, which an advert opening a window on a timer could
+ * farm into a loop. And a count says nothing at all about a page that navigated itself somewhere
+ * else while staying the same page.
+ */
+describe("deciding whether a pending secret still names the page in front", () => {
+  const front = { pageId: "p1", origin: "https://typefully.test" };
+
+  test("the same page showing the same site is the page it was asked for", () => {
+    expect(secretIsForThisPage({ ...front }, front)).toBe(true);
+  });
+
+  test("another page is refused even when it is the same site", () => {
+    // Two tabs on one site are two documents, and `e3` on one is not `e3` on the other.
+    expect(
+      secretIsForThisPage(
+        { pageId: "p2", origin: "https://typefully.test" },
+        front,
+      ),
+    ).toBe(false);
+  });
+
+  test("the same page showing another site is refused", () => {
+    // A page can navigate itself without ever ceasing to be the same page, which is why the id alone
+    // does not answer this.
+    expect(
+      secretIsForThisPage({ pageId: "p1", origin: "https://evil.test" }, front),
+    ).toBe(false);
+  });
+
+  test("a window that opened and closed again leaves the request answerable", () => {
+    /*
+     * The regression the counter caused, stated as the behaviour it broke. Opener, popup, popup
+     * closed: the browser is back where it started, the ref still resolves, and the person's paste
+     * must not be thrown away and asked for again.
+     */
+    expect(secretIsForThisPage({ ...front }, front)).toBe(true);
+  });
+
+  test("the refusal says what actually moved", () => {
+    /*
+     * Measured, not imagined. The first version of this named both origins unconditionally, and in a
+     * run against a real browser — where a site opened a second window on itself — it produced "was
+     * asked for on X and the browser is now on X", which reads as a broken refusal rather than as a
+     * reason to be careful.
+     */
+    const acrossSites = secretMovedMessage(
+      { pageId: "p1", origin: "https://typefully.test" },
+      { origin: "https://accounts.evil.test" },
+    );
+    expect(acrossSites).toContain("https://typefully.test");
+    expect(acrossSites).toContain("https://accounts.evil.test");
+
+    const sameSite = secretMovedMessage(
+      { pageId: "p1", origin: "https://typefully.test" },
+      { origin: "https://typefully.test" },
+    );
+    expect(sameSite).toContain("a different window");
+    expect(sameSite).not.toMatch(/typefully\.test.*typefully\.test/);
+  });
+
+  test("the refusal always says nothing was typed", () => {
+    // The person has just handed over a password. Whether it went anywhere is the first thing they
+    // need to know, and it is the part a terse refusal leaves them guessing about.
+    for (const front of [
+      { origin: "https://typefully.test" },
+      { origin: "https://evil.test" },
+    ]) {
+      expect(
+        secretMovedMessage(
+          { pageId: "p1", origin: "https://typefully.test" },
+          front,
+        ),
+      ).toContain("Nothing was typed");
+    }
+  });
+
+  test("a request that recorded no page is not refused on missing information", () => {
+    // Only reachable from a caller that asked for a secret before anything had looked at a page,
+    // which no real Bot does: it has to snapshot to have a ref at all.
+    expect(secretIsForThisPage({}, front)).toBe(true);
+    expect(secretIsForThisPage({ pageId: "p1" }, front)).toBe(true);
+    expect(secretIsForThisPage({ origin: "https://x.test" }, front)).toBe(true);
   });
 });
 

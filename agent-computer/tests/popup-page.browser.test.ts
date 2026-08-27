@@ -72,7 +72,7 @@ describeBrowser("a page a site opens in a second window", () => {
       const origin = `http://127.0.0.1:${site?.port}`;
 
       try {
-        const opener = await profiles.activePage("popup-test");
+        const opener = await profiles.frontPage("popup-test");
         await opener.page.goto(`${origin}/opener`, {
           waitUntil: "domcontentloaded",
         });
@@ -111,12 +111,144 @@ describeBrowser("a page a site opens in a second window", () => {
       const profiles = createProfiles(profilesDir);
 
       try {
-        const first = await profiles.activePage("last-tab-test");
+        const first = await profiles.frontPage("last-tab-test");
         await first.page.close();
 
-        const next = await profiles.activePage("last-tab-test");
+        const next = await profiles.frontPage("last-tab-test");
         expect(next.page.isClosed()).toBe(false);
         expect(profiles.liveCount()).toBe(1);
+      } finally {
+        await profiles.closeAll();
+      }
+    },
+    OPEN_TIMEOUT_MS * 6,
+  );
+});
+
+describeBrowser("a browser that cannot produce a page", () => {
+  test(
+    "is replaced rather than wedging every request after it",
+    async () => {
+      /*
+       * The failure this guards is an outage, not a wrong answer.
+       *
+       * "Connected" is not the same question as "can this still do anything": a renderer killed for
+       * memory takes every target with it while the browser process stays up. Without the recovery,
+       * the throw left the dead entry in the map, the next caller found it and threw identically, and
+       * the computer answered the same error for every request until the container restarted — the
+       * precise outage the relaunch exists to prevent.
+       *
+       * The state is built by taking `newPage` away from the live context, which is the call that
+       * fails in the real thing, and then emptying the stack so it has to be reached.
+       */
+      const { createProfiles } = await import("../src/profiles");
+      const profiles = createProfiles(profilesDir);
+
+      try {
+        const first = await profiles.frontPage("wedge-test");
+        const context = first.page.context();
+        context.newPage = () =>
+          Promise.reject(
+            new Error("Target page, context or browser has been closed"),
+          );
+        await first.page.close();
+
+        const recovered = await profiles.frontPage("wedge-test");
+
+        expect(recovered.page.isClosed()).toBe(false);
+        // One browser, not two: the unusable one is closed on the way past rather than left running.
+        expect(profiles.liveCount()).toBe(1);
+        // And it stays repaired, rather than working once and wedging on the next call.
+        const again = await profiles.frontPage("wedge-test");
+        expect(again.page.isClosed()).toBe(false);
+      } finally {
+        await profiles.closeAll();
+      }
+    },
+    OPEN_TIMEOUT_MS * 6,
+  );
+});
+
+describeBrowser("the page handed back and the number describing it", () => {
+  test(
+    "never disagree, even when a window opens while a replacement is being made",
+    async () => {
+      /*
+       * The race the `FrontPage` type exists to close, driven rather than reasoned about.
+       *
+       * Opening a page is awaited, so a window the site opens during that await is announced after
+       * the replacement and is the one in front by the time the call returns. Handing back the
+       * replacement with the stack's number is a page and a number that disagree — and because the
+       * caller records that number as the one it has seen, the next call returns the genuinely front
+       * page carrying a number it already knows, so nothing is invalidated and refs minted against
+       * the replacement resolve against the other document.
+       *
+       * Made deterministic by opening the second window inside `newPage`, which is exactly where the
+       * window would land: after the replacement exists and before the caller is answered. Waiting on
+       * a real site to win a race would pass on a fast machine and mean nothing.
+       */
+      const { createProfiles } = await import("../src/profiles");
+      const profiles = createProfiles(profilesDir);
+
+      try {
+        const start = await profiles.frontPage("race-test");
+        const context = start.page.context();
+        const openPage = context.newPage.bind(context);
+        await start.page.close();
+
+        let intruder: unknown;
+        context.newPage = async () => {
+          const replacement = await openPage();
+          intruder = await openPage();
+          return replacement;
+        };
+
+        const during = await profiles.frontPage("race-test");
+        context.newPage = openPage;
+
+        // The page that was in front when the answer was given, not the one that was made for it.
+        expect(during.page).toBe(intruder);
+
+        // And the pair still agrees on the next call, which is the property that actually protects
+        // the refs: a different page always arrives with a different number.
+        const after = await profiles.frontPage("race-test");
+        expect(after.page).toBe(during.page);
+        expect(after.activation).toBe(during.activation);
+      } finally {
+        await profiles.closeAll();
+      }
+    },
+    OPEN_TIMEOUT_MS * 6,
+  );
+});
+
+describeBrowser("what the front page says about itself", () => {
+  test(
+    "names the site, and gives a following window a different name from the opener",
+    async () => {
+      // The origin is what a person driving is shown before they type. It has to be the document
+      // actually in front, and a window a site opens has to be distinguishable from the page under
+      // it — that pair is what the secret guard compares.
+      const { createProfiles } = await import("../src/profiles");
+      const profiles = createProfiles(profilesDir);
+      const origin = `http://127.0.0.1:${site?.port}`;
+
+      try {
+        const opener = await profiles.frontPage("origin-test");
+        await opener.page.goto(`${origin}/opener`, {
+          waitUntil: "domcontentloaded",
+        });
+        const onOpener = await profiles.frontPage("origin-test");
+        expect(onOpener.origin).toBe(origin);
+
+        await onOpener.page.click("#go");
+        const onPopup = await settleOn(
+          profiles,
+          `${origin}/popup`,
+          "origin-test",
+        );
+        expect(onPopup.origin).toBe(origin);
+        expect(onPopup.pageId).not.toBe(onOpener.pageId);
       } finally {
         await profiles.closeAll();
       }
@@ -132,20 +264,23 @@ describeBrowser("a page a site opens in a second window", () => {
  * is what a route asking right now would be handed, and a popup arrives on its own schedule.
  */
 async function settleOn(
-  profiles: { activePage: (botId: string) => Promise<ActivePageLike> },
+  profiles: { frontPage: (botId: string) => Promise<FrontPageLike> },
   url: string,
-): Promise<ActivePageLike> {
+  botId = "popup-test",
+): Promise<FrontPageLike> {
   const until = Date.now() + OPEN_TIMEOUT_MS;
-  let last = await profiles.activePage("popup-test");
+  let last = await profiles.frontPage(botId);
   while (last.page.url() !== url && Date.now() < until) {
     await new Promise((resolve) => setTimeout(resolve, 100));
-    last = await profiles.activePage("popup-test");
+    last = await profiles.frontPage(botId);
   }
   return last;
 }
 
-/** Enough of what `activePage` returns for this file, without importing Playwright's types. */
-type ActivePageLike = {
+/** Enough of what `frontPage` returns for this file, without importing Playwright's types. */
+type FrontPageLike = {
+  pageId: string;
+  origin: string;
   page: {
     url: () => string;
     title: () => Promise<string>;
@@ -153,6 +288,11 @@ type ActivePageLike = {
     isClosed: () => boolean;
     goto: (url: string, options?: unknown) => Promise<unknown>;
     click: (selector: string) => Promise<void>;
+    context: () => {
+      newPage: (() => Promise<unknown>) & {
+        bind: (thisArg: unknown) => () => Promise<unknown>;
+      };
+    };
   };
   activation: number;
 };

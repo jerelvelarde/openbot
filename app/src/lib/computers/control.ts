@@ -18,6 +18,15 @@ export type ControlState = {
   requested: boolean;
   /** What the Bot is waiting for, by name only. Present means show the masked prompt. */
   secretWanted?: string;
+  /**
+   * Whose site the field is on, as the computer saw it when the Bot asked.
+   *
+   * Shown beside the masked box, because "the assistant needs your password" with no address on it is
+   * a prompt that cannot be checked — and the page it refers to was chosen by the site the Bot is on
+   * rather than by anybody here. The computer refuses the value if the browser has moved off that
+   * page since; this is so a person can refuse it first.
+   */
+  secretOrigin?: string;
 };
 
 async function callControl(
@@ -71,28 +80,4 @@ export async function supplySecret(
       error: "The assistant's computer could not be reached.",
     };
   }
-}
-
-/**
- * Serializes human input requests without blocking the caller; ordering matters for typed secrets.
- */
-let inputQueue: Promise<unknown> = Promise.resolve();
-
-/**
- * Send one human input event. Returns immediately; delivery is ordered.
- */
-export function sendHumanInput(
-  computerId: string,
-  kind: "click" | "type" | "key" | "scroll",
-  body: Record<string, unknown>,
-): void {
-  inputQueue = inputQueue
-    .then(() =>
-      tryClient(`/api/computers/${computerId}/human/${kind}`, {
-        method: "POST",
-        body,
-      }),
-    )
-    // Fire-and-forget: the user can see/retry input failures, while the input queue must keep moving.
-    .catch(() => undefined);
 }

@@ -24,16 +24,35 @@ The Bot now follows the window. The live screen moves to it, input goes to it, a
 and closing the last tab opens a fresh one rather than restarting the browser, so a sign-in that just
 succeeded is not thrown away with it.
 
+**The live screen now says whose page it is showing.** An origin sits above the picture and follows
+the browser as it moves, because which page the screen follows is chosen by the site rather than by
+OpenBot: a page carrying a compromised script can open a window at any address and have it take the
+screen within a second — arriving, in a sign-in a Bot has just handed over for, exactly when a
+sign-in window is expected. There was no address anywhere on that screen before this.
+
+**And the first window at an unfamiliar site does not get your keystrokes until you say so.** While
+you hold the wheel, a window that opens by itself at an origin you have not already accepted covers
+the screen with its address and a Continue button, and input is refused — on the socket and on the
+HTTP path both — until you confirm. Redirect hops inside that window do not ask again, nor does
+coming back to a page you were already on, because a confirmation you meet ten times is one you stop
+reading. Cross-origin is not blocked: `accounts.google.com` opened from `typefully.com` is the whole
+point, and this is the check anybody should already be making on a sign-in window, put in front of
+them at the one moment it matters. What it does not cover is a page navigating itself somewhere else
+without a new window; the address bar covers that, and stopping a person at every link they follow
+is the reflex above.
+
+The masked box for a secret now names the site it is going to, and the value is refused if the
+browser is no longer on the page the Bot named — the page, not merely the same address, so two
+windows on one site are told apart. Without that, a window opening mid-request put the person's value
+into a field on a page the Bot never described and reported it as delivered. A window that opens and
+closes again leaves the request answerable, so a stray popup no longer throws away what somebody had
+already typed.
+
 Refs do not travel between pages. An element ref belongs to the document it was taken from — `e3` is
 "Delete everything" on one page and "Deny" on the next — so moving to another page invalidates them
 the same way navigating does, and an action carrying an older snapshot is answered with "take a new
 snapshot". A Bot may lose a turn to that where the page it left would still have resolved. It is the
 side to be wrong on.
-
-A secret a person is asked for is refused if the browser has moved on since the Bot asked. Secret
-entry names a field by ref and deliberately does not re-check the snapshot generation, so without
-this a window opening mid-request put the person's value into a field on a page the Bot never
-described and reported it as delivered.
 
 ### A channel a Bot has spoken in unseen shows a dot
 

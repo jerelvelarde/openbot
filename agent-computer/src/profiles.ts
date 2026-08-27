@@ -36,7 +36,7 @@
 import { readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { type BrowserContext, chromium, type Page } from "playwright";
-import { createPageStack, type PageStack } from "./active-page";
+import { createPageStack, originOf, type PageStack } from "./page-stack";
 import { profileDirectoryFor } from "./bot-id";
 import { chooseEvictions, chooseIdle } from "./browser-eviction";
 import { egressFor, egressLabel } from "./egress";
@@ -129,17 +129,59 @@ export type BotBrowser = {
 };
 
 /**
- * The page a Bot is on, and which activation that is.
+ * The page a Bot is in front of, and everything a caller needs to know about which page it is.
  *
- * The number travels with the page rather than being asked for separately, because the two are one
- * fact and reading them in two calls is a race: a popup that opens between them hands the caller a
- * page from after the switch and a number from before it, which is the exact combination that makes
- * a stale ref look current. See active-page.ts for what the number is for.
+ * All four travel together rather than being asked for separately, because they are one fact and
+ * reading them in two calls is a race: a popup that opens in between hands the caller a page from
+ * after the switch and a number from before it, which is the exact combination that makes a stale ref
+ * look current. See page-stack.ts for what the number is for.
  */
-export type ActivePage = {
+export type FrontPage = {
   page: Page;
+  /** Changes whenever the front page changes. Invalidates refs; see `currentPage` in index.ts. */
   activation: number;
+  /**
+   * This page, as something that can be remembered and compared later.
+   *
+   * The activation number cannot do this job. It names a switch, not a page, so a popup that opens
+   * and closes leaves the browser back where it started carrying a number that says otherwise —
+   * "have we moved since?" answered yes when the honest answer is no. Anything asking "is the browser
+   * still on the page I was told about", which is what a pending secret asks, needs the page rather
+   * than the count of moves.
+   */
+  pageId: string;
+  /** Whose document this is, for showing a person before they type into it. See `originOf`. */
+  origin: string;
 };
+
+/**
+ * Names for pages, so one can be recognised again.
+ *
+ * A WeakMap because the key is the page: an entry goes when Chromium's page object does, so a browser
+ * that opens ten thousand windows over its life leaves nothing behind here. Module scope rather than
+ * per profile store, so the names are unique across the process for the same reason activations are.
+ */
+const pageNames = new WeakMap<Page, string>();
+let pagesNamed = 0;
+
+function nameOf(page: Page): string {
+  const existing = pageNames.get(page);
+  if (existing) return existing;
+  pagesNamed += 1;
+  const name = `p${pagesNamed}`;
+  pageNames.set(page, name);
+  return name;
+}
+
+/** What a caller is told about the page in front, gathered in one place so it cannot disagree. */
+function asFrontPage(page: Page, activation: number): FrontPage {
+  return {
+    page,
+    activation,
+    pageId: nameOf(page),
+    origin: originOf(page.url()),
+  };
+}
 
 export type ProfileSummary = {
   botId: string;
@@ -210,7 +252,7 @@ export function createProfiles(root: string) {
   };
   const live = new Map<string, Running>();
   /** Launches in flight, so a cold computer is started once however many callers ask at once. */
-  const starting = new Map<string, Promise<ActivePage>>();
+  const starting = new Map<string, Promise<FrontPage>>();
 
   // Checked, not joined. `join(root, botId)` normalizes `..` away, so a Bot id of `../workspace`
   // used to resolve outside the root and `reset` would delete whatever was there.
@@ -280,8 +322,9 @@ export function createProfiles(root: string) {
   const watch = (pages: PageStack<Page>, page: Page): void => {
     // Already following it. Chromium announces a page we opened ourselves through the context event
     // as well, and a second `close` handler on the same page would be a second listener leaking per
-    // tab for the life of the browser.
-    if (pages.all().includes(page)) return;
+    // tab for the life of the browser. Asked of a set rather than of the array, because this runs
+    // once per page inside Chromium's own event handler.
+    if (pages.holds(page)) return;
     pages.opened(page);
     page.once("close", () => {
       pages.closed(page);
@@ -289,7 +332,7 @@ export function createProfiles(root: string) {
   };
 
   /**
-   * The live page of a running browser, opening one if every page has gone.
+   * The front page of a running browser, opening one if every page has gone.
    *
    * The close listener is the ordinary path back from a popup, and this is the belt to its braces: a
    * page reports `isClosed()` the moment Chromium destroys it, while the event that removes it from
@@ -301,19 +344,27 @@ export function createProfiles(root: string) {
    * fine, its cookies are what the sign-in was for, and throwing it away to get a blank page back
    * would discard the thing that just succeeded.
    */
-  const activeIn = async (running: Running): Promise<ActivePage> => {
-    for (const page of running.pages.all()) {
-      if (page.isClosed()) running.pages.closed(page);
-    }
-    const open = running.pages.active();
-    if (open) return { page: open, activation: running.pages.activation() };
+  const frontOf = async (running: Running): Promise<FrontPage> => {
+    running.pages.prune((page) => page.isClosed());
+    const open = running.pages.top();
+    if (open) return asFrontPage(open, running.pages.activation());
 
     const replacement = await running.context.newPage();
     watch(running.pages, replacement);
-    return {
-      page: replacement,
-      activation: running.pages.activation(),
-    };
+    /*
+     * The stack's answer, not the page we just made, and they can differ.
+     *
+     * `newPage()` is awaited, so a page the site opened during it is announced first and is the one
+     * in front by the time this line runs. Returning `replacement` with the stack's activation would
+     * hand back a page and a number that disagree — and because the caller records that number as the
+     * one it has seen, the next call would return the genuinely front page carrying a number it
+     * already knows, so nothing would be invalidated and refs would resolve against another document.
+     * That is the exact race `FrontPage` exists to close, and it has to be closed here too.
+     */
+    return asFrontPage(
+      running.pages.top() ?? replacement,
+      running.pages.activation(),
+    );
   };
 
   const sweepLocks = async (dir: string): Promise<void> => {
@@ -326,17 +377,17 @@ export function createProfiles(root: string) {
 
   return {
     /**
-     * The page the Bot is on, starting its browser if it is not running.
+     * The page the Bot is in front of, starting its browser if it is not running.
      *
      * Started on first use rather than at boot, and re-created if it died: a crashed Chromium would
      * otherwise leave this process alive and answering the same error for every request until the
      * container restarts. This turns that into one slow request instead of an outage.
      *
-     * "The page the Bot is on" rather than "the Bot's page": a browser holds as many pages as the
-     * sites in it decide to open, and the one that matters is whichever is on top. The activation
-     * number comes back with it so a caller can tell that it moved. See active-page.ts.
+     * "The page the Bot is in front of" rather than "the Bot's page": a browser holds as many pages
+     * as the sites in it decide to open, and the one that matters is whichever is on top. What the
+     * caller needs in order to know which page that is comes back with it. See page-stack.ts.
      */
-    async activePage(botId: string): Promise<ActivePage> {
+    async frontPage(botId: string): Promise<FrontPage> {
       /*
        * One launch at a time per Bot. Calls that arrive during a launch wait for that launch instead
        * of starting another browser against the same profile directory.
@@ -348,13 +399,36 @@ export function createProfiles(root: string) {
       if (existing?.context.browser()?.isConnected()) {
         // Touched on every use, which is what makes "least recently used" mean anything.
         existing.usedAt = Date.now();
-        // A closed page no longer means a dead browser. It used to: there was one page, so losing it
-        // left nothing to act on and the only repair was to start over. Now it means a popup was
-        // dismissed, and the answer is the page underneath it rather than a restart that would make
-        // finishing a sign-in and closing the window cost the Bot its whole browser.
-        return activeIn(existing);
-      }
-      if (existing) {
+        try {
+          // A closed page no longer means a dead browser. It used to: there was one page, so losing
+          // it left nothing to act on and the only repair was to start over. Now it means a popup was
+          // dismissed, and the answer is the page underneath it rather than a restart that would make
+          // finishing a sign-in and closing the window cost the Bot its whole browser.
+          return await frontOf(existing);
+        } catch (error) {
+          /*
+           * A browser that says it is connected but cannot produce a page.
+           *
+           * The connected check is not the same question as "can this still do anything": a renderer
+           * that was killed for memory takes every target with it while the browser process stays up,
+           * and a context can go away underneath one. `frontOf` then throws on `newPage()`, and
+           * without this the exception would leave the dead entry in the map for the next caller to
+           * find and throw on identically — the same error for every request until the container
+           * restarted. That is precisely the outage the relaunch below exists to prevent, so the
+           * entry is dropped and the request falls through to a cold start.
+           */
+          console.warn(
+            JSON.stringify({
+              type: "computer-browser-unusable",
+              botId,
+              reason: "it is connected but could not produce a page",
+              error: String(error),
+            }),
+          );
+          live.delete(botId);
+          await existing.context.close().catch(() => undefined);
+        }
+      } else if (existing) {
         // Half-dead: the browser went away. Dropped rather than repaired, because a context whose
         // browser has gone is not usable for anything.
         await existing.context.close().catch(() => undefined);
@@ -411,10 +485,7 @@ export function createProfiles(root: string) {
         // After the new one is in the map, so the cap counts what is really running and the Bot that
         // just asked is the most recently used and therefore never the one closed.
         await enforceCap();
-        return {
-          page: pages.active() ?? first,
-          activation: pages.activation(),
-        };
+        return asFrontPage(pages.top() ?? first, pages.activation());
       })();
 
       starting.set(botId, launch);

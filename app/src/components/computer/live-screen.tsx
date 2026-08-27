@@ -42,12 +42,26 @@ type Props = {
   onProblem?: (problem: string | null) => void;
 };
 
+/**
+ * What document the frames are of, as the computer reports it.
+ *
+ * `awaitingAcceptance` is the computer saying it is holding this person's input back until they say
+ * they meant to be here. It is decided there, never here: a banner the browser could dismiss on its
+ * own would be decoration, and the refusal it describes is enforced on the other side of the socket.
+ */
+type ShowingPage = {
+  url: string;
+  origin: string;
+  awaitingAcceptance: boolean;
+};
+
 export function LiveScreen({ computerId, driving, onProblem }: Props) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   /** The size of the frames Chrome is sending, which is what input coordinates are relative to. */
   const frameSize = useRef<{ width: number; height: number } | null>(null);
   const [connected, setConnected] = useState(false);
+  const [showing, setShowing] = useState<ShowingPage | null>(null);
 
   useEffect(() => {
     // Same origin, so the scheme follows the page: wss when the app is served over https.
@@ -70,6 +84,9 @@ export function LiveScreen({ computerId, driving, onProblem }: Props) {
         width?: number;
         height?: number;
         error?: string;
+        url?: string;
+        origin?: string;
+        awaitingAcceptance?: boolean;
       };
       try {
         message = JSON.parse(String(event.data));
@@ -78,6 +95,21 @@ export function LiveScreen({ computerId, driving, onProblem }: Props) {
       }
       if (message.type === "error") {
         onProblem?.(message.error ?? "The screen could not be shown.");
+        return;
+      }
+      /*
+       * Which document these frames are of.
+       *
+       * The screen said nothing about this until a Bot began following the windows a site opens, and
+       * then it had to: the page being cast is chosen by the site, the swap happens within a second,
+       * and a person typing a password into a screen has no other way to tell whose page it is.
+       */
+      if (message.type === "page") {
+        setShowing({
+          url: message.url ?? "",
+          origin: message.origin ?? "",
+          awaitingAcceptance: message.awaitingAcceptance === true,
+        });
         return;
       }
       if (message.type !== "frame" || !message.data) return;
@@ -136,6 +168,20 @@ export function LiveScreen({ computerId, driving, onProblem }: Props) {
     },
     [driving],
   );
+
+  /**
+   * The person saying they meant to be on the window that took their screen.
+   *
+   * Sent bare: which origin is being agreed to is decided by the computer, from what it is actually
+   * holding back, so a message from here cannot accept an address the person was never shown. The
+   * banner does not clear itself either — it goes when the computer says the page is accepted, which
+   * is the same fact that lets input through.
+   */
+  const acceptPage = useCallback(() => {
+    const socket = socketRef.current;
+    if (socket?.readyState !== WebSocket.OPEN) return;
+    socket.send(JSON.stringify({ type: "accept-page" }));
+  }, []);
 
   /**
    * Convert from displayed canvas coordinates to page coordinates with the shared, tested helper.
@@ -225,37 +271,92 @@ export function LiveScreen({ computerId, driving, onProblem }: Props) {
     };
   }, [driving, send]);
 
+  const blocked = driving && showing?.awaitingAcceptance === true;
+
   return (
-    <canvas
-      ref={canvasRef}
-      className={`block h-auto w-full ${driving ? "cursor-crosshair" : ""}`}
-      // Only forward input during takeover.
-      {...(driving
-        ? {
-            onMouseDown: onMouse("pressed"),
-            onMouseUp: onMouse("released"),
-            onMouseMove: onMouse("moved"),
-            onContextMenu: (event: React.MouseEvent) => event.preventDefault(),
-            onWheel: (event: React.WheelEvent<HTMLCanvasElement>) => {
-              const point = at(event);
-              if (!point) return;
-              event.preventDefault();
-              send({
-                type: "wheel",
-                ...point,
-                deltaX: event.deltaX,
-                deltaY: event.deltaY,
-                modifiers: modifierBits(event),
-              });
-            },
-          }
-        : {})}
-      aria-label={
-        driving
-          ? "The assistant's screen. You have control: click and type here."
-          : "The assistant's screen, live"
-      }
-      data-connected={connected}
-    />
+    <div className="relative">
+      {/*
+        The address, above the picture, for the same reason a browser puts one there.
+
+        Always, not only while driving: somebody watching a Bot work should be able to see where it
+        has got to, and a bar that appeared only at the moment of danger would be a bar nobody had
+        learned to read. The origin rather than the whole URL, because the rest of a URL is where a
+        lookalike hides its real host behind a long and reassuring path.
+      */}
+      {showing ? (
+        <div
+          className="flex items-center gap-2 border-white/10 border-b bg-black/60 px-3 py-1.5 font-mono text-white/80 text-xs"
+          title={showing.url}
+        >
+          <span className="shrink-0 text-white/40">Showing</span>
+          <span className="truncate">{showing.origin}</span>
+        </div>
+      ) : null}
+      <canvas
+        ref={canvasRef}
+        className={`block h-auto w-full ${driving ? "cursor-crosshair" : ""}`}
+        // Only forward input during takeover.
+        {...(driving
+          ? {
+              onMouseDown: onMouse("pressed"),
+              onMouseUp: onMouse("released"),
+              onMouseMove: onMouse("moved"),
+              onContextMenu: (event: React.MouseEvent) =>
+                event.preventDefault(),
+              onWheel: (event: React.WheelEvent<HTMLCanvasElement>) => {
+                const point = at(event);
+                if (!point) return;
+                event.preventDefault();
+                send({
+                  type: "wheel",
+                  ...point,
+                  deltaX: event.deltaX,
+                  deltaY: event.deltaY,
+                  modifiers: modifierBits(event),
+                });
+              },
+            }
+          : {})}
+        aria-label={
+          driving
+            ? "The assistant's screen. You have control: click and type here."
+            : "The assistant's screen, live"
+        }
+        data-connected={connected}
+      />
+      {/*
+        A window nobody asked for, and the one moment a person can still catch it.
+
+        Every click a Bot makes is a user gesture, so a page carrying a compromised script can open a
+        window at any address and have it take this screen within a second — arriving, in a sign-in
+        the Bot has just handed over for, exactly when a sign-in window is expected. The computer is
+        refusing input until this is answered; this draws what it is refusing and why.
+
+        Over the page rather than beside it. The picture underneath is the convincing part, and a
+        notice below the fold is one nobody reads before typing.
+      */}
+      {blocked && showing ? (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/85 p-6 text-center">
+          <p className="font-medium text-sm text-white">
+            A window opened by itself and took this screen.
+          </p>
+          <p className="max-w-md break-all font-mono text-sm text-white/90">
+            {showing.origin}
+          </p>
+          <p className="max-w-md text-white/70 text-xs">
+            Nothing you type reaches it until you continue. Check that address
+            is the site you meant to sign in to — if it is not the one you
+            expect, hand the wheel back instead.
+          </p>
+          <button
+            type="button"
+            onClick={acceptPage}
+            className="rounded-md bg-white px-3 py-1.5 font-medium text-black text-xs"
+          >
+            I meant to go here — continue
+          </button>
+        </div>
+      ) : null}
+    </div>
   );
 }

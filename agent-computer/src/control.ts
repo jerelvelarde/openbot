@@ -48,21 +48,71 @@ export type ControlState = {
   secretRef?: string;
   secretSnapshotId?: number;
   /**
-   * Which of the browser's pages the field is on, as an activation number from active-page.ts.
+   * Which page the field is on, and whose document that page was showing when the Bot asked.
    *
    * Here because a ref is only meaningful against the document it was taken from, and the browser can
    * move to another one while the request is open: a site that calls `window.open` gets a second page
    * and the Bot follows it there. Refs are minted per snapshot, so `e3` exists on that page too and
-   * names something else — an ordinary search box rather than the field the Bot described. Without
-   * this, a popup opening while somebody was reaching for their password manager put their secret
-   * into it and reported success. Measured, not theorised.
+   * names something else — an ordinary search box rather than the field the Bot described. Measured
+   * without this: the value went into the popup's public search box and the response said
+   * `supplied: true`.
+   *
+   * BOTH, AND NEITHER ON ITS OWN. The page id answers "is the browser still on the page this ref
+   * names", which a switch counter cannot: a popup that opens and closes leaves the browser exactly
+   * where it started while the counter has moved twice, so counting refused a secret the person had
+   * every right to supply and threw their typing away. The origin answers the question the id cannot,
+   * which is whether that page is still showing the same site — a page the Bot described can navigate
+   * itself somewhere else without ever ceasing to be the same page.
+   *
+   * `secretOrigin` is also the only part of this a person ever sees. The surface shows it beside the
+   * masked box, because "the assistant needs your password" with no address on it is a prompt that
+   * cannot be checked, and the window it refers to was chosen by the site rather than by us.
    *
    * Absent means the request was made before anything had looked at a page, which no real Bot does:
    * it has to snapshot to have a ref at all. Nothing is compared in that case rather than refusing on
-   * a number that means "not yet".
+   * a value that means "not yet".
    */
-  secretActivation?: number;
+  secretPageId?: string;
+  secretOrigin?: string;
 };
+
+/**
+ * Is a pending secret request still about the page it was made for?
+ *
+ * Its own function, and exported, so the rule can be tested without a browser and so the two places
+ * that care — the refusal and the message explaining it — cannot drift apart. Unanswerable means
+ * allowed: a request that recorded no page was made before anything had looked at one, and refusing
+ * on missing information would break the ordinary path in order to guard a case that cannot arise.
+ */
+export function secretIsForThisPage(
+  pending: { pageId?: string; origin?: string },
+  front: { pageId: string; origin: string },
+): boolean {
+  if (pending.pageId === undefined || pending.origin === undefined) return true;
+  return pending.pageId === front.pageId && pending.origin === front.origin;
+}
+
+/**
+ * Why a secret was refused, said in terms of what actually moved.
+ *
+ * Two different things fail this check and they are not the same sentence. Naming both origins reads
+ * as nonsense when they are the same one — the first draft of this said "was asked for on X and the
+ * browser is now on X", which was measured in a run against a real browser and is the kind of message
+ * that makes somebody distrust the refusal rather than the page. Beside the predicate, so the two
+ * cannot disagree about which case is which.
+ */
+export function secretMovedMessage(
+  pending: { pageId?: string; origin?: string },
+  front: { origin: string },
+): string {
+  const asked = pending.origin ?? "another page";
+  const ending =
+    "Nothing was typed. Ask the assistant to request it again, against the page it can see now.";
+  if (pending.origin !== front.origin) {
+    return `That value was asked for on ${asked} and the browser is now on ${front.origin}. ${ending}`;
+  }
+  return `That value was asked for in a different window on ${asked}, and that window is no longer the one in front. ${ending}`;
+}
 
 /** Refusal because a person is driving. Distinct from a failure, so the Bot can be told to wait. */
 export class ControlError extends Error {
@@ -161,7 +211,8 @@ export function createControl(
       label?: unknown;
       ref?: unknown;
       snapshotId?: unknown;
-      activation?: unknown;
+      pageId?: unknown;
+      origin?: unknown;
     }): ControlState {
       if (typeof input.ref !== "string" || !input.ref.trim()) {
         throw new ControlRequestError(
@@ -177,9 +228,13 @@ export function createControl(
         secretRef: input.ref.trim(),
         secretSnapshotId:
           typeof input.snapshotId === "number" ? input.snapshotId : undefined,
-        secretActivation:
-          typeof input.activation === "number" && input.activation > 0
-            ? input.activation
+        secretPageId:
+          typeof input.pageId === "string" && input.pageId
+            ? input.pageId
+            : undefined,
+        secretOrigin:
+          typeof input.origin === "string" && input.origin
+            ? input.origin
             : undefined,
       };
       return this.get();
@@ -194,13 +249,15 @@ export function createControl(
     pendingSecret(): {
       ref: string;
       snapshotId?: number;
-      activation?: number;
+      pageId?: string;
+      origin?: string;
     } | null {
       if (!state.secretWanted || !state.secretRef) return null;
       return {
         ref: state.secretRef,
         snapshotId: state.secretSnapshotId,
-        activation: state.secretActivation,
+        pageId: state.secretPageId,
+        origin: state.secretOrigin,
       };
     },
 
@@ -216,7 +273,8 @@ export function createControl(
         secretWanted: undefined,
         secretRef: undefined,
         secretSnapshotId: undefined,
-        secretActivation: undefined,
+        secretPageId: undefined,
+        secretOrigin: undefined,
       };
     },
 

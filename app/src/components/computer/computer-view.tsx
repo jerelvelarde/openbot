@@ -551,6 +551,23 @@ export function ComputerView({
             <label className="block" htmlFor="openbot-secret">
               <span className="font-medium">The assistant needs </span>
               <span>{control.secretWanted}</span>
+              {/*
+                Whose page is about to receive this.
+
+                A label alone cannot be checked. The Bot names the field, and the page that field is
+                on was chosen by the site the Bot is working on, so the one thing a person needs in
+                order to decide whether to type a password is the address it is going to. The
+                computer refuses the value if the browser has moved off that page since it was asked
+                for; this is what lets somebody refuse it before that.
+              */}
+              {control.secretOrigin ? (
+                <>
+                  <span className="text-muted-foreground"> for </span>
+                  <span className="break-all font-mono text-xs">
+                    {control.secretOrigin}
+                  </span>
+                </>
+              ) : null}
             </label>
             <div className="mt-1.5 flex gap-2">
               <input

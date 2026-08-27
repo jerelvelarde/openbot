@@ -14,9 +14,12 @@ import {
   ControlRequestError,
   createControl,
   NO_SECRET_PENDING,
+  secretIsForThisPage,
+  secretMovedMessage,
   TAKE_CONTROL_FIRST,
 } from "./control";
 import { identity } from "./identity";
+import { originOf, unacceptedPageMessage } from "./page-stack";
 import { createProfiles, numberFromEnv, VIEWPORT } from "./profiles";
 import {
   type InputMessage,
@@ -113,13 +116,28 @@ type BotSession = {
   /** This Bot's snapshot generation. See the note above on staleness. */
   snapshotId: number;
   /**
-   * Which of the browser's pages this session last saw. See {@link currentPage}.
+   * Which page this session last saw the browser in front of, and whose document it was showing.
    *
-   * Zero means "none yet", which no real activation ever is, so the first call after a session is
-   * created counts as a change. That costs a generation nobody was using: a session with no page has
-   * handed out no refs.
+   * Absent means nothing has looked yet. The origin is kept current even when the page does not
+   * change, because a page can navigate itself somewhere else without ever ceasing to be the same
+   * page, and both the secret guard and the address a person reads have to follow that.
    */
-  pageActivation: number;
+  front?: { activation: number; pageId: string; origin: string };
+  /**
+   * Origins the person holding the wheel has said they meant to be on.
+   *
+   * Seeded when they take the wheel with whatever is on screen at that moment, because pressing
+   * "Take control" while looking at a page is as clear a statement about that page as a confirmation
+   * would be. Emptied when the wheel changes hands either way: it describes one person's session, and
+   * the next one has not agreed to anything.
+   */
+  acceptedOrigins: Set<string>;
+  /**
+   * A window that took the screen and has not been accepted. Input is refused while this is set.
+   *
+   * See {@link currentPage} for why this exists and exactly when it is raised.
+   */
+  unaccepted?: { origin: string; url: string };
   /** The one live screen viewer for this Bot, if a person is watching. */
   viewer?: {
     socket: unknown;
@@ -150,13 +168,27 @@ function forgetIdleSessions(): void {
   }
 }
 
+/**
+ * Give the wheel back, and forget what the person holding it had agreed to.
+ *
+ * One function because there are three ways the wheel goes back — handed back, the browser stopped,
+ * the profile reset — and the acceptance set belongs to the session that was driving. A handler that
+ * called `release` without this would leave the next person's first window pre-accepted by somebody
+ * else's judgement, which is exactly the kind of thing the second handler always forgets.
+ */
+function handBack(session: BotSession) {
+  session.acceptedOrigins = new Set();
+  session.unaccepted = undefined;
+  return session.control.release();
+}
+
 function sessionFor(botId: string): BotSession {
   const existing = sessions.get(botId);
   if (existing) return existing;
   const created: BotSession = {
     control: createControl(),
     snapshotId: 0,
-    pageActivation: 0,
+    acceptedOrigins: new Set(),
   };
   sessions.set(botId, created);
   // Cheap, and only ever on the path that adds one, so the map cannot grow without this running.
@@ -222,47 +254,81 @@ const DEFAULT_BOT_ID = (() => {
 })();
 
 /**
- * The page this Bot is on, and the single place a page switch is noticed.
+ * The page this Bot is in front of, and the single place a page switch is noticed.
  *
  * Every route funnels through here — the live screen, a person's input, `/navigate`, `/screenshot`,
  * `/read`, `/snapshot` and every action — which is what makes this the right place to put the
- * consequence of the browser having moved somewhere else. A site that calls `window.open` gets a
+ * consequences of the browser having moved somewhere else. A site that calls `window.open` gets a
  * second page and Chromium gives it focus; profiles.ts follows it, and this is where the rest of the
- * process finds out.
+ * process finds out. There are two consequences, and they are for different people.
  *
- * WHAT HAPPENS TO REFS TAKEN AGAINST THE PAGE THAT JUST LOST FOCUS. They are invalidated: the
- * snapshot generation is bumped exactly as a navigation bumps it, so an action carrying an older one
- * is refused with "take a new snapshot" rather than tried against a document it was never describing.
+ * FOR THE BOT: REFS TAKEN AGAINST THE PAGE THAT JUST LOST FOCUS ARE INVALIDATED. The snapshot
+ * generation is bumped exactly as a navigation bumps it, so an action carrying an older one is
+ * refused with "take a new snapshot" rather than tried against a document it was never describing.
  * Invalidated rather than quietly re-resolved, because a ref is minted per snapshot and therefore
  * exists on the popup as well, naming something else there. Measured on a two-button page: `e3` was
  * "Delete everything" on the opener and "Deny" on the window it opened.
  *
- * ON THIS PATH THE BUMP IS THE MESSAGE RATHER THAN THE SAFETY, and saying so is worth more than
- * implying otherwise. Playwright keeps its `aria-ref` registry per page, and nothing here fills one
- * except `/snapshot`, which moves the generation itself. So a popup nobody has snapshotted resolves
- * no ref at all, and one somebody has snapshotted has already invalidated the old generation.
- * Verified both ways round. What the bump buys is the honest refusal — "the page is now at 4, take a
- * new snapshot" instead of "nothing on this page has the ref e3", which describes an element as
- * missing from a page the Bot does not yet know it is on.
+ * On the acting path the bump is the message rather than the safety, and saying so is worth more than
+ * implying otherwise. Playwright keeps its `aria-ref` registry per page and nothing here fills one
+ * except `/snapshot`, which moves the generation itself, so a popup nobody has snapshotted resolves
+ * no ref at all and one somebody has snapshotted has already invalidated the old generation. Verified
+ * both ways round. What the bump buys is the honest refusal — "the page is now at 4, take a new
+ * snapshot" instead of "nothing on this page has the ref e3", which describes an element as missing
+ * from a page the Bot does not yet know it is on.
  *
- * Where it is load-bearing is `/human/secret`, which deliberately does not check the generation at
- * all. That path compares the activation instead, and the note there says what it costs not to.
+ * FOR THE PERSON: A WINDOW THEY DID NOT OPEN DOES NOT GET THEIR KEYSTROKES UNTIL THEY SAY SO. This is
+ * the part that is not about tidiness. Which page the screen follows is chosen by the site, not by
+ * us. Every click a Bot makes is a user gesture, so a page carrying a compromised third-party script
+ * can open a window at any address it likes and have it take the live screen within a second —
+ * arriving, in a sign-in the Bot has just handed over for, at the exact moment the person is expecting
+ * a sign-in window to arrive. Following popups is what makes that possible, so it ships with the
+ * answer to it rather than without.
  *
- * The price of invalidating is a wasted turn whenever a popup opens and closes between a snapshot and
- * the action it was taken for, even where the opener's refs would still have been good. That is the
- * trade the other way round from #236 and #163, and it is the right way round here: a stale ref that
- * fails loudly is a retry, and a stale ref that resolves is an action nobody asked for.
+ * The answer is not a block: `accounts.google.com` opened from `typefully.com` is cross-origin and is
+ * the whole use case. It is that the first time a window at an origin this person has not already
+ * accepted takes the screen, their input is refused until they confirm the address — which is the
+ * check anybody should be making on a sign-in window anyway, put in front of them at the one moment
+ * it matters. Redirect hops inside that window do not ask again, and neither does coming back to a
+ * page they were already on, because both would train the confirmation into a reflex and a reflex
+ * protects nobody.
+ *
+ * WHAT THIS DOES NOT COVER, said plainly: a page navigating itself to another origin without a new
+ * window. That is not raised here, because a person driving a browser follows links and a
+ * confirmation on every hop is the reflex above. The live screen shows the origin at all times and
+ * updates it on every navigation, which is the cover for that case and the reason the origin is kept
+ * current below even when the page has not changed.
  */
 async function currentPage(botId: string): Promise<Page> {
-  const { page, activation } = await profiles.activePage(botId);
+  const front = await profiles.frontPage(botId);
   const session = sessionFor(botId);
-  if (session.pageActivation !== activation) {
-    session.pageActivation = activation;
+  const previous = session.front;
+
+  if (previous?.activation !== front.activation) {
     // The same bump a new document gets from `/navigate`, for the same reason: every ref handed out
     // before now describes a document that is no longer the one being acted on.
     session.snapshotId += 1;
+    /*
+     * Only when there was a page before this one. The first look of a session has switched from
+     * nothing, which is not a window arriving under somebody's hands, and a person cannot have taken
+     * the wheel through a session that has never resolved a page.
+     */
+    if (
+      previous &&
+      session.control.humanMayDrive() &&
+      !session.acceptedOrigins.has(front.origin)
+    ) {
+      session.unaccepted = { origin: front.origin, url: front.page.url() };
+    }
   }
-  return page;
+  session.front = {
+    activation: front.activation,
+    pageId: front.pageId,
+    // Re-read every time. A page that navigates itself is still the same page, and an address the
+    // person is shown, or that a pending secret is checked against, has to be the one it is on now.
+    origin: front.origin,
+  };
+  return front.page;
 }
 
 /**
@@ -428,12 +494,45 @@ serve<StreamData>({
         };
 
         /*
+         * What document the screen is showing, sent whenever it changes.
+         *
+         * THE SCREEN USED TO SAY NOTHING ABOUT WHAT IT WAS SHOWING, and once a Bot follows the windows
+         * a site opens, that is a way to be lied to: the page being cast is chosen by the site, the
+         * swap happens within a second, and the only surface that named a page at all was the static
+         * screenshot card, which is not this. A person driving a browser needs the address the way
+         * they need it in their own browser, so it goes up the same socket as the frames and the app
+         * draws it above them.
+         *
+         * Sent on a change of URL rather than only a change of page, so that a page navigating itself
+         * — a redirect hop through a sign-in, a link the person clicked — moves the address too. The
+         * acceptance flag is part of what is compared, so the moment the person confirms a window the
+         * banner clears without waiting for anything else to happen.
+         */
+        let announced: string | undefined;
+        const announce = (target: Page) => {
+          const url = target.url();
+          const awaitingAcceptance = Boolean(session.unaccepted);
+          const signature = `${url}\n${awaitingAcceptance}`;
+          if (signature === announced) return;
+          announced = signature;
+          send({
+            type: "page",
+            url,
+            origin: originOf(url),
+            awaitingAcceptance,
+          });
+        };
+
+        /*
          * The cast follows the Bot's current page. Re-checking also handles a page being closed
          * underneath us without a listener per page.
          */
         let casting: Page | undefined;
         const attach = async () => {
           const target = await currentPage(ws.data.botId);
+          // Every tick, not only on a change of page: the address has to keep up with a page that
+          // navigates, and this is a synchronous read of a string.
+          announce(target);
           if (target === casting) return;
           const previous = session.viewer;
           const cast = await startScreencast(target, send);
@@ -462,10 +561,28 @@ serve<StreamData>({
     async message(ws, raw) {
       const session = sessionFor(ws.data.botId);
       if (!session.viewer) return;
-      let message: InputMessage;
+      let message: InputMessage | { type: "accept-page" };
       try {
-        message = JSON.parse(String(raw)) as InputMessage;
+        message = JSON.parse(String(raw)) as
+          | InputMessage
+          | { type: "accept-page" };
       } catch {
+        return;
+      }
+      /*
+       * The person saying they meant to be on the window that took their screen.
+       *
+       * The origin is taken from what is pending rather than from what the client sent, so a client
+       * cannot accept an address it made up, and the whole point is that the value being agreed to is
+       * the one the server showed. Accepted for this takeover rather than once: coming back to a page
+       * they have already agreed to must not ask again.
+       */
+      if (message.type === "accept-page") {
+        const pending = session.unaccepted;
+        if (pending) {
+          session.acceptedOrigins.add(pending.origin);
+          session.unaccepted = undefined;
+        }
         return;
       }
       // A person's input is accepted only while they hold the wheel. The socket being open is not permission:
@@ -475,6 +592,18 @@ serve<StreamData>({
       // Refuse with an error so the surface can explain why input is ignored.
       if (!session.control.humanMayDrive()) {
         ws.send(JSON.stringify({ type: "error", error: TAKE_CONTROL_FIRST }));
+        return;
+      }
+      // A window that took the screen and has not been accepted gets nothing. See `currentPage` for
+      // why this exists; the refusal is worded so the surface can put the address in front of the
+      // person rather than merely refusing them.
+      if (session.unaccepted) {
+        ws.send(
+          JSON.stringify({
+            type: "error",
+            error: unacceptedPageMessage(session.unaccepted.origin),
+          }),
+        );
         return;
       }
       try {
@@ -610,10 +739,12 @@ serve<StreamData>({
         return json(
           session.control.requestSecret({
             ...(body ?? {}),
-            // Which of the browser's pages the ref came from. The Bot has necessarily taken a
-            // snapshot to have a ref at all, and a snapshot goes through `currentPage`, so this is
-            // the page it was describing. See the note on `secretActivation` in control.ts.
-            activation: session.pageActivation,
+            // Which page the ref came from, and whose document it was showing. The Bot has
+            // necessarily taken a snapshot to have a ref at all, and a snapshot goes through
+            // `currentPage`, so this is the page it was describing. The origin is also what the
+            // person is shown beside the masked box. See the note in control.ts.
+            pageId: session.front?.pageId,
+            origin: session.front?.origin,
           }),
         );
       } catch (error) {
@@ -652,7 +783,7 @@ serve<StreamData>({
       try {
         const target = await currentPage(botId);
         /*
-         * The browser has to still be on the page the Bot was looking at when it asked.
+         * The browser has to still be on the page the Bot named, showing the site it was showing.
          *
          * This is the one guard the secret path cannot do without. Everything else here is
          * deliberately permissive about the snapshot generation, because a Bot may reasonably take
@@ -666,22 +797,29 @@ serve<StreamData>({
          * popup's URL, and nothing anywhere said the field had not been the one the Bot described.
          * This is the hazard that following a popup at all creates, so it is closed here rather than
          * left for whoever meets it.
+         *
+         * The page rather than a count of switches, and this is a correction rather than a
+         * refinement. Counting switches also refused the case where a window opened and closed again:
+         * the browser was back on the page the ref names, the ref still resolved, and the person's
+         * paste was thrown away and had to be asked for again — which an advert that opens and closes
+         * a window on a timer could have farmed into a loop. What is asked here is whether this is
+         * the page, which is the question that was always meant.
+         *
+         * It is not a check that the page is the one the person INTENDED, and nothing here can be:
+         * the Bot chose the field, and if the Bot is working on a hostile page then the field it
+         * named is on a hostile page. What makes that answerable is the origin travelling to the
+         * surface with the request, so the masked box says whose site is about to receive this.
          */
-        if (
-          pending.activation !== undefined &&
-          pending.activation !== session.pageActivation
-        ) {
+        const front = {
+          pageId: session.front?.pageId ?? "",
+          origin: session.front?.origin ?? "",
+        };
+        if (!secretIsForThisPage(pending, front)) {
           // Closed rather than left open. The ref names a field on a page that is no longer in front
           // of the browser, so retyping cannot help; the Bot sees nothing pending on its next turn
           // and asks again against a snapshot of the page that is actually there.
           session.control.secretSupplied();
-          return json(
-            {
-              error:
-                "The browser has moved to another page since that value was asked for, so the field it named is not the one in front of you. Ask the assistant to request it again.",
-            },
-            409,
-          );
+          return json({ error: secretMovedMessage(pending, front) }, 409);
         }
         // Focus the field the Bot named, and let this throw if it cannot be found. A secret must not
         // be reported as delivered unless a field receives it.
@@ -724,13 +862,34 @@ serve<StreamData>({
     }
 
     if (url.pathname === "/control/take" && request.method === "POST") {
-      return json(session.control.take());
+      /*
+       * Whatever is on screen when somebody presses "Take control" is a page they have accepted.
+       *
+       * Resolved before the handover rather than after, so that this call cannot be the thing that
+       * raises its own confirmation: while the Bot still holds the wheel, `currentPage` raises
+       * nothing. Without it the person's first act after taking control would be confirming the page
+       * they deliberately took control of, which is the reflex that makes every later confirmation
+       * worthless.
+       *
+       * Tolerant of failing. A browser that cannot produce a page has not switched to anything
+       * either, so there is nothing to accept and nothing to refuse; the empty set errs towards
+       * asking, which is the safe direction.
+       */
+      const showing = await currentPage(botId).catch(() => undefined);
+      const state = session.control.take();
+      session.acceptedOrigins = new Set(
+        showing ? [originOf(showing.url())] : [],
+      );
+      session.unaccepted = undefined;
+      return json(state);
     }
 
     if (url.pathname === "/control/release" && request.method === "POST") {
       // `reason` is dropped on release: it described the thing the person was asked to do, and once
       // they have done it, leaving it set would have the surface still showing the old request.
-      return json(session.control.release());
+      // What this person accepted goes with it: it was their judgement about their session, and the
+      // next person to take the wheel has agreed to nothing.
+      return json(handBack(session));
     }
 
     // A person's input, by pixel. The Bot addresses elements by reference because it reads a list; a
@@ -746,6 +905,15 @@ serve<StreamData>({
       > | null;
       try {
         const target = await currentPage(botId);
+        // Resolved first, because resolving is what notices that a window has taken the screen. The
+        // socket carries the same refusal; this is the other door into the same browser and it must
+        // not be the quiet one.
+        if (session.unaccepted) {
+          return json(
+            { error: unacceptedPageMessage(session.unaccepted.origin) },
+            409,
+          );
+        }
         return json(await performHumanInput(target, url.pathname, body ?? {}));
       } catch (error) {
         return json({ error: describe(error, "That did not work.") }, 502);
@@ -785,7 +953,7 @@ serve<StreamData>({
     if (url.pathname === "/computers/stop" && request.method === "POST") {
       const wasRunning = await profiles.stop(botId);
       // The wheel goes back to the Bot because the controlled browser no longer exists.
-      session.control.release();
+      handBack(session);
       return json({ stopped: true, wasRunning });
     }
 
@@ -799,7 +967,7 @@ serve<StreamData>({
     if (url.pathname === "/computers/reset" && request.method === "POST") {
       await profiles.reset(botId);
       // Reset releases control because any previous browser session and pending secret request are gone.
-      session.control.release();
+      handBack(session);
       return json({ reset: true, botId });
     }
 
