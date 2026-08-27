@@ -7,7 +7,10 @@ import type {
   RoutingCandidate,
   RoutingUndecided,
 } from "../src/routing/classify";
-import { createCoworkerRoutingService } from "../src/routing/service";
+import {
+  createCoworkerRoutingService,
+  normalizeCoworkerName,
+} from "../src/routing/service";
 
 const ACTOR = { id: "u1", role: "user" } as const;
 
@@ -193,6 +196,48 @@ describe("CoworkerRoutingService", () => {
     expect(modelCalls).toEqual([]);
   });
 
+  test("returns choices when two independent explicit names appear in long-to-short order", async () => {
+    const { service, modelCalls } = makeService();
+
+    expect(
+      await service.route({
+        actor: ACTOR,
+        text: "ask Risk Analyst and Knowledge to review this",
+      }),
+    ).toEqual({
+      kind: "ambiguous",
+      names: ["Knowledge", "Risk Analyst"],
+    });
+    expect(modelCalls).toEqual([]);
+  });
+
+  test("returns choices when two independent explicit names appear in short-to-long order", async () => {
+    const { service, modelCalls } = makeService();
+
+    expect(
+      await service.route({
+        actor: ACTOR,
+        text: "ask Knowledge and Risk Analyst to review this",
+      }),
+    ).toEqual({
+      kind: "ambiguous",
+      names: ["Knowledge", "Risk Analyst"],
+    });
+    expect(modelCalls).toEqual([]);
+  });
+
+  test("selects a profile when all explicit mentions refer to that same profile", async () => {
+    const { service, modelCalls } = makeService();
+
+    expect(
+      await service.route({
+        actor: ACTOR,
+        text: "ask Risk Analyst and Risk Analyst to review this",
+      }),
+    ).toMatchObject({ kind: "selected", agentId: "risk", viaMention: true });
+    expect(modelCalls).toEqual([]);
+  });
+
   test("labels duplicate normalized names distinctly and resolves a chosen label", async () => {
     const { service, modelCalls } = makeService({
       roster: [
@@ -208,12 +253,12 @@ describe("CoworkerRoutingService", () => {
       }),
     ).toEqual({
       kind: "ambiguous",
-      names: ["Risk Analyst (risk-copy)", "Risk Analyst (risk-id)"],
+      names: ["Risk Analyst (option 1)", "Risk Analyst (option 2)"],
     });
     expect(
       await service.route({
         actor: ACTOR,
-        text: "ask Risk Analyst (risk-copy) to review this",
+        text: "ask Risk Analyst (option 1) to review this",
       }),
     ).toMatchObject({
       kind: "selected",
@@ -221,6 +266,67 @@ describe("CoworkerRoutingService", () => {
       viaMention: true,
     });
     expect(modelCalls).toEqual([]);
+  });
+
+  test("uses stable option labels when duplicate ids differ only by case", async () => {
+    const roster = [
+      profile("risk", "Risk Analyst"),
+      profile("Risk", "Risk Analyst"),
+    ];
+    const { service, modelCalls } = makeService({ roster });
+
+    const result = await service.route({
+      actor: ACTOR,
+      text: "ask risk analyst to review this",
+    });
+    expect(result).toEqual({
+      kind: "ambiguous",
+      names: ["Risk Analyst (option 1)", "Risk Analyst (option 2)"],
+    });
+    expect(new Set(result.names.map(normalizeCoworkerName)).size).toBe(
+      result.names.length,
+    );
+    expect(
+      await service.route({
+        actor: ACTOR,
+        text: "ask Risk Analyst (option 1) to review this",
+      }),
+    ).toMatchObject({ kind: "selected", agentId: "Risk" });
+    expect(modelCalls).toEqual([]);
+  });
+
+  test("uses NFKC-distinct option labels with an order-independent mapping", async () => {
+    const optionA = profile("A", "Risk Analyst");
+    const optionFullWidthA = profile("Ａ", "Risk Analyst");
+    const forward = makeService({ roster: [optionFullWidthA, optionA] });
+    const reverse = makeService({ roster: [optionA, optionFullWidthA] });
+
+    const forwardResult = await forward.service.route({
+      actor: ACTOR,
+      text: "ask risk analyst to review this",
+    });
+    const reverseResult = await reverse.service.route({
+      actor: ACTOR,
+      text: "ask risk analyst to review this",
+    });
+
+    expect(forwardResult).toEqual({
+      kind: "ambiguous",
+      names: ["Risk Analyst (option 1)", "Risk Analyst (option 2)"],
+    });
+    expect(reverseResult).toEqual(forwardResult);
+    expect(
+      await forward.service.route({
+        actor: ACTOR,
+        text: "ask Risk Analyst (option 1) to review this",
+      }),
+    ).toMatchObject({ kind: "selected", agentId: "A" });
+    expect(
+      await forward.service.route({
+        actor: ACTOR,
+        text: "ask Risk Analyst (option 2) to review this",
+      }),
+    ).toMatchObject({ kind: "selected", agentId: "Ａ" });
   });
 
   test("returns none for an absent or empty visible roster", async () => {

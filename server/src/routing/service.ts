@@ -67,13 +67,28 @@ function hasTokenBoundaries(text: string, start: number, end: number): boolean {
     : false;
 }
 
-function containsName(text: string, name: string): boolean {
-  let start = text.indexOf(name);
+type AliasOccurrence = {
+  alias: string;
+  start: number;
+  end: number;
+  profiles: ReadonlyMap<string, AgentProfile>;
+};
+
+function occurrencesOf(
+  text: string,
+  alias: string,
+  profiles: ReadonlyMap<string, AgentProfile>,
+): AliasOccurrence[] {
+  const occurrences: AliasOccurrence[] = [];
+  let start = text.indexOf(alias);
   while (start >= 0) {
-    if (hasTokenBoundaries(text, start, start + name.length)) return true;
-    start = text.indexOf(name, start + name.length);
+    const end = start + alias.length;
+    if (hasTokenBoundaries(text, start, end)) {
+      occurrences.push({ alias, start, end, profiles });
+    }
+    start = text.indexOf(alias, start + alias.length);
   }
-  return false;
+  return occurrences;
 }
 
 function actorId(actor: RoutingActor): string | undefined {
@@ -87,6 +102,19 @@ function suffixes(name: string): string[] {
 
 function displayName(name: string): string {
   return name.normalize("NFKC").trim().replace(/\s+/gu, " ");
+}
+
+function codePointCompare(left: string, right: string): number {
+  const leftPoints = [...left];
+  const rightPoints = [...right];
+  for (let index = 0; index < leftPoints.length; index += 1) {
+    const leftPoint = leftPoints[index]?.codePointAt(0);
+    const rightPoint = rightPoints[index]?.codePointAt(0);
+    if (leftPoint === undefined) return -1;
+    if (rightPoint === undefined) return 1;
+    if (leftPoint !== rightPoint) return leftPoint - rightPoint;
+  }
+  return leftPoints.length - rightPoints.length;
 }
 
 type AliasIndex = {
@@ -109,26 +137,33 @@ function buildAliasIndex(roster: readonly AgentProfile[]): AliasIndex {
   const byNormalizedName = new Map<string, AgentProfile[]>();
   for (const profile of roster) {
     const normalized = normalizeCoworkerName(profile.name);
-    byNormalizedName.set(normalized, [
-      ...(byNormalizedName.get(normalized) ?? []),
-      profile,
-    ]);
+    const profiles = byNormalizedName.get(normalized);
+    if (profiles) profiles.push(profile);
+    else byNormalizedName.set(normalized, [profile]);
   }
 
+  const duplicateOptions = new Map<string, number>();
+  for (const profiles of byNormalizedName.values()) {
+    if (profiles.length < 2) continue;
+    profiles
+      .toSorted((left, right) => codePointCompare(left.id, right.id))
+      .forEach((profile, index) => {
+        duplicateOptions.set(profile.id, index + 1);
+      });
+  }
   const aliases = new Map<string, Map<string, AgentProfile>>();
   const labels = new Map<string, string>();
   for (const profile of roster) {
     const normalized = normalizeCoworkerName(profile.name);
-    const duplicates = byNormalizedName.get(normalized) ?? [];
-    const label =
-      duplicates.length > 1
-        ? `${displayName(profile.name)} (${profile.id})`
-        : profile.name;
+    const option = duplicateOptions.get(profile.id);
+    const label = option
+      ? `${displayName(profile.name)} (option ${option})`
+      : profile.name;
     labels.set(profile.id, label);
     addAlias(aliases, normalized, profile);
     for (const suffix of suffixes(normalized))
       addAlias(aliases, suffix, profile);
-    if (duplicates.length > 1) {
+    if (option) {
       addAlias(aliases, normalizeCoworkerName(label), profile);
     }
   }
@@ -141,7 +176,7 @@ function labelsFor(
 ): string[] {
   return [...profiles]
     .map((profile) => labels.get(profile.id) ?? profile.name)
-    .sort((left, right) => left.localeCompare(right));
+    .sort(codePointCompare);
 }
 
 function explicitNameRoute(
@@ -150,35 +185,37 @@ function explicitNameRoute(
 ): CoworkerRouteResult | null {
   const normalizedText = normalizeCoworkerName(text);
   const { aliases, labels } = buildAliasIndex(roster);
-  const matches = [...aliases.entries()]
-    .filter(([alias]) => containsName(normalizedText, alias))
-    .sort(([left], [right]) => right.length - left.length);
-  for (let start = 0; start < matches.length; ) {
-    const aliasLength = matches[start]?.[0].length;
-    if (aliasLength === undefined) break;
-    const sameLength = matches
-      .slice(start)
-      .filter(([alias]) => alias.length === aliasLength);
-    const profiles = new Map<string, AgentProfile>();
-    for (const [, candidates] of sameLength) {
-      for (const profile of candidates.values())
-        profiles.set(profile.id, profile);
+  const occurrences = [...aliases.entries()].flatMap(([alias, profiles]) =>
+    occurrencesOf(normalizedText, alias, profiles),
+  );
+  const explicitOccurrences = occurrences.filter(
+    (occurrence) =>
+      !occurrences.some(
+        (other) =>
+          other.alias.length > occurrence.alias.length &&
+          other.start < occurrence.end &&
+          occurrence.start < other.end,
+      ),
+  );
+  const profiles = new Map<string, AgentProfile>();
+  for (const occurrence of explicitOccurrences) {
+    for (const profile of occurrence.profiles.values()) {
+      profiles.set(profile.id, profile);
     }
-    if (profiles.size === 1) {
-      const chosen = profiles.values().next().value as AgentProfile;
-      return {
-        kind: "selected",
-        agentId: chosen.id,
-        name: chosen.name,
-        reason: "named by the person asking",
-        fallback: false,
-        viaMention: true,
-      };
-    }
-    if (profiles.size > 1) {
-      return { kind: "ambiguous", names: labelsFor(profiles.values(), labels) };
-    }
-    start += sameLength.length;
+  }
+  if (profiles.size === 1) {
+    const chosen = profiles.values().next().value as AgentProfile;
+    return {
+      kind: "selected",
+      agentId: chosen.id,
+      name: chosen.name,
+      reason: "named by the person asking",
+      fallback: false,
+      viaMention: true,
+    };
+  }
+  if (profiles.size > 1) {
+    return { kind: "ambiguous", names: labelsFor(profiles.values(), labels) };
   }
   return null;
 }
