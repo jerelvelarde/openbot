@@ -1102,6 +1102,140 @@ test("a retry cannot adopt or rekey mismatched non-2xx recovery media", async ()
   await waitFor(() => expect(uploads).toBe(3));
 });
 
+test("a retry cannot adopt malformed successful authority or mutate local media state", async () => {
+  const { DraftCanvas } = await import(
+    "../src/components/typefully/draft-canvas"
+  );
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
+    },
+  });
+  queryClient.setQueryData(typefullyKeys.draft(draftId), {
+    draft: authoritativeDraft(),
+  });
+  const authoritativeMedia = {
+    id: "authoritative-success-retry-media",
+    kind: "image" as const,
+    order: 0,
+    altText: "",
+    remoteId: null,
+  };
+  const uploadedFiles: File[] = [];
+  let uploads = 0;
+  globalThis.fetch = (async (_input, init) => {
+    if ((init?.method ?? "GET") === "POST") {
+      uploads += 1;
+      const file =
+        init?.body instanceof FormData ? init.body.get("file") : undefined;
+      if (file instanceof File) uploadedFiles.push(file);
+      if (uploads === 1) {
+        return new Response(
+          JSON.stringify({
+            code: "remote_error",
+            draft: {
+              id: draftId,
+              title: "Production route draft",
+              destinations: ["x"],
+              socialSetLabel: "Route account",
+              mediaCount: 1,
+              version: 2,
+              syncStatus: "remote_error",
+              proposalStatus: null,
+            },
+            media: authoritativeMedia,
+          }),
+          { status: 502, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          draft: {
+            id: draftId,
+            title: "Production route draft",
+            destinations: ["x"],
+            socialSetLabel: "Route account",
+            mediaCount: 1,
+            version: 999,
+            syncStatus: "synced",
+            proposalStatus: null,
+          },
+          media: {
+            ...authoritativeMedia,
+            remoteId: "untrusted-completed-media",
+          },
+        }),
+        { status: 201, headers: { "content-type": "application/json" } },
+      );
+    }
+    return new Response(
+      JSON.stringify({
+        draft: {
+          ...authoritativeDraft(),
+          document: {
+            ...authoritativeDraft().document,
+            media: [authoritativeMedia],
+          },
+          version: 2,
+          contentHash: "hash-2",
+          remoteVersion: 1,
+          syncStatus: "remote_error",
+        },
+      }),
+      { headers: { "content-type": "application/json" } },
+    );
+  }) as typeof fetch;
+  const view = render(
+    <QueryClientProvider client={queryClient}>
+      <DraftCanvas draftId={draftId} />
+    </QueryClientProvider>,
+  );
+  const user = userEvent.setup({ document });
+  const selectedFile = new File(["image"], "launch.png", {
+    type: "image/png",
+  });
+  await user.upload(view.getByLabelText("Add media"), selectedFile);
+  const retry = await view.findByRole("button", { name: "Retry image 1" });
+  const priorCache = queryClient.getQueryData(typefullyKeys.draft(draftId));
+  const priorItemAlert = view.getByRole("alert").textContent;
+  const priorStatus = view.getByTestId("canvas-status").textContent;
+  const priorPreviewSource = view
+    .getByTestId("preview-media")
+    .getAttribute("src");
+  const priorAltText = (
+    view.getByRole("textbox", {
+      name: "Alt text for image 1",
+    }) as HTMLInputElement
+  ).value;
+
+  await user.click(retry);
+  await waitFor(() => expect(uploads).toBe(2));
+
+  expect(queryClient.getQueryData(typefullyKeys.draft(draftId))).toBe(
+    priorCache,
+  );
+  expect(view.getByTestId("canvas-status").textContent).toBe(priorStatus);
+  expect(view.getByTestId("preview-media").getAttribute("src")).toBe(
+    priorPreviewSource,
+  );
+  expect(
+    (
+      view.getByRole("textbox", {
+        name: "Alt text for image 1",
+      }) as HTMLInputElement
+    ).value,
+  ).toBe(priorAltText);
+  expect(
+    view.getAllByRole("alert").map((alert) => alert.textContent),
+  ).toContain(priorItemAlert);
+  expect(view.getByRole("button", { name: "Retry image 1" })).toBeTruthy();
+  expect(uploadedFiles[1]).toBe(selectedFile);
+
+  await user.click(view.getByRole("button", { name: "Retry image 1" }));
+  await waitFor(() => expect(uploads).toBe(3));
+  expect(uploadedFiles[2]).toBe(selectedFile);
+});
+
 test("media busy locks edits and an autosave error blocks media operations", async () => {
   const { DraftCanvas } = await import(
     "../src/components/typefully/draft-canvas"

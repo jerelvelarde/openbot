@@ -39,10 +39,58 @@ export type TypefullyConnection = {
 };
 
 type CachedDraft = { draft: AuthoritativeDraft };
+type UploadMutationInput = {
+  draftId: string;
+  expectedVersion: number;
+  kind: "image" | "video";
+  altText: string;
+  mediaId?: string;
+};
+
+function requestBoundUploadAuthority(
+  record: { draft: unknown; media: unknown; remote?: unknown },
+  input: UploadMutationInput,
+  contract: {
+    allowedVersionDeltas: readonly number[];
+    requireCompleted?: boolean;
+    requireSynced?: boolean;
+  },
+): MediaMutationResponse | undefined {
+  const draft = draftSummary(record.draft);
+  const media = mediaDescriptor(record.media);
+  const hasRemote = record.remote !== undefined;
+  const remote = hasRemote ? remoteDraftState(record.remote) : undefined;
+  if (!draft || !media) return;
+  const versionDelta = draft.version - input.expectedVersion;
+  if (
+    !contract.allowedVersionDeltas.includes(versionDelta) ||
+    draft.id !== input.draftId ||
+    (input.mediaId !== undefined && media.id !== input.mediaId) ||
+    draft.mediaCount < 1 ||
+    media.order >= draft.mediaCount ||
+    (input.mediaId === undefined && media.order !== draft.mediaCount - 1) ||
+    media.kind !== input.kind ||
+    media.altText !== input.altText ||
+    (contract.requireCompleted && media.remoteId === null) ||
+    (contract.requireSynced && draft.syncStatus !== "synced") ||
+    (hasRemote &&
+      (!remote ||
+        remote.state !== draft.syncStatus ||
+        (remote.confirmedVersion !== null &&
+          remote.confirmedVersion > draft.version) ||
+        (remote.state === "synced" &&
+          (remote.remoteDraftId === null ||
+            remote.confirmedVersion !== draft.version ||
+            remote.confirmedHash === null))))
+  ) {
+    return;
+  }
+  return { draft, media, ...(remote ? { remote } : {}) };
+}
 
 function parseMediaMutationSuccess(
   payload: unknown,
-  input: { draftId: string; mediaId?: string },
+  input: UploadMutationInput,
 ): MediaMutationResponse {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     throw new TypefullyClientError("remote_invalid_response");
@@ -52,20 +100,23 @@ function parseMediaMutationSuccess(
   if (Object.keys(record).some((key) => !allowed.has(key))) {
     throw new TypefullyClientError("remote_invalid_response");
   }
-  const draft = draftSummary(record.draft);
-  const media = mediaDescriptor(record.media);
-  const remote =
-    record.remote === undefined ? undefined : remoteDraftState(record.remote);
-  if (
-    !draft ||
-    !media ||
-    draft.id !== input.draftId ||
-    (input.mediaId !== undefined && media.id !== input.mediaId) ||
-    (record.remote !== undefined && !remote)
-  ) {
+  const authority = requestBoundUploadAuthority(
+    {
+      draft: record.draft,
+      media: record.media,
+      ...(record.remote === undefined ? {} : { remote: record.remote }),
+    },
+    input,
+    {
+      allowedVersionDeltas: [input.mediaId === undefined ? 2 : 1],
+      requireCompleted: true,
+      requireSynced: true,
+    },
+  );
+  if (!authority) {
     throw new TypefullyClientError("remote_invalid_response");
   }
-  return { draft, media, ...(remote ? { remote } : {}) };
+  return authority;
 }
 
 function boundMediaMutationFailure(
@@ -146,13 +197,7 @@ const uploadEarlyFailureCodes = new Set([
 
 function normalizeMediaMutationErrorPayload(
   payload: unknown,
-  input: {
-    draftId: string;
-    expectedVersion: number;
-    kind: "image" | "video";
-    altText: string;
-    mediaId?: string;
-  },
+  input: UploadMutationInput,
 ): unknown {
   const parsed = uploadErrorEnvelopeSchema.safeParse(payload);
   if (!parsed.success) {
@@ -174,16 +219,16 @@ function normalizeMediaMutationErrorPayload(
     }
     return record;
   }
-  const draft = draftSummary(record.draft);
-  const media = mediaDescriptor(record.media);
   const hasRemote = "remote" in record;
-  const remote = hasRemote ? remoteDraftState(record.remote) : undefined;
+  const authority = requestBoundUploadAuthority(record, input, {
+    allowedVersionDeltas: input.mediaId ? [0, 1] : [1, 2],
+  });
+  const draft = authority?.draft;
+  const media = authority?.media;
+  const remote = authority?.remote;
   const versionDelta = draft
     ? draft.version - input.expectedVersion
     : Number.NaN;
-  const allowedVersion = input.mediaId
-    ? versionDelta === 0 || versionDelta === 1
-    : versionDelta === 1 || versionDelta === 2;
   const lateVersionDelta = input.mediaId ? 1 : 2;
   const isEarlyFailure = uploadEarlyFailureCodes.has(record.code);
   const requiresDraftId =
@@ -194,15 +239,7 @@ function normalizeMediaMutationErrorPayload(
   if (
     !draft ||
     !media ||
-    !allowedVersion ||
-    draft.id !== input.draftId ||
-    (input.mediaId !== undefined && media.id !== input.mediaId) ||
     (record.draftId !== undefined && record.draftId !== draft.id) ||
-    draft.mediaCount < 1 ||
-    media.order >= draft.mediaCount ||
-    (input.mediaId === undefined && media.order !== draft.mediaCount - 1) ||
-    media.kind !== input.kind ||
-    media.altText !== input.altText ||
     (versionDelta === lateVersionDelta && media.remoteId === null) ||
     (isEarlyFailure && versionDelta === lateVersionDelta) ||
     (isEarlyFailure &&
@@ -219,13 +256,7 @@ function normalizeMediaMutationErrorPayload(
       ? record.draftId !== input.draftId
       : record.draftId !== undefined) ||
     (record.retryAt !== undefined && record.code !== "remote_error") ||
-    (hasRemote &&
-      (!remote ||
-        remote.state !== draft.syncStatus ||
-        (remote.confirmedVersion !== null &&
-          remote.confirmedVersion > draft.version) ||
-        (remote.state === "synced" &&
-          remote.confirmedVersion !== draft.version)))
+    (hasRemote && !remote)
   ) {
     throw new TypefullyClientError("remote_invalid_response");
   }

@@ -1442,14 +1442,139 @@ describe("Typefully mutation contracts", () => {
     });
   });
 
+  test("accepts a completed retry only at expected version plus one", async () => {
+    const media = {
+      id: "retry-success",
+      kind: "image" as const,
+      order: 0,
+      altText: "Retry success",
+      remoteId: "typefully-media-retry",
+    };
+    globalThis.fetch = (async () =>
+      json({
+        draft: { ...draftSummary(3), mediaCount: 1 },
+        remote: {
+          state: "synced",
+          remoteDraftId: "remote-3",
+          confirmedVersion: 3,
+          confirmedHash: "remote-hash-3",
+        },
+        media,
+      })) as typeof fetch;
+
+    await expect(
+      mutate(uploadMediaMutationOptions(), {
+        draftId: "draft-1",
+        expectedVersion: 2,
+        mediaId: media.id,
+        kind: media.kind,
+        altText: media.altText,
+        file: new File(["x"], "x.png", { type: "image/png" }),
+      }),
+    ).resolves.toEqual({
+      draft: { ...draftSummary(3), mediaCount: 1 },
+      remote: {
+        state: "synced",
+        remoteDraftId: "remote-3",
+        confirmedVersion: 3,
+        confirmedHash: "remote-hash-3",
+      },
+      media,
+    });
+  });
+
   test.each([
     {
-      name: "malformed truthy media fields",
+      name: "an arbitrary later generation",
       inputMediaId: undefined,
       response: {
-        draft: { ...draftSummary(2), mediaCount: 1 },
+        draft: { ...draftSummary(999), mediaCount: 1 },
         media: {
-          id: "media-malformed",
+          id: "media-later-generation",
+          kind: "image",
+          order: 0,
+          altText: "Launch",
+          remoteId: "remote-1",
+        },
+      },
+    },
+    {
+      name: "a zero media count",
+      inputMediaId: undefined,
+      response: {
+        draft: { ...draftSummary(3), mediaCount: 0 },
+        media: {
+          id: "media-zero-count",
+          kind: "image",
+          order: 0,
+          altText: "Launch",
+          remoteId: "remote-1",
+        },
+      },
+    },
+    {
+      name: "an out-of-range media order",
+      inputMediaId: undefined,
+      response: {
+        draft: { ...draftSummary(3), mediaCount: 1 },
+        media: {
+          id: "media-bad-order",
+          kind: "image",
+          order: 5,
+          altText: "Launch",
+          remoteId: "remote-1",
+        },
+      },
+    },
+    {
+      name: "a mismatched media kind",
+      inputMediaId: undefined,
+      response: {
+        draft: { ...draftSummary(3), mediaCount: 1 },
+        media: {
+          id: "media-wrong-kind",
+          kind: "video",
+          order: 0,
+          altText: "Launch",
+          remoteId: "remote-1",
+        },
+      },
+    },
+    {
+      name: "mismatched alt text",
+      inputMediaId: undefined,
+      response: {
+        draft: { ...draftSummary(3), mediaCount: 1 },
+        media: {
+          id: "media-wrong-alt",
+          kind: "image",
+          order: 0,
+          altText: "Different",
+          remoteId: "remote-1",
+        },
+      },
+    },
+    {
+      name: "a missing completed remote id",
+      inputMediaId: undefined,
+      response: {
+        draft: { ...draftSummary(3), mediaCount: 1 },
+        media: {
+          id: "media-missing-remote",
+          kind: "image",
+          order: 0,
+          altText: "Launch",
+          remoteId: null,
+        },
+      },
+    },
+    {
+      name: "a malformed completed remote id",
+      inputMediaId: undefined,
+      response: {
+        draft: { ...draftSummary(3), mediaCount: 1 },
+        media: {
+          id: "media-malformed-remote",
           kind: "image",
           order: 0,
           altText: "Launch",
@@ -1458,10 +1583,70 @@ describe("Typefully mutation contracts", () => {
       },
     },
     {
+      name: "a remote state that contradicts the draft",
+      inputMediaId: undefined,
+      response: {
+        draft: { ...draftSummary(3), mediaCount: 1 },
+        remote: {
+          state: "local",
+          remoteDraftId: "remote-3",
+          confirmedVersion: 3,
+          confirmedHash: "remote-hash-3",
+        },
+        media: {
+          id: "media-remote-state",
+          kind: "image",
+          order: 0,
+          altText: "Launch",
+          remoteId: "remote-1",
+        },
+      },
+    },
+    {
+      name: "a stale confirmed remote version",
+      inputMediaId: undefined,
+      response: {
+        draft: { ...draftSummary(3), mediaCount: 1 },
+        remote: {
+          state: "synced",
+          remoteDraftId: "remote-3",
+          confirmedVersion: 2,
+          confirmedHash: "remote-hash-2",
+        },
+        media: {
+          id: "media-remote-version",
+          kind: "image",
+          order: 0,
+          altText: "Launch",
+          remoteId: "remote-1",
+        },
+      },
+    },
+    {
+      name: "a synced response without a remote draft id",
+      inputMediaId: undefined,
+      response: {
+        draft: { ...draftSummary(3), mediaCount: 1 },
+        remote: {
+          state: "synced",
+          remoteDraftId: null,
+          confirmedVersion: 3,
+          confirmedHash: "remote-hash-3",
+        },
+        media: {
+          id: "media-remote-draft",
+          kind: "image",
+          order: 0,
+          altText: "Launch",
+          remoteId: "remote-1",
+        },
+      },
+    },
+    {
       name: "a mismatched draft",
       inputMediaId: undefined,
       response: {
-        draft: { ...draftSummary(2), id: "other-draft", mediaCount: 1 },
+        draft: { ...draftSummary(3), id: "other-draft", mediaCount: 1 },
         media: {
           id: "media-other-draft",
           kind: "image",
@@ -1520,7 +1705,7 @@ describe("Typefully mutation contracts", () => {
     },
   );
 
-  test("replaces an in-cache upload placeholder when its version plus two descriptor arrives", async () => {
+  test("replaces an in-cache retry placeholder when its version plus one descriptor arrives", async () => {
     const queryClient = new QueryClient({
       defaultOptions: { mutations: { retry: false } },
     });
@@ -1538,7 +1723,7 @@ describe("Typefully mutation contracts", () => {
     );
     const pending = observer.mutate({
       draftId: "draft-1",
-      expectedVersion: 1,
+      expectedVersion: 2,
       kind: "image",
       altText: "Completed upload",
       file: new File(["x"], "x.png", { type: "image/png" }),
