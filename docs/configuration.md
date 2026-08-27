@@ -35,13 +35,24 @@ the four Intelligence variables above and a usable app URL, either through `OPEN
 documented fallback, then attach Slack to that same Intelligence project with:
 
 ```sh
+npx copilotkit@latest login
+npx copilotkit@latest project select
 npx copilotkit@latest channels setup
 ```
 
 The command installs the current Channels setup guidance and prints the prompt used by the guided
-flow. In that flow, choose the existing Intelligence project, Channel name `openbot`, and Slack as
-the provider. The provider credentials stay in CopilotKit Intelligence; do not add Slack credential
-variables to OpenBot's `.env`.
+flow. Sign in first and select the existing Intelligence project whose runtime configuration OpenBot
+uses. In the guided flow, choose Channel name `openbot` and Slack as the provider.
+
+The current CLI needs the Slack bot token and signing secret while it attaches the provider. For
+Channel `openbot`, its generated environment names are
+`INTELLIGENCE_CHANNEL_OPENBOT_SLACK_BOT_TOKEN` and
+`INTELLIGENCE_CHANNEL_OPENBOT_SLACK_SIGNING_SECRET`. Supply them only through an ignored local
+`.env`, shell environment, or preferably the CLI's `--credentials-stdin` path backed by a secret
+manager. Never commit them. OpenBot's server loads the complete `.env`, even though its runtime code
+does not read these names, so remove local copies or unset shell variables immediately after the CLI
+reports a successful attachment and before starting OpenBot. CopilotKit Intelligence stores and
+uses the provider credentials after attachment; the running OpenBot process does not require them.
 
 Use the current CLI to inspect the declared and attached state:
 
