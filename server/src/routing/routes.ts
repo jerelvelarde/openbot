@@ -1,7 +1,7 @@
 import type { MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import type { AppVariables } from "../auth/guards";
-import type { CoworkerRoutingService } from "./service";
+import type { HttpCoworkerRoutingService } from "./service";
 
 /**
  * Translate the shared coworker-routing result into the established HTTP contract.
@@ -11,7 +11,7 @@ import type { CoworkerRoutingService } from "./service";
  * and turns its outcome into status codes and JSON.
  */
 export function createRoutingRoutes(
-  routing: CoworkerRoutingService,
+  routing: HttpCoworkerRoutingService,
   requireUser: MiddlewareHandler<{ Variables: AppVariables }>,
 ) {
   const routes = new Hono<{ Variables: AppVariables }>();
