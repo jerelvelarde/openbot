@@ -13,7 +13,9 @@ import {
   throwError,
 } from "rxjs";
 import { toArray } from "rxjs/operators";
+import { z } from "zod";
 import type { ActorAgentResolver } from "../src/agents/agent-resolver";
+import { createActorAgentResolver } from "../src/agents/agent-resolver";
 import type {
   ExternalThreadBinding,
   ExternalThreadStore,
@@ -99,6 +101,7 @@ class ScriptedAgent extends AbstractAgent {
 function harness(
   options: {
     existing?: ExternalThreadBinding | null;
+    bound?: ExternalThreadBinding;
     route?: Awaited<ReturnType<CoworkerRoutingService["route"]>>;
     resolve?: ActorAgentResolver["resolveAgentForActor"];
   } = {},
@@ -124,10 +127,13 @@ function harness(
     },
     async bind(value) {
       bindCalls.push(value);
-      return binding({
-        ...value,
-        createdAt: new Date("2026-08-27T00:00:00.000Z"),
-      });
+      return (
+        options.bound ??
+        binding({
+          ...value,
+          createdAt: new Date("2026-08-27T00:00:00.000Z"),
+        })
+      );
     },
   };
   const routing: CoworkerRoutingService = {
@@ -219,6 +225,17 @@ describe("OpenBotChannelAgent", () => {
     expect(resolveCalls).toEqual([[{ id: "bob", role: "user" }, "knowledge"]]);
   });
 
+  test("resolves the binding winner when another first writer won the thread", async () => {
+    const { agent, bindCalls, resolveCalls } = harness({
+      bound: binding({ agentId: "winner", agentName: "Thread Winner" }),
+    });
+
+    await collect(agent);
+
+    expect(bindCalls[0]?.agentId).toBe("risk");
+    expect(resolveCalls).toEqual([[ACTOR, "winner"]]);
+  });
+
   test("keeps a linked coworker pinned when the current participant loses access", async () => {
     const { agent, bindCalls, routeCalls } = harness({
       existing: binding({ agentId: "private-risk", agentName: "Private Risk" }),
@@ -277,6 +294,100 @@ describe("OpenBotChannelAgent", () => {
     expect(target.received[0].messages).toBe(original.messages);
   });
 
+  test("composes a resolved remote coworker before the channel delegates its direct run", async () => {
+    const requests: RunAgentInput[] = [];
+    const fetch = async (_url: string, request: RequestInit) => {
+      const sent = JSON.parse(String(request.body)) as RunAgentInput;
+      requests.push(sent);
+      return new Response(
+        [
+          { type: "RUN_STARTED", threadId: sent.threadId, runId: sent.runId },
+          { type: "RUN_FINISHED", threadId: sent.threadId, runId: sent.runId },
+        ]
+          .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+          .join(""),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    };
+    const resolver = createActorAgentResolver({
+      loadAgents: async () => [
+        {
+          id: "risk",
+          name: "Risk Analyst",
+          type: "remote_ag_ui" as const,
+          endpoint: "https://coworker.example/ag-ui",
+          standingMessage: {
+            id: "standing-role:risk",
+            role: "system" as const,
+            content: "You are the risk coworker.",
+          },
+        },
+      ],
+      model: { provider: "openai", defaultModel: "gpt-5.6-terra" },
+      resolveModelApiKey: async () => null,
+      loadToolsForActor: (actorId) => async () => [
+        {
+          name: "mcp__risk__lookup",
+          description: "Look up a risk record.",
+          parameters: z.object({ recordId: z.string() }),
+          ref: "risk/lookup",
+          execute: async () => actorId,
+        },
+      ],
+      signRunForActor: (actorId) => (botId, runId) =>
+        `signed:${actorId}:${botId}:${runId}`,
+      agentFetch: fetch,
+    });
+    const { agent } = harness({
+      resolve: resolver.resolveAgentForActor,
+    });
+
+    await collect(agent);
+
+    const sent = requests[0];
+    expect(
+      sent?.messages.filter((message) => message.id === "standing-role:risk"),
+    ).toHaveLength(1);
+    expect(sent?.messages[0]).toMatchObject({
+      id: "standing-role:risk",
+      role: "system",
+    });
+    expect(
+      sent?.messages.find((message) => message.id === "granted-tools:risk")
+        ?.content,
+    ).toContain("risk");
+    expect(sent?.tools).toContainEqual(
+      expect.objectContaining({
+        name: "mcp__risk__lookup",
+        description: "Look up a risk record.",
+        parameters: expect.objectContaining({
+          type: "object",
+          properties: { recordId: { type: "string" } },
+          required: ["recordId"],
+          additionalProperties: false,
+        }),
+      }),
+    );
+    expect(sent?.forwardedProps).toMatchObject({
+      openbotBotId: "risk",
+      openbotDeploymentTools: ["mcp__risk__lookup"],
+      openbotRun: "signed:alice:risk:run-1",
+    });
+    for (const privateProperty of [
+      "provider",
+      "providerTenantId",
+      "providerConversationId",
+      "providerThreadId",
+      "applicationUser",
+      "actor",
+      "messageText",
+      "channelsThreadId",
+      "agentId",
+    ]) {
+      expect(sent).not.toHaveProperty(privateProperty);
+    }
+  });
+
   test("only updates current mutable routing fields in the private execution", async () => {
     const { agent } = harness();
     await runWithSlackExecution(execution(), async () => {
@@ -296,18 +407,39 @@ describe("OpenBotChannelAgent", () => {
     });
   });
 
-  test("clones are distinct fully configured agents with independent delegate abort state", async () => {
+  test("clones preserve the AbstractAgent base contract and keep delegate abort state independent", async () => {
     const first = new ScriptedAgent(() => NEVER);
     const second = new ScriptedAgent(() => NEVER);
     const { agent, deps } = harness({
       existing: binding(),
       resolve: async (actor) => (actor.id === "alice" ? first : second),
     });
+    agent.agentId = "custom-slack-router";
+    agent.description = "Custom channel router";
+    agent.threadId = "configured-thread";
+    agent.setMessages([{ id: "saved", role: "user", content: "saved" }]);
+    agent.setState({ saved: true });
+    agent.pendingInterrupts = [{ id: "interrupt-1" }] as never;
+    agent.debug = true;
+    const subscriber = {};
+    agent.subscribe(subscriber);
     const clone = agent.clone();
     expect(clone).toBeInstanceOf(OpenBotChannelAgent);
     expect(clone).not.toBe(agent);
-    expect(clone.agentId).toBe("openbot-slack");
-    expect(clone.description).toBe("OpenBot Slack router");
+    expect(clone.agentId).toBe("custom-slack-router");
+    expect(clone.description).toBe("Custom channel router");
+    expect(clone.threadId).toBe("configured-thread");
+    expect(clone.messages).toEqual([
+      { id: "saved", role: "user", content: "saved" },
+    ]);
+    expect(clone.messages).not.toBe(agent.messages);
+    expect(clone.state).toEqual({ saved: true });
+    expect(clone.state).not.toBe(agent.state);
+    expect(clone.pendingInterrupts).toEqual([{ id: "interrupt-1" }]);
+    expect(clone.pendingInterrupts).not.toBe(agent.pendingInterrupts);
+    expect(clone.debug).toEqual(agent.debug);
+    expect(clone.subscribers).toEqual([subscriber]);
+    expect(clone.subscribers).not.toBe(agent.subscribers);
 
     const originalSubscription = runWithSlackExecution(execution(), () =>
       agent.run(input()).subscribe(),
@@ -325,6 +457,117 @@ describe("OpenBotChannelAgent", () => {
     originalSubscription.unsubscribe();
     cloneSubscription.unsubscribe();
     expect(deps).toBeDefined();
+  });
+
+  test("rejects overlap before a delegate resolves, then accepts a sequential run", async () => {
+    let resolveFirst!: (target: AbstractAgent) => void;
+    const first = new Promise<AbstractAgent>(
+      (resolve) => (resolveFirst = resolve),
+    );
+    const next = new ScriptedAgent(() =>
+      of({ type: "CUSTOM", name: "next", value: true } as BaseEvent),
+    );
+    let calls = 0;
+    const { agent } = harness({
+      existing: binding(),
+      resolve: async () => (calls++ === 0 ? first : next),
+    });
+    const running = runWithSlackExecution(execution(), () =>
+      lastValueFrom(agent.run(input()).pipe(toArray())),
+    );
+    await Promise.resolve();
+
+    await expect(
+      runWithSlackExecution(execution(), () =>
+        lastValueFrom(agent.run(input()).pipe(toArray())),
+      ),
+    ).rejects.toThrow("OpenBot Slack agent is already running.");
+    agent.abortRun();
+    await expect(running).resolves.toEqual([]);
+    resolveFirst(new ScriptedAgent(() => NEVER));
+    await Promise.resolve();
+
+    await expect(collect(agent)).resolves.toEqual([
+      { type: "CUSTOM", name: "next", value: true },
+    ]);
+  });
+
+  test("rejects overlap after a delegate starts without orphaning the first delegate", async () => {
+    const target = new ScriptedAgent(() => NEVER);
+    const { agent } = harness({
+      existing: binding(),
+      resolve: async () => target,
+    });
+    const running = runWithSlackExecution(execution(), () =>
+      lastValueFrom(agent.run(input()).pipe(toArray())),
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(target.received).toHaveLength(1);
+
+    await expect(
+      runWithSlackExecution(execution(), () =>
+        lastValueFrom(agent.run(input()).pipe(toArray())),
+      ),
+    ).rejects.toThrow("OpenBot Slack agent is already running.");
+    agent.abortRun();
+    await expect(running).resolves.toEqual([]);
+    expect(target.aborts).toBe(1);
+  });
+
+  test("cancels a hanging resolution without aborting its eventual target or leaking its rejection", async () => {
+    let rejectFirst!: (error: Error) => void;
+    const pending = new Promise<AbstractAgent>((_resolve, reject) => {
+      rejectFirst = reject;
+    });
+    const reusable = new ScriptedAgent(() =>
+      of({ type: "CUSTOM", name: "reused", value: true } as BaseEvent),
+    );
+    let calls = 0;
+    const { agent } = harness({
+      existing: binding(),
+      resolve: async () => {
+        calls += 1;
+        return calls === 1 ? pending : reusable;
+      },
+    });
+    const running = runWithSlackExecution(execution(), () =>
+      lastValueFrom(agent.run(input()).pipe(toArray())),
+    );
+    await Promise.resolve();
+    agent.abortRun();
+    await expect(running).resolves.toEqual([]);
+    rejectFirst(new Error("late resolver failure"));
+    await Promise.resolve();
+    expect(reusable.aborts).toBe(0);
+
+    await expect(collect(agent)).resolves.toEqual([
+      { type: "CUSTOM", name: "reused", value: true },
+    ]);
+    expect(reusable.aborts).toBe(0);
+  });
+
+  test("aborts a started target once and aborts started work on unsubscribe", async () => {
+    const first = new ScriptedAgent(() => NEVER);
+    const second = new ScriptedAgent(() => NEVER);
+    let calls = 0;
+    const { agent } = harness({
+      existing: binding(),
+      resolve: async () => (calls++ === 0 ? first : second),
+    });
+    const active = runWithSlackExecution(execution(), () =>
+      lastValueFrom(agent.run(input()).pipe(toArray())),
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    agent.abortRun();
+    await expect(active).resolves.toEqual([]);
+    expect(first.aborts).toBe(1);
+
+    const subscription = runWithSlackExecution(execution(), () =>
+      agent.run(input()).subscribe(),
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    subscription.unsubscribe();
+    expect(second.aborts).toBe(1);
   });
 
   test("an abort before resolution cannot abort a later run's target", async () => {
