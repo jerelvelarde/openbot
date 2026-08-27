@@ -558,6 +558,17 @@ export type PluginStoreOptions = {
     toolName: string,
     args: Record<string, unknown>,
   ) => Promise<{ text: string; isError: boolean }>;
+  /**
+   * A reviewed local implementation for a first-party tool. It runs only after the normal grant and
+   * policy decisions. Returning null keeps the actor-scoped credential and vendor path unchanged.
+   */
+  firstPartyTool?: (input: {
+    serverId: string;
+    toolName: string;
+    args: Record<string, unknown>;
+    botId: string;
+    actorId: string;
+  }) => Promise<{ text: string; isError: boolean } | null>;
   /** Trading a refresh token for a short-lived access token. Defaults to a real HTTP exchange. */
   exchangeRefreshToken?: (input: {
     tokenUrl: string;
@@ -3490,6 +3501,28 @@ export function createPluginStore(options: PluginStoreOptions) {
        * it did.
        */
       try {
+        const local = await options.firstPartyTool?.({
+          serverId,
+          toolName,
+          args,
+          botId: input.botId,
+          actorId: input.actorId,
+        });
+        if (local) {
+          await recordAuditEvent(auditStore, {
+            eventType: local.isError ? "mcp.call_failed" : "mcp.call_succeeded",
+            targetType: "mcp_tool",
+            targetId: input.ref,
+            payload: local.isError
+              ? {
+                  ...decided,
+                  failure:
+                    local.text.slice(0, 400) || "the tool reported an error",
+                }
+              : decided,
+          });
+          return local;
+        }
         const { token } = await connectionTokenFor(row, entry, input.actorId);
         const vendor = injectedVendor ?? transportFor(entry).callTool;
         const result = await vendor(

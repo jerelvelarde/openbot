@@ -49,7 +49,7 @@ import {
 import { createDatabase } from "./db/client";
 import { createPeopleStore } from "./people/store";
 import { redirectUriFor } from "./plugins/oauth";
-import { createPluginStore } from "./plugins/store";
+import { createPluginStore, type PluginStore } from "./plugins/store";
 import { grantedSkills, grantedTools } from "./plugins/tools";
 import { createIntentRouter } from "./routing/classify";
 import { createModelCompleter } from "./routing/model";
@@ -60,6 +60,7 @@ import {
   loadTenantPackage,
   synchronizeTenantPackage,
 } from "./tenant-package";
+import { createTypefullyStore } from "./typefully/store";
 
 /**
  * Who is asking, for a CopilotKit request.
@@ -278,7 +279,13 @@ const computerGateway = computerProvider
  */
 const sandboxedStore = createSandboxedStore(database, bootAuditStore);
 
-const pluginStore = createPluginStore({
+let pluginStore: PluginStore;
+const typefullyStore = createTypefullyStore({
+  database,
+  auditStore: bootAuditStore,
+  plugin: () => pluginStore,
+});
+pluginStore = createPluginStore({
   database,
   auditStore: bootAuditStore,
   credentials: credentialStore,
@@ -293,6 +300,7 @@ const pluginStore = createPluginStore({
    * registering.
    */
   redirectUri: config.publicUrl ? redirectUriFor(config.publicUrl) : undefined,
+  firstPartyTool: typefullyStore.callBotTool,
 });
 
 void recordAuditEvent(bootAuditStore, {
@@ -567,6 +575,10 @@ const app = createApp(
   intentRouter,
   // What a browsing turn's screen looked like when it finished, so the transcript can show it later.
   createPageFrameStore(database),
+  // External identity confirmation routes are optional and currently mounted by their owner.
+  undefined,
+  // Local-first Typefully drafts share the exact plugin grant, policy, credential and audit boundary.
+  typefullyStore,
 );
 
 /**

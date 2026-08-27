@@ -44,6 +44,8 @@ import type { IntentRouter } from "./routing/classify";
 import { createRoutingRoutes } from "./routing/routes";
 import { createCoworkerRoutingService } from "./routing/service";
 import type { PackageStatusReader } from "./tenant-package";
+import { createTypefullyRoutes } from "./typefully/routes";
+import type { TypefullyStore } from "./typefully/store";
 
 /**
  * One row for something an administrator did to somebody's access.
@@ -175,6 +177,8 @@ export function createApp(
    * user guard, and its audit store before handing the completed surface to the app.
    */
   externalLinkRoutes?: HonoApp,
+  /** Authenticated local-first Typefully drafts, appended to preserve positional callers. */
+  typefullyStore?: TypefullyStore,
 ) {
   const app = new Hono<{ Variables: AppVariables }>();
 
@@ -718,6 +722,13 @@ export function createApp(
 
   if (externalLinkRoutes) {
     app.route("/api/external-links", externalLinkRoutes);
+  }
+
+  if (typefullyStore) {
+    app.route(
+      "/api/typefully",
+      createTypefullyRoutes(typefullyStore, requireUser),
+    );
   }
 
   if (componentStore) {
