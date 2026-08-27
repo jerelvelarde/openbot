@@ -1,4 +1,6 @@
 import { serve } from "bun";
+import { COMPUTER_GUIDANCE } from "../../shared/bot-prompt";
+import { createActorAgentResolver } from "./agents/agent-resolver";
 import { mintRunAssertion } from "./agents/callback-token";
 import { createAgentFetch } from "./agents/endpoint";
 import { createAgentProfileStore } from "./agents/profile-store";
@@ -7,8 +9,12 @@ import { createApp } from "./app";
 import { createAuditReader, createAuditStore, recordAuditEvent } from "./audit";
 import { startAuditRetention } from "./audit-retention";
 import { createAuth } from "./auth";
-import { DEV_ACTOR, initializeDevActorUser } from "./auth/dev-actor";
-import { createRoleRepository } from "./auth/guards";
+import {
+  createDevRequireUser,
+  DEV_ACTOR,
+  initializeDevActorUser,
+} from "./auth/dev-actor";
+import { createRequireUser, createRoleRepository } from "./auth/guards";
 import { createIdentityProviderStore } from "./auth/identity-provider-store";
 import type { OpenBotRole } from "./auth/roles";
 import {
@@ -45,12 +51,23 @@ import {
   resolveModelApiKey,
 } from "./credentials";
 import { createDatabase } from "./db/client";
+import { createExternalLinkStore } from "./external/link-store";
+import { createExternalLinkRoutes } from "./external/routes";
+import { createExternalThreadStore } from "./external/thread-store";
 import { createPeopleStore } from "./people/store";
 import { redirectUriFor } from "./plugins/oauth";
 import { createPluginStore } from "./plugins/store";
 import { grantedSkills, grantedTools } from "./plugins/tools";
 import { createIntentRouter } from "./routing/classify";
 import { createModelCompleter } from "./routing/model";
+import { createCoworkerRoutingService } from "./routing/service";
+import { createApprovalAuthorizer } from "./slack/approval-authorizer";
+import { createApprovalDecisionStore } from "./slack/approval-store";
+import { createOpenBotSlackChannel } from "./slack/channel";
+import { configureApprovalDecisionStore } from "./slack/components";
+import { SlackIdentityLinker } from "./slack/identity-linker";
+import { SlackIngressRegistry } from "./slack/ingress-registry";
+import { projectSlackStatus, startManagedChannelHost } from "./slack/status";
 import {
   createPackageStatusReader,
   loadTenantPackage,
@@ -132,6 +149,15 @@ const agentProfileStore = createAgentProfileStore(
   config.managedAgent?.endpoint,
   agentVault,
 );
+const approvalLinkStore = createExternalLinkStore(database);
+const approvalThreadStore = createExternalThreadStore(database);
+configureApprovalDecisionStore(createApprovalDecisionStore(database), {
+  authorize: createApprovalAuthorizer({
+    links: approvalLinkStore,
+    threads: approvalThreadStore,
+    profiles: agentProfileStore,
+  }),
+});
 // Read here rather than beside the synchronise below, because the package names the deployment and
 // the channel store needs that name before it can mint a thread id.
 const tenantPackage = await loadTenantPackage(config.tenantPackageDirectory);
@@ -407,6 +433,175 @@ const chooseSkills = createModelCompleter({
     }),
 });
 
+const actorAgentResolver = createActorAgentResolver({
+  loadAgents: loadAgentsForActor,
+  model: tenantPackage.model,
+  resolveModelApiKey: () =>
+    resolveModelApiKey({
+      encryptionKey: config.keyEncryptionKey,
+      reader: credentialStore,
+      provider: tenantPackage.model.provider,
+      keyId: tenantPackage.model.credentialSecretRef,
+      environment: process.env,
+    }),
+  stallGuard,
+  // Tools run here, not in the browser. Each one still executes through the plugin store, so the
+  // grant, the policy and the audit row are exactly where they were.
+  loadToolsForActor: (actorId) => (botId) =>
+    grantedTools({ store: pluginStore, botId, actorId }),
+  /*
+   * What the deployment tells a remote Bot about the run it is starting.
+   *
+   * Signed here, where the encryption key lives, so the runtime module never holds a secret. The Bot
+   * hands this back when it calls a tool, and it is where the Bot id and the person's name come
+   * from: its own token proves which agent is calling, this proves who it is calling for, and
+   * neither is read out of the request body any more.
+   */
+  signRunForActor: (actorId) => (botId, runId) =>
+    mintRunAssertion({ botId, actorId, runId }, config.keyEncryptionKey),
+  /*
+   * Only when a computer exists. The tools themselves are registered by the surface, so a Bot is
+   * offered them without this and the guidance is what tells it how they go together: snapshot
+   * before acting, and ask a person to take the wheel at a sign-in rather than reporting the task
+   * as impossible. Absent computer, absent guidance: a Bot is not told about hands it has not got.
+   */
+  computerGuidance: config.computer ? COMPUTER_GUIDANCE : undefined,
+  /*
+   * Which vendors this deployment connects to, held by a Bot or not.
+   *
+   * A Bot holding no grants used to be told nothing about connectors at all, so it treated a
+   * connected vendor as an ordinary website and browsed to it: a Bot with no Drive grant opened
+   * Google's sign-in page and asked a person to sign in to an account the deployment had already
+   * connected. Naming them lets it say which one it has not been granted instead.
+   *
+   * Read per request rather than held, because a connector added a minute ago has to count. A read
+   * failure must stop the run: treating unavailable infrastructure as an empty catalogue sends a
+   * Bot to vendor websites under a false statement about what the deployment has connected.
+   */
+  loadVendors: async () =>
+    (await pluginStore.listServers()).map((server) => server.id),
+  /*
+   * How a run's tools are narrowed to the ones it is about.
+   *
+   * A model picks the right tool reliably out of about ten, and a deployment of this template
+   * clears that as soon as it connects a second vendor. Past it the wrong tool gets called, or
+   * none does and the answer comes from memory, and neither says so. So a Bot holding more than a
+   * handful is offered the tools of the skills that match the message rather than everything at
+   * once. See `plugins/selection.ts`.
+   *
+   * This narrows the offer and nothing else. What a Bot may call is the grant, checked in
+   * `callTool` with the policy and the audit row exactly as before, so every path through here can
+   * be wrong without a Bot gaining anything. That is also why every failure below is silent and
+   * lands on the whole catalogue: the narrowing is worth an accuracy point, never a capability.
+   */
+  selectionForActor: (actorId) => ({
+    loadSkills: (botId) => grantedSkills({ store: pluginStore, botId }),
+    // The deployment's own model and key, the same pair the intent router uses, so selection is
+    // never a second thing to configure. It throws on a missing key, which reads as "could not
+    // choose" and leaves the whole catalogue offered.
+    choose: chooseSkills,
+    record: async (botId, selection) => {
+      await recordAuditEvent(bootAuditStore, {
+        eventType: "mcp.tools_discovered",
+        targetType: "bot",
+        targetId: botId,
+        actorUserId: actorId,
+        payload: {
+          bot: botId,
+          reason: selection.reason,
+          granted: selection.granted,
+          offered: selection.offered.length,
+          skills: selection.skills,
+        },
+      });
+    },
+  }),
+  // Every run dials the stored endpoint again, so the check that was applied when it was
+  // registered has to be applied to wherever it redirects now.
+  // Absent computer configuration means nothing opted into private hosts, which is the safe
+  // reading and the same one `createApp` takes.
+  agentFetch: createAgentFetch({
+    allowPrivateHosts: config.computer?.allowPrivateHosts === true,
+    // Named addresses are reachable on every hop, not only the one that was registered.
+    allowedHosts: config.agentEndpointAllowedHosts,
+    // The refusal is what the run already knows; this is what the deployment knows. Written here
+    // rather than in `endpoint.ts` so that file keeps deciding and nothing else, the way the
+    // target check it reuses does.
+    onRefusal: ({ address, reason }) => {
+      void recordAuditEvent(bootAuditStore, {
+        eventType: "agent.dial_refused",
+        targetType: "agent_endpoint",
+        targetId: address,
+        payload: { address, reason },
+      }).catch((error) => {
+        // A trail that cannot be written must not take a refusal down with it: the request is
+        // already refused by the time this runs, and the alternative to a logged failure here is
+        // an unhandled rejection.
+        console.error("Could not record a refused agent dial.", error);
+      });
+    },
+  }),
+});
+
+const slackRouting = createCoworkerRoutingService({
+  store: agentProfileStore,
+  router: intentRouter,
+  auditStore: bootAuditStore,
+  reachableSystems: async (agentId) => {
+    const granted = await pluginStore.listForAgent(agentId);
+    return [
+      ...new Set(
+        granted.tools.map(
+          (tool) =>
+            tool.toolName.replace(/^mcp__/, "").split("__")[0] ?? tool.toolName,
+        ),
+      ),
+    ];
+  },
+});
+const slackIngress = new SlackIngressRegistry();
+const openbotSlackChannel = createOpenBotSlackChannel({
+  identityLinker: new SlackIdentityLinker({
+    store: approvalLinkStore,
+    encryptionKey: config.keyEncryptionKey,
+    appUrl: config.appUrl,
+  }),
+  ingressRegistry: slackIngress,
+  agentDeps: {
+    routing: slackRouting,
+    store: approvalThreadStore,
+    resolver: actorAgentResolver,
+  },
+  computerGateway,
+  assistance: config.appUrl
+    ? { appUrl: config.appUrl, encryptionKey: config.keyEncryptionKey }
+    : undefined,
+});
+const copilotHandler = mountCopilotRuntime(
+  config,
+  actorAgentResolver,
+  identifyUser,
+  identifyActor,
+  "/api/copilotkit",
+  [openbotSlackChannel],
+);
+const requireExternalUser = config.singleUser
+  ? createDevRequireUser()
+  : (() => {
+      // `loadConfig` permits no-provider operation only in explicit single-user mode. Keep the
+      // invariant checked here as well, so this route can never receive an undefined auth service.
+      if (!auth)
+        throw new Error("Slack account linking requires authentication.");
+      return createRequireUser(auth, roleRepository);
+    })();
+const externalLinkRoutes = createExternalLinkRoutes({
+  store: approvalLinkStore,
+  encryptionKey: config.keyEncryptionKey,
+  requireUser: requireExternalUser,
+  auditStore: bootAuditStore,
+  agentProfileStore,
+});
+
 const app = createApp(
   config,
   auth,
@@ -420,116 +615,7 @@ const app = createApp(
   createPackageStatusReader(database),
   // The runtime call: the model, per-actor agent loading, and the two identity
   // functions are how a run is attributed to a person.
-  mountCopilotRuntime(
-    config,
-    tenantPackage.model,
-    loadAgentsForActor,
-    () =>
-      resolveModelApiKey({
-        encryptionKey: config.keyEncryptionKey,
-        reader: credentialStore,
-        provider: tenantPackage.model.provider,
-        keyId: tenantPackage.model.credentialSecretRef,
-        environment: process.env,
-      }),
-    identifyUser,
-    identifyActor,
-    stallGuard,
-    // Tools run here, not in the browser. Each one still executes through the plugin store, so the
-    // grant, the policy and the audit row are exactly where they were.
-    (actorId) => (botId) =>
-      grantedTools({ store: pluginStore, botId, actorId }),
-    /*
-     * What the deployment tells a remote Bot about the run it is starting.
-     *
-     * Signed here, where the encryption key lives, so the runtime module never holds a secret. The Bot
-     * hands this back when it calls a tool, and it is where the Bot id and the person's name come
-     * from: its own token proves which agent is calling, this proves who it is calling for, and
-     * neither is read out of the request body any more.
-     */
-    (actorId) => (botId, runId) =>
-      mintRunAssertion({ botId, actorId, runId }, config.keyEncryptionKey),
-    undefined,
-    /*
-     * Which vendors this deployment connects to, held by a Bot or not.
-     *
-     * A Bot holding no grants used to be told nothing about connectors at all, so it treated a
-     * connected vendor as an ordinary website and browsed to it: a Bot with no Drive grant opened
-     * Google's sign-in page and asked a person to sign in to an account the deployment had already
-     * connected. Naming them lets it say which one it has not been granted instead.
-     *
-     * Read per request rather than held, because a connector added a minute ago has to count, and
-     * failing is the same as having none: a Bot that cannot be told loses a sentence, not a run.
-     */
-    async () => {
-      try {
-        return (await pluginStore.listServers()).map((server) => server.id);
-      } catch {
-        return [];
-      }
-    },
-    /*
-     * How a run's tools are narrowed to the ones it is about.
-     *
-     * A model picks the right tool reliably out of about ten, and a deployment of this template
-     * clears that as soon as it connects a second vendor. Past it the wrong tool gets called, or
-     * none does and the answer comes from memory, and neither says so. So a Bot holding more than a
-     * handful is offered the tools of the skills that match the message rather than everything at
-     * once. See `plugins/selection.ts`.
-     *
-     * This narrows the offer and nothing else. What a Bot may call is the grant, checked in
-     * `callTool` with the policy and the audit row exactly as before, so every path through here can
-     * be wrong without a Bot gaining anything. That is also why every failure below is silent and
-     * lands on the whole catalogue: the narrowing is worth an accuracy point, never a capability.
-     */
-    (actorId) => ({
-      loadSkills: (botId) => grantedSkills({ store: pluginStore, botId }),
-      // The deployment's own model and key, the same pair the intent router uses, so selection is
-      // never a second thing to configure. It throws on a missing key, which reads as "could not
-      // choose" and leaves the whole catalogue offered.
-      choose: chooseSkills,
-      record: async (botId, selection) => {
-        await recordAuditEvent(bootAuditStore, {
-          eventType: "mcp.tools_discovered",
-          targetType: "bot",
-          targetId: botId,
-          actorUserId: actorId,
-          payload: {
-            bot: botId,
-            reason: selection.reason,
-            granted: selection.granted,
-            offered: selection.offered.length,
-            skills: selection.skills,
-          },
-        });
-      },
-    }),
-    // Every run dials the stored endpoint again, so the check that was applied when it was
-    // registered has to be applied to wherever it redirects now.
-    // Absent computer configuration means nothing opted into private hosts, which is the safe
-    // reading and the same one `createApp` takes.
-    createAgentFetch({
-      allowPrivateHosts: config.computer?.allowPrivateHosts === true,
-      // Named addresses are reachable on every hop, not only the one that was registered.
-      allowedHosts: config.agentEndpointAllowedHosts,
-      // The refusal is what the run already knows; this is what the deployment knows. Written here
-      // rather than in `endpoint.ts` so that file keeps deciding and nothing else, the way the
-      // target check it reuses does.
-      onRefusal: ({ address, reason }) => {
-        void recordAuditEvent(bootAuditStore, {
-          eventType: "agent.dial_refused",
-          targetType: "agent_endpoint",
-          targetId: address,
-          payload: { address, reason },
-        }).catch((error) => {
-          // A trail that cannot be written must not take a refusal down with it: the request is
-          // already refused by the time this runs, and the alternative to a logged failure here is
-          // an unhandled rejection.
-          console.error("Could not record a refused agent dial.", error);
-        });
-      },
-    }),
-  ),
+  copilotHandler,
   // The only path to an acting call.
   computerGateway,
   policyStore,
@@ -557,6 +643,12 @@ const app = createApp(
   intentRouter,
   // What a browsing turn's screen looked like when it finished, so the transcript can show it later.
   createPageFrameStore(database),
+  // External identity confirmation and assistance routes use the same actor and profile boundary.
+  externalLinkRoutes,
+  // Preserve the existing positional extension point without enabling an unrelated integration.
+  undefined,
+  // A narrow public projection: never hand `/api/capabilities` the runtime snapshot itself.
+  () => projectSlackStatus(copilotHandler.channels?.status()),
 );
 
 /**
@@ -605,7 +697,7 @@ const isProxiedStream = (data: SocketData): data is StreamData =>
 const asChannelSocket = (ws: { data: SocketData }) =>
   ws as unknown as ChannelSocket;
 
-serve<SocketData>({
+const serverOptions = {
   port,
   async fetch(request, server) {
     const url = new URL(request.url);
@@ -703,6 +795,20 @@ serve<SocketData>({
       ws.data.inward?.close();
     },
   },
+} satisfies Bun.Serve.Options<SocketData>;
+const startWeb = () => serve<SocketData>(serverOptions);
+
+const managedHost = startManagedChannelHost({
+  startWeb,
+  stopWeb: (server) => server.stop(true),
+  channels: copilotHandler.channels,
+  signals: process,
+  stopOthers: [
+    () => channelActivityListener.stop(),
+    () => policyListener.stop(),
+    () => auditRetention.stop(),
+  ],
+  exit: (code) => process.exit(code),
 });
 
 if (config.singleUser) {
@@ -714,16 +820,8 @@ if (config.singleUser) {
   );
 }
 
-// Each listener holds a connection of its own for the life of the process. Released on the way out,
-// so a watch-mode restart does not leave two behind on every reload.
-for (const signal of ["SIGINT", "SIGTERM"] as const) {
-  process.on(signal, () => {
-    void Promise.allSettled([
-      channelActivityListener.stop(),
-      policyListener.stop(),
-      Promise.resolve(auditRetention.stop()),
-    ]).finally(() => process.exit(0));
-  });
-}
-
 console.info(`OpenBot server listening on http://localhost:${port}`);
+
+// Activation is allowed to settle after HTTP starts. A missing provider or gateway outage must
+// leave the setup and health surfaces reachable, with the projected status explaining why.
+await managedHost;

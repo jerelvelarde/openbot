@@ -27,6 +27,56 @@ bash scripts/start.sh
 
 All four Intelligence values are required together. Missing any of them stops server startup.
 
+## Managed Slack
+
+OpenBot declares one managed CopilotKit Intelligence Channel named `openbot`. It does not construct
+a local Slack adapter and does not read Slack bot tokens, app tokens, or signing secrets. Configure
+the four Intelligence variables above and a usable app URL, either through `OPENBOT_APP_URL` or its
+documented fallback, then attach Slack to that same Intelligence project with:
+
+```sh
+npx copilotkit@latest login
+npx copilotkit@latest project select
+npx copilotkit@latest channels setup
+```
+
+The command installs the current Channels setup guidance and prints the prompt used by the guided
+flow. Sign in first and select the existing Intelligence project whose runtime configuration OpenBot
+uses. In the guided flow, choose Channel name `openbot` and Slack as the provider.
+
+The current CLI needs the Slack bot token and signing secret while it attaches the provider. For
+Channel `openbot`, its generated environment names are
+`INTELLIGENCE_CHANNEL_OPENBOT_SLACK_BOT_TOKEN` and
+`INTELLIGENCE_CHANNEL_OPENBOT_SLACK_SIGNING_SECRET`. Supply them only through an ignored local
+`.env`, shell environment, or preferably the CLI's `--credentials-stdin` path backed by a secret
+manager. Never commit them. OpenBot's server loads the complete `.env`, even though its runtime code
+does not read these names, so remove local copies or unset shell variables immediately after the CLI
+reports a successful attachment and before starting OpenBot. CopilotKit Intelligence stores and
+uses the provider credentials after attachment; the running OpenBot process does not require them.
+
+Use the current CLI to inspect the declared and attached state:
+
+```sh
+npx copilotkit@latest channels status
+npx copilotkit@latest channels list
+npx copilotkit@latest channels providers
+```
+
+The public `GET /api/capabilities` response exposes only `channels.slack.status`,
+`channels.slack.transport`, and `channels.slack.provider`. It is safe for a credential-free health
+check. A provider value of `not_attached` and status of `setup_required` means setup is incomplete;
+`provider: attached` confirms attachment, while `status: online` confirms the complete Channel is
+ready. Do not treat HTTP `/health` alone as proof that Slack is connected: the web server remains
+available when managed Channel activation fails so an operator can repair setup.
+
+`OPENBOT_APP_URL` is also the origin of the authenticated account-link and assistance links posted
+to Slack. It must be HTTPS outside local development; loopback HTTP is accepted locally. If it is
+absent or unusable, Slack can connect but people who cannot be linked automatically cannot finish
+linking, and secure human-assistance tools are unavailable.
+
+See [Slack](slack.md) for the manifest capability review, account-link flow, operating limits,
+security rules, troubleshooting, and release smoke test.
+
 `MANAGED_AGENT_AG_UI_URL` names the Bot in the box: the default endpoint for coworkers created in
 the product. It needs `MANAGED_AGENT_TOKEN` beside it, or the server refuses to start. Unset, the
 server starts without a managed Bot, the shipped Risk Analyst coworker is omitted, and creating a
@@ -162,11 +212,15 @@ added it. The client secret and any SAML signing material are encrypted at rest 
 The redirect URI to register with each provider is `<BETTER_AUTH_URL>/api/auth/callback/<provider>`,
 where `<provider>` is `google`, `microsoft` or `okta`.
 
-`OPENBOT_PUBLIC_URL` and `OPENBOT_APP_URL` matter only for a connector each person connects their own account to, such as Google Drive.
+`OPENBOT_PUBLIC_URL` is used by connectors each person connects to, such as Google Drive.
 
 `OPENBOT_PUBLIC_URL` builds the redirect URI the vendor sends somebody back to after they consent, which has to match what an administrator registered with that vendor character for character — so it comes from configuration rather than from the incoming request. Most deployments never set it, because `BETTER_AUTH_URL` is already the same public address. With neither, the Plugins page says the deployment cannot complete a consent flow, and no account can be connected.
 
-`OPENBOT_APP_URL` is where the callback sends the person afterwards. It is a separate setting because the app and the API are separate addresses: locally the app is Vite on `3010` and the API is `3001`, so a relative redirect would land on the API, which serves no pages. A deployment serving both from one origin can leave it unset.
+`OPENBOT_APP_URL` is where a connector callback sends the person afterwards, and where managed Slack
+sends people to link an account or complete secure assistance. It is a separate setting because the
+app and the API are separate addresses: locally the app is Vite on `3010` and the API is `3001`, so
+a relative redirect would land on the API, which serves no pages. A deployment serving both from
+one origin can leave it unset when the fallback resolves to that same app origin.
 
 ## Computer and supervisor
 

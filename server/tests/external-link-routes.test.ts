@@ -1,0 +1,375 @@
+import { describe, expect, test } from "bun:test";
+import type { MiddlewareHandler } from "hono";
+import { Hono } from "hono";
+import type { AgentProfileStore } from "../src/agents/profile-store";
+import { createApp } from "../src/app";
+import type { AuditEventInput, TransactionalAuditStore } from "../src/audit";
+import type { AppVariables } from "../src/auth/guards";
+import { loadConfig } from "../src/config";
+import type {
+  ExternalLinkCreationStore,
+  ExternalLinkStore,
+} from "../src/external/link-store";
+import { mintExternalLinkToken } from "../src/external/link-token";
+import { createExternalLinkRoutes } from "../src/external/routes";
+import { testEnvironment } from "./support/environment";
+
+const KEY = "external-link-routes-test-key";
+const NOW = 1_700_000_000_000;
+const INVALID = "This Slack link has expired or is invalid.";
+const CONFLICT = "That Slack identity is already linked.";
+const identity = {
+  provider: "slack" as const,
+  providerTenantId: "T1",
+  providerUserId: "U1",
+  providerEmail: "person@example.com",
+};
+const actor = {
+  id: "openbot-user-1",
+  email: "member@openbot.test",
+  role: "user",
+} as const;
+
+const agentProfileStore: Pick<AgentProfileStore, "get"> = {
+  get: async () => null,
+};
+
+function authenticatedAs(
+  authenticatedActor = actor,
+): MiddlewareHandler<{ Variables: AppVariables }> {
+  return async (context, next) => {
+    context.set("actor", authenticatedActor);
+    await next();
+  };
+}
+
+const unauthenticated: MiddlewareHandler<{ Variables: AppVariables }> = async (
+  context,
+) => context.json({ error: "Authentication required." }, 401);
+
+function linkFor(openbotUserId: string) {
+  return {
+    ...identity,
+    openbotUserId,
+    linkedAt: new Date(NOW),
+    updatedAt: new Date(NOW),
+  };
+}
+
+function fakeStore(
+  overrides: Partial<ExternalLinkCreationStore> = {},
+): ExternalLinkCreationStore & { links: ReturnType<typeof linkFor>[] } {
+  const links: ReturnType<typeof linkFor>[] = [];
+  async function linkWithStatus(
+    input: Parameters<ExternalLinkStore["link"]>[0],
+  ) {
+    const found = links.find(
+      (link) =>
+        link.provider === input.provider &&
+        link.providerTenantId === input.providerTenantId &&
+        link.providerUserId === input.providerUserId,
+    );
+    if (found?.openbotUserId === input.openbotUserId) {
+      return { link: found, created: false };
+    }
+    if (found) throw new Error(CONFLICT);
+    const link = linkFor(input.openbotUserId);
+    links.push(link);
+    return { link, created: true };
+  }
+  async function linkWithStatusAndAudit(
+    input: Parameters<ExternalLinkStore["link"]>[0],
+    recordAudit: () => Promise<void>,
+  ) {
+    const found = links.find(
+      (link) =>
+        link.provider === input.provider &&
+        link.providerTenantId === input.providerTenantId &&
+        link.providerUserId === input.providerUserId,
+    );
+    if (found?.openbotUserId === input.openbotUserId) {
+      return { link: found, created: false };
+    }
+    if (found) throw new Error(CONFLICT);
+    const link = linkFor(input.openbotUserId);
+    await recordAudit();
+    links.push(link);
+    return { link, created: true };
+  }
+  return Object.assign(
+    {
+      links,
+      async find() {
+        return null;
+      },
+      async findVerifiedUserByEmail() {
+        return null;
+      },
+      linkWithStatus,
+      linkWithStatusAndAudit,
+      async link(input) {
+        return (await linkWithStatus(input)).link;
+      },
+    } satisfies ExternalLinkCreationStore,
+    overrides,
+  );
+}
+
+function appFor(
+  store = fakeStore(),
+  requireUser = authenticatedAs(),
+  rows: AuditEventInput[] = [],
+  auditStore: TransactionalAuditStore = {
+    insert: async (event) => void rows.push(event),
+    inTransaction: () => ({ insert: async (event) => void rows.push(event) }),
+  },
+) {
+  const app = new Hono<{ Variables: AppVariables }>();
+  app.route(
+    "/api/external-links",
+    createExternalLinkRoutes({
+      store,
+      encryptionKey: KEY,
+      requireUser,
+      auditStore,
+      agentProfileStore,
+    }),
+  );
+  return { app, rows, store };
+}
+
+const baseStore: ExternalLinkStore = {
+  find: async () => null,
+  findVerifiedUserByEmail: async () => null,
+  link: async (input) => linkFor(input.openbotUserId),
+};
+
+function requestToken(token: string) {
+  return `?token=${encodeURIComponent(token)}`;
+}
+
+async function liveToken() {
+  return mintExternalLinkToken(identity, KEY);
+}
+
+describe("external Slack link confirmation routes", () => {
+  test("GET shows only the safe Slack display metadata after authentication", async () => {
+    const { app } = appFor();
+    const token = await liveToken();
+
+    const response = await app.request(
+      `http://openbot.test/api/external-links/slack${requestToken(token)}`,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      providerTenantId: "T1",
+      providerUserId: "U1",
+      providerEmail: "person@example.com",
+    });
+  });
+
+  test("GET maps a missing or invalid claim to one stable public refusal", async () => {
+    const { app } = appFor();
+    const expired = await mintExternalLinkToken(identity, KEY, NOW);
+
+    for (const suffix of ["", "?token=invalid", requestToken(expired)]) {
+      const response = await app.request(
+        `http://openbot.test/api/external-links/slack${suffix}`,
+      );
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: INVALID });
+    }
+  });
+
+  test("POST uses the authenticated actor rather than a body-supplied user id", async () => {
+    const { app, rows, store } = appFor();
+    const token = await liveToken();
+
+    const response = await app.request(
+      "http://openbot.test/api/external-links/slack",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token, openbotUserId: "forged-user" }),
+      },
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ linked: true });
+    expect(store.links).toEqual([linkFor(actor.id)]);
+    expect(rows).toEqual([
+      {
+        eventType: "external_identity.linked",
+        targetType: "user",
+        targetId: actor.id,
+        actorUserId: actor.id,
+        payload: {
+          provider: "slack",
+          providerTenantId: "T1",
+          providerUserId: "U1",
+        },
+      },
+    ]);
+  });
+
+  test("POST is idempotent without duplicating audit when the store returns an existing same-actor link", async () => {
+    const { app, store, rows } = appFor();
+    const token = await liveToken();
+
+    for (let call = 0; call < 2; call += 1) {
+      const response = await app.request(
+        "http://openbot.test/api/external-links/slack",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ token }),
+        },
+      );
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ linked: true });
+    }
+
+    expect(store.links).toEqual([linkFor(actor.id)]);
+    expect(rows).toHaveLength(1);
+  });
+
+  test("rolls back an unauditable creation so a successful retry writes exactly one audit event", async () => {
+    const rows: AuditEventInput[] = [];
+    let failuresRemaining = 1;
+    const auditStore: TransactionalAuditStore = {
+      insert: async (event) => {
+        if (failuresRemaining > 0) {
+          failuresRemaining -= 1;
+          throw new Error("audit table unavailable");
+        }
+        rows.push(event);
+      },
+      inTransaction: () => auditStore,
+    };
+    const { app, store } = appFor(
+      fakeStore(),
+      authenticatedAs(),
+      rows,
+      auditStore,
+    );
+    const token = await liveToken();
+    const request = () =>
+      app.request("http://openbot.test/api/external-links/slack", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token }),
+      });
+
+    expect((await request()).status).toBe(500);
+    expect(store.links).toEqual([]);
+
+    expect((await request()).status).toBe(200);
+    expect((await request()).status).toBe(200);
+    expect(store.links).toEqual([linkFor(actor.id)]);
+    expect(rows).toHaveLength(1);
+  });
+
+  test("POST refuses a replay for another actor without reassigning the link", async () => {
+    const { app, store, rows } = appFor();
+    const token = await liveToken();
+    await app.request("http://openbot.test/api/external-links/slack", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token }),
+    });
+
+    const differentActor = { ...actor, id: "openbot-user-2" } as const;
+    const replay = appFor(store, authenticatedAs(differentActor), rows).app;
+    const response = await replay.request(
+      "http://openbot.test/api/external-links/slack",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token }),
+      },
+    );
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: CONFLICT });
+    expect(store.links).toEqual([linkFor(actor.id)]);
+    expect(rows).toHaveLength(1);
+  });
+
+  test("GET and POST are both rejected without authentication", async () => {
+    const { app, store } = appFor(fakeStore(), unauthenticated);
+    const token = await liveToken();
+
+    const get = await app.request(
+      `http://openbot.test/api/external-links/slack${requestToken(token)}`,
+    );
+    const post = await app.request(
+      "http://openbot.test/api/external-links/slack",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token }),
+      },
+    );
+
+    expect(get.status).toBe(401);
+    expect(post.status).toBe(401);
+    expect(store.links).toEqual([]);
+  });
+
+  test("POST maps missing, malformed, and expired tokens to the same public refusal", async () => {
+    const { app } = appFor();
+    const expired = await mintExternalLinkToken(identity, KEY, NOW);
+    const requests = [
+      {},
+      { body: "{not-json" },
+      { body: JSON.stringify({ token: expired }) },
+    ];
+
+    for (const request of requests) {
+      const response = await app.request(
+        "http://openbot.test/api/external-links/slack",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          ...request,
+        },
+      );
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: INVALID });
+    }
+  });
+
+  test("createApp mounts the optional external link routes under its authenticated API prefix", async () => {
+    const token = await liveToken();
+    const externalLinkRoutes = createExternalLinkRoutes({
+      store: fakeStore(),
+      encryptionKey: KEY,
+      requireUser: authenticatedAs(),
+      auditStore: {
+        insert: async () => undefined,
+        inTransaction: () => ({ insert: async () => undefined }),
+      },
+      agentProfileStore,
+    });
+    const app = createApp(
+      loadConfig(testEnvironment()),
+      undefined,
+      undefined,
+      ...(Array.from({ length: 18 }) as never[]),
+      externalLinkRoutes,
+    );
+
+    const response = await app.request(
+      `http://openbot.test/api/external-links/slack${requestToken(token)}`,
+    );
+
+    expect(response.status).toBe(200);
+  });
+
+  test("keeps the base external link store usable without confirmation-only methods", async () => {
+    await expect(
+      baseStore.link({ ...identity, openbotUserId: actor.id }),
+    ).resolves.toEqual(linkFor(actor.id));
+  });
+});
