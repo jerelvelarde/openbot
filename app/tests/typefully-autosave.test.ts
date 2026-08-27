@@ -143,6 +143,38 @@ describe("Typefully autosave controller", () => {
     });
   });
 
+  test("never delivers a stale outer snapshot after a nested transition", () => {
+    const timer = clock();
+    const controller = createAutosaveController({
+      initialDraftId: "draft-current",
+      initialDocument: base,
+      initialVersion: 1,
+      scheduler: timer.scheduler,
+      save: async () => saved(2),
+    });
+    const listenerA: string[] = [];
+    const listenerB: Array<{ delivered: string; current: string }> = [];
+    controller.subscribe(({ state }) => {
+      listenerA.push(state.kind);
+      if (state.kind === "saving") controller.reload(base, 7, "reloaded");
+    });
+    controller.subscribe(({ state }) => {
+      listenerB.push({
+        delivered: state.kind,
+        current: controller.getSnapshot().state.kind,
+      });
+    });
+
+    controller.mediaSettled(edited("obsolete"));
+
+    expect(listenerA).toEqual(["dirty", "saving", "idle"]);
+    expect(listenerB).toEqual([
+      { delivered: "dirty", current: "dirty" },
+      { delivered: "idle", current: "idle" },
+    ]);
+    expect(controller.getSnapshot().state.kind).toBe("idle");
+  });
+
   test("does not call save after a saving subscriber disposes", () => {
     const timer = clock();
     let calls = 0;
