@@ -473,15 +473,14 @@ export function createTypefullyRoutes(
         (descriptor.kind === "video" && !status.mime.startsWith("video/"))
       )
         throw new Error("Typefully returned a mismatched media preview.");
-      const asset = await mediaPreview.fetchAsset(status.url, status.mime);
-      const contentType = asset.headers.get("content-type");
-      if (!contentType)
-        throw new Error("Typefully returned an invalid media preview asset.");
-      return new Response(asset.body, {
-        status: 200,
+      if (context.req.query("status") === "1")
+        return context.json({ state: "ready", mime: status.mime });
+      return new Response(null, {
+        status: 302,
         headers: {
           "cache-control": "private, no-store",
-          "content-type": contentType,
+          location: status.url,
+          "referrer-policy": "no-referrer",
           "x-content-type-options": "nosniff",
         },
       });

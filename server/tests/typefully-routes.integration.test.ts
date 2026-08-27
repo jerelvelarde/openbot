@@ -141,10 +141,6 @@ app.route(
         previewCredential = input.token;
         return previewStatus;
       },
-      fetchAsset: async () =>
-        new Response("preview-bytes", {
-          headers: { "content-type": "image/png" },
-        }),
     },
   }),
 );
@@ -304,7 +300,7 @@ describe("Typefully draft routes", () => {
     ).toEqual([]);
   });
 
-  test("proxies owned remote media without exposing credentials or crossing tenant and Bot boundaries", async () => {
+  test("redirects owned remote media without exposing credentials or crossing tenant and Bot boundaries", async () => {
     const { body } = await createDraft();
     const current = await store.readDraft(body.draft.id, ownerId);
     await store.saveDraft({
@@ -355,11 +351,21 @@ describe("Typefully draft routes", () => {
     expect(detached.status).toBe(409);
     expect(previewCredential).toBeNull();
 
+    const statusResponse = await app.request(
+      `/api/typefully/drafts/${current.id}/media/local-media/preview?status=1`,
+    );
+    expect(statusResponse.status).toBe(200);
+    expect(await statusResponse.json()).toEqual({
+      state: "ready",
+      mime: "image/png",
+    });
     const response = await preview();
-    expect(response.status).toBe(200);
-    expect(response.headers.get("content-type")).toBe("image/png");
+    expect(response.status).toBe(302);
     expect(response.headers.get("cache-control")).toBe("private, no-store");
-    expect(await response.text()).toBe("preview-bytes");
+    expect(response.headers.get("location")).toBe(
+      "https://cdn.typefully.example/launch.png",
+    );
+    expect(response.headers.get("referrer-policy")).toBe("no-referrer");
     expect(previewCredential).toBe("route-personal-key");
     expect(JSON.stringify([...response.headers])).not.toContain(
       "route-personal-key",

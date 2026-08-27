@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
-import { render, waitFor } from "@testing-library/react";
+import { act, render, waitFor } from "@testing-library/react";
 import { platformTextMetrics } from "../src/lib/typefully/preview";
 import type { CanonicalDraftDocument } from "../src/lib/typefully/queries";
 
@@ -121,23 +121,25 @@ test("local videos and remote media use safe native-aspect semantic previews", a
   expect(remoteImage.textContent).not.toContain("Image:");
 });
 
-test("reloaded remote media renders only through authenticated same-origin blob previews", async () => {
+test("reloaded remote media polls same-origin status and renders native redirect URLs", async () => {
   const { PlatformPreview } = await import(
     "../src/components/typefully/platform-preview"
   );
   const originalFetch = globalThis.fetch;
-  const originalCreate = URL.createObjectURL;
-  const originalRevoke = URL.revokeObjectURL;
   const calls: string[] = [];
-  URL.createObjectURL = (blob) => `blob:${blob.type}`;
-  URL.revokeObjectURL = () => {};
   globalThis.fetch = (async (input) => {
     const url = String(input);
     calls.push(url);
     const video = url.includes("/second/");
-    return new Response(video ? "video" : "image", {
-      headers: { "content-type": video ? "video/mp4" : "image/png" },
-    });
+    return new Response(
+      JSON.stringify({
+        state: "ready",
+        mime: video ? "video/mp4" : "image/png",
+      }),
+      {
+        headers: { "content-type": "application/json" },
+      },
+    );
   }) as typeof fetch;
   try {
     const view = render(
@@ -155,15 +157,16 @@ test("reloaded remote media renders only through authenticated same-origin blob 
     );
     expect(view.getByLabelText("Video: Demo video").tagName).toBe("VIDEO");
     expect(calls).toEqual([
-      "/api/typefully/drafts/draft-private/media/first/preview?attempt=0",
-      "/api/typefully/drafts/draft-private/media/second/preview?attempt=0",
+      "/api/typefully/drafts/draft-private/media/first/preview?status=1&attempt=0&poll=0",
+      "/api/typefully/drafts/draft-private/media/second/preview?status=1&attempt=0&poll=0",
     ]);
+    expect(
+      view.getByLabelText("Image: Product screenshot").getAttribute("src"),
+    ).toBe("/api/typefully/drafts/draft-private/media/first/preview?asset=0");
     expect(view.container.innerHTML).not.toContain("cdn.typefully");
     expect(view.container.innerHTML).not.toContain("api_key");
   } finally {
     globalThis.fetch = originalFetch;
-    URL.createObjectURL = originalCreate;
-    URL.revokeObjectURL = originalRevoke;
   }
 });
 
@@ -200,6 +203,113 @@ test("remote media exposes processing and bounded failure states", async () => {
     ).toBeTruthy();
     expect(await view.findByText("Transcode failed")).toBeTruthy();
     expect(view.getByRole("button", { name: "Retry preview" })).toBeTruthy();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("processing previews poll with bounded exponential delays and eventually become ready", async () => {
+  const { RemoteMediaPreview } = await import(
+    "../src/components/typefully/remote-media-preview"
+  );
+  const originalFetch = globalThis.fetch;
+  const callbacks: Array<() => void> = [];
+  const delays: number[] = [];
+  const pollDelays = [10, 20] as const;
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls += 1;
+    return calls < 3
+      ? new Response(JSON.stringify({ state: "processing" }), { status: 202 })
+      : new Response(JSON.stringify({ state: "ready", mime: "image/png" }));
+  }) as typeof fetch;
+  try {
+    const view = render(
+      <RemoteMediaPreview
+        altText="Launch"
+        draftId="draft-private"
+        kind="image"
+        mediaId="media-1"
+        pollDelaysMs={pollDelays}
+        pollScheduler={{
+          clear: () => {},
+          set: (callback, delay) => {
+            callbacks.push(callback);
+            delays.push(delay);
+            return callbacks.length as ReturnType<typeof setTimeout>;
+          },
+        }}
+      />,
+    );
+    expect(
+      await view.findByText("Typefully is processing this media…"),
+    ).toBeTruthy();
+    expect(delays).toEqual([10]);
+    await act(async () => callbacks.shift()?.());
+    await waitFor(() => expect(delays).toEqual([10, 20]));
+    await act(async () => callbacks.shift()?.());
+    await waitFor(() =>
+      expect(view.getByLabelText("Image: Launch").tagName).toBe("IMG"),
+    );
+    expect(calls).toBe(3);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("processing poll exhaustion exposes retry and unmount aborts an active request", async () => {
+  const { RemoteMediaPreview } = await import(
+    "../src/components/typefully/remote-media-preview"
+  );
+  const originalFetch = globalThis.fetch;
+  const callbacks: Array<() => void> = [];
+  const pollDelays = [10] as const;
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({ state: "processing" }), {
+      status: 202,
+    })) as typeof fetch;
+  try {
+    const exhausted = render(
+      <RemoteMediaPreview
+        altText="Launch"
+        draftId="draft-private"
+        kind="image"
+        mediaId="media-1"
+        pollDelaysMs={pollDelays}
+        pollScheduler={{
+          clear: () => {},
+          set: (callback) => {
+            callbacks.push(callback);
+            return callbacks.length as ReturnType<typeof setTimeout>;
+          },
+        }}
+      />,
+    );
+    await exhausted.findByText("Typefully is processing this media…");
+    await act(async () => callbacks.shift()?.());
+    expect(
+      await exhausted.findByRole("button", { name: "Retry preview" }),
+    ).toBeTruthy();
+    exhausted.unmount();
+
+    let aborted = false;
+    globalThis.fetch = ((_input, init) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          aborted = true;
+          reject(new DOMException("Aborted", "AbortError"));
+        });
+      })) as typeof fetch;
+    const pending = render(
+      <RemoteMediaPreview
+        altText="Launch"
+        draftId="draft-private"
+        kind="image"
+        mediaId="media-2"
+      />,
+    );
+    pending.unmount();
+    expect(aborted).toBe(true);
   } finally {
     globalThis.fetch = originalFetch;
   }

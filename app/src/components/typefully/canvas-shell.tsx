@@ -299,8 +299,7 @@ export function CanvasShell({
     Boolean(
       autosave &&
         autosave.state.kind !== "idle" &&
-        autosave.state.kind !== "saved" &&
-        autosave.state.kind !== "error",
+        autosave.state.kind !== "saved",
     );
   const readinessMessage = readiness(
     draft,
@@ -463,7 +462,9 @@ export function CanvasShell({
                   <SectionTitle>Media</SectionTitle>
                   <MediaEditor
                     document={document}
-                    editingDisabled={autosave?.state.kind === "conflict"}
+                    editingDisabled={
+                      mediaBusy || autosave?.state.kind === "conflict"
+                    }
                     onReorder={onMediaReorder ?? (() => {})}
                     onRemove={onRemoveMedia ?? (() => {})}
                     onRetry={onRetryMedia ?? (() => {})}

@@ -102,6 +102,22 @@ function replaceMedia(
   };
 }
 
+function replaceMediaIdentity(
+  document: CanonicalDraftDocument,
+  previousId: string,
+  media: CanonicalDraftDocument["media"][number],
+) {
+  return {
+    ...document,
+    media: [
+      ...document.media.filter(
+        (item) => item.id !== previousId && item.id !== media.id,
+      ),
+      media,
+    ].sort((left, right) => left.order - right.order),
+  };
+}
+
 function EditableDraftCanvas({
   draft,
   onDraftCreated,
@@ -126,6 +142,7 @@ function EditableDraftCanvas({
   );
   const [mediaBusy, setMediaBusy] = useState(false);
   const mediaBusyRef = useRef(false);
+  const mediaOperation = useRef(0);
   const routedDraft = useRef<string | null>(null);
   const files = useRef(new Map<string, File>());
   const urls = useRef(new Map<string, string>());
@@ -173,6 +190,7 @@ function EditableDraftCanvas({
   );
 
   useEffect(() => {
+    if (mediaBusy) return;
     const settled =
       snapshot.state.kind === "idle" || snapshot.state.kind === "saved";
     if (!settled || snapshot.target.version > draft.version) return;
@@ -186,7 +204,13 @@ function EditableDraftCanvas({
       draft.id,
       confirmed ? "confirmed" : "local",
     );
-  }, [controller, draft, snapshot.state.kind, snapshot.target.version]);
+  }, [
+    controller,
+    draft,
+    mediaBusy,
+    snapshot.state.kind,
+    snapshot.target.version,
+  ]);
 
   useEffect(() => {
     const createdId = snapshot.createdDraft?.draftId;
@@ -241,15 +265,38 @@ function EditableDraftCanvas({
     });
   };
 
+  const rekeyLocal = (previousId: string, mediaId: string) => {
+    if (previousId === mediaId) return;
+    const file = files.current.get(previousId);
+    if (file) {
+      files.current.delete(previousId);
+      files.current.set(mediaId, file);
+    }
+    const url = urls.current.get(previousId);
+    if (url) {
+      urls.current.delete(previousId);
+      urls.current.set(mediaId, url);
+    }
+    setLocalMediaUrls((current) => {
+      const next = { ...current };
+      const previous = next[previousId];
+      delete next[previousId];
+      if (previous) next[mediaId] = previous;
+      return next;
+    });
+    setMediaStates((current) => {
+      const next = { ...current };
+      const previous = next[previousId];
+      delete next[previousId];
+      if (previous) next[mediaId] = previous;
+      return next;
+    });
+  };
+
   const uploadOne = async (file: File, existingId?: string) => {
     if (mediaBusyRef.current) return;
     const stable = controller.getSnapshot();
-    if (
-      stable.state.kind !== "idle" &&
-      stable.state.kind !== "saved" &&
-      stable.state.kind !== "error"
-    )
-      return;
+    if (stable.state.kind !== "idle" && stable.state.kind !== "saved") return;
     const mediaId = existingId ?? `media-${crypto.randomUUID()}`;
     const existing = stable.document.media.find((item) => item.id === mediaId);
     const descriptor = existing ?? {
@@ -271,8 +318,9 @@ function EditableDraftCanvas({
       optimistic,
       stable.target.version,
       stable.target.draftId,
-      stable.state.kind === "error" ? "local" : stable.state.remote,
+      stable.state.remote,
     );
+    const operation = ++mediaOperation.current;
     mediaBusyRef.current = true;
     setMediaBusy(true);
     setMediaStates((current) => ({
@@ -286,10 +334,19 @@ function EditableDraftCanvas({
         kind: descriptor.kind,
         altText: descriptor.altText,
         file,
-        mediaId,
+        ...(existing ? { mediaId } : {}),
       });
-      const settled = result.media ?? descriptor;
-      const next = replaceMedia(controller.getSnapshot().document, settled);
+      const settled = result.media ?? (existing ? descriptor : null);
+      if (!settled)
+        throw new Error("The upload returned no authoritative media ID.");
+      rekeyLocal(mediaId, settled.id);
+      const current = controller.getSnapshot();
+      if (
+        mediaOperation.current !== operation ||
+        current.target.draftId !== stable.target.draftId
+      )
+        return;
+      const next = replaceMediaIdentity(current.document, mediaId, settled);
       controller.reload(
         next,
         result.draft.version,
@@ -298,34 +355,42 @@ function EditableDraftCanvas({
       );
       setMediaStates((current) => ({
         ...current,
-        [mediaId]: settled.remoteId
-          ? { kind: "ready", previewUrl: urls.current.get(mediaId) }
+        [settled.id]: settled.remoteId
+          ? { kind: "ready", previewUrl: urls.current.get(settled.id) }
           : {
               kind: "uncertain",
               message: "Typefully could not confirm this upload.",
-              previewUrl: urls.current.get(mediaId),
+              previewUrl: urls.current.get(settled.id),
             },
       }));
     } catch (error) {
       const clientError =
         error instanceof TypefullyClientError ? error : undefined;
       const failed = clientError?.media ?? descriptor;
-      const next = replaceMedia(controller.getSnapshot().document, failed);
+      rekeyLocal(mediaId, failed.id);
+      const current = controller.getSnapshot();
+      if (
+        mediaOperation.current !== operation ||
+        current.target.draftId !== stable.target.draftId
+      )
+        return;
+      const next = replaceMediaIdentity(current.document, mediaId, failed);
       const committedVersion = clientError?.draft?.version;
       if (committedVersion !== undefined) {
-        controller.remoteFailed(
+        controller.reload(
           next,
           committedVersion,
-          clientError,
           stable.target.draftId,
+          "local",
         );
       } else {
         controller.reload(
-          next,
+          existing ? next : stable.document,
           stable.target.version,
           stable.target.draftId,
           "local",
         );
+        if (!existing) forgetLocal(failed.id);
       }
       const uncertain =
         clientError?.code === "outcome_unknown" ||
@@ -333,11 +398,11 @@ function EditableDraftCanvas({
         clientError?.code === "remote_error";
       setMediaStates((current) => ({
         ...current,
-        [mediaId]: {
+        [failed.id]: {
           kind: uncertain ? "uncertain" : "failed",
           message:
             clientError?.message ?? "This upload failed. Retry or remove it.",
-          previewUrl: urls.current.get(mediaId),
+          previewUrl: urls.current.get(failed.id),
         },
       }));
     } finally {
@@ -366,12 +431,7 @@ function EditableDraftCanvas({
   const removeMedia = async (mediaId: string) => {
     if (mediaBusyRef.current) return;
     const stable = controller.getSnapshot();
-    if (
-      stable.state.kind !== "idle" &&
-      stable.state.kind !== "saved" &&
-      stable.state.kind !== "error"
-    )
-      return;
+    if (stable.state.kind !== "idle" && stable.state.kind !== "saved") return;
     const previous = stable.document;
     const next = {
       ...previous,
@@ -381,8 +441,9 @@ function EditableDraftCanvas({
       next,
       stable.target.version,
       stable.target.draftId,
-      stable.state.kind === "error" ? "local" : stable.state.remote,
+      stable.state.remote,
     );
+    const operation = ++mediaOperation.current;
     mediaBusyRef.current = true;
     setMediaBusy(true);
     try {
@@ -391,6 +452,12 @@ function EditableDraftCanvas({
         mediaId,
         expectedVersion: stable.target.version,
       });
+      const current = controller.getSnapshot();
+      if (
+        mediaOperation.current !== operation ||
+        current.target.draftId !== stable.target.draftId
+      )
+        return;
       controller.reload(
         next,
         result.draft.version,
@@ -406,12 +473,18 @@ function EditableDraftCanvas({
     } catch (error) {
       const clientError =
         error instanceof TypefullyClientError ? error : undefined;
+      const current = controller.getSnapshot();
+      if (
+        mediaOperation.current !== operation ||
+        current.target.draftId !== stable.target.draftId
+      )
+        return;
       if (clientError?.draft?.version !== undefined) {
-        controller.remoteFailed(
+        controller.reload(
           next,
           clientError.draft.version,
-          clientError,
           stable.target.draftId,
+          "local",
         );
         setMediaStates((current) => {
           const updated = { ...current };
@@ -424,7 +497,7 @@ function EditableDraftCanvas({
           previous,
           stable.target.version,
           stable.target.draftId,
-          stable.state.kind === "error" ? "local" : stable.state.remote,
+          stable.state.remote,
         );
         setMediaStates((current) => ({
           ...current,
@@ -488,8 +561,12 @@ function EditableDraftCanvas({
       localMediaUrls={localMediaUrls}
       mediaBusy={mediaBusy}
       mediaStates={mediaStates}
-      onMediaReorder={controller.textChanged}
-      onMediaTextChange={controller.textChanged}
+      onMediaReorder={(next) => {
+        if (!mediaBusyRef.current) controller.textChanged(next);
+      }}
+      onMediaTextChange={(next) => {
+        if (!mediaBusyRef.current) controller.textChanged(next);
+      }}
       onReload={() => void reload()}
       onRemoveMedia={(mediaId) => void removeMedia(mediaId)}
       onRetryMedia={retryMedia}
@@ -498,7 +575,9 @@ function EditableDraftCanvas({
         void controller.saveAsNewDraft();
       }}
       onSelectMedia={(selected) => void selectMedia(selected)}
-      onTextChange={controller.textChanged}
+      onTextChange={(next) => {
+        if (!mediaBusyRef.current) controller.textChanged(next);
+      }}
       onPreparePublication={() => void preparePublication()}
       proposal={proposal}
       proposalError={

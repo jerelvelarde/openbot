@@ -14,7 +14,7 @@ import {
 } from "../src/plugins/typefully-rest";
 
 describe("Typefully media preview transport", () => {
-  test("loads official media status and proxies a safe ready asset without exposing the key", async () => {
+  test("returns a browser redirect target without a DNS-rebindable server asset fetch", async () => {
     const calls: Array<{ url: string; authorization: string | null }> = [];
     const fetch = (async (input, init) => {
       const url = String(input);
@@ -30,7 +30,7 @@ describe("Typefully media preview transport", () => {
             status: "ready",
             error_reason: null,
             media_urls: {
-              original: "https://cdn.typefully.example/launch.png",
+              original: "https://rebind-preview.example/launch.png",
               large: null,
               medium: null,
               small: null,
@@ -38,10 +38,7 @@ describe("Typefully media preview transport", () => {
           }),
           { status: 200, headers: { "content-type": "application/json" } },
         );
-      return new Response("image-bytes", {
-        status: 200,
-        headers: { "content-type": "image/png", "content-length": "11" },
-      });
+      throw new Error("The server must never fetch the unpinned media host.");
     }) as typeof globalThis.fetch;
     const transport = createTypefullyMediaPreviewTransport(fetch);
     const status = await transport.getStatus({
@@ -55,16 +52,12 @@ describe("Typefully media preview transport", () => {
       mime: "image/png",
     });
     if (status.state !== "ready") throw new Error("Expected ready media.");
-    const asset = await transport.fetchAsset(status.url);
-    expect(await asset.text()).toBe("image-bytes");
+    expect(status.url).toBe("https://rebind-preview.example/launch.png");
     expect(calls[0]).toEqual({
       url: "https://api.typefully.com/v2/social-sets/12/media/77",
       authorization: "Bearer tf-private-key",
     });
-    expect(calls[1]).toEqual({
-      url: "https://cdn.typefully.example/launch.png",
-      authorization: null,
-    });
+    expect(calls).toHaveLength(1);
   });
 
   test("reports processing and failure safely and rejects SSRF media URLs", async () => {

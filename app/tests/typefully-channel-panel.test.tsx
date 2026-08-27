@@ -859,6 +859,227 @@ test("production draft canvas keeps editing during a delayed save and coalesces 
   );
 });
 
+test("draft media add omits an id, then retry and remove use the server-authoritative id", async () => {
+  const { DraftCanvas } = await import(
+    "../src/components/typefully/draft-canvas"
+  );
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
+    },
+  });
+  queryClient.setQueryData(typefullyKeys.draft(draftId), {
+    draft: authoritativeDraft(),
+  });
+  const calls: Array<{
+    url: string;
+    method: string;
+    mediaId: FormDataEntryValue | null;
+  }> = [];
+  const media = {
+    id: "authoritative-media-id",
+    kind: "image" as const,
+    order: 0,
+    altText: "",
+    remoteId: null as string | null,
+  };
+  let uploadCount = 0;
+  globalThis.fetch = (async (input, init) => {
+    const url = typeof input === "string" ? input : input.url;
+    const method = init?.method ?? "GET";
+    const form = init?.body instanceof FormData ? init.body : null;
+    calls.push({ url, method, mediaId: form?.get("mediaId") ?? null });
+    if (method === "POST") {
+      uploadCount += 1;
+      const version = uploadCount + 1;
+      const completed =
+        uploadCount === 1
+          ? media
+          : { ...media, remoteId: "typefully-media-77" };
+      return new Response(
+        JSON.stringify({
+          ...(uploadCount === 1
+            ? {
+                code: "remote_error",
+                message: "Upload failed. Retry it.",
+              }
+            : {}),
+          draft: {
+            id: draftId,
+            title: "Production route draft",
+            destinations: ["x"],
+            socialSetLabel: "Route account",
+            mediaCount: 1,
+            version,
+            syncStatus: uploadCount === 1 ? "remote_error" : "synced",
+            proposalStatus: null,
+          },
+          remote: {
+            state: uploadCount === 1 ? "remote_error" : "synced",
+            remoteDraftId: "remote-1",
+            confirmedVersion: uploadCount === 1 ? 1 : version,
+            confirmedHash: `hash-${version}`,
+          },
+          media: completed,
+        }),
+        {
+          status: uploadCount === 1 ? 502 : 201,
+          headers: { "content-type": "application/json" },
+        },
+      );
+    }
+    if (method === "DELETE")
+      return new Response(
+        JSON.stringify({
+          draft: {
+            id: draftId,
+            title: "Production route draft",
+            destinations: ["x"],
+            socialSetLabel: "Route account",
+            mediaCount: 0,
+            version: 4,
+            syncStatus: "synced",
+            proposalStatus: null,
+          },
+          remote: {
+            state: "synced",
+            remoteDraftId: "remote-1",
+            confirmedVersion: 4,
+            confirmedHash: "hash-4",
+          },
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    return new Response(JSON.stringify({ draft: authoritativeDraft() }), {
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  const view = render(
+    <QueryClientProvider client={queryClient}>
+      <DraftCanvas draftId={draftId} />
+    </QueryClientProvider>,
+  );
+  const user = userEvent.setup({ document });
+  await user.upload(
+    view.getByLabelText("Add media"),
+    new File(["image"], "launch.png", { type: "image/png" }),
+  );
+  const retry = await view.findByRole("button", { name: "Retry image 1" });
+  expect(calls[0]).toMatchObject({
+    url: `/api/typefully/drafts/${draftId}/media`,
+    method: "POST",
+    mediaId: null,
+  });
+  await user.click(retry);
+  await waitFor(() => expect(uploadCount).toBe(2));
+  expect(calls.filter((call) => call.method === "POST")[1]).toMatchObject({
+    method: "POST",
+    mediaId: media.id,
+  });
+  await user.click(view.getByRole("button", { name: "Remove image 1" }));
+  await waitFor(() =>
+    expect(calls.some((call) => call.method === "DELETE")).toBe(true),
+  );
+  expect(calls.find((call) => call.method === "DELETE")?.url).toBe(
+    `/api/typefully/drafts/${draftId}/media/${media.id}`,
+  );
+});
+
+test("media busy locks edits and an autosave error blocks media operations", async () => {
+  const { DraftCanvas } = await import(
+    "../src/components/typefully/draft-canvas"
+  );
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
+    },
+  });
+  queryClient.setQueryData(typefullyKeys.draft(draftId), {
+    draft: authoritativeDraft(),
+  });
+  let finishUpload!: (response: Response) => void;
+  let uploadStarted = false;
+  globalThis.fetch = (async (_input, init) => {
+    const method = init?.method ?? "GET";
+    if (method === "POST") {
+      uploadStarted = true;
+      return await new Promise<Response>((resolve) => {
+        finishUpload = resolve;
+      });
+    }
+    if (method === "PUT")
+      return new Response(
+        JSON.stringify({ code: "remote_error", message: "Save failed." }),
+        { status: 502, headers: { "content-type": "application/json" } },
+      );
+    return new Response(JSON.stringify({ draft: authoritativeDraft() }), {
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+  const view = render(
+    <QueryClientProvider client={queryClient}>
+      <DraftCanvas draftId={draftId} />
+    </QueryClientProvider>,
+  );
+  const user = userEvent.setup({ document });
+  const editor = view.getByRole("textbox", { name: "X post 1" });
+  await user.upload(
+    view.getByLabelText("Add media"),
+    new File(["image"], "launch.png", { type: "image/png" }),
+  );
+  await waitFor(() => expect(uploadStarted).toBe(true));
+  expect((editor as HTMLTextAreaElement).disabled).toBe(true);
+  await user.type(editor, "must-not-apply");
+  expect((editor as HTMLTextAreaElement).value).toBe("Route body");
+  finishUpload(
+    new Response(
+      JSON.stringify({
+        draft: {
+          id: draftId,
+          title: "Production route draft",
+          destinations: ["x"],
+          socialSetLabel: "Route account",
+          mediaCount: 1,
+          version: 3,
+          syncStatus: "synced",
+          proposalStatus: null,
+        },
+        remote: {
+          state: "synced",
+          remoteDraftId: "remote-1",
+          confirmedVersion: 3,
+          confirmedHash: "hash-3",
+        },
+        media: {
+          id: "authoritative-media-id",
+          kind: "image",
+          order: 0,
+          altText: "",
+          remoteId: "typefully-media-77",
+        },
+      }),
+      { status: 201, headers: { "content-type": "application/json" } },
+    ),
+  );
+  await waitFor(() =>
+    expect((editor as HTMLTextAreaElement).disabled).toBe(false),
+  );
+  expect((editor as HTMLTextAreaElement).value).toBe("Route body");
+
+  await user.type(editor, "!");
+  await waitFor(
+    () =>
+      expect(view.getByRole("status").textContent).toContain(
+        "Not saved to Typefully",
+      ),
+    { timeout: 1_500 },
+  );
+  expect((view.getByLabelText("Add media") as HTMLInputElement).disabled).toBe(
+    true,
+  );
+});
+
 test("production review control prepares a proposal without publishing", async () => {
   const { DraftCanvas } = await import(
     "../src/components/typefully/draft-canvas"

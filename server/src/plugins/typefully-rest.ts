@@ -23,7 +23,6 @@ const TYPEFULLY_ACCOUNT_FIELD_CHARS = 200;
 const TYPEFULLY_ME_MAX_BYTES = 16_384;
 export const TYPEFULLY_REMOVE_MEDIA_MAX_DRAFT_BYTES = 1_000_000;
 const TYPEFULLY_MEDIA_STATUS_MAX_BYTES = 32_768;
-const TYPEFULLY_MEDIA_PREVIEW_MAX_BYTES = 25_000_000;
 const TYPEFULLY_MEDIA_PREVIEW_MIMES = new Set([
   "image/jpeg",
   "image/png",
@@ -127,63 +126,6 @@ export function createTypefullyMediaPreviewTransport(
         );
       }
       return mediaPreviewStatus(value, input.token);
-    },
-    async fetchAsset(url: string, expectedMime?: string): Promise<Response> {
-      const target = checkNavigationTarget(url);
-      const parsed = target.allowed ? new URL(target.url) : null;
-      if (
-        !target.allowed ||
-        parsed?.protocol !== "https:" ||
-        parsed.username !== "" ||
-        parsed.password !== ""
-      )
-        throw new Error("Typefully returned an unsafe media preview response.");
-      const response = await fetchImplementation(target.url, {
-        method: "GET",
-        redirect: "error",
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-      const contentType = response.headers
-        .get("content-type")
-        ?.split(";", 1)[0]
-        ?.trim();
-      const contentLength = Number(response.headers.get("content-length"));
-      if (
-        !response.ok ||
-        !contentType ||
-        !TYPEFULLY_MEDIA_PREVIEW_MIMES.has(contentType) ||
-        (expectedMime !== undefined && contentType !== expectedMime) ||
-        (Number.isFinite(contentLength) &&
-          contentLength > TYPEFULLY_MEDIA_PREVIEW_MAX_BYTES)
-      ) {
-        await response.body?.cancel().catch(() => {});
-        throw new Error("Typefully returned an invalid media preview asset.");
-      }
-      const reader = response.body?.getReader();
-      const chunks: Uint8Array[] = [];
-      let total = 0;
-      if (reader) {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (!value) continue;
-          total += value.byteLength;
-          if (total > TYPEFULLY_MEDIA_PREVIEW_MAX_BYTES) {
-            await reader.cancel().catch(() => {});
-            throw new Error(
-              "Typefully returned an oversized media preview asset.",
-            );
-          }
-          chunks.push(value);
-        }
-      }
-      const bytes = new Uint8Array(total);
-      let offset = 0;
-      for (const chunk of chunks) {
-        bytes.set(chunk, offset);
-        offset += chunk.byteLength;
-      }
-      return new Response(bytes, { headers: { "content-type": contentType } });
     },
   };
 }
