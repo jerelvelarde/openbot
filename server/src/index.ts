@@ -67,11 +67,7 @@ import { createOpenBotSlackChannel } from "./slack/channel";
 import { configureApprovalDecisionStore } from "./slack/components";
 import { SlackIdentityLinker } from "./slack/identity-linker";
 import { SlackIngressRegistry } from "./slack/ingress-registry";
-import {
-  activateManagedChannels,
-  createGracefulShutdown,
-  projectSlackStatus,
-} from "./slack/status";
+import { projectSlackStatus, startManagedChannelHost } from "./slack/status";
 import {
   createPackageStatusReader,
   loadTenantPackage,
@@ -478,16 +474,12 @@ const actorAgentResolver = createActorAgentResolver({
    * Google's sign-in page and asked a person to sign in to an account the deployment had already
    * connected. Naming them lets it say which one it has not been granted instead.
    *
-   * Read per request rather than held, because a connector added a minute ago has to count, and
-   * failing is the same as having none: a Bot that cannot be told loses a sentence, not a run.
+   * Read per request rather than held, because a connector added a minute ago has to count. A read
+   * failure must stop the run: treating unavailable infrastructure as an empty catalogue sends a
+   * Bot to vendor websites under a false statement about what the deployment has connected.
    */
-  loadVendors: async () => {
-    try {
-      return (await pluginStore.listServers()).map((server) => server.id);
-    } catch {
-      return [];
-    }
-  },
+  loadVendors: async () =>
+    (await pluginStore.listServers()).map((server) => server.id),
   /*
    * How a run's tools are narrowed to the ones it is about.
    *
@@ -703,7 +695,7 @@ const isProxiedStream = (data: SocketData): data is StreamData =>
 const asChannelSocket = (ws: { data: SocketData }) =>
   ws as unknown as ChannelSocket;
 
-serve<SocketData>({
+const serverOptions = {
   port,
   async fetch(request, server) {
     const url = new URL(request.url);
@@ -801,20 +793,21 @@ serve<SocketData>({
       ws.data.inward?.close();
     },
   },
-});
+} satisfies Bun.Serve.Options<SocketData>;
+const startWeb = () => serve<SocketData>(serverOptions);
 
-const shutdown = createGracefulShutdown({
+const managedHost = startManagedChannelHost({
+  startWeb,
+  stopWeb: (server) => server.stop(true),
   channels: copilotHandler.channels,
+  signals: process,
   stopOthers: [
     () => channelActivityListener.stop(),
     () => policyListener.stop(),
     () => auditRetention.stop(),
   ],
-  exit: () => process.exit(0),
+  exit: (code) => process.exit(code),
 });
-for (const signal of ["SIGINT", "SIGTERM"] as const) {
-  process.on(signal, () => void shutdown());
-}
 
 if (config.singleUser) {
   // Loud, every boot. A server that is not checking who is asking should never be a quiet default.
@@ -829,4 +822,4 @@ console.info(`OpenBot server listening on http://localhost:${port}`);
 
 // Activation is allowed to settle after HTTP starts. A missing provider or gateway outage must
 // leave the setup and health surfaces reachable, with the projected status explaining why.
-await activateManagedChannels(copilotHandler.channels);
+await managedHost;
