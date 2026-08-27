@@ -645,6 +645,8 @@ const app = createApp(
   createPageFrameStore(database),
   // External identity confirmation and assistance routes use the same actor and profile boundary.
   externalLinkRoutes,
+  // Preserve the existing positional extension point without enabling an unrelated integration.
+  undefined,
   // A narrow public projection: never hand `/api/capabilities` the runtime snapshot itself.
   () => projectSlackStatus(copilotHandler.channels?.status()),
 );

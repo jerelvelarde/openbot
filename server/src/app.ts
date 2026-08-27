@@ -176,6 +176,8 @@ export function createApp(
    * user guard, and its audit store before handing the completed surface to the app.
    */
   externalLinkRoutes?: HonoApp<{ Variables: AppVariables }>,
+  /** Reserved to preserve the positional boundary for deployments built from earlier revisions. */
+  _reservedExternalStore?: unknown,
   /** Credential-free managed Slack readiness, appended to preserve positional callers. */
   slackStatus: () => SlackStatus = () => ({
     status: "stopped",

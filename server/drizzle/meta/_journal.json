@@ -150,31 +150,10 @@
       "breakpoints": true
     },
     {
-      "idx": 22,
+      "idx": 21,
       "version": "7",
-      "when": 1787824586314,
-      "tag": "0022_external_thread_bindings",
-      "breakpoints": true
-    },
-    {
-      "idx": 23,
-      "version": "7",
-      "when": 1787825391885,
-      "tag": "0023_immutable_external_threads",
-      "breakpoints": true
-    },
-    {
-      "idx": 24,
-      "version": "7",
-      "when": 1787833508227,
-      "tag": "0024_cold_vermin",
-      "breakpoints": true
-    },
-    {
-      "idx": 25,
-      "version": "7",
-      "when": 1787835208872,
-      "tag": "0025_approval_decision_retry",
+      "when": 1787848990772,
+      "tag": "0021_slack_channels",
       "breakpoints": true
     }
   ]
