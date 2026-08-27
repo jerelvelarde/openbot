@@ -441,6 +441,158 @@ test("failed authority recovery permits status checks but never repeats the acti
   expect(respond).not.toHaveBeenCalled();
 });
 
+test("a disconnected publish and failed authority GET stays status-check-only", async () => {
+  let initialLoaded = false;
+  const calls: string[] = [];
+  globalThis.fetch = mock(async (input, init) => {
+    calls.push(`${init?.method ?? "GET"} ${String(input)}`);
+    if (init?.method === "POST") throw new TypeError("connection reset");
+    if (!initialLoaded) {
+      initialLoaded = true;
+      return Response.json({ proposal: proposal("pending") });
+    }
+    throw new TypeError("status unavailable");
+  }) as typeof fetch;
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const respond = mock(async () => {});
+  const view = render(
+    <QueryClientProvider client={client}>
+      <TypefullyPublicationDecision
+        args={{
+          proposalId,
+          draftId,
+          destinations: ["x", "linkedin"],
+          version: 7,
+          expiresAt,
+        }}
+        respond={respond}
+        status="executing"
+      />
+    </QueryClientProvider>,
+  );
+  const user = userEvent.setup({ document });
+  await user.click(await view.findByRole("button", { name: "Publish now" }));
+  expect(
+    (await view.findAllByText("Publishing status unknown")).length,
+  ).toBeGreaterThan(0);
+  expect(calls).toEqual([
+    `GET /api/typefully/proposals/${proposalId}`,
+    `POST /api/typefully/proposals/${proposalId}/publish`,
+    `GET /api/typefully/proposals/${proposalId}`,
+  ]);
+  expect(view.queryByRole("button", { name: "Publish now" })).toBeNull();
+  expect(view.queryByRole("button", { name: "Decline" })).toBeNull();
+  expect(
+    client.getQueryData(typefullyKeys.proposal(proposalId)),
+  ).toBeUndefined();
+  expect(respond).not.toHaveBeenCalled();
+});
+
+test("a disconnected action with bound pending authority cannot repeat publish or decline", async () => {
+  for (const [action, recovered] of [
+    ["Publish now", "pending"],
+    ["Decline", "in_flight"],
+  ] as const) {
+    let attempted = false;
+    const calls: string[] = [];
+    globalThis.fetch = mock(async (input, init) => {
+      calls.push(`${init?.method ?? "GET"} ${String(input)}`);
+      if (init?.method === "POST") {
+        attempted = true;
+        throw new TypeError("connection reset");
+      }
+      return Response.json({
+        proposal: proposal(attempted ? recovered : "pending"),
+      });
+    }) as typeof fetch;
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
+    const respond = mock(async () => {});
+    const view = render(
+      <QueryClientProvider client={client}>
+        <TypefullyPublicationDecision
+          args={{
+            proposalId,
+            draftId,
+            destinations: ["x", "linkedin"],
+            version: 7,
+            expiresAt,
+          }}
+          respond={respond}
+          status="executing"
+        />
+      </QueryClientProvider>,
+    );
+    const user = userEvent.setup({ document });
+    await user.click(await view.findByRole("button", { name: action }));
+    expect(
+      (await view.findAllByText("Publishing status unknown")).length,
+    ).toBeGreaterThan(0);
+    expect(view.queryByRole("button", { name: "Publish now" })).toBeNull();
+    expect(view.queryByRole("button", { name: "Decline" })).toBeNull();
+    expect(
+      client.getQueryData(typefullyKeys.proposal(proposalId)),
+    ).toBeUndefined();
+    expect(calls).toHaveLength(3);
+    expect(respond).not.toHaveBeenCalled();
+    view.unmount();
+  }
+});
+
+test("a disconnected action converges only from bound terminal authority", async () => {
+  for (const [action, recovered] of [
+    ["Publish now", "published"],
+    ["Decline", "declined"],
+  ] as const) {
+    let attempted = false;
+    const calls: string[] = [];
+    globalThis.fetch = mock(async (input, init) => {
+      calls.push(`${init?.method ?? "GET"} ${String(input)}`);
+      if (init?.method === "POST") {
+        attempted = true;
+        throw new TypeError("connection reset");
+      }
+      return Response.json({
+        proposal: proposal(attempted ? recovered : "pending"),
+      });
+    }) as typeof fetch;
+    const respond = mock(async () => {});
+    const view = render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <TypefullyPublicationDecision
+          args={{
+            proposalId,
+            draftId,
+            destinations: ["x", "linkedin"],
+            version: 7,
+            expiresAt,
+          }}
+          respond={respond}
+          status="executing"
+        />
+      </QueryClientProvider>,
+    );
+    const user = userEvent.setup({ document });
+    await user.click(await view.findByRole("button", { name: action }));
+    await waitFor(() => expect(respond).toHaveBeenCalledTimes(1));
+    expect(respond.mock.calls[0]?.[0]).toMatchObject({ outcome: recovered });
+    expect(calls).toHaveLength(3);
+    expect(view.queryByRole("button", { name: "Publish now" })).toBeNull();
+    expect(view.queryByRole("button", { name: "Decline" })).toBeNull();
+    view.unmount();
+  }
+});
+
 test("a malformed decline response cannot issue a duplicate decline", async () => {
   let declined = false;
   const calls: string[] = [];

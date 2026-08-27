@@ -808,23 +808,12 @@ function proposalAction(
         }),
       ]);
     },
-    onError: (error, input) => {
-      if (
-        error instanceof TypefullyClientError &&
-        error.code === "remote_invalid_response"
-      ) {
-        return queryClient?.invalidateQueries({
-          queryKey: typefullyKeys.proposal(input.proposalId),
-          exact: true,
-          refetchType: "none",
-        });
-      }
-      return queryClient?.invalidateQueries({
+    onError: (_error, input) =>
+      queryClient?.invalidateQueries({
         queryKey: typefullyKeys.proposal(input.proposalId),
         exact: true,
-        refetchType: "all",
-      });
-    },
+        refetchType: "none",
+      }),
   });
 }
 

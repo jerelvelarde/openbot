@@ -496,40 +496,9 @@ export function TypefullyProposalReviewLoader({
         },
       );
       completed = result.proposal;
-    } catch (error) {
-      if (
-        error instanceof TypefullyClientError &&
-        error.code === "remote_invalid_response"
-      ) {
-        await recoverActionAuthority();
-        return;
-      }
-      const refreshed = await query.refetch();
-      const latest = refreshed.data?.proposal;
-      if (
-        latest &&
-        proposalMatchesSummary(latest, summary) &&
-        statusFor(latest) !== "pending" &&
-        statusFor(latest) !== "in_flight" &&
-        statusFor(latest) !== "unknown"
-      ) {
-        try {
-          await answer({
-            outcome: statusFor(latest),
-            proposalId: latest.id,
-            draftId: latest.draftId,
-            version: latest.version,
-          });
-        } catch {
-          setActionError("The publication decision could not be sent.");
-        }
-      } else {
-        setActionError(
-          error instanceof TypefullyClientError
-            ? error.message
-            : "The publication decision could not be completed. Try again.",
-        );
-      }
+    } catch {
+      await recoverActionAuthority();
+      return;
     }
     if (!completed) return;
     if (completed.status === "unknown") return;
