@@ -177,12 +177,14 @@ async function synchronize(
   draftId: string,
   actorId: string,
   expected?: { version: number; hash: string },
+  attemptId?: string,
 ) {
   const outcome = await store.syncDraft({
     draftId,
     actorId,
     expectedVersion: expected?.version,
     expectedHash: expected?.hash,
+    attemptId,
   });
   if (outcome.result.isError) {
     const message = safeError(outcome.result.text);
@@ -507,11 +509,19 @@ export function createTypefullyRoutes(
               media: [...current.document.media, media],
             },
           });
+      const attempt = await store.beginMediaAttempt({
+        draftId: saved.id,
+        actorId: context.var.actor.id,
+        toolName: "upload_media",
+        expectedVersion: saved.version,
+        expectedHash: saved.contentHash,
+      });
       try {
         const remote = await store.callRemoteTool({
           draftId: current.id,
           actorId: context.var.actor.id,
           toolName: "upload_media",
+          attemptId: attempt.attemptId,
           args: {
             socialSetId: Number(saved.document.socialSetId),
             fileName: file.name,
@@ -522,6 +532,7 @@ export function createTypefullyRoutes(
             draftId: saved.id,
             actorId: context.var.actor.id,
             expectedVersion: saved.version,
+            attemptId: attempt.attemptId,
             error: remote.text,
           });
           return context.json(
@@ -553,6 +564,7 @@ export function createTypefullyRoutes(
           confirmed.id,
           context.var.actor.id,
           { version: confirmed.version, hash: confirmed.contentHash },
+          attempt.attemptId,
         );
         if (!synced.ok) {
           return context.json(
@@ -570,6 +582,13 @@ export function createTypefullyRoutes(
         );
       } catch (error) {
         if (error instanceof ConnectionRequiredError) {
+          await store.recordRemoteFailure({
+            draftId: saved.id,
+            actorId: context.var.actor.id,
+            expectedVersion: saved.version,
+            attemptId: attempt.attemptId,
+            error,
+          });
           return errorResponse(context, error, saved.id);
         }
         if (
@@ -577,12 +596,20 @@ export function createTypefullyRoutes(
           error instanceof BotNotAttachedError ||
           error instanceof PluginRefusedError
         ) {
+          await store.recordRemoteFailure({
+            draftId: saved.id,
+            actorId: context.var.actor.id,
+            expectedVersion: saved.version,
+            attemptId: attempt.attemptId,
+            error,
+          });
           return errorResponse(context, error, saved.id);
         }
         const failed = await store.recordRemoteFailure({
           draftId: saved.id,
           actorId: context.var.actor.id,
           expectedVersion: saved.version,
+          attemptId: attempt.attemptId,
           error,
         });
         return context.json(
@@ -606,6 +633,7 @@ export function createTypefullyRoutes(
   routes.delete("/drafts/:id/media/:mediaId", async (context) => {
     const draftId = context.req.param("id");
     let saved: TypefullyDraft | null = null;
+    let mediaAttemptId: string | null = null;
     try {
       const body = await jsonBody(context);
       if (!Number.isSafeInteger(body.expectedVersion)) {
@@ -630,6 +658,14 @@ export function createTypefullyRoutes(
         expectedVersion: body.expectedVersion as number,
         document: { ...current.document, media },
       });
+      const attempt = await store.beginMediaAttempt({
+        draftId: saved.id,
+        actorId: context.var.actor.id,
+        toolName: "remove_media",
+        expectedVersion: saved.version,
+        expectedHash: saved.contentHash,
+      });
+      mediaAttemptId = attempt.attemptId;
       if (descriptor.remoteId !== null && current.remoteDraftId !== null) {
         for (const platform of current.document.destinations) {
           for (const [postIndex] of current.document.posts.entries()) {
@@ -637,6 +673,7 @@ export function createTypefullyRoutes(
               draftId: current.id,
               actorId: context.var.actor.id,
               toolName: "remove_media",
+              attemptId: attempt.attemptId,
               args: {
                 socialSetId: Number(current.document.socialSetId),
                 draftId: Number(current.remoteDraftId),
@@ -651,6 +688,7 @@ export function createTypefullyRoutes(
                 actorId: context.var.actor.id,
                 expectedVersion: saved.version,
                 expectedHash: saved.contentHash,
+                attemptId: attempt.attemptId,
                 error: removed.text,
               });
               return context.json(
@@ -666,10 +704,16 @@ export function createTypefullyRoutes(
           }
         }
       }
-      const synced = await synchronize(store, saved.id, context.var.actor.id, {
-        version: saved.version,
-        hash: saved.contentHash,
-      });
+      const synced = await synchronize(
+        store,
+        saved.id,
+        context.var.actor.id,
+        {
+          version: saved.version,
+          hash: saved.contentHash,
+        },
+        attempt.attemptId,
+      );
       if (!synced.ok) {
         return context.json(
           {
@@ -698,6 +742,7 @@ export function createTypefullyRoutes(
           actorId: context.var.actor.id,
           expectedVersion: saved.version,
           expectedHash: saved.contentHash,
+          ...(mediaAttemptId ? { attemptId: mediaAttemptId } : {}),
           error,
         });
         return context.json(

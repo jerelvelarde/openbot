@@ -959,6 +959,7 @@ export function createTypefullyStore(options: {
       actorId: string;
       expectedVersion?: number;
       expectedHash?: string;
+      attemptId?: string;
     }): Promise<{
       draft: TypefullyDraft;
       result: { text: string; isError: boolean };
@@ -971,7 +972,28 @@ export function createTypefullyStore(options: {
       for (let pass = 0; pass < 2; pass += 1) {
         authorized = await store.authorizeRemoteOperation(input);
         try {
-          claim = await claimSyncAttempt(authorized.draft, input.actorId);
+          if (input.attemptId) {
+            const current = await ownedDraft(
+              database,
+              input.draftId,
+              input.actorId,
+            );
+            if (
+              current.attemptId !== input.attemptId ||
+              current.attemptState !== "in_flight" ||
+              current.version !== input.expectedVersion ||
+              current.contentHash !== input.expectedHash
+            )
+              throw new StaleRemoteAttemptError();
+            authorized.draft = current;
+            claim = {
+              kind: "claimed",
+              draft: current,
+              attemptId: input.attemptId,
+            };
+          } else {
+            claim = await claimSyncAttempt(authorized.draft, input.actorId);
+          }
           break;
         } catch (error) {
           if (error instanceof StaleAuthorizationError && pass === 0) continue;
@@ -1115,12 +1137,19 @@ export function createTypefullyStore(options: {
       actorId: string;
       toolName: "upload_media" | "remove_media";
       args: Record<string, unknown>;
+      attemptId?: string;
     }): Promise<{ draft: TypefullyDraft; text: string; isError: boolean }> {
       const draft = await store.authorizeTool({
         draftId: input.draftId,
         actorId: input.actorId,
         toolName: input.toolName,
       });
+      if (
+        input.attemptId &&
+        (draft.attemptId !== input.attemptId ||
+          draft.attemptState !== "in_flight")
+      )
+        throw new StaleRemoteAttemptError();
       const dispatchVendor = plugin().dispatchVendor;
       if (!dispatchVendor)
         throw new Error("Typefully remote calls are unavailable.");
@@ -1146,6 +1175,57 @@ export function createTypefullyStore(options: {
       const decision = await plugin().decide("mcp", ref, draft.botId);
       if (!decision.allowed) throw new GrantRequiredError(ref, decision.reason);
       return draft;
+    },
+
+    async beginMediaAttempt(input: {
+      draftId: string;
+      actorId: string;
+      toolName: "upload_media" | "remove_media";
+      expectedVersion: number;
+      expectedHash: string;
+    }): Promise<{ draft: TypefullyDraft; attemptId: string }> {
+      await store.authorizeTool(input);
+      return database.transaction(async (transaction) => {
+        const current = await lockedOwnedDraft(
+          transaction,
+          input.draftId,
+          input.actorId,
+        );
+        if (
+          current.version !== input.expectedVersion ||
+          current.contentHash !== input.expectedHash
+        ) {
+          throw new VersionConflictError(current.version, current.contentHash);
+        }
+        if (current.attemptId !== null) throw new SyncInProgressError();
+        const attemptId = randomUUID();
+        const instant = now();
+        const [row] = await transaction
+          .update(typefullyDrafts)
+          .set({
+            attemptId,
+            attemptKind: input.toolName,
+            attemptState: "in_flight",
+            attemptVersion: current.version,
+            attemptHash: current.contentHash,
+            attemptRemoteDraftId: current.remoteDraftId,
+            attemptLeaseExpiresAt: new Date(
+              instant.getTime() + Math.max(1, attemptLeaseMs),
+            ),
+            syncStatus: "syncing",
+            lastError: null,
+            updatedAt: instant,
+          })
+          .where(
+            and(
+              eq(typefullyDrafts.id, current.id),
+              isNull(typefullyDrafts.attemptId),
+            ),
+          )
+          .returning(draftSelection);
+        if (!row) throw new SyncInProgressError();
+        return { draft: asDraft(row), attemptId };
+      });
     },
 
     async reconcileUncertainCreate(input: {
