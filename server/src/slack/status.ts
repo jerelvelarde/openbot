@@ -71,10 +71,20 @@ export async function activateManagedChannels(
 
 type StoppableChannels = { stop(): Promise<void> };
 
+export type ShutdownFailure = {
+  code: "shutdown_stop_failed" | "shutdown_promise_rejected";
+  component: string;
+};
+
+function reportShutdownFailure(failure: ShutdownFailure): void {
+  console.error("OpenBot shutdown failed", failure);
+}
+
 export type GracefulShutdownOptions = {
   channels?: StoppableChannels;
   stopOthers: ReadonlyArray<() => void | Promise<void>>;
-  exit: () => void;
+  exit: (code: 0 | 1) => void;
+  reportFailure?: (failure: ShutdownFailure) => void;
 };
 
 /** Build one idempotent signal handler so SIGINT and SIGTERM cannot tear down twice. */
@@ -82,13 +92,35 @@ export function createGracefulShutdown({
   channels,
   stopOthers,
   exit,
+  reportFailure = reportShutdownFailure,
 }: GracefulShutdownOptions): () => Promise<void> {
   let shutdown: Promise<void> | undefined;
   return () => {
-    shutdown ??= Promise.allSettled([
-      ...(channels ? [Promise.resolve().then(() => channels.stop())] : []),
-      ...stopOthers.map((stop) => Promise.resolve().then(stop)),
-    ]).then(() => exit());
+    const stops = [
+      ...(channels
+        ? [{ component: "channels", stop: () => channels.stop() }]
+        : []),
+      ...stopOthers.map((stop, index) => ({
+        component: `background_${index}`,
+        stop,
+      })),
+    ];
+    shutdown ??= Promise.allSettled(
+      stops.map(({ stop }) => Promise.resolve().then(stop)),
+    ).then((results) => {
+      const failures = results.flatMap((result, index) =>
+        result.status === "rejected"
+          ? [
+              {
+                code: "shutdown_stop_failed" as const,
+                component: stops[index]?.component ?? "unknown",
+              },
+            ]
+          : [],
+      );
+      for (const failure of failures) reportFailure(failure);
+      exit(failures.length > 0 ? 1 : 0);
+    });
     return shutdown;
   };
 }
@@ -104,6 +136,7 @@ export type ShutdownSignalSource = {
 export function registerShutdownSignals(
   signals: ShutdownSignalSource,
   shutdown: () => Promise<void>,
+  reportFailure: (failure: ShutdownFailure) => void = reportShutdownFailure,
 ): () => void {
   let registered = true;
   const unregister = () => {
@@ -113,7 +146,13 @@ export function registerShutdownSignals(
     signals.off("SIGTERM", onSignal);
   };
   const onSignal = () => {
-    void shutdown().finally(unregister);
+    unregister();
+    void shutdown().catch(() =>
+      reportFailure({
+        code: "shutdown_promise_rejected",
+        component: "signal_handler",
+      }),
+    );
   };
   signals.on("SIGINT", onSignal);
   signals.on("SIGTERM", onSignal);
@@ -128,7 +167,7 @@ export type ManagedChannelHostOptions<WebHost> = {
   channels?: ManagedChannelsControl;
   signals: ShutdownSignalSource;
   stopOthers: ReadonlyArray<() => void | Promise<void>>;
-  exit(): void;
+  exit(code: 0 | 1): void;
   reportActivationFailure?: (error: unknown) => void;
 };
 

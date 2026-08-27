@@ -832,7 +832,7 @@ const managedHost = startManagedChannelHost({
     () => policyListener.stop(),
     () => auditRetention.stop(),
   ],
-  exit: () => process.exit(0),
+  exit: (code) => process.exit(code),
 });
 
 if (config.singleUser) {

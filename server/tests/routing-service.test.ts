@@ -46,6 +46,7 @@ function makeService(
       fallback: boolean;
       undecided: RoutingUndecided | null;
     };
+    reachableSystems?: (agentId: string) => Promise<readonly string[]>;
   } = {},
 ) {
   const roster = options.roster ?? [
@@ -89,7 +90,12 @@ function makeService(
   } as unknown as AuditStore;
 
   return {
-    service: createCoworkerRoutingService({ store, router, auditStore }),
+    service: createCoworkerRoutingService({
+      store,
+      router,
+      auditStore,
+      reachableSystems: options.reachableSystems,
+    }),
     modelCalls,
     audits,
   };
@@ -480,6 +486,19 @@ describe("CoworkerRoutingService", () => {
       viaMention: false,
     });
     expect(modelCalls).toHaveLength(1);
+  });
+
+  test("fails safely when coworker reachability cannot be loaded", async () => {
+    const { service, modelCalls } = makeService({
+      reachableSystems: async () => {
+        throw new Error("postgres://admin:secret@private-db/routing");
+      },
+    });
+
+    await expect(
+      service.route({ actor: ACTOR, text: "what is in Drive?" }),
+    ).rejects.toThrow("Coworker reachability is temporarily unavailable");
+    expect(modelCalls).toEqual([]);
   });
 
   test("passes only the actor-visible roster to intent routing", async () => {

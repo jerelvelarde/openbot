@@ -54,6 +54,16 @@ export type CreateCoworkerRoutingServiceOptions = {
   reachableSystems?: (agentId: string) => Promise<readonly string[]>;
 };
 
+/** A safe categorical failure for a roster whose connector reachability could not be checked. */
+export class CoworkerReachabilityUnavailableError extends Error {
+  readonly code = "coworker_reachability_unavailable";
+
+  constructor() {
+    super("Coworker reachability is temporarily unavailable");
+    this.name = "CoworkerReachabilityUnavailableError";
+  }
+}
+
 /** Normalize people-facing names before matching, without making matching fuzzy. */
 export function normalizeCoworkerName(value: string): string {
   return value.normalize("NFKC").toLowerCase().trim().replace(/\s+/gu, " ");
@@ -334,9 +344,9 @@ export function createCoworkerRoutingService(
         roleDescription: profile.roleDescription,
         ...(options.reachableSystems
           ? {
-              reaches: await options
-                .reachableSystems(profile.id)
-                .catch(() => [] as readonly string[]),
+              reaches: await options.reachableSystems(profile.id).catch(() => {
+                throw new CoworkerReachabilityUnavailableError();
+              }),
             }
           : {}),
       })),

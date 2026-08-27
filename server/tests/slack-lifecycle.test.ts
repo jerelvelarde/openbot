@@ -3,7 +3,9 @@ import { createApp } from "../src/app";
 import { loadConfig } from "../src/config";
 import {
   activateManagedChannels,
+  createGracefulShutdown,
   projectSlackStatus,
+  registerShutdownSignals,
   startManagedChannelHost,
 } from "../src/slack/status";
 import { testEnvironment } from "./support/environment";
@@ -148,6 +150,69 @@ describe("managed Channels lifecycle", () => {
     expect(exits).toBe(1);
     expect(signals.count("SIGINT")).toBe(0);
     expect(signals.count("SIGTERM")).toBe(0);
+  });
+
+  test("reports failed stops canonically and exits unsuccessfully", async () => {
+    const logged = spyOn(console, "error").mockImplementation(() => {});
+    const exitCodes: Array<number | undefined> = [];
+    try {
+      const shutdown = createGracefulShutdown({
+        channels: {
+          stop: async () => {
+            throw new Error("xoxb-secret-token");
+          },
+        },
+        stopOthers: [async () => {}],
+        exit: (code) => exitCodes.push(code),
+      });
+
+      await shutdown();
+
+      expect(exitCodes).toEqual([1]);
+      expect(logged).toHaveBeenCalledWith("OpenBot shutdown failed", {
+        code: "shutdown_stop_failed",
+        component: "channels",
+      });
+      expect(JSON.stringify(logged.mock.calls)).not.toContain(
+        "xoxb-secret-token",
+      );
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  test("handles a rejecting signal shutdown and still unregisters listeners", async () => {
+    const listeners = new Map<string, Set<() => void>>();
+    const signals = {
+      on(signal: "SIGINT" | "SIGTERM", listener: () => void) {
+        const registered = listeners.get(signal) ?? new Set();
+        registered.add(listener);
+        listeners.set(signal, registered);
+      },
+      off(signal: "SIGINT" | "SIGTERM", listener: () => void) {
+        listeners.get(signal)?.delete(listener);
+      },
+    };
+    const logged = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      registerShutdownSignals(signals, async () => {
+        throw new Error("private shutdown detail");
+      });
+      for (const listener of listeners.get("SIGTERM") ?? []) listener();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(listeners.get("SIGINT")?.size ?? 0).toBe(0);
+      expect(listeners.get("SIGTERM")?.size ?? 0).toBe(0);
+      expect(logged).toHaveBeenCalledWith("OpenBot shutdown failed", {
+        code: "shutdown_promise_rejected",
+        component: "signal_handler",
+      });
+      expect(JSON.stringify(logged.mock.calls)).not.toContain(
+        "private shutdown detail",
+      );
+    } finally {
+      logged.mockRestore();
+    }
   });
 
   test("the production Bun host force-stops active WebSockets", async () => {
