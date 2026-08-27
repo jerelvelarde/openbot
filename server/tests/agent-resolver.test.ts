@@ -59,4 +59,54 @@ describe("actor-scoped agent resolver", () => {
       "Coworker private-risk is unavailable to this user.",
     );
   });
+
+  test("rejects an agent when the actor has no visible coworkers", async () => {
+    const resolver = createActorAgentResolver({
+      loadAgents: async () => [],
+      model: { provider: "openai", defaultModel: "gpt-5.6-terra" },
+      resolveModelApiKey: async () => "openai-secret",
+    });
+
+    expect(
+      await rejectionMessage(() =>
+        resolver.resolveAgentForActor(
+          { id: "u1", role: "user" },
+          "private-risk",
+        ),
+      ),
+    ).toBe("Coworker private-risk is unavailable to this user.");
+  });
+
+  test("rejects inherited object keys as unavailable coworkers", async () => {
+    const resolver = createActorAgentResolver({
+      loadAgents: async () => [
+        {
+          id: "risk",
+          name: "Risk Analyst",
+          type: "built_in" as const,
+          systemPrompt: "Assess operational risk.",
+        },
+      ],
+      model: { provider: "openai", defaultModel: "gpt-5.6-terra" },
+      resolveModelApiKey: async () => "openai-secret",
+    });
+
+    for (const agentId of ["constructor", "toString", "__proto__"]) {
+      expect(
+        await rejectionMessage(() =>
+          resolver.resolveAgentForActor({ id: "u1", role: "user" }, agentId),
+        ),
+      ).toBe(`Coworker ${agentId} is unavailable to this user.`);
+    }
+  });
 });
+
+async function rejectionMessage(run: () => Promise<unknown>) {
+  try {
+    await run();
+  } catch (error) {
+    if (error instanceof Error) return error.message;
+    throw error;
+  }
+  throw new Error("Expected the run to reject.");
+}
