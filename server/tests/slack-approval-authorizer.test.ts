@@ -29,7 +29,17 @@ function authorizer(
       getByChannelsThreadId: async () =>
         options.boundAgentId === null
           ? null
-          : ({ agentId: options.boundAgentId ?? "risk" } as never),
+          : ({
+              channelsThreadId: "thread-1",
+              provider: "slack",
+              providerTenantId: "tenant-1",
+              providerConversationId: "channel-1",
+              providerThreadId: "provider-thread-1",
+              agentId: options.boundAgentId ?? "risk",
+              agentName: "Risk Analyst",
+              createdByUserId: "creator",
+              createdAt: new Date(),
+            } as const),
     } as never,
     profiles: {
       get: async () => (options.accessible === false ? null : ({} as never)),
@@ -54,6 +64,13 @@ describe("Slack approval authorization", () => {
   });
 
   test("accepts only an active canonical user with current access to the pinned coworker", async () => {
-    expect(await authorizer()({ userId: "u1", presentation })).toBe(true);
+    expect(await authorizer()({ userId: "u1", presentation })).toEqual({
+      actor: { id: "u1", role: "user" },
+      applicationUser: { id: "u1", name: "u1" },
+      provider: "slack",
+      providerTenantId: "tenant-1",
+      providerConversationId: "channel-1",
+      providerThreadId: "provider-thread-1",
+    });
   });
 });

@@ -1,0 +1,151 @@
+/** @jsxImportSource @copilotkit/channels */
+import {
+  type Channel,
+  type ChannelIdentityContext,
+  createChannel,
+} from "@copilotkit/channels";
+import { Actions, Button, Message, Section } from "@copilotkit/channels/ui";
+import type { ComputerGateway } from "../computer/gateway";
+import type { SlackAssistanceOptions } from "./assistance";
+import {
+  OpenBotChannelAgent,
+  type OpenBotChannelAgentDependencies,
+} from "./channel-agent";
+import { ApprovalCard } from "./components";
+import {
+  createSlackComputerTools,
+  type SlackComputerTool,
+} from "./computer-tools";
+import {
+  runWithSlackExecution,
+  type SlackExecution,
+} from "./execution-context";
+import type {
+  SlackIdentityLinker,
+  SlackIdentityResult,
+} from "./identity-linker";
+import { SlackIngressRegistry } from "./ingress-registry";
+
+export type OpenBotSlackChannelDependencies = {
+  identityLinker: Pick<SlackIdentityLinker, "resolve">;
+  agentDeps: OpenBotChannelAgentDependencies;
+  ingressRegistry?: SlackIngressRegistry;
+  computerGateway?: ComputerGateway;
+  assistance?: SlackAssistanceOptions;
+};
+
+function linkCard(linkUrl: string) {
+  return (
+    <Message fallbackText={`Link your OpenBot account: ${linkUrl}`}>
+      <Section>
+        Link your Slack identity to OpenBot before asking a coworker to run.
+      </Section>
+      <Actions>
+        <Button url={linkUrl} style="primary">
+          Link OpenBot account
+        </Button>
+      </Actions>
+    </Message>
+  );
+}
+
+function eventId(context: ChannelIdentityContext): string | undefined {
+  const id = context.event.id;
+  return typeof id === "string" ? id : undefined;
+}
+
+function isNewMessage(message: { operation?: { kind?: string } }): boolean {
+  return message.operation?.kind === "created";
+}
+
+function executionFor(
+  identityContext: ChannelIdentityContext,
+  result: Extract<SlackIdentityResult, { kind: "linked" }>,
+  conversationKey: string,
+  messageText: string,
+): SlackExecution {
+  return {
+    actor: result.actor,
+    applicationUser: result.user,
+    provider: "slack",
+    providerTenantId: identityContext.tenant.id,
+    providerConversationId: identityContext.conversation.id,
+    providerThreadId: conversationKey,
+    channelsConversationKey: conversationKey,
+    messageText,
+  };
+}
+
+/** Declare the managed OpenBot Slack Channel. The Copilot runtime attaches its adapter. */
+export function createOpenBotSlackChannel(
+  deps: OpenBotSlackChannelDependencies,
+): Channel {
+  const ingress = deps.ingressRegistry ?? new SlackIngressRegistry();
+  const tools: SlackComputerTool[] = deps.computerGateway
+    ? createSlackComputerTools(deps.computerGateway, deps.assistance)
+    : [];
+  const channel = createChannel({
+    name: "openbot",
+    identifyUser: async (context) => {
+      if (context.actor.kind !== "human") return null;
+      const identityResult = await deps.identityLinker.resolve(context);
+      ingress.remember(eventId(context), {
+        identityContext: context,
+        identityResult,
+      });
+      return identityResult.kind === "linked" ? identityResult.user : null;
+    },
+    agent: (threadId) => new OpenBotChannelAgent(threadId, deps.agentDeps),
+    tools,
+    components: [ApprovalCard],
+    showToolStatus: true,
+    store: { concurrency: "serial", actionRetentionMs: 10 * 60_000 },
+  });
+
+  async function runLinked({
+    message,
+    thread,
+    subscribe,
+  }: {
+    message: Parameters<Parameters<Channel["onMention"]>[0]>[0]["message"];
+    thread: Parameters<Parameters<Channel["onMention"]>[0]>[0]["thread"];
+    subscribe: boolean;
+  }): Promise<void> {
+    if (message.actor.kind !== "human" || !isNewMessage(message)) return;
+    const remembered = ingress.take(message.eventId);
+    if (!remembered) {
+      throw new Error("Managed Slack ingress identity is no longer available.");
+    }
+    if (remembered.identityResult.kind === "unlinked") {
+      await thread.post(linkCard(remembered.identityResult.linkUrl));
+      return;
+    }
+    if (!message.user) {
+      throw new Error("Managed Slack ingress identity did not match its user.");
+    }
+    if (subscribe) await thread.subscribe();
+    const execution = executionFor(
+      remembered.identityContext,
+      remembered.identityResult,
+      thread.conversationKey,
+      message.text,
+    );
+    await runWithSlackExecution(execution, () =>
+      thread.runAgent(
+        message.contentParts?.length
+          ? { prompt: message.contentParts }
+          : undefined,
+      ),
+    );
+  }
+
+  channel.onMention(({ message, thread }) =>
+    runLinked({ message, thread, subscribe: true }),
+  );
+  channel.onMessage(async ({ message, thread }) => {
+    if (!isNewMessage(message) || !(await thread.isSubscribed())) return;
+    await runLinked({ message, thread, subscribe: false });
+  });
+
+  return channel;
+}
