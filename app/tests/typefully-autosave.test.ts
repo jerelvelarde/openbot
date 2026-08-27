@@ -70,6 +70,22 @@ const saved = (
   remote,
 });
 
+const newDraftResult = {
+  draftId: "new-draft",
+  version: 1,
+  remote: "local" as const,
+  draft: {
+    id: "new-draft",
+    title: "Draft",
+    destinations: ["x"] as Array<"x" | "linkedin">,
+    socialSetLabel: "OpenBot",
+    mediaCount: 0,
+    version: 1,
+    syncStatus: "local" as const,
+    proposalStatus: null,
+  },
+};
+
 describe("Typefully autosave controller", () => {
   test("debounces a burst of text edits into one save after 600 ms", async () => {
     const timer = clock();
@@ -147,20 +163,41 @@ describe("Typefully autosave controller", () => {
     });
   });
 
-  test("suppresses stale responses and keeps the latest local document", async () => {
+  test("serializes and coalesces edits behind an in-flight save", async () => {
     const timer = clock();
     const first = deferred<SaveDraftResult>();
     const second = deferred<SaveDraftResult>();
-    let call = 0;
+    const calls: Array<{
+      document: CanonicalDraftDocument;
+      expectedVersion: number;
+      signal: AbortSignal;
+    }> = [];
     const controller = createAutosaveController({
       initialDocument: base,
       initialVersion: 1,
       scheduler: timer.scheduler,
-      save: () => (++call === 1 ? first.promise : second.promise),
+      save: (input) => {
+        calls.push(input);
+        return calls.length === 1 ? first.promise : second.promise;
+      },
     });
 
     controller.mediaSettled(edited("first"));
+    const firstSignal = calls[0]?.signal;
+    controller.mediaSettled(edited("middle"));
     controller.mediaSettled(edited("latest"));
+    expect(calls).toHaveLength(1);
+    expect(firstSignal?.aborted).toBe(false);
+
+    first.resolve(saved(2));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toMatchObject({
+      document: edited("latest"),
+      expectedVersion: 2,
+    });
+
     second.resolve(saved(3));
     await Promise.resolve();
     await Promise.resolve();
@@ -170,34 +207,65 @@ describe("Typefully autosave controller", () => {
       version: 3,
       remote: "confirmed",
     });
-
-    first.resolve(saved(2));
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(controller.getSnapshot().state).toEqual({
-      kind: "saved",
-      version: 3,
-      remote: "confirmed",
-    });
   });
 
-  test("does not mark newly edited text saved when an older request finishes", async () => {
+  test("queues debounced text behind a server-committed request without aborting it", async () => {
     const timer = clock();
     const first = deferred<SaveDraftResult>();
+    const calls: Array<{ expectedVersion: number; signal: AbortSignal }> = [];
     const controller = createAutosaveController({
       initialDocument: base,
       initialVersion: 1,
       scheduler: timer.scheduler,
-      save: () => first.promise,
+      save: (input) => {
+        calls.push(input);
+        return calls.length === 1 ? first.promise : Promise.resolve(saved(3));
+      },
     });
     controller.mediaSettled(edited("being saved"));
     controller.textChanged(edited("new unsaved text"));
+    expect(calls[0]?.signal.aborted).toBe(false);
+    timer.fire();
     first.resolve(saved(2));
     await Promise.resolve();
     await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(calls.map(({ expectedVersion }) => expectedVersion)).toEqual([1, 2]);
     expect(controller.getSnapshot()).toMatchObject({
       document: edited("new unsaved text"),
-      state: { kind: "dirty", baseVersion: 1 },
+      state: { kind: "saved", version: 3 },
+    });
+  });
+
+  test("stops a queued write on conflict and preserves its latest local document", async () => {
+    const timer = clock();
+    const first = deferred<SaveDraftResult>();
+    let calls = 0;
+    const controller = createAutosaveController({
+      initialDocument: base,
+      initialVersion: 1,
+      scheduler: timer.scheduler,
+      save: () => {
+        calls += 1;
+        return first.promise;
+      },
+    });
+    controller.mediaSettled(edited("first"));
+    controller.mediaSettled(edited("latest queued"));
+    first.reject(
+      new TypefullyClientError("version_conflict", { currentVersion: 4 }),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(calls).toBe(1);
+    expect(controller.getSnapshot()).toMatchObject({
+      document: edited("latest queued"),
+      state: {
+        kind: "conflict",
+        local: edited("latest queued"),
+        currentVersion: 4,
+      },
     });
   });
 
@@ -215,9 +283,10 @@ describe("Typefully autosave controller", () => {
           currentHash: "current",
         });
       },
-      saveAsNewDraft: async (document) => {
+      saveAsNewDraft: async (document, signal) => {
+        expect(signal).toBeInstanceOf(AbortSignal);
         savedAsNew = document;
-        return saved(1, "local");
+        return newDraftResult;
       },
     });
 
@@ -234,7 +303,8 @@ describe("Typefully autosave controller", () => {
       "saveAsNewDraft",
     ]);
 
-    await controller.saveAsNewDraft();
+    const recovered = await controller.saveAsNewDraft();
+    expect(recovered?.draftId).toBe("new-draft");
     expect(savedAsNew).toEqual(local);
     controller.reload(base, 8);
     expect(controller.getSnapshot()).toMatchObject({
@@ -272,6 +342,45 @@ describe("Typefully autosave controller", () => {
     });
   });
 
+  test("makes save-as-new single-flight and aborts recovery on dispose", async () => {
+    const timer = clock();
+    const recovery = deferred<{
+      draftId: string;
+      version: number;
+      remote: "local" | "confirmed";
+      draft: typeof newDraftResult.draft;
+    }>();
+    let recoverySignal: AbortSignal | undefined;
+    let calls = 0;
+    const controller = createAutosaveController({
+      initialDocument: base,
+      initialVersion: 2,
+      scheduler: timer.scheduler,
+      save: async () => {
+        throw new TypefullyClientError("version_conflict", {
+          currentVersion: 3,
+        });
+      },
+      saveAsNewDraft: (_document, signal) => {
+        calls += 1;
+        recoverySignal = signal;
+        return recovery.promise;
+      },
+    });
+    controller.textChanged(edited("preserved"));
+    timer.fire();
+    await Promise.resolve();
+    await Promise.resolve();
+    const first = controller.saveAsNewDraft();
+    const second = controller.saveAsNewDraft();
+    expect(first).toBe(second);
+    expect(calls).toBe(1);
+    controller.dispose();
+    expect(recoverySignal?.aborted).toBe(true);
+    recovery.reject(new DOMException("Aborted", "AbortError"));
+    expect(await first).toBeUndefined();
+  });
+
   test("uses safe errors and disables publish for every unsettled state", async () => {
     const timer = clock();
     const pending = deferred<SaveDraftResult>();
@@ -297,6 +406,30 @@ describe("Typefully autosave controller", () => {
         "This draft could not be saved. Your changes are still here; try again.",
     });
     expect(canPublish(controller.getSnapshot().state)).toBe(false);
+  });
+
+  test("contains a synchronous save failure without escaping the controller", async () => {
+    const timer = clock();
+    const local = edited("still safe");
+    const controller = createAutosaveController({
+      initialDocument: base,
+      initialVersion: 1,
+      scheduler: timer.scheduler,
+      save: () => {
+        throw new Error("unsafe synchronous detail");
+      },
+    });
+    controller.textChanged(local);
+    expect(() => timer.fire()).not.toThrow();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(controller.getSnapshot().state).toEqual({
+      kind: "error",
+      local,
+      message:
+        "This draft could not be saved. Your changes are still here; try again.",
+    });
   });
 
   test("retries a remote failure from the locally persisted server version", async () => {
@@ -358,6 +491,7 @@ describe("Typefully autosave controller", () => {
     });
     controller.textChanged(edited("pending"));
     timer.fire();
+    controller.textChanged(edited("still pending"));
     controller.dispose();
     expect(signal?.aborted).toBe(true);
     expect(timer.cleared).toBeGreaterThan(0);

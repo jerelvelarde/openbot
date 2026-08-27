@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { MutationObserver, QueryClient } from "@tanstack/react-query";
 import {
-  connectTypefullyMutationOptions,
+  connectTypefully,
   createDraftMutationOptions,
   declineProposalMutationOptions,
   deleteMediaMutationOptions,
@@ -36,6 +37,17 @@ const document: CanonicalDraftDocument = {
   media: [],
   scheduleAt: null,
 };
+
+const draftSummary = (version: number, syncStatus = "synced" as const) => ({
+  id: "draft-1",
+  title: "Launch",
+  destinations: ["x"] as const,
+  socialSetLabel: "OpenBot",
+  mediaCount: 0,
+  version,
+  syncStatus,
+  proposalStatus: null,
+});
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -91,7 +103,16 @@ describe("Typefully query contracts", () => {
 
 describe("Typefully mutation contracts", () => {
   test("sends exact JSON routes and bodies", async () => {
-    const calls = capture({});
+    const calls = capture({
+      proposal: {
+        id: "proposal-1",
+        draftId: "draft/1",
+        version: 5,
+        destinations: ["x"],
+        expiresAt: "2026-08-28T00:00:00.000Z",
+        status: "pending",
+      },
+    });
     await mutate(createDraftMutationOptions(), {
       channelId: "channel-1",
       botId: "bot-1",
@@ -228,14 +249,11 @@ describe("Typefully mutation contracts", () => {
       );
     }) as typeof fetch;
 
-    const options = connectTypefullyMutationOptions();
-    const serializedOptions = JSON.stringify(options);
-    expect(serializedOptions).not.toContain(apiKey);
     expect(JSON.stringify(typefullyKeys)).not.toContain(apiKey);
 
     let caught: unknown;
     try {
-      await mutate(options, { apiKey });
+      await connectTypefully(apiKey);
     } catch (error) {
       caught = error;
     }
@@ -264,7 +282,7 @@ describe("Typefully mutation contracts", () => {
         apiKey,
       })) as typeof fetch;
 
-    const result = await mutate(connectTypefullyMutationOptions(), { apiKey });
+    const result = await connectTypefully(apiKey);
     expect(result).toEqual({
       connection: {
         serverId: "typefully",
@@ -290,7 +308,7 @@ describe("Typefully mutation contracts", () => {
       )) as typeof fetch;
     let failure: unknown;
     try {
-      await mutate(connectTypefullyMutationOptions(), { apiKey });
+      await connectTypefully(apiKey);
     } catch (error) {
       failure = error;
     }
@@ -305,9 +323,244 @@ describe("Typefully mutation contracts", () => {
           connectedAt: "2026-08-27T00:00:00.000Z",
         },
       })) as typeof fetch;
+    expect(connectTypefully(apiKey)).rejects.toThrow("could not be completed");
+  });
+
+  test("never creates a secret-bearing TanStack mutation cache entry", async () => {
+    const apiKey = "tf_cache_secret";
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    globalThis.fetch = (async (url: string | URL | Request) =>
+      String(url).endsWith("/connections/typefully")
+        ? json({ ok: true })
+        : json({
+            connection: {
+              serverId: "typefully",
+              authMethod: "api_key",
+              accountLabel: null,
+              connectedAt: "2026-08-27T00:00:00.000Z",
+            },
+          })) as typeof fetch;
+
+    const observer = new MutationObserver(
+      queryClient,
+      disconnectTypefullyMutationOptions(),
+    );
+    await observer.mutate(undefined);
+    const before = queryClient.getMutationCache().getAll().length;
+    const connected = await connectTypefully(apiKey);
+    expect(connected.connection.accountLabel).toBeNull();
+    expect(queryClient.getMutationCache().getAll()).toHaveLength(before);
     expect(
-      mutate(connectTypefullyMutationOptions(), { apiKey }),
-    ).rejects.toThrow("could not be completed");
+      JSON.stringify(queryClient.getMutationCache().getAll()),
+    ).not.toContain(apiKey);
+
+    globalThis.fetch = (async () =>
+      json(
+        { code: "invalid_api_key", currentHash: apiKey },
+        400,
+      )) as typeof fetch;
+    await expect(connectTypefully(apiKey)).rejects.toThrow("did not accept");
+    expect(queryClient.getMutationCache().getAll()).toHaveLength(before);
+    expect(
+      JSON.stringify(queryClient.getMutationCache().getAll()),
+    ).not.toContain(apiKey);
+  });
+
+  test("normalizes proposal preparation to its bounded summary", async () => {
+    globalThis.fetch = (async () =>
+      json(
+        {
+          proposal: {
+            id: "proposal-1",
+            draftId: "draft-1",
+            version: 3,
+            destinations: ["x"],
+            expiresAt: "2026-08-28T00:00:00.000Z",
+            status: "pending",
+            snapshot: document,
+            contentHash: "must-not-enter-cache",
+          },
+        },
+        201,
+      )) as typeof fetch;
+    const result = await mutate(prepareProposalMutationOptions(), {
+      draftId: "draft-1",
+      expectedVersion: 3,
+    });
+    expect(result).toEqual({
+      proposal: {
+        id: "proposal-1",
+        draftId: "draft-1",
+        version: 3,
+        destinations: ["x"],
+        expiresAt: "2026-08-28T00:00:00.000Z",
+        status: "pending",
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain("snapshot");
+    expect(JSON.stringify(result)).not.toContain("contentHash");
+  });
+
+  test("rejects an invalid or unbounded proposal summary", async () => {
+    const valid = {
+      id: "proposal-1",
+      draftId: "draft-1",
+      version: 1,
+      destinations: ["x"],
+      expiresAt: "2026-08-28T00:00:00.000Z",
+      status: "pending",
+    };
+    for (const proposal of [
+      { ...valid, id: "p".repeat(121) },
+      { ...valid, version: 0 },
+      { ...valid, destinations: ["x", "x"] },
+      { ...valid, expiresAt: "not-a-date" },
+    ]) {
+      globalThis.fetch = (async () => json({ proposal })) as typeof fetch;
+      await expect(
+        mutate(prepareProposalMutationOptions(), {
+          draftId: "draft-1",
+          expectedVersion: 1,
+        }),
+      ).rejects.toMatchObject({ code: "invalid_request" });
+    }
+  });
+
+  test("retains bounded media failure details and patches authoritative cache", async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    queryClient.setQueryData(typefullyKeys.draft("draft-1"), {
+      draft: {
+        id: "draft-1",
+        document,
+        version: 1,
+        contentHash: "old",
+        remoteDraftId: "22",
+        remoteVersion: 1,
+        remoteHash: "old",
+        syncStatus: "synced",
+        lastError: null,
+        createdAt: "2026-08-27T00:00:00.000Z",
+        updatedAt: "2026-08-27T00:00:00.000Z",
+      },
+    });
+    const media = {
+      id: "media-1",
+      kind: "image" as const,
+      order: 0,
+      altText: "Launch",
+      remoteId: "remote-1",
+    };
+    globalThis.fetch = (async () =>
+      json(
+        {
+          code: "reconciliation_required",
+          draftId: "draft-1",
+          draft: { ...draftSummary(2, "remote_error"), mediaCount: 1 },
+          media,
+          message: "untrusted",
+        },
+        409,
+      )) as typeof fetch;
+    const observer = new MutationObserver(
+      queryClient,
+      uploadMediaMutationOptions(queryClient),
+    );
+    let failure: unknown;
+    try {
+      await observer.mutate({
+        draftId: "draft-1",
+        expectedVersion: 1,
+        kind: "image",
+        altText: "Launch",
+        file: new File(["x"], "x.png", { type: "image/png" }),
+      });
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toMatchObject({
+      code: "reconciliation_required",
+      draftId: "draft-1",
+      draft: { version: 2, syncStatus: "remote_error" },
+      media,
+    });
+    expect(
+      queryClient.getQueryData(typefullyKeys.draft("draft-1")),
+    ).toMatchObject({
+      draft: {
+        version: 2,
+        syncStatus: "remote_error",
+        document: { media: [media] },
+      },
+    });
+  });
+
+  test("carries remote-error media identity into explicit retry and remove calls", async () => {
+    const media = {
+      id: "retry-media",
+      kind: "image" as const,
+      order: 0,
+      altText: "Retry me",
+      remoteId: null,
+    };
+    globalThis.fetch = (async () =>
+      json(
+        {
+          code: "remote_error",
+          retryAt: "2026-08-27T01:00:00.000Z",
+          draft: { ...draftSummary(2, "remote_error"), mediaCount: 1 },
+          remote: {
+            state: "remote_error",
+            remoteDraftId: "22",
+            confirmedVersion: 1,
+            confirmedHash: "old",
+          },
+          media,
+        },
+        502,
+      )) as typeof fetch;
+    let failure: TypefullyClientError | undefined;
+    try {
+      await mutate(uploadMediaMutationOptions(), {
+        draftId: "draft-1",
+        expectedVersion: 1,
+        kind: "image",
+        altText: "Retry me",
+        file: new File(["x"], "x.png", { type: "image/png" }),
+      });
+    } catch (error) {
+      failure = error as TypefullyClientError;
+    }
+    expect(failure).toMatchObject({
+      code: "remote_error",
+      retryAt: "2026-08-27T01:00:00.000Z",
+      draft: { version: 2 },
+      media,
+    });
+
+    const calls = capture({});
+    await mutate(uploadMediaMutationOptions(), {
+      draftId: "draft-1",
+      expectedVersion: failure?.draft?.version ?? 0,
+      kind: "image",
+      altText: "Retry me",
+      file: new File(["x"], "x.png", { type: "image/png" }),
+      mediaId: failure?.media?.id,
+    });
+    await mutate(deleteMediaMutationOptions(), {
+      draftId: "draft-1",
+      expectedVersion: failure?.draft?.version ?? 0,
+      mediaId: failure?.media?.id ?? "",
+    });
+    const retryForm = calls[0]?.init?.body;
+    expect(retryForm).toBeInstanceOf(FormData);
+    expect((retryForm as FormData).get("mediaId")).toBe("retry-media");
+    expect(calls[1]?.url).toBe(
+      "/api/typefully/drafts/draft-1/media/retry-media",
+    );
   });
 
   test("preserves typed, bounded recovery details without trusting server messages", async () => {

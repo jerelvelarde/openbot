@@ -81,6 +81,11 @@ export type PublicationProposal = {
   failureDetail: string | null;
 };
 
+export type ProposalSummary = Pick<
+  PublicationProposal,
+  "id" | "draftId" | "version" | "destinations" | "expiresAt" | "status"
+>;
+
 export type TypefullyErrorCode =
   | "access_revoked"
   | "bot_not_attached"
@@ -123,6 +128,7 @@ export type TypefullyErrorDetails = {
   retryAt?: string;
   draft?: DraftSummary;
   remote?: RemoteDraftState;
+  media?: CanonicalDraftDocument["media"][number] | null;
 };
 
 const ERROR_MESSAGES: Partial<Record<TypefullyErrorCode, string>> = {
@@ -254,6 +260,36 @@ function remoteDraftState(value: unknown): RemoteDraftState | undefined {
   };
 }
 
+function mediaDescriptor(
+  value: unknown,
+): CanonicalDraftDocument["media"][number] | null | undefined {
+  if (value === null) return null;
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return undefined;
+  const item = value as Record<string, unknown>;
+  const id = boundedString(item.id, 120);
+  const altText = boundedString(item.altText, 10_000);
+  const remoteId = boundedString(item.remoteId, 240);
+  if (
+    id === undefined ||
+    (item.kind !== "image" && item.kind !== "video") ||
+    !Number.isSafeInteger(item.order) ||
+    (item.order as number) < 0 ||
+    (item.order as number) >= 20 ||
+    altText === undefined ||
+    (item.remoteId !== null && remoteId === undefined)
+  ) {
+    return undefined;
+  }
+  return {
+    id,
+    kind: item.kind,
+    order: item.order as number,
+    altText,
+    remoteId: item.remoteId === null ? null : (remoteId ?? null),
+  };
+}
+
 export class TypefullyClientError extends Error {
   readonly code: TypefullyErrorCode;
   readonly currentVersion?: number;
@@ -265,6 +301,7 @@ export class TypefullyClientError extends Error {
   readonly retryAt?: string;
   readonly draft?: DraftSummary;
   readonly remote?: RemoteDraftState;
+  readonly media?: CanonicalDraftDocument["media"][number] | null;
 
   constructor(code: TypefullyErrorCode, details: TypefullyErrorDetails = {}) {
     super(
@@ -334,6 +371,9 @@ export async function typefullyRequest<T>(
       : {}),
     ...(remoteDraftState(record.remote)
       ? { remote: remoteDraftState(record.remote) }
+      : {}),
+    ...(mediaDescriptor(record.media) !== undefined
+      ? { media: mediaDescriptor(record.media) }
       : {}),
   });
 }

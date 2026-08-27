@@ -1,4 +1,8 @@
-import { type CanonicalDraftDocument, TypefullyClientError } from "./queries";
+import {
+  type CanonicalDraftDocument,
+  type DraftSummary,
+  TypefullyClientError,
+} from "./queries";
 
 export type AutosaveState =
   | { kind: "idle"; version: number; remote: "local" | "confirmed" }
@@ -15,6 +19,11 @@ export type AutosaveState =
 export type SaveDraftResult = {
   version: number;
   remote: "local" | "confirmed";
+};
+
+export type SaveAsNewDraftResult = SaveDraftResult & {
+  draftId: string;
+  draft: DraftSummary;
 };
 
 export type AutosaveSnapshot = {
@@ -41,7 +50,8 @@ type AutosaveOptions = {
   }): Promise<SaveDraftResult>;
   saveAsNewDraft?: (
     document: CanonicalDraftDocument,
-  ) => Promise<SaveDraftResult>;
+    signal: AbortSignal,
+  ) => Promise<SaveAsNewDraftResult>;
 };
 
 const browserScheduler: Scheduler = {
@@ -74,8 +84,13 @@ export function createAutosaveController(options: AutosaveOptions) {
   };
   let timer: unknown;
   let disposed = false;
-  let sequence = 0;
-  const active = new Map<number, AbortController>();
+  let pending = false;
+  let ready = false;
+  let pendingImmediate = false;
+  let activeSave: AbortController | undefined;
+  let recoveryAbort: AbortController | undefined;
+  let recoveryPromise: Promise<SaveAsNewDraftResult | undefined> | undefined;
+  let recoveryToken: object | undefined;
 
   const actions = (): AutosaveSnapshot["actions"] => {
     if (state.kind === "conflict") return ["reload", "saveAsNewDraft"];
@@ -95,57 +110,71 @@ export function createAutosaveController(options: AutosaveOptions) {
     if (timer !== undefined) scheduler.clearTimeout(timer);
     timer = undefined;
   };
-  const invalidateActive = () => {
-    sequence += 1;
-    for (const abort of active.values()) abort.abort();
-  };
-
-  const runSave = async () => {
-    if (disposed) return;
+  const runSave = () => {
+    if (disposed || activeSave || !pending || !ready) return;
     clearTimer();
-    const requestId = ++sequence;
     const baseVersion = version;
     const local = document;
     const abort = new AbortController();
-    active.set(requestId, abort);
+    activeSave = abort;
+    pending = false;
+    ready = false;
+    pendingImmediate = false;
     state = { kind: "saving", baseVersion };
     emit();
+    let operation: Promise<SaveDraftResult>;
     try {
-      const result = await options.save({
+      operation = options.save({
         document: local,
         expectedVersion: baseVersion,
         signal: abort.signal,
       });
-      if (disposed || requestId !== sequence) return;
-      version = result.version;
-      state = { kind: "saved", version, remote: result.remote };
-      emit();
     } catch (error) {
-      if (disposed || abort.signal.aborted || requestId !== sequence) return;
-      if (
-        error instanceof TypefullyClientError &&
-        error.code === "version_conflict" &&
-        error.currentVersion !== undefined
-      ) {
-        state = {
-          kind: "conflict",
-          local: document,
-          currentVersion: error.currentVersion,
-        };
-      } else {
-        if (error instanceof TypefullyClientError && error.draft) {
-          version = error.draft.version;
-        }
-        state = {
-          kind: "error",
-          local: document,
-          message: safeSaveMessage(error),
-        };
-      }
-      emit();
-    } finally {
-      active.delete(requestId);
+      operation = Promise.reject(error);
     }
+    void operation
+      .then((result) => {
+        if (disposed || activeSave !== abort) return;
+        activeSave = undefined;
+        version = result.version;
+        if (pending) {
+          state = { kind: "dirty", baseVersion: version };
+          emit();
+          runSave();
+          return;
+        }
+        state = { kind: "saved", version, remote: result.remote };
+        emit();
+      })
+      .catch((error: unknown) => {
+        if (disposed || activeSave !== abort || abort.signal.aborted) return;
+        activeSave = undefined;
+        clearTimer();
+        pending = false;
+        ready = false;
+        pendingImmediate = false;
+        if (
+          error instanceof TypefullyClientError &&
+          error.code === "version_conflict" &&
+          error.currentVersion !== undefined
+        ) {
+          state = {
+            kind: "conflict",
+            local: document,
+            currentVersion: error.currentVersion,
+          };
+        } else {
+          if (error instanceof TypefullyClientError && error.draft) {
+            version = error.draft.version;
+          }
+          state = {
+            kind: "error",
+            local: document,
+            message: safeSaveMessage(error),
+          };
+        }
+        emit();
+      });
   };
 
   return {
@@ -156,62 +185,100 @@ export function createAutosaveController(options: AutosaveOptions) {
     },
     textChanged(next: CanonicalDraftDocument) {
       if (disposed) return;
-      invalidateActive();
       document = next;
+      pending = true;
       state = { kind: "dirty", baseVersion: version };
       emit();
+      if (pendingImmediate) return;
+      ready = false;
       clearTimer();
-      timer = scheduler.setTimeout(
-        () => void runSave(),
-        options.debounceMs ?? 600,
-      );
+      timer = scheduler.setTimeout(() => {
+        timer = undefined;
+        ready = true;
+        runSave();
+      }, options.debounceMs ?? 600);
     },
     mediaSettled(next: CanonicalDraftDocument) {
       if (disposed) return;
-      invalidateActive();
       document = next;
+      pending = true;
+      pendingImmediate = true;
+      ready = true;
       state = { kind: "dirty", baseVersion: version };
       emit();
-      void runSave();
+      clearTimer();
+      runSave();
     },
     retry() {
       if (disposed || state.kind !== "error") return;
-      void runSave();
+      pending = true;
+      ready = true;
+      pendingImmediate = true;
+      runSave();
     },
     reload(authoritative: CanonicalDraftDocument, currentVersion: number) {
       if (disposed) return;
       clearTimer();
-      sequence += 1;
-      for (const abort of active.values()) abort.abort();
-      active.clear();
+      activeSave?.abort();
+      activeSave = undefined;
+      recoveryAbort?.abort();
+      recoveryAbort = undefined;
+      recoveryPromise = undefined;
+      recoveryToken = undefined;
+      pending = false;
+      ready = false;
+      pendingImmediate = false;
       document = authoritative;
       version = currentVersion;
       state = { kind: "idle", version, remote: "local" };
       emit();
     },
-    async saveAsNewDraft() {
+    saveAsNewDraft(): Promise<SaveAsNewDraftResult | undefined> | undefined {
+      if (recoveryPromise) return recoveryPromise;
       if (disposed || state.kind !== "conflict" || !options.saveAsNewDraft)
-        return;
+        return undefined;
       const local = document;
-      try {
-        const result = await options.saveAsNewDraft(local);
-        if (disposed || document !== local) return;
-        version = result.version;
-        state = { kind: "saved", version, remote: result.remote };
-        emit();
-        return result;
-      } catch (error) {
-        if (disposed || document !== local) return;
-        state = { kind: "error", local, message: safeSaveMessage(error) };
-      }
+      const abort = new AbortController();
+      const token = {};
+      recoveryAbort = abort;
+      recoveryToken = token;
+      state = { kind: "saving", baseVersion: version };
       emit();
+      const operation = (async () => {
+        try {
+          const result = await options.saveAsNewDraft?.(local, abort.signal);
+          if (!result || disposed || document !== local || abort.signal.aborted)
+            return undefined;
+          version = result.version;
+          state = { kind: "saved", version, remote: result.remote };
+          emit();
+          return result;
+        } catch (error) {
+          if (disposed || document !== local || abort.signal.aborted)
+            return undefined;
+          state = { kind: "error", local, message: safeSaveMessage(error) };
+          emit();
+          return undefined;
+        } finally {
+          if (recoveryToken === token) {
+            recoveryPromise = undefined;
+            recoveryToken = undefined;
+          }
+          if (recoveryAbort === abort) recoveryAbort = undefined;
+        }
+      })();
+      recoveryPromise = operation;
+      return operation;
     },
     dispose() {
       if (disposed) return;
       disposed = true;
       clearTimer();
-      for (const abort of active.values()) abort.abort();
-      active.clear();
+      activeSave?.abort();
+      activeSave = undefined;
+      recoveryAbort?.abort();
+      recoveryAbort = undefined;
+      recoveryToken = undefined;
       listeners.clear();
     },
   };
