@@ -1281,11 +1281,21 @@ export function createTypefullyStore(options: {
         return asProposal(claimed as SelectedProposal);
       });
 
+      // Re-resolve the grant, policy and actor credential after the durable claim. The earlier
+      // authorization protects the remote comparison; this one is the last server-side boundary
+      // before the irreversible write. If it fails, the already-committed `unknown` fence remains
+      // and only reconciliation may move the proposal again.
+      const finalAuthorization = await authorizePublication({
+        botId: proposal.botId,
+        actorId: input.actorId,
+        operation: "publish_now",
+      });
+
       let outcome: PublicationOutcome;
       try {
         outcome = safePublicationOutcome(
           await publicationVendor.publishDraft({
-            token: authorized.token,
+            token: finalAuthorization.token,
             ...identity,
           }),
         );

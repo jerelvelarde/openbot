@@ -33,6 +33,8 @@ const draftIds: string[] = [];
 let publishCalls = 0;
 let publishBarrier: Promise<void> | null = null;
 let authorizeError: Error | null = null;
+let publishAuthorizationCalls = 0;
+let failSecondPublishAuthorization = false;
 let remoteDocument: unknown;
 let publishResult: {
   outcome: "published" | "failed" | "unknown";
@@ -46,8 +48,16 @@ const plugin = {
     actorBotId === botId && ref === "typefully/prepare_publication"
       ? ({ allowed: true } as const)
       : ({ allowed: false, reason: "Grant removed." } as const),
-  authorizeOperation: async () => {
+  authorizeOperation: async (input: { ref: string }) => {
     if (authorizeError) throw authorizeError;
+    if (input.ref.endsWith("/publish_now")) {
+      publishAuthorizationCalls += 1;
+      if (failSecondPublishAuthorization && publishAuthorizationCalls === 2) {
+        throw Object.assign(new Error("Grant changed before publication"), {
+          code: "grant_required",
+        });
+      }
+    }
     return { token: "personal-key" };
   },
 };
@@ -358,6 +368,30 @@ describe("immutable Typefully publication proposals", () => {
     expect(await store.readProposal(proposal.id, ownerId)).toMatchObject({
       status: "expired",
     });
+  });
+
+  test("rechecks authorization after the durable claim and before the vendor write", async () => {
+    const draft = await syncedDraft();
+    const proposal = await store.prepareProposal({
+      draftId: draft.id,
+      actorId: ownerId,
+      expectedVersion: draft.version,
+    });
+    publishCalls = 0;
+    publishAuthorizationCalls = 0;
+    failSecondPublishAuthorization = true;
+    try {
+      await expect(
+        store.approveAndPublish({ proposalId: proposal.id, actorId: ownerId }),
+      ).rejects.toMatchObject({ code: "grant_required" });
+      expect(publishAuthorizationCalls).toBe(2);
+      expect(publishCalls).toBe(0);
+      expect(await store.readProposal(proposal.id, ownerId)).toMatchObject({
+        status: "unknown",
+      });
+    } finally {
+      failSecondPublishAuthorization = false;
+    }
   });
 
   test("records known vendor refusal as failed and audits metadata without content", async () => {
