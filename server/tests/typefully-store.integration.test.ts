@@ -883,6 +883,28 @@ describe("owned local Typefully drafts", () => {
     ).toBeGreaterThanOrEqual(7);
   });
 
+  test("redacts complete escaped plain-form credential values", async () => {
+    const created = await createOwnedDraft();
+    const failed = await store.recordRemoteFailure({
+      draftId: created.id,
+      actorId: ownerId,
+      expectedVersion: 1,
+      error: [
+        String.raw`token="prefix\"quoted-secret\\tail"`,
+        String.raw`client_secret='prefix\'single-secret\\tail'`,
+        "ordinary prose remains readable",
+      ].join("; "),
+    });
+
+    for (const secretFragment of ["quoted-secret", "single-secret", "tail"]) {
+      expect(failed.lastError).not.toContain(secretFragment);
+    }
+    expect(failed.lastError).toContain("ordinary prose remains readable");
+    expect(
+      failed.lastError?.match(/\[redacted\]/g)?.length,
+    ).toBeGreaterThanOrEqual(2);
+  });
+
   test("redacts JSON credential fields including escaped string content", async () => {
     const created = await createOwnedDraft();
     const escapedSecret = 'prefix"quoted-secret\\tail';
