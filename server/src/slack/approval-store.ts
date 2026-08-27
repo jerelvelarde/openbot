@@ -31,29 +31,48 @@ export interface ApprovalDecisionStore {
 export function createApprovalDecisionStore(
   database: Database,
 ): ApprovalDecisionStore {
+  const get = async (
+    presentationId: string,
+  ): Promise<ApprovalPresentation | null> => {
+    const [row] = await database
+      .select({
+        presentationId: approvalDecisions.presentationId,
+        channelsThreadId: approvalDecisions.channelsThreadId,
+        conversationKey: approvalDecisions.conversationKey,
+        agentId: approvalDecisions.agentId,
+        createdByUserId: approvalDecisions.createdByUserId,
+        createdAt: approvalDecisions.createdAt,
+      })
+      .from(approvalDecisions)
+      .where(eq(approvalDecisions.presentationId, presentationId))
+      .limit(1);
+    return row ?? null;
+  };
+
   return {
     async present(input) {
-      await database
+      const inserted = await database
         .insert(approvalDecisions)
         .values(input)
-        .onConflictDoNothing({ target: approvalDecisions.presentationId });
+        .onConflictDoNothing({ target: approvalDecisions.presentationId })
+        .returning({ presentationId: approvalDecisions.presentationId });
+      if (inserted.length > 0) return;
+
+      const existing = await get(input.presentationId);
+      if (
+        !existing ||
+        existing.channelsThreadId !== input.channelsThreadId ||
+        existing.conversationKey !== input.conversationKey ||
+        existing.agentId !== input.agentId ||
+        existing.createdByUserId !== input.createdByUserId
+      ) {
+        throw new Error(
+          "Approval presentation conflicts with its authorization subject.",
+        );
+      }
     },
 
-    async get(presentationId) {
-      const [row] = await database
-        .select({
-          presentationId: approvalDecisions.presentationId,
-          channelsThreadId: approvalDecisions.channelsThreadId,
-          conversationKey: approvalDecisions.conversationKey,
-          agentId: approvalDecisions.agentId,
-          createdByUserId: approvalDecisions.createdByUserId,
-          createdAt: approvalDecisions.createdAt,
-        })
-        .from(approvalDecisions)
-        .where(eq(approvalDecisions.presentationId, presentationId))
-        .limit(1);
-      return row ?? null;
-    },
+    get,
 
     async begin(input) {
       return database.transaction(async (transaction) => {

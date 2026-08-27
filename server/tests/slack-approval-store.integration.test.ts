@@ -61,10 +61,6 @@ type BoundAction = {
   id: string;
   value: {
     presentationId: string;
-    channelsThreadId: string;
-    conversationKey: string;
-    agentId: string;
-    createdByUserId: string;
     approved: boolean;
   };
 };
@@ -167,12 +163,10 @@ async function present() {
   ]);
   expect(actions.map(({ value }) => value.approved)).toEqual([true, false]);
   for (const action of actions) {
-    expect(action.value).toMatchObject({
-      channelsThreadId,
-      conversationKey: "approval-thread",
-      agentId,
-      createdByUserId: user1,
-    });
+    expect(Object.keys(action.value).sort()).toEqual([
+      "approved",
+      "presentationId",
+    ]);
   }
   presentationIds.add(actions[0]!.value.presentationId);
   return { ...running, actions, lifecycle, state };
@@ -216,6 +210,35 @@ afterAll(async () => {
 });
 
 describe("durable Slack approval decisions", () => {
+  test("a presentation id cannot be rebound to another authorization subject", async () => {
+    const store = createApprovalDecisionStore(database);
+    const presentationId = crypto.randomUUID();
+    presentationIds.add(presentationId);
+    await store.present({
+      presentationId,
+      channelsThreadId,
+      conversationKey: "approval-thread",
+      agentId,
+      createdByUserId: user1,
+    });
+
+    await expect(
+      store.present({
+        presentationId,
+        channelsThreadId,
+        conversationKey: "different-conversation",
+        agentId,
+        createdByUserId: user2,
+      }),
+    ).rejects.toThrow("authorization subject");
+    expect(await store.get(presentationId)).toMatchObject({
+      channelsThreadId,
+      conversationKey: "approval-thread",
+      agentId,
+      createdByUserId: user1,
+    });
+  });
+
   test("an unlinked or inaccessible participant cannot claim the presentation", async () => {
     const fixture = await present();
     try {
@@ -343,7 +366,10 @@ describe("durable Slack approval decisions", () => {
         user1,
         {
           ...first.actions[0]!.value,
+          channelsThreadId: "provider-tampered-thread",
+          conversationKey: "provider-tampered-conversation",
           agentId: "provider-tampered-agent",
+          createdByUserId: "provider-tampered-user",
           approved: false,
         },
       );

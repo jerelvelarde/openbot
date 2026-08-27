@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createChannel, FakeAdapter, FakeAgent } from "@copilotkit/channels";
+import { renderSlackMessage } from "@copilotkit/channels/slack/render";
 import type { MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import type { AgentProfileStore } from "../src/agents/profile-store";
@@ -291,6 +292,7 @@ test("approval buttons resume the originating thread with a boolean decision", a
     },
   );
   const rendered = await renderApproval("Deploy this release?");
+  expect(presentations.size).toBe(1);
   const message = rendered as {
     props: { children: Array<{ props: { children: unknown } }> };
   };
@@ -366,6 +368,7 @@ test("a render outside Slack execution is inert and its actions fail closed", as
       props: { children: Array<{ props: Record<string, unknown> }> };
     }
   ).props.children[0]!;
+  expect(action.props.value).toBeNull();
   await expect(
     (action.props.onClick as (context: unknown) => Promise<void>)({
       action: { id: "cold-action", value: action.props.value },
@@ -376,7 +379,7 @@ test("a render outside Slack execution is inert and its actions fail closed", as
   expect(calls).toEqual([]);
 });
 
-test("an existing presentation with a mismatched stored subject fails closed", async () => {
+test("an existing presentation for another conversation fails closed", async () => {
   let beginCalls = 0;
   configureApprovalDecisionStore(
     {
@@ -384,8 +387,8 @@ test("an existing presentation with a mismatched stored subject fails closed", a
       async get(presentationId) {
         return {
           presentationId,
-          channelsThreadId: "different-thread",
-          conversationKey: "conversation-1",
+          channelsThreadId: "thread-1",
+          conversationKey: "different-conversation",
           agentId: "agent-1",
           createdByUserId: "user-1",
           createdAt: new Date(),
@@ -525,6 +528,16 @@ function interactiveActionIds(value: unknown): string[] {
   ];
 }
 
+function slackButtonValues(value: unknown): string[] {
+  if (!value || typeof value !== "object") return [];
+  const record = value as Record<string, unknown>;
+  const own =
+    record.type === "button" && typeof record.value === "string"
+      ? [record.value]
+      : [];
+  return [...own, ...Object.values(record).flatMap(slackButtonValues)];
+}
+
 test("registered ApprovalCard binds durable one-use actions that resume its thread", async () => {
   const presentations = new Map<string, Record<string, unknown>>();
   const completed = new Set<string>();
@@ -608,6 +621,31 @@ test("registered ApprovalCard binds durable one-use actions that resume its thre
     const actionIds = (adapter.posted[0] ?? []).flatMap(interactiveActionIds);
     expect(actionIds).toHaveLength(2);
     expect(new Set(actionIds).size).toBe(2);
+    const blockKit = renderSlackMessage(adapter.posted[0] ?? []);
+    const buttonValues = slackButtonValues(blockKit.blocks).map((value) =>
+      JSON.parse(value),
+    );
+    expect(buttonValues).toHaveLength(2);
+    expect(buttonValues.map((value) => Object.keys(value).sort())).toEqual([
+      ["approved", "presentationId"],
+      ["approved", "presentationId"],
+    ]);
+    expect(buttonValues.map(({ approved }) => approved)).toEqual([true, false]);
+    expect(buttonValues[0]?.presentationId).toBe(
+      buttonValues[1]?.presentationId,
+    );
+    expect(buttonValues[0]?.presentationId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    );
+    const serializedButtonValues = JSON.stringify(buttonValues);
+    for (const privateSubject of [
+      "thread-1",
+      "approval-thread",
+      "agent-1",
+      "U1",
+    ]) {
+      expect(serializedButtonValues).not.toContain(privateSubject);
+    }
     const beforeResume = lifecycle.length;
 
     await adapter.getSink().onInteraction({
