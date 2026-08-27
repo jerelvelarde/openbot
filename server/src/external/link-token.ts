@@ -5,6 +5,8 @@ export const EXTERNAL_LINK_TTL_MS = 10 * 60_000;
 
 const EXTERNAL_LINK_LABEL = "external-link:v1";
 const INVALID_LINK_MESSAGE = "This Slack link has expired or is invalid.";
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 type ExternalLinkClaim = ExternalProviderIdentity & {
   issuedAt: number;
@@ -20,6 +22,10 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+function isUuid(value: unknown): value is string {
+  return typeof value === "string" && UUID_PATTERN.test(value);
+}
+
 function asClaim(value: unknown): ExternalLinkClaim | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
 
@@ -31,11 +37,11 @@ function asClaim(value: unknown): ExternalLinkClaim | null {
     !isNonEmptyString(claim.providerUserId) ||
     (claim.providerEmail !== null && typeof claim.providerEmail !== "string") ||
     typeof issuedAt !== "number" ||
-    !Number.isFinite(issuedAt) ||
+    !Number.isSafeInteger(issuedAt) ||
     typeof expiresAt !== "number" ||
-    !Number.isFinite(expiresAt) ||
-    expiresAt < issuedAt ||
-    !isNonEmptyString(claim.nonce)
+    !Number.isSafeInteger(expiresAt) ||
+    expiresAt !== issuedAt + EXTERNAL_LINK_TTL_MS ||
+    !isUuid(claim.nonce)
   ) {
     return null;
   }
@@ -70,7 +76,9 @@ export async function readExternalLinkToken(
     if (!unsealed) return invalidLink();
 
     const claim = asClaim(JSON.parse(unsealed));
-    if (!claim || now > claim.expiresAt) return invalidLink();
+    if (!claim || now < claim.issuedAt || now > claim.expiresAt) {
+      return invalidLink();
+    }
 
     return {
       provider: claim.provider,
