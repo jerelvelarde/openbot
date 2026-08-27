@@ -289,16 +289,18 @@ Add `{ kind: "user-api-key" }` to `CatalogueAuth`, add `"typefully-rest"` to `Tr
   vendor: "Typefully",
   summary: "Draft and schedule posts in the account of whoever is asking.",
   host: "https://api.typefully.com",
-  path: "/v1",
+  path: "/v2",
   transport: "typefully-rest",
   auth: { kind: "user-api-key" },
   writeTools: Object.freeze([
     "create_draft", "update_draft", "upload_media", "remove_media",
     "schedule_draft", "delete_draft",
   ]),
-  docsUrl: "https://support.typefully.com/en/articles/8718287-typefully-api",
+  docsUrl: "https://typefully.com/docs/api",
 }
 ```
+
+Use Typefully's current v2 resource paths beneath that base: `/social-sets`, `/social-sets/{social_set_id}/drafts`, `/social-sets/{social_set_id}/drafts/{draft_id}`, and `/social-sets/{social_set_id}/media/upload`. Scheduling is a draft create/patch using the vendor's `publish_at` field; never use the v1 API or its legacy draft routes.
 
 Update every exhaustive auth-kind assertion and browser-facing `CatalogueItem` union.
 
