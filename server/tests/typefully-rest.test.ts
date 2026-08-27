@@ -104,39 +104,86 @@ describe("the reviewed Typefully tool surface", () => {
   test("pins the live v2 post, media, and create-share bounds in the schema", async () => {
     const tools = await listTools({ url: connection.url });
     const create = tools.find((tool) => tool.name === "create_draft");
+    const update = tools.find((tool) => tool.name === "update_draft");
     const schema = create?.inputSchema as {
       properties?: {
         share?: { type?: unknown };
         platforms?: {
+          minProperties?: unknown;
           properties?: {
             x?: {
-              properties?: {
-                posts?: {
-                  maxItems?: unknown;
-                  items?: {
-                    properties?: {
-                      text?: { maxLength?: unknown };
-                      mediaIds?: { maxItems?: unknown };
+              oneOf?: {
+                required?: string[];
+                properties?: {
+                  posts?: {
+                    maxItems?: unknown;
+                    items?: {
+                      properties?: {
+                        text?: { maxLength?: unknown };
+                        mediaIds?: { maxItems?: unknown };
+                      };
                     };
                   };
                 };
-              };
+              }[];
             };
           };
+        };
+        planAt?: {
+          anyOf?: { anyOf?: { maxLength?: unknown }[] }[];
         };
       };
     };
 
-    const post = schema.properties?.platforms?.properties?.x?.properties?.posts;
+    const post =
+      schema.properties?.platforms?.properties?.x?.oneOf?.[0]?.properties
+        ?.posts;
     expect(post?.items?.properties?.text?.maxLength).toBe(50_000);
     expect(post?.items?.properties?.mediaIds?.maxItems).toBe(10);
+    expect(
+      schema.properties?.platforms?.properties?.x?.oneOf?.[0]?.required,
+    ).toContain("posts");
+    expect(
+      schema.properties?.platforms?.properties?.x?.oneOf?.[1]?.required,
+    ).not.toContain("posts");
     expect(schema.properties?.share?.type).toBe("boolean");
+    expect(schema.properties?.platforms?.minProperties).toBe(1);
+    expect(schema.properties?.planAt?.anyOf?.[0]?.anyOf?.[1]?.maxLength).toBe(
+      64,
+    );
+    expect(
+      (update?.inputSchema.anyOf as { required?: string[] }[] | undefined)?.map(
+        (branch) => branch.required,
+      ),
+    ).toEqual([["platforms"], ["draftTitle"], ["share"], ["planAt"]]);
   });
 
   test("is registered for the frozen Typefully catalogue entry", () => {
     const entry = catalogueEntry("typefully");
     expect(entry?.transport).toBe("typefully-rest");
     expect(transportFor(entry).callTool).toBe(callTool);
+  });
+
+  test("returns a deep clone so one listing cannot mutate the static manifest", async () => {
+    const first = await listTools({ url: connection.url });
+    first[0]!.name = "mutated";
+    const root = first[1]!.inputSchema as {
+      properties?: Record<string, { description?: string }>;
+    };
+    if (root.properties?.socialSetId) {
+      root.properties.socialSetId.description = "mutated nested schema";
+    }
+
+    const second = await listTools({ url: connection.url });
+    expect(second[0]?.name).toBe("list_social_sets");
+    const secondSchema = second[1]?.inputSchema as
+      | {
+          properties?: Record<string, { description?: string }>;
+        }
+      | undefined;
+    expect(secondSchema?.properties?.socialSetId?.description).not.toBe(
+      "mutated nested schema",
+    );
   });
 });
 
@@ -219,23 +266,6 @@ describe("v2 request mapping", () => {
         body: { file_name: "launch.png" },
       },
       {
-        name: "remove_media",
-        args: {
-          socialSetId: 12,
-          draftId: 34,
-          platforms: {
-            x: { enabled: true, posts: [{ text: "Hello X", mediaIds: [] }] },
-          },
-        },
-        method: "PATCH",
-        path: "/v2/social-sets/12/drafts/34",
-        body: {
-          platforms: {
-            x: { enabled: true, posts: [{ text: "Hello X", media_ids: [] }] },
-          },
-        },
-      },
-      {
         name: "schedule_draft",
         args: { socialSetId: 12, draftId: 34, publishAt: plannedAt },
         method: "PATCH",
@@ -271,6 +301,115 @@ describe("v2 request mapping", () => {
       );
     }
     expect(calls).toHaveLength(cases.length);
+  });
+
+  test("remove_media reads the marker-preserving draft and removes only the named reference", async () => {
+    const authoritative = {
+      id: 34,
+      publish_at: "2099-08-27T12:00:00Z",
+      platforms: {
+        x: {
+          enabled: true,
+          vendor_setting: { preserve: true },
+          posts: [
+            {
+              text: '<typ:comment-thread id="c1">Keep marker</typ:comment-thread>',
+              media_ids: ["target-media", "keep-media"],
+              quote_post_url: "https://example.test/post",
+            },
+            { text: "Untouched post", media_ids: ["other-media"] },
+          ],
+        },
+        linkedin: { enabled: false, vendor_disabled_field: "preserve" },
+        future_platform: {
+          enabled: true,
+          posts: [{ text: "Unknown platform stays", media_ids: ["future"] }],
+          future_field: 42,
+        },
+      },
+    };
+    const calls: FetchCall[] = [];
+    const fetch = (async (
+      requestInput: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      const headers = new Headers(init?.headers);
+      calls.push({
+        url: String(requestInput),
+        method: init?.method ?? "GET",
+        authorization: headers.get("authorization"),
+        contentType: headers.get("content-type"),
+        body: typeof init?.body === "string" ? init.body : null,
+        signal: init?.signal ?? null,
+      });
+      return calls.length === 1
+        ? new Response(JSON.stringify(authoritative), {
+            headers: { "content-type": "application/json" },
+          })
+        : new Response(JSON.stringify({ ok: true }), {
+            headers: { "content-type": "application/json" },
+          });
+    }) as typeof globalThis.fetch;
+    const transport = createTypefullyRestTransport(fetch);
+
+    const result = await transport.callTool(connection, "remove_media", {
+      socialSetId: 12,
+      draftId: 34,
+      platform: "x",
+      postIndex: 0,
+      mediaId: "target-media",
+    });
+
+    expect(result.isError).toBe(false);
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.method).toBe("GET");
+    expect(calls[0]?.url).toBe(
+      "https://api.typefully.com/v2/social-sets/12/drafts/34",
+    );
+    expect(new URL(calls[0]!.url).search).toBe("");
+    expect(calls[1]?.method).toBe("PATCH");
+    const patched = JSON.parse(calls[1]?.body ?? "null");
+    expect(Object.keys(patched)).toEqual(["platforms"]);
+    expect(patched.platforms).toEqual({
+      ...authoritative.platforms,
+      x: {
+        ...authoritative.platforms.x,
+        posts: [
+          {
+            ...authoritative.platforms.x.posts[0],
+            media_ids: ["keep-media"],
+          },
+          authoritative.platforms.x.posts[1],
+        ],
+      },
+    });
+    expect(JSON.stringify(patched)).not.toContain("publish_at");
+  });
+
+  test("remove_media refuses a missing target after the authoritative GET", async () => {
+    const { fetch, calls } = recordingFetch({
+      body: {
+        platforms: {
+          x: {
+            enabled: true,
+            posts: [{ text: "Keep", media_ids: ["different-media"] }],
+          },
+        },
+      },
+    });
+    const transport = createTypefullyRestTransport(fetch);
+    const result = await transport.callTool(connection, "remove_media", {
+      socialSetId: 12,
+      draftId: 34,
+      platform: "x",
+      postIndex: 0,
+      mediaId: "missing-media",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain("not attached");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.method).toBe("GET");
   });
 
   test("pins requests beneath the reviewed v2 base instead of trusting the connection URL", async () => {
@@ -366,6 +505,11 @@ describe("fail-closed validation", () => {
         fileName: "launch.png",
         contentType: "image/png",
       }),
+      transport.callTool(connection, "remove_media", {
+        socialSetId: 1,
+        draftId: 2,
+        platforms,
+      }),
     ];
 
     for (const attempt of attempts) {
@@ -414,6 +558,70 @@ describe("fail-closed validation", () => {
       });
       expect(result.isError).toBe(true);
     }
+    expect(calls).toHaveLength(0);
+  });
+
+  test("allows disabled platforms without posts and requires posts when enabled", async () => {
+    const disabled = recordingFetch();
+    const disabledTransport = createTypefullyRestTransport(disabled.fetch);
+    const accepted = await disabledTransport.callTool(
+      connection,
+      "create_draft",
+      {
+        socialSetId: 1,
+        platforms: { linkedin: { enabled: false } },
+      },
+    );
+    expect(accepted.isError).toBe(false);
+    expect(JSON.parse(disabled.calls[0]?.body ?? "null")).toEqual({
+      platforms: { linkedin: { enabled: false } },
+    });
+
+    const enabled = recordingFetch();
+    const enabledTransport = createTypefullyRestTransport(enabled.fetch);
+    const refused = await enabledTransport.callTool(
+      connection,
+      "create_draft",
+      {
+        socialSetId: 1,
+        platforms: { linkedin: { enabled: true } },
+      },
+    );
+    expect(refused.isError).toBe(true);
+    expect(enabled.calls).toHaveLength(0);
+  });
+
+  test("bounds and flattens hostile validation values", async () => {
+    const { fetch, calls } = recordingFetch();
+    const transport = createTypefullyRestTransport(fetch);
+    const hostileKey = `bad\n\u0000${"x".repeat(2_000)}`;
+    const failures = [
+      await transport.callTool(connection, "list_social_sets", {
+        [hostileKey]: true,
+      }),
+      await transport.callTool(connection, "create_draft", {
+        socialSetId: 1,
+        platforms: { [hostileKey]: { enabled: false } },
+      }),
+      await transport.callTool(connection, "schedule_draft", {
+        socialSetId: 1,
+        draftId: 2,
+        publishAt: `2099-01-01T00:00:00Z\n${"x".repeat(2_000)}`,
+      }),
+      await transport.callTool(connection, "create_draft", {
+        socialSetId: 1,
+        platforms,
+        planAt: `2099-01-01T00:00:00Z\n${"x".repeat(2_000)}`,
+      }),
+    ];
+
+    for (const result of failures) {
+      expect(result.isError).toBe(true);
+      expect(result.text.length).toBeLessThan(500);
+      expect(result.text).not.toMatch(/[\r\n]/);
+      expect(result.text).not.toContain("\u0000");
+    }
+    expect(failures.some((result) => result.truncated)).toBe(true);
     expect(calls).toHaveLength(0);
   });
 
@@ -483,6 +691,77 @@ describe("fail-closed validation", () => {
 });
 
 describe("bounded and redacted failures", () => {
+  test("bounds and cancels oversized chunked success and error streams", async () => {
+    async function run(status: number) {
+      let cancelled = false;
+      const encoder = new TextEncoder();
+      const fetch = (async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            pull(controller) {
+              controller.enqueue(encoder.encode("x".repeat(8_000)));
+            },
+            cancel() {
+              cancelled = true;
+            },
+          }),
+          { status },
+        )) as typeof globalThis.fetch;
+      const transport = createTypefullyRestTransport(fetch);
+      const result = await transport.callTool(
+        connection,
+        "list_social_sets",
+        {},
+      );
+      return { cancelled, result };
+    }
+
+    const success = await run(200);
+    expect(success.cancelled).toBe(true);
+    expect(success.result.isError).toBe(false);
+    expect(success.result.truncated).toBe(true);
+    expect(success.result.text).toContain("[truncated:");
+    expect(success.result.text.length).toBeLessThan(MAX_RESULT_CHARS + 500);
+
+    const error = await run(422);
+    expect(error.cancelled).toBe(true);
+    expect(error.result.isError).toBe(true);
+    expect(error.result.truncated).toBe(true);
+    expect(error.result.text).toContain("[truncated:");
+    expect(error.result.text.length).toBeLessThan(MAX_RESULT_CHARS + 500);
+  });
+
+  test("turns post-header success and error stream failures into canonical results", async () => {
+    for (const status of [200, 422]) {
+      const encoder = new TextEncoder();
+      const fetch = (async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(encoder.encode('{"partial":'));
+            },
+            pull(controller) {
+              controller.error(new Error("stream failed with tf-secret-key"));
+            },
+          }),
+          { status },
+        )) as typeof globalThis.fetch;
+      const transport = createTypefullyRestTransport(fetch);
+
+      const result = await transport.callTool(
+        connection,
+        "list_social_sets",
+        {},
+      );
+      expect(result).toEqual({
+        text: expect.stringContaining("could not be read"),
+        isError: true,
+        truncated: false,
+      });
+      expect(result.text).not.toContain(connection.token);
+    }
+  });
+
   test("uses an abort timeout and reports it canonically", async () => {
     const calls: FetchCall[] = [];
     const fetch = (async (
@@ -545,10 +824,10 @@ describe("bounded and redacted failures", () => {
   });
 
   test("reports a bounded Retry-After on 429 and does not retry", async () => {
-    const retryAfter = `120-${"x".repeat(1_000)}`;
+    const retryAfter = `120-${connection.token}-${"x".repeat(1_000)}`;
     const { fetch, calls } = recordingFetch({
       status: 429,
-      text: "do not retain this body",
+      text: `do not retain this body ${connection.token}`,
       headers: { "retry-after": retryAfter },
     });
     const transport = createTypefullyRestTransport(fetch);
@@ -559,6 +838,8 @@ describe("bounded and redacted failures", () => {
     expect(result.text).toContain("120-");
     expect(result.text.length).toBeLessThan(500);
     expect(result.text).not.toContain("do not retain this body");
+    expect(result.text).not.toContain(connection.token);
+    expect(result.truncated).toBe(true);
     expect(calls).toHaveLength(1);
   });
 
@@ -566,7 +847,7 @@ describe("bounded and redacted failures", () => {
     const { fetch } = recordingFetch({
       status: 422,
       body: {
-        detail: `bad request ${"x".repeat(5_000)}`,
+        detail: `bad request ${connection.token} ${"x".repeat(5_000)}`,
         secret_debug: connection.token,
       },
     });
@@ -578,7 +859,7 @@ describe("bounded and redacted failures", () => {
     expect(result.text).toContain("bad request");
     expect(result.text.length).toBeLessThan(1_000);
     expect(result.text).not.toContain(connection.token);
-    expect(result.truncated).toBe(false);
+    expect(result.truncated).toBe(true);
   });
 
   test("visibly truncates oversized successful responses", async () => {
@@ -592,5 +873,18 @@ describe("bounded and redacted failures", () => {
     expect(result.truncated).toBe(true);
     expect(result.text).toContain("[truncated:");
     expect(result.text.length).toBeLessThan(MAX_RESULT_CHARS + 200);
+  });
+
+  test("redacts the bearer token from successful vendor text", async () => {
+    const { fetch } = recordingFetch({
+      body: { echoed: connection.token, safe: "keep this" },
+    });
+    const transport = createTypefullyRestTransport(fetch);
+
+    const result = await transport.callTool(connection, "list_social_sets", {});
+    expect(result.isError).toBe(false);
+    expect(result.text).toContain("keep this");
+    expect(result.text).toContain("[redacted]");
+    expect(result.text).not.toContain(connection.token);
   });
 });

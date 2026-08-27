@@ -1,453 +1,126 @@
-import { type McpCallResult, type McpTool, resultText } from "./mcp";
+import { MAX_RESULT_CHARS, type McpCallResult, type McpTool } from "./mcp";
+import {
+  inputSchemaFor,
+  parseTypefullyCall,
+  TYPEFULLY_TOOL_NAMES,
+  type TypefullyCall,
+  type TypefullyToolName,
+} from "./typefully-contracts";
 
 const TYPEFULLY_API_URL = "https://api.typefully.com/v2";
 const REQUEST_TIMEOUT_MS = 30_000;
-const SAFE_ERROR_CHARS = 400;
+const SAFE_MESSAGE_CHARS = 400;
+const SAFE_ERROR_BODY_BYTES = 8_192;
 const RETRY_AFTER_CHARS = 120;
+const AUTHORITATIVE_DRAFT_BYTES = 1_000_000;
 
 type Connection = { url: string; token?: string };
 type FetchImplementation = typeof globalThis.fetch;
 
-const postSchema = {
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    text: { type: "string", maxLength: 50_000 },
-    mediaIds: {
-      type: "array",
-      maxItems: 10,
-      items: { type: "string", minLength: 1, maxLength: 240 },
-    },
-  },
-  required: ["text"],
-} as const;
+const TOOL_DESCRIPTIONS: Record<TypefullyToolName, string> = {
+  list_social_sets:
+    "List the Typefully social sets your personal account can access.",
+  list_drafts: "List drafts in one Typefully social set.",
+  get_draft: "Get one Typefully draft.",
+  create_draft:
+    "Create an unscheduled or inertly planned Typefully draft. This tool cannot publish immediately.",
+  update_draft:
+    "Update reviewed fields on a Typefully draft. This tool cannot publish immediately.",
+  upload_media:
+    "Request a presigned Typefully media-upload URL. This only initiates the upload and never accepts file bytes.",
+  remove_media:
+    "Remove one named media reference from an authoritative Typefully draft while preserving its other platform content.",
+  schedule_draft:
+    'Schedule a draft for a future ISO 8601 datetime or the next free slot. "now" is always refused.',
+  delete_draft: "Delete one Typefully draft.",
+};
 
-const platformSchema = {
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    enabled: { type: "boolean" },
-    posts: { type: "array", minItems: 1, maxItems: 50, items: postSchema },
-  },
-  required: ["enabled", "posts"],
-} as const;
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const nested of Object.values(value)) deepFreeze(nested);
+    Object.freeze(value);
+  }
+  return value;
+}
 
-const platformsSchema = {
-  type: "object",
-  additionalProperties: false,
-  minProperties: 1,
-  properties: {
-    x: platformSchema,
-    linkedin: platformSchema,
-    threads: platformSchema,
-    bluesky: platformSchema,
-    mastodon: platformSchema,
-  },
-} as const;
-
-const socialSetIdSchema = {
-  type: "integer",
-  minimum: 1,
-  description: "The positive integer id of the Typefully social set.",
-} as const;
-
-const draftIdSchema = {
-  type: "integer",
-  minimum: 1,
-  description: "The positive integer id of the Typefully draft.",
-} as const;
-
-const paginationProperties = {
-  limit: {
-    type: "integer",
-    minimum: 1,
-    maximum: 50,
-    description: "At most 50 records to return.",
-  },
-  offset: {
-    type: "integer",
-    minimum: 0,
-    description: "How many records to skip.",
-  },
-} as const;
-
-const draftFields = {
-  platforms: platformsSchema,
-  draftTitle: {
-    type: ["string", "null"],
-    maxLength: 512,
-    description: "An internal title; it is not posted.",
-  },
-  planAt: {
-    type: ["string", "null"],
-    description:
-      'A future ISO 8601 datetime or "next-free-slot". Planning is inert and never publishes.',
-  },
-} as const;
-
-const TOOLS: readonly McpTool[] = Object.freeze([
-  {
-    name: "list_social_sets",
-    description:
-      "List the Typefully social sets your personal account can access.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      properties: paginationProperties,
-    },
-  },
-  {
-    name: "list_drafts",
-    description: "List drafts in one Typefully social set.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      properties: { socialSetId: socialSetIdSchema, ...paginationProperties },
-      required: ["socialSetId"],
-    },
-  },
-  {
-    name: "get_draft",
-    description: "Get one Typefully draft.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      properties: { socialSetId: socialSetIdSchema, draftId: draftIdSchema },
-      required: ["socialSetId", "draftId"],
-    },
-  },
-  {
-    name: "create_draft",
-    description:
-      "Create an unscheduled or inertly planned Typefully draft. This tool cannot publish immediately.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        socialSetId: socialSetIdSchema,
-        ...draftFields,
-        share: { type: "boolean" },
-      },
-      required: ["socialSetId", "platforms"],
-    },
-  },
-  {
-    name: "update_draft",
-    description:
-      "Update reviewed fields on a Typefully draft. This tool cannot publish immediately.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        socialSetId: socialSetIdSchema,
-        draftId: draftIdSchema,
-        ...draftFields,
-        share: { type: ["boolean", "null"] },
-      },
-      required: ["socialSetId", "draftId"],
-    },
-  },
-  {
-    name: "upload_media",
-    description:
-      "Request a presigned Typefully media-upload URL. This only initiates the upload and never accepts file bytes.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        socialSetId: socialSetIdSchema,
-        fileName: {
-          type: "string",
-          minLength: 1,
-          maxLength: 255,
-          pattern:
-            "^[a-zA-Z0-9_.()\\-]+\\.(?:[jJ][pP][gG]|[jJ][pP][eE][gG]|[pP][nN][gG]|[wW][eE][bB][pP]|[gG][iI][fF]|[mM][pP]4|[mM][oO][vV]|[pP][dD][fF])$",
-        },
-      },
-      required: ["socialSetId", "fileName"],
-    },
-  },
-  {
-    name: "remove_media",
-    description:
-      "Update a draft with a fully reviewed platforms value from which the media reference has already been removed.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        socialSetId: socialSetIdSchema,
-        draftId: draftIdSchema,
-        platforms: platformsSchema,
-      },
-      required: ["socialSetId", "draftId", "platforms"],
-    },
-  },
-  {
-    name: "schedule_draft",
-    description:
-      'Schedule a draft for a future ISO 8601 datetime or the next free slot. "now" is always refused.',
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        socialSetId: socialSetIdSchema,
-        draftId: draftIdSchema,
-        publishAt: {
-          type: "string",
-          description:
-            'A future ISO 8601 datetime with timezone or "next-free-slot"; never "now".',
-        },
-      },
-      required: ["socialSetId", "draftId", "publishAt"],
-    },
-  },
-  {
-    name: "delete_draft",
-    description: "Delete one Typefully draft.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      properties: { socialSetId: socialSetIdSchema, draftId: draftIdSchema },
-      required: ["socialSetId", "draftId"],
-    },
-  },
-]);
+const TOOLS = deepFreeze(
+  TYPEFULLY_TOOL_NAMES.map((name) => ({
+    name,
+    description: TOOL_DESCRIPTIONS[name],
+    inputSchema: inputSchemaFor(name),
+  })) satisfies McpTool[],
+);
 
 export const listNeedsCredential = false;
 
 export async function listTools(_connection: Connection): Promise<McpTool[]> {
-  return TOOLS.map((tool) => ({ ...tool }));
+  return structuredClone(TOOLS) as McpTool[];
 }
 
-const failure = (text: string): McpCallResult => ({
-  text,
-  isError: true,
-  truncated: false,
-});
+function failure(text: string, truncated = false): McpCallResult {
+  return { text, isError: true, truncated };
+}
 
-function successful(text: string): McpCallResult {
-  const rendered = resultText([{ type: "text", text }]);
-  return { ...rendered, isError: false };
+function safeFailure(message: string): McpCallResult {
+  const oneLine = message
+    .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (oneLine.length <= SAFE_MESSAGE_CHARS) return failure(oneLine);
+  const suffix = " [truncated]";
+  return failure(
+    `${oneLine.slice(0, SAFE_MESSAGE_CHARS - suffix.length)}${suffix}`,
+    true,
+  );
+}
+
+type SanitizedText = { text: string; truncated: boolean };
+
+function sanitizeVendorText(
+  value: string,
+  token: string,
+  maxChars: number,
+  oneLine = false,
+): SanitizedText {
+  let text = value.replaceAll(token, "[redacted]");
+  if (oneLine) {
+    text = text
+      .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+  if (text.length <= maxChars) return { text, truncated: false };
+  return { text: text.slice(0, maxChars), truncated: true };
+}
+
+function truncationNotice(oneLine = false): string {
+  return oneLine
+    ? " [truncated: vendor response exceeded the safe limit]"
+    : "\n\n[truncated: vendor response exceeded the safe limit]";
+}
+
+type BoundedBody = { text: string; truncated: boolean };
+
+function successfulBody(body: BoundedBody, token: string): McpCallResult {
+  let rendered = body.text;
+  if (!body.truncated && body.text.trim() !== "") {
+    try {
+      rendered = JSON.stringify(JSON.parse(body.text));
+    } catch {
+      // Successful plain text is useful too; it is sanitized and bounded below.
+    }
+  }
+  const safe = sanitizeVendorText(rendered, token, MAX_RESULT_CHARS);
+  const truncated = body.truncated || safe.truncated;
+  const text =
+    safe.text.trim() === ""
+      ? "The tool returned no content. Nothing was found, so there is nothing here to answer from."
+      : `${safe.text}${truncated ? truncationNotice() : ""}`;
+  return { text, isError: false, truncated };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function unknownField(
-  args: Record<string, unknown>,
-  allowed: readonly string[],
-): string | null {
-  const unexpected = Object.keys(args).find((key) => !allowed.includes(key));
-  return unexpected ?? null;
-}
-
-function positiveInteger(
-  args: Record<string, unknown>,
-  key: "socialSetId" | "draftId",
-): number | null {
-  const value = args[key];
-  return typeof value === "number" && Number.isSafeInteger(value) && value > 0
-    ? value
-    : null;
-}
-
-function pagination(
-  args: Record<string, unknown>,
-):
-  | { ok: true; query: Record<string, string> }
-  | { ok: false; message: string } {
-  const query: Record<string, string> = {};
-  if (args.limit !== undefined) {
-    if (
-      typeof args.limit !== "number" ||
-      !Number.isSafeInteger(args.limit) ||
-      args.limit < 1 ||
-      args.limit > 50
-    ) {
-      return { ok: false, message: "limit must be an integer from 1 to 50." };
-    }
-    query.limit = String(args.limit);
-  }
-  if (args.offset !== undefined) {
-    if (
-      typeof args.offset !== "number" ||
-      !Number.isSafeInteger(args.offset) ||
-      args.offset < 0
-    ) {
-      return { ok: false, message: "offset must be a non-negative integer." };
-    }
-    query.offset = String(args.offset);
-  }
-  return { ok: true, query };
-}
-
-const PLATFORM_NAMES = new Set([
-  "x",
-  "linkedin",
-  "threads",
-  "bluesky",
-  "mastodon",
-]);
-
-function reviewedPlatforms(
-  value: unknown,
-):
-  | { ok: true; value: Record<string, unknown> }
-  | { ok: false; message: string } {
-  if (!isRecord(value) || Object.keys(value).length === 0) {
-    return { ok: false, message: "platforms must name at least one platform." };
-  }
-
-  const mapped: Record<string, unknown> = {};
-  for (const [platformName, rawPlatform] of Object.entries(value)) {
-    if (!PLATFORM_NAMES.has(platformName) || !isRecord(rawPlatform)) {
-      return {
-        ok: false,
-        message: `platforms.${platformName} is not supported.`,
-      };
-    }
-    const extraPlatformField = unknownField(rawPlatform, ["enabled", "posts"]);
-    if (extraPlatformField) {
-      return {
-        ok: false,
-        message: `platforms.${platformName}.${extraPlatformField} is not allowed.`,
-      };
-    }
-    if (typeof rawPlatform.enabled !== "boolean") {
-      return {
-        ok: false,
-        message: `platforms.${platformName}.enabled must be a boolean.`,
-      };
-    }
-    if (
-      !Array.isArray(rawPlatform.posts) ||
-      rawPlatform.posts.length < 1 ||
-      rawPlatform.posts.length > 50
-    ) {
-      return {
-        ok: false,
-        message: `platforms.${platformName}.posts must contain 1 to 50 posts.`,
-      };
-    }
-    const posts: Record<string, unknown>[] = [];
-    for (const [index, rawPost] of rawPlatform.posts.entries()) {
-      if (!isRecord(rawPost)) {
-        return {
-          ok: false,
-          message: `platforms.${platformName}.posts[${index}] must be an object.`,
-        };
-      }
-      const extraPostField = unknownField(rawPost, ["text", "mediaIds"]);
-      if (extraPostField) {
-        return {
-          ok: false,
-          message: `platforms.${platformName}.posts[${index}].${extraPostField} is not allowed.`,
-        };
-      }
-      if (typeof rawPost.text !== "string" || rawPost.text.length > 50_000) {
-        return {
-          ok: false,
-          message: `platforms.${platformName}.posts[${index}].text must be a string of at most 50000 characters.`,
-        };
-      }
-      const post: Record<string, unknown> = { text: rawPost.text };
-      if (rawPost.mediaIds !== undefined) {
-        if (
-          !Array.isArray(rawPost.mediaIds) ||
-          rawPost.mediaIds.length > 10 ||
-          rawPost.mediaIds.some(
-            (id) => typeof id !== "string" || id.length < 1 || id.length > 240,
-          )
-        ) {
-          return {
-            ok: false,
-            message: `platforms.${platformName}.posts[${index}].mediaIds is invalid.`,
-          };
-        }
-        post.media_ids = [...rawPost.mediaIds];
-      }
-      posts.push(post);
-    }
-    mapped[platformName] = { enabled: rawPlatform.enabled, posts };
-  }
-  return { ok: true, value: mapped };
-}
-
-function futureDateOrSlot(value: unknown): value is string {
-  if (value === "next-free-slot") return true;
-  if (typeof value !== "string") return false;
-  const match = value.match(
-    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|([+-])(\d{2}):(\d{2}))$/,
-  );
-  if (!match) return false;
-
-  const [, yearText, monthText, dayText, hourText, minuteText, secondText] =
-    match;
-  const fractionText = match[7] ?? "0";
-  const zone = match[8];
-  const offsetSign = match[9];
-  const offsetHourText = match[10];
-  const offsetMinuteText = match[11];
-  if (
-    yearText === undefined ||
-    monthText === undefined ||
-    dayText === undefined ||
-    hourText === undefined ||
-    minuteText === undefined ||
-    secondText === undefined ||
-    zone === undefined
-  ) {
-    return false;
-  }
-
-  const year = Number(yearText);
-  const month = Number(monthText);
-  const day = Number(dayText);
-  const hour = Number(hourText);
-  const minute = Number(minuteText);
-  const second = Number(secondText);
-  // JavaScript dates retain milliseconds. RFC 3339 allows more precision, so retain the first
-  // three digits for calendar round-tripping without rejecting a valid sub-millisecond suffix.
-  const millisecond = Number(fractionText.slice(0, 3).padEnd(3, "0"));
-  const local = new Date(0);
-  local.setUTCFullYear(year, month - 1, day);
-  local.setUTCHours(hour, minute, second, millisecond);
-  if (
-    local.getUTCFullYear() !== year ||
-    local.getUTCMonth() !== month - 1 ||
-    local.getUTCDate() !== day ||
-    local.getUTCHours() !== hour ||
-    local.getUTCMinutes() !== minute ||
-    local.getUTCSeconds() !== second ||
-    local.getUTCMilliseconds() !== millisecond
-  ) {
-    return false;
-  }
-
-  let offsetMinutes = 0;
-  if (zone !== "Z") {
-    const offsetHour = Number(offsetHourText);
-    const offsetMinute = Number(offsetMinuteText);
-    if (offsetHour > 23 || offsetMinute > 59 || offsetSign === undefined) {
-      return false;
-    }
-    offsetMinutes =
-      (offsetSign === "+" ? 1 : -1) * (offsetHour * 60 + offsetMinute);
-  }
-  const timestamp = Date.parse(value);
-  if (!Number.isFinite(timestamp) || timestamp <= Date.now()) return false;
-
-  const roundTrip = new Date(timestamp + offsetMinutes * 60_000);
-  return (
-    roundTrip.getUTCFullYear() === year &&
-    roundTrip.getUTCMonth() === month - 1 &&
-    roundTrip.getUTCDate() === day &&
-    roundTrip.getUTCHours() === hour &&
-    roundTrip.getUTCMinutes() === minute &&
-    roundTrip.getUTCSeconds() === second &&
-    roundTrip.getUTCMilliseconds() === millisecond
-  );
 }
 
 type RequestSpec = {
@@ -457,301 +130,185 @@ type RequestSpec = {
   body?: Record<string, unknown>;
 };
 
-type BuiltRequest =
-  | { ok: true; request: RequestSpec }
-  | { ok: false; message: string };
+type ModelPlatform = {
+  enabled: boolean;
+  posts?: { text: string; mediaIds?: string[] }[];
+};
 
-function idError(key: "socialSetId" | "draftId"): BuiltRequest {
+function vendorPlatforms(
+  value: Record<string, ModelPlatform | undefined>,
+): Record<string, unknown> {
+  const mapped: Record<string, unknown> = {};
+  for (const [name, platform] of Object.entries(value)) {
+    if (!platform) continue;
+    const vendorPlatform: Record<string, unknown> = {
+      enabled: platform.enabled,
+    };
+    if (platform.posts !== undefined) {
+      vendorPlatform.posts = platform.posts.map((post) => ({
+        text: post.text,
+        ...(post.mediaIds === undefined
+          ? {}
+          : { media_ids: [...post.mediaIds] }),
+      }));
+    }
+    mapped[name] = vendorPlatform;
+  }
+  return mapped;
+}
+
+function paginationQuery(args: {
+  limit?: number;
+  offset?: number;
+}): Record<string, string> {
   return {
-    ok: false,
-    message: `${key} must be a positive integer.`,
+    ...(args.limit === undefined ? {} : { limit: String(args.limit) }),
+    ...(args.offset === undefined ? {} : { offset: String(args.offset) }),
   };
 }
 
-function buildDraftBody(
-  args: Record<string, unknown>,
-  createDraft: boolean,
-):
-  | { ok: true; body: Record<string, unknown> }
-  | { ok: false; message: string } {
-  const body: Record<string, unknown> = {};
-  if (args.platforms !== undefined) {
-    const platforms = reviewedPlatforms(args.platforms);
-    if (!platforms.ok) return platforms;
-    body.platforms = platforms.value;
-  } else if (createDraft) {
-    return { ok: false, message: "platforms is required." };
-  }
-  if (args.draftTitle !== undefined) {
-    if (
-      args.draftTitle !== null &&
-      (typeof args.draftTitle !== "string" || args.draftTitle.length > 512)
-    ) {
-      return {
-        ok: false,
-        message:
-          "draftTitle must be null or a string of at most 512 characters.",
-      };
-    }
-    body.draft_title = args.draftTitle;
-  }
-  if (args.share !== undefined) {
-    if (
-      typeof args.share !== "boolean" &&
-      !(args.share === null && !createDraft)
-    ) {
-      return {
-        ok: false,
-        message: createDraft
-          ? "share must be a boolean when creating a draft."
-          : "share must be null or a boolean.",
-      };
-    }
-    body.share = args.share;
-  }
-  if (args.planAt !== undefined) {
-    if (args.planAt !== null && !futureDateOrSlot(args.planAt)) {
-      return {
-        ok: false,
-        message:
-          'planAt must be null, "next-free-slot", or a future ISO 8601 datetime with timezone.',
-      };
-    }
-    body.plan_at = args.planAt;
-  }
-  if (Object.keys(body).length === 0) {
-    return {
-      ok: false,
-      message: "At least one reviewed draft field is required.",
-    };
-  }
-  return { ok: true, body };
+function draftBody(args: {
+  platforms?: Record<string, ModelPlatform | undefined>;
+  draftTitle?: string | null;
+  share?: boolean | null;
+  planAt?: string | null;
+}): Record<string, unknown> {
+  return {
+    ...(args.platforms === undefined
+      ? {}
+      : { platforms: vendorPlatforms(args.platforms) }),
+    ...(args.draftTitle === undefined ? {} : { draft_title: args.draftTitle }),
+    ...(args.share === undefined ? {} : { share: args.share }),
+    ...(args.planAt === undefined ? {} : { plan_at: args.planAt }),
+  };
 }
 
 function buildRequest(
-  toolName: string,
-  args: Record<string, unknown>,
-): BuiltRequest {
-  if (toolName === "list_social_sets") {
-    const extra = unknownField(args, ["limit", "offset"]);
-    if (extra) return { ok: false, message: `${extra} is not allowed.` };
-    const page = pagination(args);
-    if (!page.ok) return page;
-    return {
-      ok: true,
-      request: { method: "GET", path: "/social-sets", query: page.query },
-    };
-  }
-
-  if (toolName === "list_drafts") {
-    const extra = unknownField(args, ["socialSetId", "limit", "offset"]);
-    if (extra) return { ok: false, message: `${extra} is not allowed.` };
-    const socialSetId = positiveInteger(args, "socialSetId");
-    if (!socialSetId) return idError("socialSetId");
-    const page = pagination(args);
-    if (!page.ok) return page;
-    return {
-      ok: true,
-      request: {
+  call: Exclude<TypefullyCall, { toolName: "remove_media" }>,
+): RequestSpec {
+  switch (call.toolName) {
+    case "list_social_sets":
+      return {
         method: "GET",
-        path: `/social-sets/${socialSetId}/drafts`,
-        query: page.query,
-      },
-    };
-  }
-
-  if (toolName === "get_draft" || toolName === "delete_draft") {
-    const extra = unknownField(args, ["socialSetId", "draftId"]);
-    if (extra) return { ok: false, message: `${extra} is not allowed.` };
-    const socialSetId = positiveInteger(args, "socialSetId");
-    if (!socialSetId) return idError("socialSetId");
-    const draftId = positiveInteger(args, "draftId");
-    if (!draftId) return idError("draftId");
-    return {
-      ok: true,
-      request: {
-        method: toolName === "get_draft" ? "GET" : "DELETE",
-        path: `/social-sets/${socialSetId}/drafts/${draftId}`,
-      },
-    };
-  }
-
-  if (toolName === "create_draft" || toolName === "update_draft") {
-    const allowed = [
-      "socialSetId",
-      ...(toolName === "update_draft" ? ["draftId"] : []),
-      "platforms",
-      "draftTitle",
-      "share",
-      "planAt",
-    ];
-    const extra = unknownField(args, allowed);
-    if (extra) return { ok: false, message: `${extra} is not allowed.` };
-    const socialSetId = positiveInteger(args, "socialSetId");
-    if (!socialSetId) return idError("socialSetId");
-    const draftId =
-      toolName === "update_draft" ? positiveInteger(args, "draftId") : null;
-    if (toolName === "update_draft" && !draftId) return idError("draftId");
-    const body = buildDraftBody(args, toolName === "create_draft");
-    if (!body.ok) return body;
-    return {
-      ok: true,
-      request: {
-        method: toolName === "create_draft" ? "POST" : "PATCH",
-        path:
-          toolName === "create_draft"
-            ? `/social-sets/${socialSetId}/drafts`
-            : `/social-sets/${socialSetId}/drafts/${draftId}`,
-        body: body.body,
-      },
-    };
-  }
-
-  if (toolName === "upload_media") {
-    const extra = unknownField(args, ["socialSetId", "fileName"]);
-    if (extra) return { ok: false, message: `${extra} is not allowed.` };
-    const socialSetId = positiveInteger(args, "socialSetId");
-    if (!socialSetId) return idError("socialSetId");
-    const fileName = args.fileName;
-    if (
-      typeof fileName !== "string" ||
-      fileName.length > 255 ||
-      !/^[a-zA-Z0-9_.()-]+\.(?:jpg|jpeg|png|webp|gif|mp4|mov|pdf)$/i.test(
-        fileName,
-      )
-    ) {
-      return {
-        ok: false,
-        message: "fileName is not a supported media filename.",
+        path: "/social-sets",
+        query: paginationQuery(call.args),
       };
-    }
-    return {
-      ok: true,
-      request: {
+    case "list_drafts":
+      return {
+        method: "GET",
+        path: `/social-sets/${call.args.socialSetId}/drafts`,
+        query: paginationQuery(call.args),
+      };
+    case "get_draft":
+      return {
+        method: "GET",
+        path: `/social-sets/${call.args.socialSetId}/drafts/${call.args.draftId}`,
+      };
+    case "create_draft":
+      return {
         method: "POST",
-        path: `/social-sets/${socialSetId}/media/upload`,
-        body: { file_name: fileName },
-      },
-    };
-  }
-
-  if (toolName === "remove_media") {
-    const extra = unknownField(args, ["socialSetId", "draftId", "platforms"]);
-    if (extra) return { ok: false, message: `${extra} is not allowed.` };
-    const socialSetId = positiveInteger(args, "socialSetId");
-    if (!socialSetId) return idError("socialSetId");
-    const draftId = positiveInteger(args, "draftId");
-    if (!draftId) return idError("draftId");
-    const platforms = reviewedPlatforms(args.platforms);
-    if (!platforms.ok) return platforms;
-    return {
-      ok: true,
-      request: {
-        method: "PATCH",
-        path: `/social-sets/${socialSetId}/drafts/${draftId}`,
-        body: { platforms: platforms.value },
-      },
-    };
-  }
-
-  if (toolName === "schedule_draft") {
-    const extra = unknownField(args, ["socialSetId", "draftId", "publishAt"]);
-    if (extra) return { ok: false, message: `${extra} is not allowed.` };
-    const socialSetId = positiveInteger(args, "socialSetId");
-    if (!socialSetId) return idError("socialSetId");
-    const draftId = positiveInteger(args, "draftId");
-    if (!draftId) return idError("draftId");
-    if (
-      typeof args.publishAt === "string" &&
-      args.publishAt.toLowerCase() === "now"
-    ) {
-      return {
-        ok: false,
-        message: 'Immediate publication (publishAt "now") is not available.',
+        path: `/social-sets/${call.args.socialSetId}/drafts`,
+        body: draftBody(call.args),
       };
-    }
-    if (!futureDateOrSlot(args.publishAt)) {
+    case "update_draft":
       return {
-        ok: false,
-        message:
-          'publishAt must be "next-free-slot" or a future ISO 8601 datetime with timezone.',
-      };
-    }
-    return {
-      ok: true,
-      request: {
         method: "PATCH",
-        path: `/social-sets/${socialSetId}/drafts/${draftId}`,
-        body: { publish_at: args.publishAt },
-      },
-    };
+        path: `/social-sets/${call.args.socialSetId}/drafts/${call.args.draftId}`,
+        body: draftBody(call.args),
+      };
+    case "upload_media":
+      return {
+        method: "POST",
+        path: `/social-sets/${call.args.socialSetId}/media/upload`,
+        body: { file_name: call.args.fileName },
+      };
+    case "schedule_draft":
+      return {
+        method: "PATCH",
+        path: `/social-sets/${call.args.socialSetId}/drafts/${call.args.draftId}`,
+        body: { publish_at: call.args.publishAt },
+      };
+    case "delete_draft":
+      return {
+        method: "DELETE",
+        path: `/social-sets/${call.args.socialSetId}/drafts/${call.args.draftId}`,
+      };
   }
-
-  return {
-    ok: false,
-    message: `${toolName} is not a tool this connector implements. Refresh the stored tool list.`,
-  };
 }
 
-function safeRetryAfter(value: string | null): string | null {
-  if (!value) return null;
-  const bounded = value
-    .replace(/[^\x20-\x7e]/g, "")
-    .slice(0, RETRY_AFTER_CHARS)
-    .trim();
-  return bounded || null;
-}
-
-function safeVendorMessage(body: string, token: string): string | null {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(body);
-  } catch {
-    return null;
+async function readBoundedBody(
+  response: Response,
+  maxBytes: number,
+): Promise<BoundedBody> {
+  if (!response.body) return { text: "", truncated: false };
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    if (!value || value.byteLength === 0) continue;
+    const remaining = maxBytes - total;
+    if (value.byteLength > remaining) {
+      if (remaining > 0) chunks.push(value.slice(0, remaining));
+      await reader.cancel();
+      total += Math.max(remaining, 0);
+      return decodeBody(chunks, total, true);
+    }
+    chunks.push(value);
+    total += value.byteLength;
   }
-  if (!isRecord(parsed)) return null;
-  const nested = isRecord(parsed.error) ? parsed.error.message : null;
-  const candidates = [parsed.detail, parsed.message, parsed.error, nested];
-  const message = candidates.find((value) => typeof value === "string");
-  if (typeof message !== "string") return null;
-  return message
-    .replaceAll(token, "[redacted]")
-    .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ")
-    .slice(0, SAFE_ERROR_CHARS)
-    .trim();
+  return decodeBody(chunks, total, false);
 }
 
-async function execute(
+function decodeBody(
+  chunks: Uint8Array[],
+  total: number,
+  truncated: boolean,
+): BoundedBody {
+  const joined = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { text: new TextDecoder().decode(joined), truncated };
+}
+
+type RawResponse = { response: Response; body: BoundedBody };
+
+async function requestTypefully(
   fetchImplementation: FetchImplementation,
   timeoutMs: number,
-  connection: Connection,
+  token: string,
   request: RequestSpec,
-): Promise<McpCallResult> {
-  if (!connection.token) {
-    return failure(
-      "No personal Typefully credential was available for this call. Connect your Typefully account and try again.",
-    );
-  }
-
+  successBodyBytes = MAX_RESULT_CHARS,
+): Promise<RawResponse | McpCallResult> {
   const url = new URL(`${TYPEFULLY_API_URL}${request.path}`);
   for (const [key, value] of Object.entries(request.query ?? {})) {
     url.searchParams.set(key, value);
   }
-  const headers = new Headers({
-    authorization: `Bearer ${connection.token}`,
-  });
+  const headers = new Headers({ authorization: `Bearer ${token}` });
   const body =
     request.body === undefined ? undefined : JSON.stringify(request.body);
   if (body !== undefined) headers.set("content-type", "application/json");
 
-  let response: Response;
+  let receivedHeaders = false;
   try {
-    response = await fetchImplementation(url, {
+    const response = await fetchImplementation(url, {
       method: request.method,
       headers,
       body,
       signal: AbortSignal.timeout(timeoutMs),
     });
+    receivedHeaders = true;
+    const bodyLimit = response.ok
+      ? successBodyBytes + token.length
+      : SAFE_ERROR_BODY_BYTES + token.length;
+    return {
+      response,
+      body: await readBoundedBody(response, bodyLimit),
+    };
   } catch (error) {
     if (
       error instanceof Error &&
@@ -759,42 +316,138 @@ async function execute(
     ) {
       return failure("Typefully did not answer in time.");
     }
-    return failure("Typefully could not be reached.");
+    return failure(
+      receivedHeaders
+        ? "Typefully response could not be read."
+        : "Typefully could not be reached.",
+    );
   }
+}
 
+function vendorMessage(body: BoundedBody, token: string): SanitizedText | null {
+  if (body.truncated) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body.text);
+  } catch {
+    return null;
+  }
+  if (!isRecord(parsed)) return null;
+  const nested = isRecord(parsed.error) ? parsed.error.message : null;
+  const candidate = [parsed.detail, parsed.message, parsed.error, nested].find(
+    (value): value is string => typeof value === "string",
+  );
+  return candidate === undefined
+    ? null
+    : sanitizeVendorText(candidate, token, SAFE_MESSAGE_CHARS, true);
+}
+
+function responseResult(raw: RawResponse, token: string): McpCallResult {
+  const { response, body } = raw;
   if (response.status === 401) {
     return failure(
       "Typefully authentication failed (401). Reconnect your personal Typefully account and try again.",
     );
   }
   if (response.status === 429) {
-    const retryAfter = safeRetryAfter(response.headers.get("retry-after"));
+    const retryAfterHeader = response.headers.get("retry-after");
+    const retryAfter = retryAfterHeader
+      ? sanitizeVendorText(retryAfterHeader, token, RETRY_AFTER_CHARS, true)
+      : null;
+    const truncated = body.truncated || retryAfter?.truncated === true;
+    const base = retryAfter?.text
+      ? `Typefully rate limited this request (429). Retry-After: ${retryAfter.text}.`
+      : "Typefully rate limited this request (429).";
     return failure(
-      retryAfter
-        ? `Typefully rate limited this request (429). Retry-After: ${retryAfter}.`
-        : "Typefully rate limited this request (429).",
+      `${base}${truncated ? truncationNotice(true) : ""}`,
+      truncated,
     );
   }
-
-  const responseBody = await response.text();
   if (!response.ok) {
-    const detail = safeVendorMessage(responseBody, connection.token);
+    const detail = vendorMessage(body, token);
+    const truncated = body.truncated || detail?.truncated === true;
+    const base = detail?.text
+      ? `Typefully refused this request (${response.status}): ${detail.text}`
+      : `Typefully refused this request (${response.status}).`;
     return failure(
-      detail
-        ? `Typefully refused this request (${response.status}): ${detail}`
-        : `Typefully refused this request (${response.status}).`,
+      `${base}${truncated ? truncationNotice(true) : ""}`,
+      truncated,
+    );
+  }
+  return successfulBody(body, token);
+}
+
+async function removeMedia(
+  fetchImplementation: FetchImplementation,
+  timeoutMs: number,
+  token: string,
+  call: Extract<TypefullyCall, { toolName: "remove_media" }>,
+): Promise<McpCallResult> {
+  const path = `/social-sets/${call.args.socialSetId}/drafts/${call.args.draftId}`;
+  const fetched = await requestTypefully(
+    fetchImplementation,
+    timeoutMs,
+    token,
+    { method: "GET", path },
+    AUTHORITATIVE_DRAFT_BYTES,
+  );
+  if (!("response" in fetched)) return fetched;
+  if (!fetched.response.ok) return responseResult(fetched, token);
+  if (fetched.body.truncated) {
+    return failure(
+      `Typefully's draft response was too large to update safely.${truncationNotice(true)}`,
+      true,
     );
   }
 
-  let rendered = responseBody;
-  if (responseBody.trim() !== "") {
-    try {
-      rendered = JSON.stringify(JSON.parse(responseBody));
-    } catch {
-      // A successful non-JSON response is still useful result text and remains bounded below.
-    }
+  let draft: unknown;
+  try {
+    draft = JSON.parse(fetched.body.text);
+  } catch {
+    return failure("Typefully returned a draft that could not be read safely.");
   }
-  return successful(rendered);
+  if (!isRecord(draft) || !isRecord(draft.platforms)) {
+    return failure("Typefully returned a draft without a platforms object.");
+  }
+  const platform = draft.platforms[call.args.platform];
+  if (!isRecord(platform) || !Array.isArray(platform.posts)) {
+    return failure("The selected platform has no posts in this draft.");
+  }
+  const post = platform.posts[call.args.postIndex];
+  if (!isRecord(post) || !Array.isArray(post.media_ids)) {
+    return failure("The selected post has no attached media.");
+  }
+  const targetIndex = post.media_ids.indexOf(call.args.mediaId);
+  if (targetIndex < 0) {
+    return failure("The named media is not attached to the selected post.");
+  }
+
+  const preservedPlatforms = structuredClone(draft.platforms);
+  const preservedPlatform = preservedPlatforms[call.args.platform];
+  if (!isRecord(preservedPlatform) || !Array.isArray(preservedPlatform.posts)) {
+    return failure(
+      "Typefully returned a draft that could not be updated safely.",
+    );
+  }
+  const preservedPost = preservedPlatform.posts[call.args.postIndex];
+  if (!isRecord(preservedPost) || !Array.isArray(preservedPost.media_ids)) {
+    return failure(
+      "Typefully returned a draft that could not be updated safely.",
+    );
+  }
+  preservedPost.media_ids.splice(targetIndex, 1);
+
+  const patched = await requestTypefully(
+    fetchImplementation,
+    timeoutMs,
+    token,
+    {
+      method: "PATCH",
+      path,
+      body: { platforms: preservedPlatforms },
+    },
+  );
+  return "response" in patched ? responseResult(patched, token) : patched;
 }
 
 export function createTypefullyRestTransport(
@@ -810,9 +463,28 @@ export function createTypefullyRestTransport(
       toolName: string,
       args: Record<string, unknown>,
     ): Promise<McpCallResult> {
-      const built = buildRequest(toolName, args);
-      if (!built.ok) return failure(built.message);
-      return execute(fetchImplementation, timeoutMs, connection, built.request);
+      const parsed = parseTypefullyCall(toolName, args);
+      if (!parsed.ok) return safeFailure(parsed.message);
+      if (!connection.token) {
+        return failure(
+          "No personal Typefully credential was available for this call. Connect your Typefully account and try again.",
+        );
+      }
+      if (parsed.call.toolName === "remove_media") {
+        return removeMedia(
+          fetchImplementation,
+          timeoutMs,
+          connection.token,
+          parsed.call,
+        );
+      }
+      const raw = await requestTypefully(
+        fetchImplementation,
+        timeoutMs,
+        connection.token,
+        buildRequest(parsed.call),
+      );
+      return "response" in raw ? responseResult(raw, connection.token) : raw;
     },
   };
 }
