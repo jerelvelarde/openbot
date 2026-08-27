@@ -244,6 +244,29 @@ type ReviewLoaderProps = {
   onReviewAgain?: () => void;
 };
 
+type ProposalRefusalReason =
+  | "unavailable"
+  | "access_revoked"
+  | "bot_not_attached"
+  | "channel_forbidden"
+  | "grant_required"
+  | "remote_refused";
+
+function proposalRefusalReason(error: unknown): ProposalRefusalReason | null {
+  if (!(error instanceof TypefullyClientError)) return null;
+  if (error.code === "draft_not_found") return "unavailable";
+  if (
+    error.code === "access_revoked" ||
+    error.code === "bot_not_attached" ||
+    error.code === "channel_forbidden" ||
+    error.code === "grant_required" ||
+    error.code === "remote_refused"
+  ) {
+    return error.code;
+  }
+  return null;
+}
+
 export function TypefullyProposalReviewLoader({
   summary,
   respond,
@@ -267,9 +290,25 @@ export function TypefullyProposalReviewLoader({
   const authoritative = query.data?.proposal;
   const bound = authoritative && sameSummary(authoritative, summary);
   const effectiveStatus = bound ? statusFor(authoritative) : null;
+  const refusalReason = proposalRefusalReason(query.error);
 
   useEffect(() => {
-    if (!respond || !authoritative) return;
+    if (!respond) return;
+    if (refusalReason) {
+      void answer({
+        outcome: "refused",
+        proposalId: summary.id,
+        draftId: summary.draftId,
+        version: summary.version,
+        reason: refusalReason,
+      }).catch(() =>
+        setActionError(
+          "The publication decision could not be sent. Try again.",
+        ),
+      );
+      return;
+    }
+    if (!authoritative) return;
     if (!bound) {
       void answer({
         outcome: "changed",
@@ -297,7 +336,15 @@ export function TypefullyProposalReviewLoader({
     }).catch(() =>
       setActionError("The publication decision could not be sent. Try again."),
     );
-  }, [answer, authoritative, bound, effectiveStatus, respond, summary]);
+  }, [
+    answer,
+    authoritative,
+    bound,
+    effectiveStatus,
+    refusalReason,
+    respond,
+    summary,
+  ]);
 
   if (query.isPending) {
     return (
@@ -306,11 +353,30 @@ export function TypefullyProposalReviewLoader({
       </p>
     );
   }
+  if (refusalReason) {
+    return (
+      <div className="space-y-2 text-sm text-destructive" role="alert">
+        <p>This publication review is unavailable.</p>
+        <p>No proposal content was disclosed.</p>
+        {actionError ? <p>{actionError}</p> : null}
+      </div>
+    );
+  }
   if (query.error || !authoritative) {
     return (
-      <p className="text-sm text-destructive" role="alert">
-        This publication review is unavailable.
-      </p>
+      <div className="space-y-2 text-sm" role="alert">
+        <p className="text-destructive">
+          This publication review could not be loaded. Try again.
+        </p>
+        <button
+          className="rounded-[8px] border border-border bg-card px-3 py-2 disabled:opacity-50"
+          disabled={query.isFetching}
+          onClick={() => void query.refetch()}
+          type="button"
+        >
+          {query.isFetching ? "Retrying…" : "Retry"}
+        </button>
+      </div>
     );
   }
   if (!bound) {

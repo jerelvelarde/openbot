@@ -108,8 +108,13 @@ export type ComponentStore = {
 const iso = (value: Date | string | null): string | null =>
   value === null ? null : value instanceof Date ? value.toISOString() : value;
 
+const EXPLICIT_COMPONENT_GRANTS = new Set([
+  "connectTypefullyAccount",
+  "approveTypefullyPublication",
+]);
+
 export function requiresExplicitComponentGrant(name: string): boolean {
-  return name === "connectTypefullyAccount";
+  return EXPLICIT_COMPONENT_GRANTS.has(name);
 }
 
 /** Browser catalogue announcements are authenticated user input, not trusted build identity. */

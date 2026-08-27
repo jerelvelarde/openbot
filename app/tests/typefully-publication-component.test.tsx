@@ -3,6 +3,7 @@ import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { StrictMode } from "react";
 import {
   GALLERY,
   TypefullyProposalReview,
@@ -232,6 +233,165 @@ test("closing a pending decision leaves it unanswered", async () => {
   );
   await view.findByRole("button", { name: "Publish now" });
   view.unmount();
+  await Promise.resolve();
+  expect(respond).not.toHaveBeenCalled();
+});
+
+test("authoritative non-disclosure and grant refusals answer once without exposing a retry", async () => {
+  for (const refusal of [
+    { status: 404, code: "draft_not_found", reason: "unavailable" },
+    { status: 403, code: "grant_required", reason: "grant_required" },
+    { status: 403, code: "remote_refused", reason: "remote_refused" },
+  ] as const) {
+    globalThis.fetch = mock(async () =>
+      Response.json({ code: refusal.code }, { status: refusal.status }),
+    ) as typeof fetch;
+    const respond = mock(async () => {});
+    const view = render(
+      <QueryClientProvider
+        client={
+          new QueryClient({
+            defaultOptions: { queries: { retry: false } },
+          })
+        }
+      >
+        <TypefullyPublicationDecision
+          args={{
+            proposalId,
+            draftId,
+            destinations: ["x", "linkedin"],
+            version: 7,
+            expiresAt,
+          }}
+          respond={respond}
+          status="executing"
+        />
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(respond).toHaveBeenCalledTimes(1));
+    expect(respond.mock.calls[0]?.[0]).toEqual({
+      outcome: "refused",
+      proposalId,
+      draftId,
+      version: 7,
+      reason: refusal.reason,
+    });
+    expect(view.getByRole("alert").textContent).toContain(
+      "publication review is unavailable",
+    );
+    expect(view.queryByRole("button", { name: "Retry" })).toBeNull();
+    view.unmount();
+  }
+});
+
+test("a transient initial proposal load stays pending and can be retried", async () => {
+  let attempts = 0;
+  globalThis.fetch = mock(async () => {
+    attempts += 1;
+    if (attempts === 1) throw new TypeError("offline");
+    return Response.json({ proposal: proposal("pending") });
+  }) as typeof fetch;
+  const respond = mock(async () => {});
+  const view = render(
+    <QueryClientProvider
+      client={
+        new QueryClient({ defaultOptions: { queries: { retry: false } } })
+      }
+    >
+      <TypefullyPublicationDecision
+        args={{
+          proposalId,
+          draftId,
+          destinations: ["x", "linkedin"],
+          version: 7,
+          expiresAt,
+        }}
+        respond={respond}
+        status="executing"
+      />
+    </QueryClientProvider>,
+  );
+  const user = userEvent.setup({ document });
+
+  expect(await view.findByRole("button", { name: "Retry" })).toBeTruthy();
+  expect(respond).not.toHaveBeenCalled();
+  await user.click(view.getByRole("button", { name: "Retry" }));
+  expect(await view.findByRole("button", { name: "Publish now" })).toBeTruthy();
+  expect(respond).not.toHaveBeenCalled();
+});
+
+test("StrictMode attempts a rejected terminal refusal response only once", async () => {
+  globalThis.fetch = mock(async () =>
+    Response.json({ code: "draft_not_found" }, { status: 404 }),
+  ) as typeof fetch;
+  const respond = mock(async () => {
+    throw new Error("run gone");
+  });
+  const view = render(
+    <StrictMode>
+      <QueryClientProvider
+        client={
+          new QueryClient({
+            defaultOptions: { queries: { retry: false } },
+          })
+        }
+      >
+        <TypefullyPublicationDecision
+          args={{
+            proposalId,
+            draftId,
+            destinations: ["x", "linkedin"],
+            version: 7,
+            expiresAt,
+          }}
+          respond={respond}
+          status="executing"
+        />
+      </QueryClientProvider>
+    </StrictMode>,
+  );
+
+  await waitFor(() => expect(respond).toHaveBeenCalledTimes(1));
+  await Promise.resolve();
+  expect(respond).toHaveBeenCalledTimes(1);
+  expect(view.getByRole("alert").textContent).toContain(
+    "decision could not be sent",
+  );
+});
+
+test("unmounting before a terminal proposal refusal arrives leaves the decision pending", async () => {
+  let release: (() => void) | undefined;
+  globalThis.fetch = mock(
+    async () =>
+      new Promise<Response>((resolve) => {
+        release = () =>
+          resolve(Response.json({ code: "draft_not_found" }, { status: 404 }));
+      }),
+  ) as typeof fetch;
+  const respond = mock(async () => {});
+  const view = render(
+    <QueryClientProvider
+      client={
+        new QueryClient({ defaultOptions: { queries: { retry: false } } })
+      }
+    >
+      <TypefullyPublicationDecision
+        args={{
+          proposalId,
+          draftId,
+          destinations: ["x", "linkedin"],
+          version: 7,
+          expiresAt,
+        }}
+        respond={respond}
+        status="executing"
+      />
+    </QueryClientProvider>,
+  );
+  await waitFor(() => expect(release).toBeDefined());
+  view.unmount();
+  release?.();
   await Promise.resolve();
   expect(respond).not.toHaveBeenCalled();
 });

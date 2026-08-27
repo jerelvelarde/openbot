@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { eq, inArray } from "drizzle-orm";
+import { readFile } from "node:fs/promises";
+import { eq, inArray, sql } from "drizzle-orm";
 import { DATA_FUNCTIONS } from "../src/components/functions";
 import {
   ComponentNotFoundError,
@@ -253,6 +254,15 @@ describe("learning what a build ships", () => {
     defaultPublished: true,
     grantMode: "open" as const,
   };
+  const publicationOptIn = {
+    name: "approveTypefullyPublication",
+    title: "Publication approval",
+    kind: "decision",
+    description: "Approves one immutable Typefully publication proposal.",
+    // A stale or hostile browser announcement cannot publish this decision surface globally.
+    defaultPublished: true,
+    grantMode: "open" as const,
+  };
 
   test("a component the deployment has never seen is added, published and available to every Bot", async () => {
     const { added } = await store.syncCatalogue([announced]);
@@ -302,6 +312,88 @@ describe("learning what a build ships", () => {
     expect(
       (await store.listForAgent(botB)).map((item) => item.name),
     ).not.toContain(optIn.name);
+  });
+
+  test("publication approval ignores malicious open defaults and requires publish plus one explicit grant", async () => {
+    expect((await store.syncCatalogue([publicationOptIn])).added).toEqual([
+      publicationOptIn.name,
+    ]);
+
+    const inserted = (await store.list()).find(
+      (component) => component.name === publicationOptIn.name,
+    );
+    expect(inserted).toMatchObject({
+      published: false,
+      grantMode: "explicit",
+      grantedTo: [],
+    });
+    expect(
+      (await store.listForAgent(botA)).map((item) => item.name),
+    ).not.toContain(publicationOptIn.name);
+
+    await store.publish(publicationOptIn.name, "admin@example.test");
+    expect(
+      (await store.listForAgent(botA)).map((item) => item.name),
+    ).not.toContain(publicationOptIn.name);
+    expect(
+      (await store.listForAgent(botB)).map((item) => item.name),
+    ).not.toContain(publicationOptIn.name);
+
+    await store.grant(publicationOptIn.name, botA);
+    expect((await store.listForAgent(botA)).map((item) => item.name)).toContain(
+      publicationOptIn.name,
+    );
+    expect(
+      (await store.listForAgent(botB)).map((item) => item.name),
+    ).not.toContain(publicationOptIn.name);
+  });
+
+  test("the publication governance migration removes inverted legacy assignments and republishes nothing", async () => {
+    await database
+      .update(components)
+      .set({
+        grantMode: "open",
+        published: true,
+        publishedDescription: publicationOptIn.description,
+        publishedAt: new Date(),
+      })
+      .where(eq(components.name, publicationOptIn.name));
+    await database
+      .insert(componentExclusions)
+      .values({
+        componentName: publicationOptIn.name,
+        agentId: botB,
+        withheldBy: "legacy-admin@example.test",
+      })
+      .onConflictDoNothing();
+
+    const migration = await readFile(
+      new URL(
+        "../drizzle/0029_lock_typefully_publication_component.sql",
+        import.meta.url,
+      ),
+      "utf8",
+    );
+    for (const statement of migration.split("--> statement-breakpoint")) {
+      if (statement.trim()) await database.execute(sql.raw(statement));
+    }
+
+    expect(
+      (await store.list()).find(
+        (component) => component.name === publicationOptIn.name,
+      ),
+    ).toMatchObject({
+      grantMode: "explicit",
+      published: false,
+      publishedDescription: null,
+      grantedTo: [],
+    });
+    expect(
+      (await store.listForAgent(botA)).map((item) => item.name),
+    ).not.toContain(publicationOptIn.name);
+    expect(
+      (await store.listForAgent(botB)).map((item) => item.name),
+    ).not.toContain(publicationOptIn.name);
   });
 
   test("announcing NEVER overwrites what the deployment decided", async () => {
@@ -370,11 +462,18 @@ describe("learning what a build ships", () => {
         inArray(componentExclusions.componentName, [
           announced.name,
           optIn.name,
+          publicationOptIn.name,
         ]),
       );
     await database
       .delete(components)
-      .where(inArray(components.name, [announced.name, optIn.name]));
+      .where(
+        inArray(components.name, [
+          announced.name,
+          optIn.name,
+          publicationOptIn.name,
+        ]),
+      );
   });
 });
 
