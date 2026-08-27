@@ -1,5 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { MAX_POSTS, POST_BODY_LIMIT } from "@/lib/typefully/preview";
+import {
+  MAX_POSTS,
+  POST_BODY_LIMIT,
+  platformTextMetrics,
+} from "@/lib/typefully/preview";
 import type {
   CanonicalDraftDocument,
   TypefullyDestination,
@@ -107,6 +111,7 @@ export function DraftEditor({
       <div className="space-y-3">
         {document.posts.map((post, index) => {
           const body = post[platform];
+          const metrics = platformTextMetrics(platform, body);
           const label = `${LABELS[platform]} post ${index + 1}`;
           const errorId = `${platform}-${post.id}-error`;
           return (
@@ -148,6 +153,7 @@ export function DraftEditor({
               </div>
               <textarea
                 aria-describedby={errorId}
+                aria-invalid={!metrics.valid}
                 aria-label={label}
                 className="min-h-28 w-full resize-y rounded-[4px] border border-input bg-background px-3 py-2 text-sm leading-[22px] outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 disabled={disabled}
@@ -161,11 +167,14 @@ export function DraftEditor({
                 value={body}
               />
               <p
-                className="mt-1 text-right text-xs text-muted-foreground"
+                className={`mt-1 text-right text-xs ${metrics.valid ? "text-muted-foreground" : "text-destructive"}`}
                 id={errorId}
               >
-                {body.length.toLocaleString()} /{" "}
-                {POST_BODY_LIMIT.toLocaleString()}
+                {metrics.count.toLocaleString()} /{" "}
+                {metrics.limit.toLocaleString()}
+                {!metrics.valid
+                  ? ` — ${LABELS[platform]} limit exceeded`
+                  : null}
               </p>
             </article>
           );

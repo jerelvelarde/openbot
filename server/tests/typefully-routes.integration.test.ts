@@ -18,6 +18,7 @@ import {
   mcpTools,
   pluginGrants,
   typefullyDrafts,
+  typefullyPublicationProposals,
   users,
 } from "../src/db/schema";
 import {
@@ -45,6 +46,7 @@ let actorId = ownerId;
 let granted = true;
 let routeRemoteDocument: unknown;
 let routePublishCalls = 0;
+let routeCredentialCalls = 0;
 let routeVerificationError: PublicationVerificationError | null = null;
 
 const plugin = {
@@ -53,18 +55,22 @@ const plugin = {
       ? ({ allowed: true } as const)
       : ({ allowed: false, reason: "Grant removed." } as const),
   dispatchVendor: async () => {
+    routeCredentialCalls += 1;
     throw new ConnectionRequiredError("typefully", "Typefully");
   },
-  authorizeOperation: async () => ({
-    token: "route-personal-key",
-    decision: {
-      allowed: true,
-      forward: true,
-      mode: "enforce",
-      matched: "true",
-      source: "allow",
-    },
-  }),
+  authorizeOperation: async () => {
+    routeCredentialCalls += 1;
+    return {
+      token: "route-personal-key",
+      decision: {
+        allowed: true,
+        forward: true,
+        mode: "enforce",
+        matched: "true",
+        source: "allow",
+      },
+    };
+  },
 };
 const store = createTypefullyStore({
   database,
@@ -248,7 +254,26 @@ describe("Typefully draft routes", () => {
       channelId: source.channelId,
       botId: source.botId,
       document: copiedDocument,
+      remoteDraftId: null,
+      remoteVersion: null,
+      remoteHash: null,
+      syncStatus: "local",
+      lastError: null,
+      attemptId: null,
+      attemptKind: null,
+      attemptState: null,
+      attemptVersion: null,
+      attemptHash: null,
+      attemptRemoteDraftId: null,
+      attemptLeaseExpiresAt: null,
     });
+    expect(routeCredentialCalls).toBe(0);
+    expect(
+      await database
+        .select({ id: typefullyPublicationProposals.id })
+        .from(typefullyPublicationProposals)
+        .where(eq(typefullyPublicationProposals.draftId, result.draft.id)),
+    ).toEqual([]);
   });
 
   test("proposal routes prepare, privately load, and publish only after the human endpoint", async () => {

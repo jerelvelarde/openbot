@@ -1,9 +1,11 @@
 import { type KeyboardEvent, useId, useRef, useState } from "react";
 import { type AutosaveSnapshot, canPublish } from "@/lib/typefully/autosave";
+import { platformTextMetrics } from "@/lib/typefully/preview";
 import type {
   AuthoritativeDraft,
   CanonicalDraftDocument,
   DraftSyncStatus,
+  ProposalSummary,
   TypefullyDestination,
 } from "@/lib/typefully/queries";
 import { DraftEditor } from "./draft-editor";
@@ -171,6 +173,15 @@ function readiness(
   mediaBusy: boolean,
 ) {
   if (
+    document.posts.some((post) =>
+      document.destinations.some(
+        (destination) =>
+          !platformTextMetrics(destination, post[destination]).valid,
+      ),
+    )
+  )
+    return "Resolve destination character limits before requesting approval";
+  if (
     mediaBusy ||
     document.media.some((item) => item.remoteId === null) ||
     Object.values(mediaStates).some((state) => state.kind !== "ready")
@@ -213,13 +224,18 @@ export type CanvasShellProps = {
   localMediaUrls?: Readonly<Record<string, string>>;
   mediaBusy?: boolean;
   onTextChange?: (next: CanonicalDraftDocument) => void;
-  onMediaChange?: (next: CanonicalDraftDocument) => void;
+  onMediaTextChange?: (next: CanonicalDraftDocument) => void;
+  onMediaReorder?: (next: CanonicalDraftDocument) => void;
   onSelectMedia?: (files: File[]) => void;
   onRetryMedia?: (mediaId: string) => void;
   onRemoveMedia?: (mediaId: string) => void;
   onReload?: () => void;
   onSaveAsNew?: () => void;
   onRetrySave?: () => void;
+  onPreparePublication?: () => void;
+  proposal?: ProposalSummary | null;
+  proposalPreparing?: boolean;
+  proposalError?: string | null;
 };
 
 export function CanvasShell({
@@ -230,13 +246,18 @@ export function CanvasShell({
   localMediaUrls = {},
   mediaBusy = false,
   onTextChange,
-  onMediaChange,
+  onMediaTextChange,
+  onMediaReorder,
   onSelectMedia,
   onRetryMedia,
   onRemoveMedia,
   onReload,
   onSaveAsNew,
   onRetrySave,
+  onPreparePublication,
+  proposal = null,
+  proposalPreparing = false,
+  proposalError = null,
 }: CanvasShellProps) {
   const destinations = document.destinations;
   const [requestedPlatform, setRequestedPlatform] =
@@ -261,7 +282,8 @@ export function CanvasShell({
     `${viewportBase}-panel-${value}`;
   const interactive = Boolean(
     onTextChange &&
-      onMediaChange &&
+      onMediaTextChange &&
+      onMediaReorder &&
       onSelectMedia &&
       onRetryMedia &&
       onRemoveMedia,
@@ -280,6 +302,17 @@ export function CanvasShell({
         autosave.state.kind !== "saved" &&
         autosave.state.kind !== "error",
     );
+  const readinessMessage = readiness(
+    draft,
+    document,
+    autosave,
+    mediaStates,
+    mediaBusy,
+  );
+  const publicationReady =
+    readinessMessage === "Ready for approval" &&
+    !proposalPreparing &&
+    proposal === null;
 
   return (
     <div
@@ -308,9 +341,29 @@ export function CanvasShell({
             className="rounded-full bg-muted/65 px-1.5 py-0.5 text-xs"
             data-testid="publish-readiness"
           >
-            {readiness(draft, document, autosave, mediaStates, mediaBusy)} ·
-            Publishing approval is required
+            {readinessMessage} · Publishing approval is required
           </span>
+          <button
+            className="rounded-[8px] bg-primary px-3 py-2 text-sm font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={!publicationReady || !onPreparePublication}
+            onClick={onPreparePublication}
+            type="button"
+          >
+            {proposalPreparing ? "Preparing review…" : "Review & publish"}
+          </button>
+          {proposal ? (
+            <p
+              className="w-full rounded-[4px] bg-muted/65 px-3 py-2 text-xs"
+              role="status"
+            >
+              Review required. This preparation does not publish the draft.
+            </p>
+          ) : null}
+          {proposalError ? (
+            <p className="w-full text-xs text-destructive" role="alert">
+              {safeDraftError(proposalError)}
+            </p>
+          ) : null}
           {saveMessage ? (
             <p
               className="w-full rounded-[4px] bg-destructive/10 px-3 py-2 text-xs text-destructive"
@@ -385,7 +438,9 @@ export function CanvasShell({
                   >
                     {interactive ? (
                       <DraftEditor
-                        disabled={mediaBusy}
+                        disabled={
+                          mediaBusy || autosave?.state.kind === "conflict"
+                        }
                         document={document}
                         onChange={onTextChange ?? (() => {})}
                         platform={option.id}
@@ -407,12 +462,14 @@ export function CanvasShell({
                 <div>
                   <SectionTitle>Media</SectionTitle>
                   <MediaEditor
-                    disabled={mediaDisabled}
                     document={document}
-                    onChange={onMediaChange ?? (() => {})}
+                    editingDisabled={autosave?.state.kind === "conflict"}
+                    onReorder={onMediaReorder ?? (() => {})}
                     onRemove={onRemoveMedia ?? (() => {})}
                     onRetry={onRetryMedia ?? (() => {})}
                     onSelect={onSelectMedia ?? (() => {})}
+                    onTextChange={onMediaTextChange ?? (() => {})}
+                    remoteOperationsDisabled={mediaDisabled}
                     states={mediaStates}
                   />
                 </div>

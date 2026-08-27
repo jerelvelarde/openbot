@@ -15,24 +15,28 @@ export type MediaItemState =
 export function MediaEditor({
   document,
   states,
-  onChange,
+  onTextChange,
+  onReorder,
   onSelect,
   onRetry,
   onRemove,
-  disabled = false,
+  editingDisabled = false,
+  remoteOperationsDisabled = false,
 }: {
   document: CanonicalDraftDocument;
   states: Readonly<Record<string, MediaItemState>>;
-  onChange(next: CanonicalDraftDocument): void;
+  onTextChange(next: CanonicalDraftDocument): void;
+  onReorder(next: CanonicalDraftDocument): void;
   onSelect(files: File[]): void;
   onRetry(mediaId: string): void;
   onRemove(mediaId: string): void;
-  disabled?: boolean;
+  editingDisabled?: boolean;
+  remoteOperationsDisabled?: boolean;
 }) {
   const [error, setError] = useState<string | null>(null);
   const media = orderedMedia(document);
   const updateAlt = (id: string, altText: string) =>
-    onChange({
+    onTextChange({
       ...document,
       media: document.media.map((item) =>
         item.id === id ? { ...item, altText } : item,
@@ -47,7 +51,7 @@ export function MediaEditor({
     if (!currentItem || !targetItem) return;
     next[index] = targetItem;
     next[target] = currentItem;
-    onChange({
+    onReorder({
       ...document,
       media: next.map((item, order) => ({ ...item, order })),
     });
@@ -75,7 +79,7 @@ export function MediaEditor({
           accept="image/jpeg,image/png,image/webp,image/gif,video/mp4,video/quicktime"
           aria-label="Add media"
           className="sr-only"
-          disabled={disabled || media.length >= MAX_MEDIA}
+          disabled={remoteOperationsDisabled || media.length >= MAX_MEDIA}
           multiple
           onChange={(event) => select(event.currentTarget.files)}
           type="file"
@@ -120,7 +124,7 @@ export function MediaEditor({
                   <button
                     aria-label={`Move ${name} up`}
                     className="rounded-[4px] px-2 py-1 text-xs hover:bg-muted/65"
-                    disabled={disabled || index === 0}
+                    disabled={editingDisabled || index === 0}
                     onClick={() => move(index, -1)}
                     type="button"
                   >
@@ -129,7 +133,7 @@ export function MediaEditor({
                   <button
                     aria-label={`Move ${name} down`}
                     className="rounded-[4px] px-2 py-1 text-xs hover:bg-muted/65"
-                    disabled={disabled || index === media.length - 1}
+                    disabled={editingDisabled || index === media.length - 1}
                     onClick={() => move(index, 1)}
                     type="button"
                   >
@@ -139,7 +143,7 @@ export function MediaEditor({
                     <button
                       aria-label={`Retry ${name}`}
                       className="rounded-[4px] px-2 py-1 text-xs hover:bg-muted/65"
-                      disabled={disabled}
+                      disabled={remoteOperationsDisabled}
                       onClick={() => onRetry(item.id)}
                       type="button"
                     >
@@ -149,7 +153,9 @@ export function MediaEditor({
                   <button
                     aria-label={`Remove ${name}`}
                     className="rounded-[4px] px-2 py-1 text-xs hover:bg-destructive/10"
-                    disabled={disabled || state?.kind === "uploading"}
+                    disabled={
+                      remoteOperationsDisabled || state?.kind === "uploading"
+                    }
                     onClick={() => onRemove(item.id)}
                     type="button"
                   >
@@ -162,7 +168,7 @@ export function MediaEditor({
                 <input
                   aria-label={`Alt text for ${name}`}
                   className="mt-1 w-full rounded-[4px] border border-input bg-background px-3 py-2 text-sm text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  disabled={disabled || state?.kind === "uploading"}
+                  disabled={editingDisabled}
                   maxLength={ALT_TEXT_LIMIT}
                   onChange={(event) =>
                     updateAlt(item.id, event.currentTarget.value)

@@ -267,7 +267,10 @@ function RouteComponent() {
       }
       detail={
         draft !== undefined ? (
-          <DraftCanvas draftId={draft} />
+          <DraftCanvas
+            draftId={draft}
+            onDraftCreated={(draftId) => void show({ draft: draftId })}
+          />
         ) : agentId === undefined ? null : isWatching ? (
           // Manual watch remains active even when there is no current browser action.
           <ComputerViewPanel agentId={agentId} name={channel?.data?.name} />

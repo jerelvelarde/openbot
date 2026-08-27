@@ -1,8 +1,4 @@
-import {
-  orderedMedia,
-  POST_BODY_LIMIT,
-  previewPosts,
-} from "@/lib/typefully/preview";
+import { orderedMedia, previewPosts } from "@/lib/typefully/preview";
 import type {
   CanonicalDraftDocument,
   TypefullyDestination,
@@ -83,9 +79,9 @@ export function PlatformPreview({
                       ? `${post.position} / ${post.total}`
                       : "Post"}
                   </span>
-                  <span>
+                  <span className={post.valid ? undefined : "text-destructive"}>
                     {post.characters.toLocaleString()} /{" "}
-                    {POST_BODY_LIMIT.toLocaleString()}
+                    {post.limit.toLocaleString()}
                   </span>
                 </div>
                 <p className="whitespace-pre-wrap break-words text-sm leading-[22px]">
@@ -101,23 +97,41 @@ export function PlatformPreview({
             {media.map((item) => {
               const localUrl = localMediaUrls[item.id];
               const mediaLabel = `${item.kind === "image" ? "Image" : "Video"}: ${item.altText || "No alt text"}`;
+              if (localUrl && item.kind === "image")
+                return (
+                  <img
+                    alt={item.altText}
+                    aria-label={mediaLabel}
+                    className="aspect-video w-full rounded-[4px] bg-muted/65 object-cover"
+                    data-testid="preview-media"
+                    key={item.id}
+                    src={localUrl}
+                  />
+                );
+              if (localUrl && item.kind === "video")
+                return (
+                  <video
+                    aria-label={mediaLabel}
+                    className="aspect-video w-full rounded-[4px] bg-muted/65 object-cover"
+                    controls
+                    data-testid="preview-media"
+                    key={item.id}
+                    muted
+                    playsInline
+                    src={localUrl}
+                  />
+                );
               return (
                 <div
                   aria-label={mediaLabel}
-                  className="flex min-h-20 items-center justify-center overflow-hidden rounded-[4px] bg-muted/65 text-center text-xs text-muted-foreground"
+                  className="flex aspect-video items-center justify-center rounded-[4px] bg-muted/65 text-xs text-muted-foreground"
                   data-testid="preview-media"
                   key={item.id}
                   role="img"
                 >
-                  {localUrl && item.kind === "image" ? (
-                    <img
-                      alt={item.altText}
-                      className="h-full w-full object-cover"
-                      src={localUrl}
-                    />
-                  ) : (
-                    <span className="px-2">{mediaLabel}</span>
-                  )}
+                  <span aria-hidden>
+                    {item.kind === "image" ? "Media" : "Video"}
+                  </span>
                 </div>
               );
             })}

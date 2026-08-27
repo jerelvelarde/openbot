@@ -736,3 +736,320 @@ test("draft canvas refuses a different valid draft returned for the requested id
     undefined,
   );
 });
+
+test("production draft canvas keeps editing during a delayed save and coalesces the latest document", async () => {
+  const { DraftCanvas } = await import(
+    "../src/components/typefully/draft-canvas"
+  );
+  const requests: Array<{ expectedVersion: number; body: string }> = [];
+  let resolveFirst!: (response: Response) => void;
+  let getVersion = 1;
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
+    },
+  });
+  queryClient.setQueryData(typefullyKeys.draft(draftId), {
+    draft: authoritativeDraft(),
+  });
+  globalThis.fetch = (async (_input, init) => {
+    const method = init?.method ?? "GET";
+    if (method === "PUT") {
+      const payload = JSON.parse(String(init?.body)) as {
+        expectedVersion: number;
+        document: { posts: Array<{ x: string }> };
+      };
+      requests.push({
+        expectedVersion: payload.expectedVersion,
+        body: payload.document.posts[0]?.x ?? "",
+      });
+      const version = payload.expectedVersion + 1;
+      const response = new Response(
+        JSON.stringify({
+          draft: {
+            id: draftId,
+            title: "Production route draft",
+            destinations: ["x"],
+            socialSetLabel: "Route account",
+            mediaCount: 0,
+            version,
+            syncStatus: "synced",
+            proposalStatus: null,
+          },
+          remote: {
+            state: "synced",
+            remoteDraftId: "remote-1",
+            confirmedVersion: version,
+            confirmedHash: `hash-${version}`,
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+      if (requests.length === 1)
+        return await new Promise<Response>((resolve) => {
+          resolveFirst = resolve;
+        });
+      getVersion = version;
+      return response;
+    }
+    const body = requests.at(-1)?.body ?? "Route body";
+    return new Response(
+      JSON.stringify({
+        draft: {
+          ...authoritativeDraft(),
+          version: getVersion,
+          contentHash: `hash-${getVersion}`,
+          remoteVersion: getVersion,
+          remoteHash: `hash-${getVersion}`,
+          document: {
+            ...authoritativeDraft().document,
+            posts: [{ id: "p1", x: body, linkedin: "" }],
+          },
+        },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  }) as typeof fetch;
+
+  const view = render(
+    <QueryClientProvider client={queryClient}>
+      <DraftCanvas draftId={draftId} />
+    </QueryClientProvider>,
+  );
+  const user = userEvent.setup({ document });
+  const editor = view.getByRole("textbox", { name: "X post 1" });
+  await user.type(editor, "A");
+  await waitFor(() => expect(requests).toHaveLength(1), { timeout: 1_500 });
+  expect((editor as HTMLTextAreaElement).disabled).toBe(false);
+  await user.type(editor, "BC");
+  expect((editor as HTMLTextAreaElement).value).toBe("Route bodyABC");
+  getVersion = 2;
+  resolveFirst(
+    new Response(
+      JSON.stringify({
+        draft: {
+          id: draftId,
+          title: "Production route draft",
+          destinations: ["x"],
+          socialSetLabel: "Route account",
+          mediaCount: 0,
+          version: 2,
+          syncStatus: "synced",
+          proposalStatus: null,
+        },
+        remote: {
+          state: "synced",
+          remoteDraftId: "remote-1",
+          confirmedVersion: 2,
+          confirmedHash: "hash-2",
+        },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+  );
+  await waitFor(() => expect(requests).toHaveLength(2));
+  expect(requests).toEqual([
+    { expectedVersion: 1, body: "Route bodyA" },
+    { expectedVersion: 2, body: "Route bodyABC" },
+  ]);
+  await waitFor(() =>
+    expect(view.getByRole("status").textContent).toContain(
+      "Saved to Typefully",
+    ),
+  );
+});
+
+test("production review control prepares a proposal without publishing", async () => {
+  const { DraftCanvas } = await import(
+    "../src/components/typefully/draft-canvas"
+  );
+  const calls: Array<{ url: string; method: string; body?: unknown }> = [];
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
+    },
+  });
+  queryClient.setQueryData(typefullyKeys.draft(draftId), {
+    draft: authoritativeDraft(),
+  });
+  globalThis.fetch = (async (input, init) => {
+    const url = typeof input === "string" ? input : input.url;
+    const method = init?.method ?? "GET";
+    calls.push({
+      url,
+      method,
+      body: init?.body ? JSON.parse(String(init.body)) : undefined,
+    });
+    if (method === "POST")
+      return new Response(
+        JSON.stringify({
+          proposal: {
+            id: "proposal-1",
+            draftId,
+            version: 1,
+            destinations: ["x"],
+            expiresAt: "2026-08-28T00:00:00.000Z",
+            status: "pending",
+          },
+        }),
+        { status: 201, headers: { "content-type": "application/json" } },
+      );
+    return new Response(JSON.stringify({ draft: authoritativeDraft() }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+  const view = render(
+    <QueryClientProvider client={queryClient}>
+      <DraftCanvas draftId={draftId} />
+    </QueryClientProvider>,
+  );
+  await userEvent
+    .setup({ document })
+    .click(view.getByRole("button", { name: "Review & publish" }));
+  expect(await view.findByText(/Review required/)).toBeTruthy();
+  expect(calls).toContainEqual({
+    url: `/api/typefully/drafts/${draftId}/proposals`,
+    method: "POST",
+    body: { expectedVersion: 1 },
+  });
+  expect(calls.some((call) => call.url.includes("/publish"))).toBe(false);
+});
+
+test("save as new pushes the production route onto the authoritative copied draft", async () => {
+  const copiedId = "17a7b81e-2360-43a4-872c-c13175832a5d";
+  const copiedBody = "Keep this conflicted copy";
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
+    },
+  });
+  queryClient.setQueryData(channelKeys.detail(channel.id), channel);
+  queryClient.setQueryData(agentKeys.detail("bot-1"), {
+    id: "bot-1",
+    name: "Launch Bot",
+    title: "Writer",
+    roleDescription: "Writes launch posts",
+    avatarSeed: "launch",
+    visibility: "private",
+    endpoint: null,
+    hasAuth: false,
+    hasCallbackToken: false,
+    hidden: false,
+    systemOwned: true,
+    canManage: false,
+    mine: false,
+  });
+  queryClient.setQueryData(channelKeys.list(), {
+    pages: [{ channels: [], nextCursor: null }],
+    pageParams: [""],
+  });
+  queryClient.setQueryData(typefullyKeys.draft(draftId), {
+    draft: authoritativeDraft(),
+  });
+  globalThis.fetch = (async (input, init) => {
+    const url = typeof input === "string" ? input : input.url;
+    const method = init?.method ?? "GET";
+    if (method === "PUT")
+      return new Response(
+        JSON.stringify({ code: "version_conflict", currentVersion: 2 }),
+        { status: 409, headers: { "content-type": "application/json" } },
+      );
+    if (method === "POST" && url.endsWith(`/${draftId}/copy`))
+      return new Response(
+        JSON.stringify({
+          draft: {
+            id: copiedId,
+            title: "Production route draft",
+            destinations: ["x"],
+            socialSetLabel: "Route account",
+            mediaCount: 0,
+            version: 1,
+            syncStatus: "local",
+            proposalStatus: null,
+          },
+        }),
+        { status: 201, headers: { "content-type": "application/json" } },
+      );
+    if (method === "GET" && url.includes(`/drafts/${copiedId}`))
+      return new Response(
+        JSON.stringify({
+          draft: {
+            ...authoritativeDraft(),
+            id: copiedId,
+            version: 1,
+            contentHash: "copy-hash",
+            remoteDraftId: null,
+            remoteVersion: null,
+            remoteHash: null,
+            syncStatus: "local",
+            document: {
+              ...authoritativeDraft().document,
+              posts: [{ id: "p1", x: copiedBody, linkedin: "" }],
+            },
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    if (method === "GET" && url.includes(`/drafts/${draftId}`))
+      return new Response(
+        JSON.stringify({
+          draft: { ...authoritativeDraft(), version: 2 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    return new Response(JSON.stringify({ version: "test", agents: {} }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  const root = createRootRoute({ component: ProductionTestRoot });
+  const route = ProductionChannelRoute.update({
+    id: "/channel/$channelId",
+    path: "/channel/$channelId",
+    getParentRoute: () => root,
+  });
+  const router = createRouter({
+    routeTree: root.addChildren([route]),
+    history: createMemoryHistory({
+      initialEntries: [`/channel/${channel.id}?draft=${draftId}`],
+    }),
+    context: { queryClient },
+  });
+  await router.load();
+  const view = render(
+    <QueryClientProvider client={queryClient}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>,
+  );
+  const user = userEvent.setup({ document });
+  const editor = await view.findByRole("textbox", { name: "X post 1" });
+  await user.clear(editor);
+  await user.type(editor, copiedBody);
+  expect((editor as HTMLTextAreaElement).disabled).toBe(false);
+  expect(
+    await view.findByRole(
+      "button",
+      { name: "Save as new" },
+      { timeout: 1_500 },
+    ),
+  ).toBeTruthy();
+  await user.click(view.getByRole("button", { name: "Save as new" }));
+  await waitFor(() =>
+    expect(router.state.location.search).toEqual({ draft: copiedId }),
+  );
+  expect(
+    (
+      (await view.findByRole("textbox", {
+        name: "X post 1",
+      })) as HTMLTextAreaElement
+    ).value,
+  ).toBe(copiedBody);
+  await act(async () => {
+    await router.history.back();
+  });
+  await waitFor(() =>
+    expect(router.state.location.search).toEqual({ draft: draftId }),
+  );
+});

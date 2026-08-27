@@ -4,6 +4,7 @@ import { createAutosaveController } from "@/lib/typefully/autosave";
 import {
   copyDraftMutationOptions,
   deleteMediaMutationOptions,
+  prepareProposalMutationOptions,
   saveDraftMutationOptions,
   uploadMediaMutationOptions,
 } from "@/lib/typefully/mutations";
@@ -11,6 +12,7 @@ import {
   type AuthoritativeDraft,
   type CanonicalDraftDocument,
   draftQueryOptions,
+  type ProposalSummary,
   TypefullyClientError,
 } from "@/lib/typefully/queries";
 import { CanvasShell } from "./canvas-shell";
@@ -44,7 +46,13 @@ function DraftRefusal({ error }: { error: unknown }) {
   return <p role="alert">This draft could not load. Try again.</p>;
 }
 
-export function DraftCanvas({ draftId }: { draftId: string }) {
+export function DraftCanvas({
+  draftId,
+  onDraftCreated,
+}: {
+  draftId: string;
+  onDraftCreated?: (draftId: string) => void;
+}) {
   const draft = useQuery(draftQueryOptions(draftId));
 
   if (draft.isPending) {
@@ -62,7 +70,11 @@ export function DraftCanvas({ draftId }: { draftId: string }) {
     );
   }
   return (
-    <EditableDraftCanvas draft={draft.data.draft} key={draft.data.draft.id} />
+    <EditableDraftCanvas
+      draft={draft.data.draft}
+      key={draft.data.draft.id}
+      onDraftCreated={onDraftCreated}
+    />
   );
 }
 
@@ -90,12 +102,22 @@ function replaceMedia(
   };
 }
 
-function EditableDraftCanvas({ draft }: { draft: AuthoritativeDraft }) {
+function EditableDraftCanvas({
+  draft,
+  onDraftCreated,
+}: {
+  draft: AuthoritativeDraft;
+  onDraftCreated?: (draftId: string) => void;
+}) {
   const queryClient = useQueryClient();
   const save = useMutation(saveDraftMutationOptions(queryClient));
   const upload = useMutation(uploadMediaMutationOptions(queryClient));
   const remove = useMutation(deleteMediaMutationOptions(queryClient));
   const copy = useMutation(copyDraftMutationOptions());
+  const prepareProposal = useMutation(
+    prepareProposalMutationOptions(queryClient),
+  );
+  const [proposal, setProposal] = useState<ProposalSummary | null>(null);
   const [mediaStates, setMediaStates] = useState<
     Record<string, MediaItemState>
   >({});
@@ -104,6 +126,7 @@ function EditableDraftCanvas({ draft }: { draft: AuthoritativeDraft }) {
   );
   const [mediaBusy, setMediaBusy] = useState(false);
   const mediaBusyRef = useRef(false);
+  const routedDraft = useRef<string | null>(null);
   const files = useRef(new Map<string, File>());
   const urls = useRef(new Map<string, string>());
   const initialConfirmed =
@@ -148,6 +171,34 @@ function EditableDraftCanvas({ draft }: { draft: AuthoritativeDraft }) {
     controller.getSnapshot,
     controller.getSnapshot,
   );
+
+  useEffect(() => {
+    const confirmed =
+      draft.syncStatus === "synced" &&
+      draft.remoteVersion === draft.version &&
+      draft.remoteHash === draft.contentHash;
+    controller.adoptAuthoritative(
+      draft.document,
+      draft.version,
+      draft.id,
+      confirmed ? "confirmed" : "local",
+    );
+  }, [controller, draft]);
+
+  useEffect(() => {
+    const createdId = snapshot.createdDraft?.draftId;
+    const settled =
+      snapshot.state.kind === "idle" || snapshot.state.kind === "saved";
+    if (
+      !createdId ||
+      !settled ||
+      snapshot.target.draftId !== createdId ||
+      routedDraft.current === createdId
+    )
+      return;
+    routedDraft.current = createdId;
+    onDraftCreated?.(createdId);
+  }, [onDraftCreated, snapshot]);
 
   useEffect(
     () => () => {
@@ -405,6 +456,18 @@ function EditableDraftCanvas({ draft }: { draft: AuthoritativeDraft }) {
       );
     }
   };
+  const preparePublication = async () => {
+    const current = controller.getSnapshot();
+    try {
+      const result = await prepareProposal.mutateAsync({
+        draftId: current.target.draftId,
+        expectedVersion: current.target.version,
+      });
+      setProposal(result.proposal);
+    } catch {
+      // The mutation exposes a bounded client error below; it never publishes.
+    }
+  };
 
   return (
     <CanvasShell
@@ -414,7 +477,8 @@ function EditableDraftCanvas({ draft }: { draft: AuthoritativeDraft }) {
       localMediaUrls={localMediaUrls}
       mediaBusy={mediaBusy}
       mediaStates={mediaStates}
-      onMediaChange={controller.mediaSettled}
+      onMediaReorder={controller.textChanged}
+      onMediaTextChange={controller.textChanged}
       onReload={() => void reload()}
       onRemoveMedia={(mediaId) => void removeMedia(mediaId)}
       onRetryMedia={retryMedia}
@@ -424,6 +488,16 @@ function EditableDraftCanvas({ draft }: { draft: AuthoritativeDraft }) {
       }}
       onSelectMedia={(selected) => void selectMedia(selected)}
       onTextChange={controller.textChanged}
+      onPreparePublication={() => void preparePublication()}
+      proposal={proposal}
+      proposalError={
+        prepareProposal.error instanceof TypefullyClientError
+          ? prepareProposal.error.message
+          : prepareProposal.error
+            ? "This review could not be prepared. Try again."
+            : null
+      }
+      proposalPreparing={prepareProposal.isPending}
     />
   );
 }

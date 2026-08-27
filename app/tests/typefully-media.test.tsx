@@ -36,10 +36,11 @@ test("validates MIME and 25 MB before selecting uploads", async () => {
   const view = render(
     <MediaEditor
       document={documentFixture}
-      onChange={() => {}}
+      onReorder={() => {}}
       onRemove={() => {}}
       onRetry={() => {}}
       onSelect={onSelect}
+      onTextChange={() => {}}
       states={{}}
     />,
   );
@@ -66,10 +67,11 @@ test("shows honest upload state and failed or uncertain Retry/Remove actions", a
   const view = render(
     <MediaEditor
       document={documentFixture}
-      onChange={() => {}}
+      onReorder={() => {}}
       onRemove={remove}
       onRetry={retry}
       onSelect={() => {}}
+      onTextChange={() => {}}
       states={{
         b: { kind: "failed", message: "Upload could not be confirmed" },
         a: { kind: "uploading" },
@@ -91,21 +93,27 @@ test("edits alt text and reorders canonical media", async () => {
   const { MediaEditor } = await import(
     "../src/components/typefully/media-editor"
   );
-  const onChange = mock(() => {});
+  const onTextChange = mock(() => {});
+  const onReorder = mock(() => {});
   let latest = documentFixture;
   function Harness() {
     const [current, setCurrent] = useState(documentFixture);
     return (
       <MediaEditor
         document={current}
-        onChange={(next) => {
-          onChange(next);
+        onReorder={(next) => {
+          onReorder(next);
           latest = next;
           setCurrent(next);
         }}
         onRemove={() => {}}
         onRetry={() => {}}
         onSelect={() => {}}
+        onTextChange={(next) => {
+          onTextChange(next);
+          latest = next;
+          setCurrent(next);
+        }}
         states={{}}
       />
     );
@@ -117,7 +125,10 @@ test("edits alt text and reorders canonical media", async () => {
   await user.clear(alt);
   await user.type(alt, "Updated alt");
   expect(latest.media[0]?.altText).toBe("Updated alt");
+  expect(onTextChange).toHaveBeenCalled();
+  expect(onReorder).not.toHaveBeenCalled();
   await user.click(view.getByRole("button", { name: "Move Second up" }));
+  expect(onReorder).toHaveBeenCalledTimes(1);
   expect(latest.media.map((item) => [item.id, item.order])).toEqual([
     ["b", 0],
     ["a", 1],

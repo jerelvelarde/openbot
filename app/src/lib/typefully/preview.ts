@@ -1,6 +1,9 @@
+import twitterText from "twitter-text";
 import type { CanonicalDraftDocument, TypefullyDestination } from "./queries";
 
 export const POST_BODY_LIMIT = 100_000;
+export const X_POST_LIMIT = 280;
+export const LINKEDIN_POST_LIMIT = 3_000;
 export const ALT_TEXT_LIMIT = 10_000;
 export const MAX_POSTS = 50;
 export const MAX_MEDIA = 20;
@@ -19,21 +22,58 @@ export type PreviewPost = {
   id: string;
   body: string;
   characters: number;
+  limit: number;
+  valid: boolean;
   position: number;
   total: number;
 };
+
+export type PlatformTextMetrics = {
+  count: number;
+  limit: number;
+  valid: boolean;
+};
+
+export function platformTextMetrics(
+  platform: TypefullyDestination,
+  body: string,
+): PlatformTextMetrics {
+  const normalized = body.normalize("NFC");
+  if (platform === "x") {
+    const parsed = twitterText.parseTweet(normalized);
+    return {
+      count: parsed.weightedLength,
+      limit: X_POST_LIMIT,
+      valid: parsed.valid && parsed.weightedLength <= X_POST_LIMIT,
+    };
+  }
+
+  // LinkedIn publishes a 3,000-character limit. Count Unicode code points so
+  // supplementary characters are one character rather than two UTF-16 units.
+  const characters = Array.from(normalized).length;
+  return {
+    count: characters,
+    limit: LINKEDIN_POST_LIMIT,
+    valid: characters <= LINKEDIN_POST_LIMIT,
+  };
+}
 
 export function previewPosts(
   document: CanonicalDraftDocument,
   platform: TypefullyDestination,
 ): PreviewPost[] {
-  return document.posts.map((post, index) => ({
-    id: post.id,
-    body: post[platform],
-    characters: post[platform].length,
-    position: index + 1,
-    total: document.posts.length,
-  }));
+  return document.posts.map((post, index) => {
+    const metrics = platformTextMetrics(platform, post[platform]);
+    return {
+      id: post.id,
+      body: post[platform],
+      characters: metrics.count,
+      limit: metrics.limit,
+      valid: metrics.valid,
+      position: index + 1,
+      total: document.posts.length,
+    };
+  });
 }
 
 export function orderedMedia(document: CanonicalDraftDocument) {

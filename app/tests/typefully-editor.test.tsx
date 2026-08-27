@@ -53,13 +53,13 @@ test("edits independent destination variants and reports strict character bounds
     x: "Edited X",
     linkedin: "LinkedIn one",
   });
-  expect(view.getByText("5 / 100,000")).toBeTruthy();
+  expect(view.getByText("5 / 280")).toBeTruthy();
   expect(view.getByLabelText("X post 1").getAttribute("maxlength")).toBe(
     "100000",
   );
 });
 
-test("character counters match the canonical UTF-16 string bound", async () => {
+test("character counters show X weighted limits instead of storage bounds", async () => {
   const { DraftEditor } = await import(
     "../src/components/typefully/draft-editor"
   );
@@ -74,7 +74,7 @@ test("character counters match the canonical UTF-16 string bound", async () => {
     <DraftEditor document={unicode} onChange={() => {}} platform="x" />,
   );
 
-  expect(view.getByText("2 / 100,000")).toBeTruthy();
+  expect(view.getByText("2 / 280")).toBeTruthy();
 });
 
 test("adds, reorders, and removes post blocks with keyboard-labelled controls", async () => {

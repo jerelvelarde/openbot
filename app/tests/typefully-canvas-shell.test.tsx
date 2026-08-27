@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, expect, mock, test } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import { cleanup, render } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -159,7 +159,7 @@ test("canvas explains an empty destination instead of inventing a preview", asyn
   expect(view.queryByRole("tab", { name: "LinkedIn" })).toBeNull();
 });
 
-test("publish readiness follows authoritative sync state and never offers direct publish", async () => {
+test("review control follows publication readiness and never offers direct publish", async () => {
   const { CanvasShell } = await import(
     "../src/components/typefully/canvas-shell"
   );
@@ -182,6 +182,13 @@ test("publish readiness follows authoritative sync state and never offers direct
       expected,
     );
     expect(view.queryByRole("button", { name: /publish now/i })).toBeNull();
+    expect(
+      (
+        view.getByRole("button", {
+          name: "Review & publish",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
     cleanup();
   }
 
@@ -191,6 +198,34 @@ test("publish readiness follows authoritative sync state and never offers direct
   expect(unconfirmed.getByTestId("publish-readiness").textContent).toContain(
     "Wait for Typefully confirmation",
   );
+
+  cleanup();
+  const prepare = mock(() => {});
+  const ready = render(
+    <CanvasShell draft={draft} onPreparePublication={prepare} />,
+  );
+  const control = ready.getByRole("button", { name: "Review & publish" });
+  expect((control as HTMLButtonElement).disabled).toBe(false);
+  await userEvent.setup({ document }).click(control);
+  expect(prepare).toHaveBeenCalledTimes(1);
+  expect(ready.queryByRole("button", { name: /publish now/i })).toBeNull();
+
+  ready.rerender(
+    <CanvasShell
+      draft={draft}
+      mediaStates={{
+        missing: { kind: "failed", message: "Upload failed" },
+      }}
+      onPreparePublication={prepare}
+    />,
+  );
+  expect(
+    (
+      ready.getByRole("button", {
+        name: "Review & publish",
+      }) as HTMLButtonElement
+    ).disabled,
+  ).toBe(true);
 });
 
 test("remote errors surface a bounded redacted authoritative detail", async () => {
@@ -232,7 +267,8 @@ test("interactive canvas renders optimistic autosave and conflict recovery witho
   };
   const callbacks = {
     onTextChange: () => {},
-    onMediaChange: () => {},
+    onMediaReorder: () => {},
+    onMediaTextChange: () => {},
     onSelectMedia: () => {},
     onRetryMedia: () => {},
     onRemoveMedia: () => {},
@@ -288,4 +324,64 @@ test("interactive canvas renders optimistic autosave and conflict recovery witho
   expect(view.getByTestId("publish-readiness").textContent).toContain(
     "Resolve the save conflict",
   );
+});
+
+test("dirty autosave keeps local media metadata editable while remote operations wait", async () => {
+  const { CanvasShell } = await import(
+    "../src/components/typefully/canvas-shell"
+  );
+  const withMedia = {
+    ...draft.document,
+    media: [
+      {
+        id: "first",
+        kind: "image" as const,
+        order: 0,
+        altText: "First",
+        remoteId: "r1",
+      },
+      {
+        id: "second",
+        kind: "video" as const,
+        order: 1,
+        altText: "Second",
+        remoteId: "r2",
+      },
+    ],
+  };
+  const snapshot: AutosaveSnapshot = {
+    document: withMedia,
+    state: { kind: "saving", baseVersion: draft.version },
+    target: { draftId: draft.id, version: draft.version },
+    createdDraft: null,
+    actions: [],
+  };
+  const view = render(
+    <CanvasShell
+      autosave={snapshot}
+      document={withMedia}
+      draft={{ ...draft, document: withMedia }}
+      onMediaReorder={() => {}}
+      onMediaTextChange={() => {}}
+      onRemoveMedia={() => {}}
+      onRetryMedia={() => {}}
+      onSelectMedia={() => {}}
+      onTextChange={() => {}}
+    />,
+  );
+
+  expect(
+    (view.getByLabelText("Alt text for First") as HTMLInputElement).disabled,
+  ).toBe(false);
+  expect(
+    (view.getByRole("button", { name: "Move Second up" }) as HTMLButtonElement)
+      .disabled,
+  ).toBe(false);
+  expect((view.getByLabelText("Add media") as HTMLInputElement).disabled).toBe(
+    true,
+  );
+  expect(
+    (view.getByRole("button", { name: "Remove First" }) as HTMLButtonElement)
+      .disabled,
+  ).toBe(true);
 });

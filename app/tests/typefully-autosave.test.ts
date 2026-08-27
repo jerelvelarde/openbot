@@ -848,6 +848,81 @@ describe("Typefully autosave controller", () => {
     );
   });
 
+  test("adopts canonical server authority for the exact settled save generation", async () => {
+    const timer = clock();
+    const saving = deferred<SaveDraftResult>();
+    const controller = createAutosaveController({
+      initialDraftId: "draft-current",
+      initialDocument: base,
+      initialVersion: 1,
+      scheduler: timer.scheduler,
+      save: () => saving.promise,
+    });
+    controller.textChanged(edited("client spelling"));
+    timer.fire();
+    expect(
+      controller.adoptAuthoritative(
+        edited("canonical spelling"),
+        2,
+        "draft-current",
+        "confirmed",
+      ),
+    ).toBe(true);
+    saving.resolve(saved(2));
+    await saving.promise;
+    await Promise.resolve();
+    expect(controller.getSnapshot()).toMatchObject({
+      document: edited("canonical spelling"),
+      state: { kind: "saved", version: 2, remote: "confirmed" },
+    });
+  });
+
+  test("ignores delayed authority while newer local content is dirty", async () => {
+    const timer = clock();
+    const saving = deferred<SaveDraftResult>();
+    const controller = createAutosaveController({
+      initialDraftId: "draft-current",
+      initialDocument: base,
+      initialVersion: 1,
+      scheduler: timer.scheduler,
+      save: () => saving.promise,
+    });
+    controller.textChanged(edited("being saved"));
+    timer.fire();
+    controller.textChanged(edited("newer local"));
+    expect(controller.adoptAuthoritative(edited("stale refetch"), 2)).toBe(
+      false,
+    );
+    saving.resolve(saved(2));
+    await saving.promise;
+    await Promise.resolve();
+    expect(controller.getSnapshot().document).toEqual(edited("newer local"));
+  });
+
+  test("adopts a later authoritative refetch after local work settles", async () => {
+    const timer = clock();
+    const controller = createAutosaveController({
+      initialDraftId: "draft-current",
+      initialDocument: base,
+      initialVersion: 1,
+      scheduler: timer.scheduler,
+      save: async () => saved(2),
+    });
+    controller.textChanged(edited("local"));
+    timer.fire();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(
+      controller.adoptAuthoritative(
+        edited("canonical"),
+        2,
+        "draft-current",
+        "confirmed",
+      ),
+    ).toBe(true);
+    expect(controller.getSnapshot().document).toEqual(edited("canonical"));
+  });
+
   test("aborts in-flight work and clears timers on unmount cleanup", () => {
     const timer = clock();
     let signal: AbortSignal | undefined;
