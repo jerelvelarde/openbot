@@ -51,6 +51,12 @@ let previewCredential: string | null = null;
 let previewStatus:
   | { state: "processing"; fileName: string; mime: string }
   | {
+      state: "failed";
+      fileName: string;
+      mime: string;
+      reason: string;
+    }
+  | {
       state: "ready";
       fileName: string;
       mime: string;
@@ -327,7 +333,10 @@ describe("Typefully draft routes", () => {
       );
 
     actorId = outsiderId;
-    expect((await preview()).status).toBe(404);
+    const hidden = await preview();
+    expect(hidden.status).toBe(404);
+    expect(hidden.headers.get("cache-control")).toBe("private, no-store");
+    expect(hidden.headers.get("referrer-policy")).toBe("no-referrer");
     actorId = ownerId;
     expect(previewCredential).toBeNull();
 
@@ -335,6 +344,7 @@ describe("Typefully draft routes", () => {
     const refused = await preview();
     granted = true;
     expect(refused.status).toBe(403);
+    expect(refused.headers.get("cache-control")).toBe("private, no-store");
     expect(await refused.json()).toMatchObject({ code: "grant_required" });
     expect(previewCredential).toBeNull();
 
@@ -349,12 +359,17 @@ describe("Typefully draft routes", () => {
     const detached = await preview();
     await database.insert(channelAgents).values({ channelId, agentId: botId });
     expect(detached.status).toBe(409);
+    expect(detached.headers.get("cache-control")).toBe("private, no-store");
     expect(previewCredential).toBeNull();
 
     const statusResponse = await app.request(
       `/api/typefully/drafts/${current.id}/media/local-media/preview?status=1`,
     );
     expect(statusResponse.status).toBe(200);
+    expect(statusResponse.headers.get("cache-control")).toBe(
+      "private, no-store",
+    );
+    expect(statusResponse.headers.get("referrer-policy")).toBe("no-referrer");
     expect(await statusResponse.json()).toEqual({
       state: "ready",
       mime: "image/png",
@@ -378,10 +393,25 @@ describe("Typefully draft routes", () => {
     };
     const processing = await preview();
     expect(processing.status).toBe(202);
+    expect(processing.headers.get("cache-control")).toBe("private, no-store");
     expect(await processing.json()).toEqual({
       state: "processing",
       fileName: "launch.png",
       mime: "image/png",
+    });
+    previewStatus = {
+      state: "failed",
+      fileName: "launch.png",
+      mime: "image/png",
+      reason: "Transcode failed",
+    };
+    const failed = await preview();
+    expect(failed.status).toBe(422);
+    expect(failed.headers.get("cache-control")).toBe("private, no-store");
+    expect(failed.headers.get("referrer-policy")).toBe("no-referrer");
+    expect(await failed.json()).toMatchObject({
+      state: "failed",
+      reason: "Transcode failed",
     });
   });
 

@@ -582,8 +582,10 @@ describe("Typefully synchronization", () => {
         draft: { version: 2, syncStatus: "remote_error" },
       });
       const quarantined = await store.readDraft(id, ownerId);
-      const mediaId = quarantined.document.media[0]?.id;
+      const descriptor = quarantined.document.media[0];
+      const mediaId = descriptor?.id;
       expect(mediaId).toBeString();
+      expect(body.media).toEqual(descriptor);
 
       const retry = new FormData();
       retry.set("expectedVersion", "2");
@@ -674,9 +676,27 @@ describe("Typefully synchronization", () => {
       ref: "typefully/upload_media",
     });
 
-    const current = await app.request(`/api/typefully/drafts/${id}`);
-    const currentBody = await current.json();
-    const mediaId = currentBody.draft.document.media[0].id;
+    const afterDenied = await store.readDraft(id, ownerId);
+    expect(afterDenied).toMatchObject({ version: 1 });
+    expect(afterDenied.document.media).toEqual([]);
+    const mediaId = "media-remove-grant";
+    await store.saveDraft({
+      draftId: id,
+      actorId: ownerId,
+      expectedVersion: afterDenied.version,
+      document: {
+        ...afterDenied.document,
+        media: [
+          {
+            id: mediaId,
+            kind: "image",
+            order: 0,
+            altText: "Remove grant",
+            remoteId: null,
+          },
+        ],
+      },
+    });
     deniedRefs.add("typefully/update_draft");
     const removed = await app.request(
       `/api/typefully/drafts/${id}/media/${mediaId}`,
@@ -725,6 +745,60 @@ describe("Typefully synchronization", () => {
     });
   });
 
+  test("media upload connection failure returns its persisted authoritative descriptor", async () => {
+    const id = await createDraft();
+    thrownFailure = new ConnectionRequiredError("typefully", "Typefully");
+    const form = new FormData();
+    form.set("expectedVersion", "1");
+    form.set("kind", "image");
+    form.set("altText", "Disconnected upload");
+    form.set(
+      "file",
+      new File(["image"], "disconnected.png", { type: "image/png" }),
+    );
+    const response = await app.request(`/api/typefully/drafts/${id}/media`, {
+      method: "POST",
+      body: form,
+    });
+    thrownFailure = null;
+    expect(response.status).toBe(409);
+    const body = await response.json();
+    const stored = await store.readDraft(id, ownerId);
+    const descriptor = stored.document.media[0];
+    expect(body).toMatchObject({
+      code: "connection_required",
+      draftId: id,
+      draft: { id, version: 2, mediaCount: 1 },
+      media: { remoteId: null },
+    });
+    expect(body.media).toEqual(descriptor);
+    expect(stored).toMatchObject({ version: 2, syncStatus: "remote_error" });
+  });
+
+  test("media upload plugin refusal returns its persisted authoritative descriptor", async () => {
+    const id = await createDraft();
+    queuedResults.push(new PluginRefusedError("Policy refused upload.", null));
+    const form = new FormData();
+    form.set("expectedVersion", "1");
+    form.set("kind", "image");
+    form.set("altText", "Policy refused upload");
+    form.set("file", new File(["image"], "refused.png", { type: "image/png" }));
+    const response = await app.request(`/api/typefully/drafts/${id}/media`, {
+      method: "POST",
+      body: form,
+    });
+    expect(response.status).toBe(403);
+    const body = await response.json();
+    const stored = await store.readDraft(id, ownerId);
+    expect(body).toMatchObject({
+      code: "remote_refused",
+      draft: { id, version: 2, mediaCount: 1 },
+      media: { altText: "Policy refused upload", remoteId: null },
+    });
+    expect(body.media).toEqual(stored.document.media[0]);
+    expect(stored).toMatchObject({ version: 2, syncStatus: "remote_error" });
+  });
+
   test("a detached Bot blocks media upload without recording a remote failure", async () => {
     const id = await createDraft();
     await database
@@ -748,9 +822,9 @@ describe("Typefully synchronization", () => {
       const local = await app.request(`/api/typefully/drafts/${id}`);
       expect(await local.json()).toMatchObject({
         draft: {
-          version: 2,
-          syncStatus: "grant_blocked",
-          document: { media: [expect.objectContaining({ remoteId: null })] },
+          version: 1,
+          syncStatus: "local",
+          document: { media: [] },
         },
       });
     } finally {
@@ -998,7 +1072,11 @@ describe("Typefully synchronization", () => {
       { method: "POST", body: second },
     );
     expect(overlappingMedia.status).toBe(409);
-    expect(await overlappingMedia.json()).toEqual({ code: "sync_in_progress" });
+    expect(await overlappingMedia.json()).toMatchObject({
+      code: "sync_in_progress",
+      draft: { id, version: 3, mediaCount: 2 },
+      media: { altText: "Second overlap", remoteId: null },
+    });
     expect(calls.length).toBe(callsWhileHeld);
 
     release.resolve();

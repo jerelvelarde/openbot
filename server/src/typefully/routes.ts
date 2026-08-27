@@ -204,6 +204,68 @@ function errorResponse(
   );
 }
 
+function persistedMediaFailureResponse(
+  context: Context<{ Variables: AppVariables }>,
+  error: unknown,
+  draft: TypefullyDraft,
+  media: MediaDescriptor,
+) {
+  const authority = { draft: summary(draft), media };
+  if (error instanceof ConnectionRequiredError) {
+    return context.json(
+      {
+        code: error.code,
+        serverId: error.serverId,
+        draftId: draft.id,
+        connectPath: error.connectPath,
+        ...authority,
+      },
+      409,
+    );
+  }
+  if (error instanceof GrantRequiredError) {
+    return context.json(
+      { code: error.code, ref: error.ref, ...authority },
+      403,
+    );
+  }
+  if (error instanceof BotNotAttachedError) {
+    return context.json({ code: error.code, ...authority }, 409);
+  }
+  if (error instanceof PluginRefusedError) {
+    return context.json(
+      {
+        code: "remote_refused",
+        message: safeError(error),
+        ...authority,
+      },
+      403,
+    );
+  }
+  if (error instanceof SyncInProgressError) {
+    return context.json({ code: error.code, ...authority }, 409);
+  }
+  if (error instanceof ReconciliationRequiredError) {
+    return context.json(
+      {
+        code: error.code,
+        draftId: error.draftId,
+        message: safeError(error),
+        ...authority,
+      },
+      409,
+    );
+  }
+  return context.json(
+    {
+      code: "remote_error",
+      message: safeError(error),
+      ...authority,
+    },
+    502,
+  );
+}
+
 async function jsonBody(context: {
   req: { raw: Request; json(): Promise<unknown> };
 }) {
@@ -431,6 +493,8 @@ export function createTypefullyRoutes(
 
   routes.get("/drafts/:id/media/:mediaId/preview", async (context) => {
     const draftId = context.req.param("id");
+    context.header("cache-control", "private, no-store");
+    context.header("referrer-policy", "no-referrer");
     try {
       const authorized = await store.authorizeMediaPreview({
         draftId,
@@ -682,6 +746,8 @@ export function createTypefullyRoutes(
   });
 
   routes.post("/drafts/:id/media", async (context) => {
+    let persistedDraft: TypefullyDraft | null = null;
+    let authoritativeMedia: MediaDescriptor | null = null;
     try {
       const form = await boundedFormData(context.req.raw);
       const file = form.get("file");
@@ -714,6 +780,11 @@ export function createTypefullyRoutes(
       if (existing && expectedVersion !== current.version) {
         throw new VersionConflictError(current.version, current.contentHash);
       }
+      await store.authorizeTool({
+        draftId: current.id,
+        actorId: context.var.actor.id,
+        toolName: "upload_media",
+      });
       const media: MediaDescriptor = existing ?? {
         id: randomUUID(),
         kind,
@@ -721,6 +792,7 @@ export function createTypefullyRoutes(
         altText,
         remoteId: null,
       };
+      authoritativeMedia = media;
       const saved = existing
         ? current
         : await store.saveDraft({
@@ -732,6 +804,7 @@ export function createTypefullyRoutes(
               media: [...current.document.media, media],
             },
           });
+      persistedDraft = saved;
       const attempt = await store.beginMediaAttempt({
         draftId: saved.id,
         actorId: context.var.actor.id,
@@ -839,34 +912,34 @@ export function createTypefullyRoutes(
               message:
                 "The media upload outcome is uncertain. Confirm it in Typefully or remove the media before retrying.",
               draft: summary(uncertain),
-              media: initiatedMedia,
+              media: initiatedMedia ?? media,
             },
             409,
           );
         }
         if (error instanceof ConnectionRequiredError) {
-          await store.recordRemoteFailure({
+          const failed = await store.recordRemoteFailure({
             draftId: saved.id,
             actorId: context.var.actor.id,
             expectedVersion: saved.version,
             attemptId: attempt.attemptId,
             error,
           });
-          return errorResponse(context, error, saved.id);
+          return persistedMediaFailureResponse(context, error, failed, media);
         }
         if (
           error instanceof GrantRequiredError ||
           error instanceof BotNotAttachedError ||
           error instanceof PluginRefusedError
         ) {
-          await store.recordRemoteFailure({
+          const failed = await store.recordRemoteFailure({
             draftId: saved.id,
             actorId: context.var.actor.id,
             expectedVersion: saved.version,
             attemptId: attempt.attemptId,
             error,
           });
-          return errorResponse(context, error, saved.id);
+          return persistedMediaFailureResponse(context, error, failed, media);
         }
         const failed = await store.recordRemoteFailure({
           draftId: saved.id,
@@ -888,6 +961,14 @@ export function createTypefullyRoutes(
     } catch (error) {
       if (error instanceof MediaTooLargeError) {
         return context.json({ code: "media_too_large" }, 413);
+      }
+      if (persistedDraft && authoritativeMedia) {
+        return persistedMediaFailureResponse(
+          context,
+          error,
+          persistedDraft,
+          authoritativeMedia,
+        );
       }
       return errorResponse(context, error, context.req.param("id"));
     }

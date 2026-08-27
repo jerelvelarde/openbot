@@ -1080,6 +1080,78 @@ test("media busy locks edits and an autosave error blocks media operations", asy
   );
 });
 
+for (const [label, uploadResult] of [
+  ["network failure", () => Promise.reject(new TypeError("offline"))],
+  [
+    "malformed success",
+    () =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            draft: {
+              id: draftId,
+              title: "Production route draft",
+              destinations: ["x"],
+              socialSetLabel: "Route account",
+              mediaCount: 1,
+              version: 2,
+              syncStatus: "local",
+              proposalStatus: null,
+            },
+          }),
+          { status: 201, headers: { "content-type": "application/json" } },
+        ),
+      ),
+  ],
+] as const) {
+  test(`uncommitted first-upload ${label} fully clears its optimistic readiness state`, async () => {
+    const { DraftCanvas } = await import(
+      "../src/components/typefully/draft-canvas"
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
+      },
+    });
+    queryClient.setQueryData(typefullyKeys.draft(draftId), {
+      draft: authoritativeDraft(),
+    });
+    globalThis.fetch = (async (_input, init) => {
+      if ((init?.method ?? "GET") === "POST") return uploadResult();
+      return new Response(JSON.stringify({ draft: authoritativeDraft() }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    const view = render(
+      <QueryClientProvider client={queryClient}>
+        <DraftCanvas draftId={draftId} />
+      </QueryClientProvider>,
+    );
+    await userEvent
+      .setup({ document })
+      .upload(
+        view.getByLabelText("Add media"),
+        new File(["image"], "launch.png", { type: "image/png" }),
+      );
+    await waitFor(() =>
+      expect(
+        (view.getByLabelText("Add media") as HTMLInputElement).disabled,
+      ).toBe(false),
+    );
+    expect(view.queryByRole("button", { name: /Remove image/ })).toBeNull();
+    expect(view.getByTestId("publish-readiness").textContent).toContain(
+      "Ready for approval",
+    );
+    expect(
+      (
+        view.getByRole("button", {
+          name: "Review & publish",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(false);
+  });
+}
+
 test("production review control prepares a proposal without publishing", async () => {
   const { DraftCanvas } = await import(
     "../src/components/typefully/draft-canvas"

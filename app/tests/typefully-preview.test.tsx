@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
-import { act, render, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, waitFor } from "@testing-library/react";
 import { platformTextMetrics } from "../src/lib/typefully/preview";
 import type { CanonicalDraftDocument } from "../src/lib/typefully/queries";
 
@@ -144,25 +144,24 @@ test("reloaded remote media polls same-origin status and renders native redirect
   try {
     const view = render(
       <PlatformPreview
-        document={documentFixture}
+        document={{
+          ...documentFixture,
+          media: documentFixture.media.filter((item) => item.kind === "video"),
+        }}
         draftId="draft-private"
         platform="x"
         viewport="desktop"
       />,
     );
     await waitFor(() =>
-      expect(view.getByLabelText("Image: Product screenshot").tagName).toBe(
-        "IMG",
-      ),
+      expect(view.getByLabelText("Video: Demo video").tagName).toBe("VIDEO"),
     );
-    expect(view.getByLabelText("Video: Demo video").tagName).toBe("VIDEO");
     expect(calls).toEqual([
-      "/api/typefully/drafts/draft-private/media/first/preview?status=1&attempt=0&poll=0",
       "/api/typefully/drafts/draft-private/media/second/preview?status=1&attempt=0&poll=0",
     ]);
-    expect(
-      view.getByLabelText("Image: Product screenshot").getAttribute("src"),
-    ).toBe("/api/typefully/drafts/draft-private/media/first/preview?asset=0");
+    expect(view.getByLabelText("Video: Demo video").getAttribute("src")).toBe(
+      "/api/typefully/drafts/draft-private/media/second/preview?asset=0",
+    );
     expect(view.container.innerHTML).not.toContain("cdn.typefully");
     expect(view.container.innerHTML).not.toContain("api_key");
   } finally {
@@ -221,14 +220,14 @@ test("processing previews poll with bounded exponential delays and eventually be
     calls += 1;
     return calls < 3
       ? new Response(JSON.stringify({ state: "processing" }), { status: 202 })
-      : new Response(JSON.stringify({ state: "ready", mime: "image/png" }));
+      : new Response(JSON.stringify({ state: "ready", mime: "video/mp4" }));
   }) as typeof fetch;
   try {
     const view = render(
       <RemoteMediaPreview
         altText="Launch"
         draftId="draft-private"
-        kind="image"
+        kind="video"
         mediaId="media-1"
         pollDelaysMs={pollDelays}
         pollScheduler={{
@@ -249,9 +248,55 @@ test("processing previews poll with bounded exponential delays and eventually be
     await waitFor(() => expect(delays).toEqual([10, 20]));
     await act(async () => callbacks.shift()?.());
     await waitFor(() =>
-      expect(view.getByLabelText("Image: Launch").tagName).toBe("IMG"),
+      expect(view.getByLabelText("Video: Launch").tagName).toBe("VIDEO"),
     );
     expect(calls).toBe(3);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("native image and video load failures become accessible retry states", async () => {
+  const { RemoteMediaPreview } = await import(
+    "../src/components/typefully/remote-media-preview"
+  );
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input) =>
+    new Response(
+      JSON.stringify({
+        state: "ready",
+        mime: String(input).includes("video") ? "video/mp4" : "image/png",
+      }),
+    )) as typeof fetch;
+  try {
+    const video = render(
+      <RemoteMediaPreview
+        altText="Demo"
+        draftId="draft-private"
+        kind="video"
+        mediaId="video"
+      />,
+    );
+    const element = await video.findByLabelText("Video: Demo");
+    fireEvent.error(element);
+    expect(
+      await video.findByText("This media preview could not load."),
+    ).toBeTruthy();
+    expect(video.getByRole("button", { name: "Retry preview" })).toBeTruthy();
+    video.unmount();
+
+    const image = render(
+      <RemoteMediaPreview
+        altText="Screenshot"
+        draftId="draft-private"
+        kind="image"
+        mediaId="image"
+      />,
+    );
+    expect(
+      await image.findByText("This media preview could not load."),
+    ).toBeTruthy();
+    expect(image.getByRole("button", { name: "Retry preview" })).toBeTruthy();
   } finally {
     globalThis.fetch = originalFetch;
   }

@@ -366,6 +366,21 @@ function EditableDraftCanvas({
     } catch (error) {
       const clientError =
         error instanceof TypefullyClientError ? error : undefined;
+      if (!existing && !clientError?.media) {
+        controller.reload(
+          stable.document,
+          stable.target.version,
+          stable.target.draftId,
+          stable.state.remote,
+        );
+        forgetLocal(mediaId);
+        setMediaStates((current) => {
+          const next = { ...current };
+          delete next[mediaId];
+          return next;
+        });
+        return;
+      }
       const failed = clientError?.media ?? descriptor;
       rekeyLocal(mediaId, failed.id);
       const current = controller.getSnapshot();

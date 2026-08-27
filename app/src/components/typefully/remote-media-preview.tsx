@@ -137,12 +137,18 @@ export function RemoteMediaPreview({
 
   const label = `${kind === "image" ? "Image" : "Video"}: ${altText || "No alt text"}`;
   if (state.kind === "ready") {
+    const nativeLoadFailed = () =>
+      setState({
+        kind: "failed",
+        message: "This media preview could not load.",
+      });
     return kind === "image" ? (
       <img
         alt={altText}
         aria-label={label}
         className="aspect-video w-full rounded-[4px] bg-muted/65 object-cover"
         data-testid="preview-media"
+        onError={nativeLoadFailed}
         referrerPolicy="no-referrer"
         src={state.url}
       />
@@ -153,6 +159,7 @@ export function RemoteMediaPreview({
         controls
         data-testid="preview-media"
         muted
+        onError={nativeLoadFailed}
         playsInline
         src={state.url}
       />
