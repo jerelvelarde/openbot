@@ -188,6 +188,7 @@ export const syncStatusSchema = z.enum([
   "remote_error",
   "grant_blocked",
 ]);
+export type DraftSyncStatus = z.infer<typeof syncStatusSchema>;
 
 export const proposalStatusSchema = z.enum([
   "pending",
@@ -197,6 +198,7 @@ export const proposalStatusSchema = z.enum([
   "failed",
   "unknown",
 ]);
+export type ProposalStatus = z.infer<typeof proposalStatusSchema>;
 
 export const draftSummaryInputSchema = z.strictObject({
   id: z.string().uuid(),
@@ -209,16 +211,18 @@ export const draftSummaryInputSchema = z.strictObject({
 
 export type DraftSummaryInput = z.input<typeof draftSummaryInputSchema>;
 
-export function draftSummary(input: DraftSummaryInput): {
+export type DraftSummary = {
   id: string;
   title: string;
   destinations: ("x" | "linkedin")[];
   socialSetLabel: string | null;
   mediaCount: number;
   version: number;
-  syncStatus: string;
-  proposalStatus: string | null;
-} {
+  syncStatus: DraftSyncStatus;
+  proposalStatus: ProposalStatus | null;
+};
+
+export function draftSummary(input: DraftSummaryInput): DraftSummary {
   const parsed = draftSummaryInputSchema.parse(input);
   let title = parsed.document.title.trim();
   if (title.length === 0) {
