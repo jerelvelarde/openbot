@@ -1183,6 +1183,52 @@ describe("bounded and redacted failures", () => {
     });
   });
 
+  test("treats mutating timeout and server statuses as uncertain but explicit refusals as definite", async () => {
+    for (const status of [408, 418, 500, 502, 503, 504]) {
+      const transport = createTypefullyRestTransport(
+        (async () =>
+          new Response(JSON.stringify({ message: "temporary failure" }), {
+            status,
+          })) as typeof fetch,
+      );
+      expect(
+        await transport.callTool(connection, "create_draft", {
+          socialSetId: 12,
+          platforms: { x: { enabled: true, posts: [{ text: "Create" }] } },
+        }),
+      ).toMatchObject({
+        isError: true,
+        sideEffectOutcome: "uncertain",
+      });
+    }
+
+    for (const status of [422, 429]) {
+      const transport = createTypefullyRestTransport(
+        (async () => new Response("refused", { status })) as typeof fetch,
+      );
+      expect(
+        await transport.callTool(connection, "create_draft", {
+          socialSetId: 12,
+          platforms: { x: { enabled: true, posts: [{ text: "Create" }] } },
+        }),
+      ).toMatchObject({
+        isError: true,
+        sideEffectOutcome: "definitely_not_applied",
+      });
+    }
+
+    const readOnlyFailure = createTypefullyRestTransport(
+      (async () =>
+        new Response("temporary failure", { status: 503 })) as typeof fetch,
+    );
+    expect(
+      await readOnlyFailure.callTool(connection, "list_social_sets", {}),
+    ).toMatchObject({
+      isError: true,
+      sideEffectOutcome: "definitely_not_applied",
+    });
+  });
+
   test("treats a successful write whose body cannot be read as uncertain", async () => {
     const encoder = new TextEncoder();
     const unreadable = (async () =>

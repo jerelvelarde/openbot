@@ -17,6 +17,7 @@ import {
   typefullyPublicationProposals,
   users,
 } from "../src/db/schema";
+import { createTypefullyRestTransport } from "../src/plugins/typefully-rest";
 import {
   createTypefullyStore,
   DraftNotFoundError,
@@ -1272,6 +1273,82 @@ describe("owned local Typefully drafts", () => {
       attemptId: replacement.attemptId,
       remoteDraftId: null,
     });
+  });
+
+  test("real REST status provenance reaches store retry fencing", async () => {
+    for (const initialStatus of [408, 500, 502, 503, 504, 422, 429]) {
+      let status = initialStatus;
+      let requests = 0;
+      const transport = createTypefullyRestTransport((async () => {
+        requests += 1;
+        return new Response(
+          status === 200
+            ? JSON.stringify({ id: "812" })
+            : JSON.stringify({ message: "temporary failure" }),
+          {
+            status,
+            headers: status === 429 ? { "retry-after": "60" } : undefined,
+          },
+        );
+      }) as typeof fetch);
+      const restStore = createTypefullyStore({
+        database,
+        auditStore: createAuditStore(database),
+        plugin: () => ({
+          decide: async () => ({ allowed: true }) as const,
+          dispatchVendor: async ({ ref, args }) =>
+            transport.callTool(
+              { url: "https://api.typefully.com/v2", token: "tf-test-key" },
+              ref.split("/").at(-1) ?? "",
+              args,
+            ),
+        }),
+        vendor: "typefully",
+      });
+      const current = await restStore.createDraft({
+        ownerUserId: ownerId,
+        channelId,
+        botId,
+        document: { ...document(), socialSetId: "12" },
+      });
+      draftIds.push(current.id);
+      if ([408, 500, 502, 503, 504].includes(initialStatus)) {
+        await expect(
+          restStore.syncDraft({ draftId: current.id, actorId: ownerId }),
+        ).rejects.toMatchObject({
+          code: "reconciliation_required",
+          draftId: current.id,
+        });
+        expect(await restStore.readDraft(current.id, ownerId)).toMatchObject({
+          attemptState: "outcome_uncertain",
+          syncStatus: "remote_error",
+        });
+        await expect(
+          restStore.syncDraft({ draftId: current.id, actorId: ownerId }),
+        ).rejects.toMatchObject({ code: "reconciliation_required" });
+        expect(requests).toBe(1);
+      } else {
+        const first = await restStore.syncDraft({
+          draftId: current.id,
+          actorId: ownerId,
+        });
+        expect(first.result.isError).toBe(true);
+        expect(first.draft).toMatchObject({
+          attemptId: null,
+          syncStatus: "remote_error",
+        });
+        status = 200;
+        const retried = await restStore.syncDraft({
+          draftId: current.id,
+          actorId: ownerId,
+        });
+        expect(retried.draft).toMatchObject({
+          remoteDraftId: "812",
+          syncStatus: "synced",
+        });
+        expect(requests).toBe(2);
+      }
+    }
   });
 
   test("only the owner can attach a valid id to an uncertain create", async () => {

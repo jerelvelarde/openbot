@@ -17,6 +17,7 @@ import {
   ConnectionRequiredError,
   PluginRefusedError,
 } from "../src/plugins/store";
+import { createTypefullyRestTransport } from "../src/plugins/typefully-rest";
 import { createTypefullyRoutes } from "../src/typefully/routes";
 import {
   BotNotAttachedError,
@@ -38,6 +39,7 @@ const calls: { ref: string; args: Record<string, unknown> }[] = [];
 let nextRemoteId = "501";
 let failure: { text: string } | null = null;
 let thrownFailure: Error | null = null;
+const restStatuses: number[] = [];
 const queuedResults: Array<
   | {
       text: string;
@@ -66,6 +68,21 @@ const plugin = {
     const queued = queuedResults.shift();
     if (queued instanceof Error) throw queued;
     if (queued) return queued;
+    const restStatus = restStatuses.shift();
+    if (restStatus !== undefined) {
+      const transport = createTypefullyRestTransport(
+        (async () =>
+          new Response(JSON.stringify({ message: "temporary failure" }), {
+            status: restStatus,
+            headers: restStatus === 429 ? { "retry-after": "60" } : undefined,
+          })) as typeof fetch,
+      );
+      return transport.callTool(
+        { url: "https://api.typefully.com/v2", token: "tf-test-key" },
+        input.ref.split("/").at(-1) ?? "",
+        input.args,
+      );
+    }
     if (thrownFailure) throw thrownFailure;
     if (failure) return { text: failure.text, isError: true };
     return { text: JSON.stringify({ id: nextRemoteId }), isError: false };
@@ -312,6 +329,43 @@ describe("Typefully synchronization", () => {
     });
   });
 
+  test("real REST write statuses quarantine uncertain creates and retry explicit refusals", async () => {
+    for (const status of [408, 500, 502, 503, 504]) {
+      const id = await createDraft();
+      const before = calls.length;
+      restStatuses.push(status);
+      const uncertain = await app.request(`/api/typefully/drafts/${id}/sync`, {
+        method: "POST",
+      });
+      expect(uncertain.status).toBe(409);
+      expect(await uncertain.json()).toMatchObject({
+        code: "reconciliation_required",
+        draftId: id,
+      });
+      const repeated = await app.request(`/api/typefully/drafts/${id}/sync`, {
+        method: "POST",
+      });
+      expect(repeated.status).toBe(409);
+      expect(calls).toHaveLength(before + 1);
+    }
+
+    for (const status of [422, 429]) {
+      const id = await createDraft();
+      const before = calls.length;
+      restStatuses.push(status);
+      const refused = await app.request(`/api/typefully/drafts/${id}/sync`, {
+        method: "POST",
+      });
+      expect(refused.status).toBe(502);
+      expect((await store.readDraft(id, ownerId)).attemptId).toBeNull();
+      const retried = await app.request(`/api/typefully/drafts/${id}/sync`, {
+        method: "POST",
+      });
+      expect(retried.status).toBe(200);
+      expect(calls).toHaveLength(before + 2);
+    }
+  });
+
   test("reconciles one uncertain create without a second POST and updates that attached id thereafter", async () => {
     const id = await createDraft();
     const before = calls.length;
@@ -548,6 +602,52 @@ describe("Typefully synchronization", () => {
       expect(
         calls.filter((call) => call.ref === "typefully/upload_media"),
       ).toHaveLength(before + 1);
+      expect(byteUploads).toHaveLength(0);
+    }
+  });
+
+  test("real REST timeout and server statuses quarantine media allocation without retrying bytes", async () => {
+    for (const status of [408, 500, 502, 503, 504]) {
+      const id = await createDraft();
+      restStatuses.push(status);
+      byteUploads.length = 0;
+      const before = calls.length;
+      const form = new FormData();
+      form.set("expectedVersion", "1");
+      form.set("kind", "image");
+      form.set("altText", "Uncertain REST allocation");
+      form.set(
+        "file",
+        new File(["image"], "uncertain.png", { type: "image/png" }),
+      );
+      const first = await app.request(`/api/typefully/drafts/${id}/media`, {
+        method: "POST",
+        body: form,
+      });
+      expect(first.status).toBe(409);
+      expect(await first.json()).toMatchObject({
+        code: "reconciliation_required",
+        draftId: id,
+      });
+      const quarantined = await store.readDraft(id, ownerId);
+      const mediaId = quarantined.document.media[0]?.id;
+      expect(mediaId).toBeString();
+
+      const retry = new FormData();
+      retry.set("expectedVersion", String(quarantined.version));
+      retry.set("mediaId", mediaId as string);
+      retry.set("kind", "image");
+      retry.set("altText", "Uncertain REST allocation");
+      retry.set(
+        "file",
+        new File(["image"], "uncertain.png", { type: "image/png" }),
+      );
+      const repeated = await app.request(`/api/typefully/drafts/${id}/media`, {
+        method: "POST",
+        body: retry,
+      });
+      expect(repeated.status).toBe(409);
+      expect(calls).toHaveLength(before + 1);
       expect(byteUploads).toHaveLength(0);
     }
   });
