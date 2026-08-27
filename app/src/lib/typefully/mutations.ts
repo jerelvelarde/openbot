@@ -404,7 +404,7 @@ export function prepareProposalMutationOptions(queryClient?: QueryClient) {
           refetchType: "all",
         }),
         queryClient.invalidateQueries({
-          queryKey: typefullyKeys.proposalSummary(result.proposal.id),
+          queryKey: typefullyKeys.proposal(result.proposal.id),
           exact: true,
           refetchType: "all",
         }),
@@ -438,7 +438,7 @@ function proposalAction(
       );
       await Promise.all([
         queryClient.invalidateQueries({
-          queryKey: typefullyKeys.proposalSummary(input.proposalId),
+          queryKey: typefullyKeys.proposal(input.proposalId),
           exact: true,
           refetchType: "all",
         }),

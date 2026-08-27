@@ -109,11 +109,6 @@ describe("Typefully query contracts", () => {
       "proposal",
       "proposal/one",
     ]);
-    expect(typefullyKeys.proposalSummary("proposal/one")).toEqual([
-      "typefully",
-      "proposal-summary",
-      "proposal/one",
-    ]);
     expect(typefullyKeys.lists()).toEqual(["typefully", "list"]);
 
     await draftQueryOptions("draft/one").queryFn?.({} as never);
@@ -428,7 +423,7 @@ describe("Typefully mutation contracts", () => {
     expect(JSON.stringify(result)).not.toContain("contentHash");
   });
 
-  test("preparing a proposal invalidates draft, summary, and list caches without replacing the full proposal", async () => {
+  test("preparing a proposal invalidates draft, proposal, and list caches without replacing the full proposal", async () => {
     const queryClient = new QueryClient({
       defaultOptions: { mutations: { retry: false } },
     });
@@ -453,9 +448,6 @@ describe("Typefully mutation contracts", () => {
     queryClient.setQueryData(typefullyKeys.draft("draft-1"), {
       draft: authoritativeDraft(3),
     });
-    queryClient.setQueryData(typefullyKeys.proposalSummary("proposal-1"), {
-      proposal: { ...summary, status: "expired" },
-    });
     queryClient.setQueryData(typefullyKeys.proposal("proposal-1"), {
       proposal: fullProposal,
     });
@@ -476,7 +468,7 @@ describe("Typefully mutation contracts", () => {
       queryClient.getQueryState(typefullyKeys.draft("draft-1"))?.isInvalidated,
     ).toBe(true);
     expect(
-      queryClient.getQueryState(typefullyKeys.proposalSummary("proposal-1"))
+      queryClient.getQueryState(typefullyKeys.proposal("proposal-1"))
         ?.isInvalidated,
     ).toBe(true);
     expect(

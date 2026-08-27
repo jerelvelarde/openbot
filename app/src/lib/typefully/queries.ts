@@ -387,8 +387,6 @@ export const typefullyKeys = {
   all: ["typefully"] as const,
   lists: () => ["typefully", "list"] as const,
   draft: (draftId: string) => ["typefully", "draft", draftId] as const,
-  proposalSummary: (proposalId: string) =>
-    ["typefully", "proposal-summary", proposalId] as const,
   proposal: (proposalId: string) =>
     ["typefully", "proposal", proposalId] as const,
 };
