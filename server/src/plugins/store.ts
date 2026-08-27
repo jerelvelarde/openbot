@@ -3385,6 +3385,67 @@ export function createPluginStore(options: PluginStoreOptions) {
     },
 
     /**
+     * Authorize a reviewed server-only operation without advertising it as a tool. The caller must
+     * still name a real advertised grant that gates the operation; only the reserved operation name
+     * is evaluated by policy. Returning the actor's live token keeps the credential check and policy
+     * decision adjacent and leaves no generic HTTP or model-callable publish surface.
+     */
+    async authorizeOperation(input: {
+      requiredGrantRef: string;
+      ref: string;
+      botId: string;
+      actorId: string;
+      context: {
+        intent: "write_tool";
+        mcp: { server: string; tool: string; effect: "write" };
+      };
+    }): Promise<{
+      token: string;
+      decision: ReturnType<typeof evaluateActionPolicy>;
+    }> {
+      const [serverId, ...operationParts] = input.ref.split("/");
+      const operation = operationParts.join("/");
+      if (
+        !serverId ||
+        !operation ||
+        input.context.intent !== "write_tool" ||
+        input.context.mcp.server !== serverId ||
+        input.context.mcp.tool !== operation ||
+        input.context.mcp.effect !== "write" ||
+        !input.requiredGrantRef.startsWith(`${serverId}/`)
+      ) {
+        throw new PluginRefusedError("The server operation is invalid.", null);
+      }
+      const grant = await this.decide(
+        "mcp",
+        input.requiredGrantRef,
+        input.botId,
+      );
+      if (!grant.allowed) throw new PluginRefusedError(grant.reason, null);
+      const { row, entry } = await requireServer(serverId);
+      const context: PolicyContext = {
+        tool: { name: toolNameFor(input.ref) },
+        bot: { id: input.botId },
+        actor: { id: input.actorId },
+        page: { url: "", host: "" },
+        element: { ref: "", role: "", name: "", type: "" },
+        key: "",
+        file: { path: "", name: "", extension: "" },
+        command: "",
+        intent: input.context.intent,
+        mcp: input.context.mcp,
+      };
+      const decision = evaluateActionPolicy(options.policy(), context);
+      if (!decision.forward) {
+        throw new PluginRefusedError(decision.reason, decision.matched);
+      }
+      const { token } = await connectionTokenFor(row, entry, input.actorId);
+      if (!token)
+        throw new ConnectionRequiredError(serverId, entry?.title ?? serverId);
+      return { token, decision };
+    },
+
+    /**
      * Call a tool on somebody else's server, on a Bot's behalf.
      *
      * Decide, record, then act, which is the order the computer gateway uses and for the same
@@ -3402,6 +3463,16 @@ export function createPluginStore(options: PluginStoreOptions) {
       const toolName = rest.join("/");
       if (!serverId || !toolName) {
         throw new PluginRefusedError(`${input.ref} is not a tool.`, null);
+      }
+      if (
+        serverId === "typefully" &&
+        toolName !== "prepare_publication" &&
+        /publish|publication/i.test(toolName)
+      ) {
+        throw new PluginRefusedError(
+          "Immediate Typefully publication requires an immutable proposal and explicit human approval.",
+          null,
+        );
       }
 
       const decision = await this.decide("mcp", input.ref, input.botId);

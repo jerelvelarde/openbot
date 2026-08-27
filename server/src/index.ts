@@ -68,11 +68,7 @@ import { createOpenBotSlackChannel } from "./slack/channel";
 import { configureApprovalDecisionStore } from "./slack/components";
 import { SlackIdentityLinker } from "./slack/identity-linker";
 import { SlackIngressRegistry } from "./slack/ingress-registry";
-import {
-  activateManagedChannels,
-  createGracefulShutdown,
-  projectSlackStatus,
-} from "./slack/status";
+import { projectSlackStatus, startManagedChannelHost } from "./slack/status";
 import {
   createPackageStatusReader,
   loadTenantPackage,
@@ -725,7 +721,7 @@ const isProxiedStream = (data: SocketData): data is StreamData =>
 const asChannelSocket = (ws: { data: SocketData }) =>
   ws as unknown as ChannelSocket;
 
-serve<SocketData>({
+const serverOptions = {
   port,
   async fetch(request, server) {
     const url = new URL(request.url);
@@ -823,10 +819,14 @@ serve<SocketData>({
       ws.data.inward?.close();
     },
   },
-});
+} satisfies Bun.Serve.Options<SocketData>;
+const startWeb = () => serve<SocketData>(serverOptions);
 
-const shutdown = createGracefulShutdown({
+const managedHost = startManagedChannelHost({
+  startWeb,
+  stopWeb: (server) => server.stop(),
   channels: copilotHandler.channels,
+  signals: process,
   stopOthers: [
     () => channelActivityListener.stop(),
     () => policyListener.stop(),
@@ -834,9 +834,6 @@ const shutdown = createGracefulShutdown({
   ],
   exit: () => process.exit(0),
 });
-for (const signal of ["SIGINT", "SIGTERM"] as const) {
-  process.on(signal, () => void shutdown());
-}
 
 if (config.singleUser) {
   // Loud, every boot. A server that is not checking who is asking should never be a quiet default.
@@ -851,4 +848,4 @@ console.info(`OpenBot server listening on http://localhost:${port}`);
 
 // Activation is allowed to settle after HTTP starts. A missing provider or gateway outage must
 // leave the setup and health surfaces reachable, with the projected status explaining why.
-await activateManagedChannels(copilotHandler.channels);
+await managedHost;

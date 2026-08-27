@@ -42,6 +42,8 @@ const channelId = `typefully-route-channel-${suffix}`;
 const draftIds: string[] = [];
 let actorId = ownerId;
 let granted = true;
+let routeRemoteDocument: unknown;
+let routePublishCalls = 0;
 
 const plugin = {
   decide: async (_kind: "mcp" | "skill", _ref: string, agentId: string) =>
@@ -51,11 +53,20 @@ const plugin = {
   dispatchVendor: async () => {
     throw new ConnectionRequiredError("typefully", "Typefully");
   },
+  authorizeOperation: async () => ({ token: "route-personal-key" }),
 };
 const store = createTypefullyStore({
   database,
   auditStore: createAuditStore(database),
   plugin: () => plugin,
+  publicationVendor: {
+    fetchDraft: async () => ({ document: routeRemoteDocument }),
+    publishDraft: async () => {
+      routePublishCalls += 1;
+      return { outcome: "published", vendorResultId: "route-published" };
+    },
+    reconcileDraft: async () => ({ outcome: "unknown" }),
+  },
 });
 const governedPluginStore = createPluginStore({
   database,
@@ -175,6 +186,100 @@ async function createDraft() {
 }
 
 describe("Typefully draft routes", () => {
+  test("proposal routes prepare, privately load, and publish only after the human endpoint", async () => {
+    const { body } = await createDraft();
+    const local = await store.readDraft(body.draft.id, ownerId);
+    routeRemoteDocument = local.document;
+    const synced = await store.recordRemoteConfirmation({
+      draftId: local.id,
+      actorId: ownerId,
+      expectedVersion: local.version,
+      expectedHash: local.contentHash,
+      remoteDraftId: "222",
+    });
+    routePublishCalls = 0;
+    const prepared = await app.request(
+      `/api/typefully/drafts/${local.id}/proposals`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ expectedVersion: synced.version }),
+      },
+    );
+    expect(prepared.status).toBe(201);
+    const preparedBody = (await prepared.json()) as {
+      proposal: { id: string; status: string; snapshot?: unknown };
+    };
+    expect(preparedBody.proposal).toMatchObject({ status: "pending" });
+    expect(preparedBody.proposal).not.toHaveProperty("snapshot");
+    expect(routePublishCalls).toBe(0);
+
+    actorId = outsiderId;
+    const hidden = await app.request(
+      `/api/typefully/proposals/${preparedBody.proposal.id}`,
+    );
+    actorId = ownerId;
+    expect(hidden.status).toBe(404);
+
+    const loaded = await app.request(
+      `/api/typefully/proposals/${preparedBody.proposal.id}`,
+    );
+    expect(loaded.status).toBe(200);
+    expect(await loaded.json()).toMatchObject({
+      proposal: { snapshot: local.document, status: "pending" },
+    });
+
+    const published = await app.request(
+      `/api/typefully/proposals/${preparedBody.proposal.id}/publish`,
+      { method: "POST" },
+    );
+    expect(published.status).toBe(200);
+    expect(await published.json()).toMatchObject({
+      proposal: { status: "published", vendorResultId: "route-published" },
+    });
+    expect(routePublishCalls).toBe(1);
+  });
+
+  test("a stale publish grant cannot surface or cross the signed plugin boundary", async () => {
+    const staleRef = "typefully/publish_now";
+    await governedPluginStore.refreshTools("typefully");
+    const refreshed = await database
+      .select({ name: mcpTools.name })
+      .from(mcpTools)
+      .where(eq(mcpTools.serverId, "typefully"));
+    expect(refreshed.map((tool) => tool.name)).toContain("prepare_publication");
+    expect(
+      refreshed.some(
+        (tool) =>
+          tool.name !== "prepare_publication" &&
+          /publish|publication/i.test(tool.name),
+      ),
+    ).toBe(false);
+    await database.insert(pluginGrants).values({
+      kind: "mcp",
+      ref: staleRef,
+      agentId: botId,
+    });
+    try {
+      const listed = await governedPluginStore.listForAgent(botId);
+      expect(listed.tools.map((tool) => tool.ref)).not.toContain(staleRef);
+      await expect(
+        governedPluginStore.callTool({
+          ref: staleRef,
+          args: {},
+          botId,
+          actorId: ownerId,
+        }),
+      ).rejects.toMatchObject({ name: "PluginRefusedError" });
+    } finally {
+      await database
+        .delete(pluginGrants)
+        .where(
+          and(eq(pluginGrants.ref, staleRef), eq(pluginGrants.agentId, botId)),
+        );
+    }
+  });
+
   test("create returns a bounded summary and GET returns the authoritative document", async () => {
     const { response, body } = await createDraft();
     expect(response.status).toBe(201);

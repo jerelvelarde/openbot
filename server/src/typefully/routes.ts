@@ -10,6 +10,7 @@ import {
   type MediaUploadDependencies,
   uploadPresignedMedia,
 } from "./media-upload";
+import { ProposalStateError, type PublicationProposal } from "./publication";
 import {
   BotNotAttachedError,
   DraftNotFoundError,
@@ -61,6 +62,24 @@ function authoritative(draft: TypefullyDraft) {
     lastError: draft.lastError,
     createdAt: draft.createdAt.toISOString(),
     updatedAt: draft.updatedAt.toISOString(),
+  };
+}
+
+function proposalView(proposal: PublicationProposal) {
+  return {
+    id: proposal.id,
+    draftId: proposal.draftId,
+    version: proposal.version,
+    destinations: proposal.destinations,
+    expiresAt: proposal.expiresAt,
+    status: proposal.status,
+    snapshot: proposal.snapshot,
+    contentHash: proposal.contentHash,
+    decidedAt: proposal.decidedAt,
+    completedAt: proposal.completedAt,
+    vendorResultId: proposal.vendorResultId,
+    publishedUrl: proposal.publishedUrl,
+    failureDetail: proposal.failureDetail,
   };
 }
 
@@ -137,6 +156,12 @@ function errorResponse(
         message: safeError(error),
       },
       409,
+    );
+  }
+  if (error instanceof ProposalStateError) {
+    return context.json(
+      { code: error.code, message: safeError(error) },
+      error.status,
     );
   }
   if (error instanceof ConnectionRequiredError) {
@@ -487,6 +512,72 @@ export function createTypefullyRoutes(
       });
     } catch (error) {
       return errorResponse(context, error, draftId);
+    }
+  });
+
+  routes.post("/drafts/:id/proposals", async (context) => {
+    const draftId = context.req.param("id");
+    try {
+      const body = await jsonBody(context);
+      if (!Number.isSafeInteger(body.expectedVersion)) {
+        throw new Error("expectedVersion must be an integer.");
+      }
+      const proposal = await store.prepareProposal({
+        draftId,
+        actorId: context.var.actor.id,
+        expectedVersion: body.expectedVersion as number,
+      });
+      return context.json({ proposal }, 201);
+    } catch (error) {
+      return errorResponse(context, error, draftId);
+    }
+  });
+
+  routes.get("/proposals/:id", async (context) => {
+    try {
+      const proposal = await store.readProposal(
+        context.req.param("id"),
+        context.var.actor.id,
+      );
+      return context.json({ proposal: proposalView(proposal) });
+    } catch (error) {
+      return errorResponse(context, error);
+    }
+  });
+
+  routes.post("/proposals/:id/decline", async (context) => {
+    try {
+      const proposal = await store.declineProposal(
+        context.req.param("id"),
+        context.var.actor.id,
+      );
+      return context.json({ proposal: proposalView(proposal) });
+    } catch (error) {
+      return errorResponse(context, error);
+    }
+  });
+
+  routes.post("/proposals/:id/publish", async (context) => {
+    try {
+      const proposal = await store.approveAndPublish({
+        proposalId: context.req.param("id"),
+        actorId: context.var.actor.id,
+      });
+      return context.json({ proposal: proposalView(proposal) });
+    } catch (error) {
+      return errorResponse(context, error);
+    }
+  });
+
+  routes.post("/proposals/:id/reconcile", async (context) => {
+    try {
+      const proposal = await store.reconcileProposal({
+        proposalId: context.req.param("id"),
+        actorId: context.var.actor.id,
+      });
+      return context.json({ proposal: proposalView(proposal) });
+    } catch (error) {
+      return errorResponse(context, error);
     }
   });
 

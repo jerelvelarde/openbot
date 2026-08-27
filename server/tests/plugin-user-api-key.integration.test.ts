@@ -5,10 +5,13 @@ import { createAuditStore } from "../src/audit";
 import { createCredentialStore, decryptSecret } from "../src/credentials";
 import { createDatabase } from "../src/db/client";
 import {
+  agents,
   auditEvents,
   credentials,
   mcpServers,
+  mcpTools,
   mcpUserCredentials,
+  pluginGrants,
   revokedAccess,
   users,
 } from "../src/db/schema";
@@ -27,6 +30,7 @@ const secondUserId = `typefully-key-other-${suffix}`;
 const serverId = "typefully";
 const encryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 const apiKey = `tf-personal-${suffix}`;
+const botId = `typefully-key-bot-${suffix}`;
 let serverExisted = false;
 
 const validated: string[] = [];
@@ -78,6 +82,25 @@ beforeAll(async () => {
     { id: userId, email: `${userId}@openbot.test` },
     { id: secondUserId, email: `${secondUserId}@openbot.test` },
   ]);
+  await database.insert(agents).values({
+    id: botId,
+    name: "Typefully publication gate bot",
+    type: "remote_ag_ui",
+    configuration: {},
+  });
+  await database
+    .insert(mcpTools)
+    .values({
+      serverId,
+      name: "prepare_publication",
+      description: "Prepare publication",
+    })
+    .onConflictDoNothing();
+  await database.insert(pluginGrants).values({
+    kind: "mcp",
+    ref: `${serverId}/prepare_publication`,
+    agentId: botId,
+  });
 });
 
 afterAll(async () => {
@@ -96,6 +119,8 @@ afterAll(async () => {
     .delete(revokedAccess)
     .where(eq(revokedAccess.email, `${secondUserId}@openbot.test`));
   await database.delete(users).where(inArray(users.id, [userId, secondUserId]));
+  await database.delete(pluginGrants).where(eq(pluginGrants.agentId, botId));
+  await database.delete(agents).where(eq(agents.id, botId));
   if (!serverExisted) {
     await database.delete(mcpServers).where(eq(mcpServers.id, serverId));
   }
@@ -159,6 +184,42 @@ describe("personal Typefully API-key connections", () => {
       .from(auditEvents)
       .where(eq(auditEvents.targetId, serverId));
     expect(JSON.stringify(audit)).not.toContain(apiKey);
+  });
+
+  test("authorizes the reserved publish policy with the live actor key but never a publish grant", async () => {
+    const currentKey = `${apiKey}-publication`;
+    await store.connectUserApiKey({
+      serverId,
+      userId,
+      apiKey: currentKey,
+      by: `${userId}@openbot.test`,
+    });
+
+    const authorized = await store.authorizeOperation({
+      requiredGrantRef: `${serverId}/prepare_publication`,
+      ref: `${serverId}/publish_now`,
+      botId,
+      actorId: userId,
+      context: {
+        intent: "write_tool",
+        mcp: { server: serverId, tool: "publish_now", effect: "write" },
+      },
+    });
+    expect(authorized.token).toBe(currentKey);
+    expect(authorized.decision).toMatchObject({ allowed: true, forward: true });
+
+    await expect(
+      store.authorizeOperation({
+        requiredGrantRef: `${serverId}/publish_now`,
+        ref: `${serverId}/publish_now`,
+        botId,
+        actorId: userId,
+        context: {
+          intent: "write_tool",
+          mcp: { server: serverId, tool: "publish_now", effect: "write" },
+        },
+      }),
+    ).rejects.toMatchObject({ name: "PluginRefusedError" });
   });
 
   test("rotates the exact prior key and leaves one live credential", async () => {

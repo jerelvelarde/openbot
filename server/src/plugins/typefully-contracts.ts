@@ -154,6 +154,7 @@ export const TYPEFULLY_TOOL_NAMES = [
   "remove_media",
   "schedule_draft",
   "delete_draft",
+  "prepare_publication",
 ] as const;
 
 export type TypefullyToolName = (typeof TYPEFULLY_TOOL_NAMES)[number];
@@ -216,6 +217,10 @@ export const typefullyVendorContracts = {
     publishAt: futureDateOrSlot,
   }),
   delete_draft: z.strictObject({ socialSetId, draftId }),
+  prepare_publication: z.strictObject({
+    draftId: z.string().uuid(),
+    expectedVersion: z.number().int().positive(),
+  }),
 } satisfies Record<TypefullyToolName, z.ZodType>;
 
 const localCreateDraft = z.strictObject({

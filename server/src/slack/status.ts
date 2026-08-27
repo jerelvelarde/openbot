@@ -52,11 +52,14 @@ type ChannelsActivation = {
   ready(options?: { timeoutMs?: number }): Promise<void>;
 };
 
+function reportActivationFailure(error: unknown): void {
+  console.error("OpenBot Slack Channel activation failed", error);
+}
+
 /** Activation is observable but non-fatal: the HTTP application remains available for setup. */
 export async function activateManagedChannels(
   channels: ChannelsActivation | undefined,
-  reportFailure: (error: unknown) => void = () =>
-    console.error("OpenBot Slack Channel activation failed"),
+  reportFailure: (error: unknown) => void = reportActivationFailure,
 ): Promise<void> {
   if (!channels) return;
   try {
@@ -88,4 +91,64 @@ export function createGracefulShutdown({
     ]).then(() => exit());
     return shutdown;
   };
+}
+
+type ShutdownSignal = "SIGINT" | "SIGTERM";
+
+export type ShutdownSignalSource = {
+  on(signal: ShutdownSignal, listener: () => void): unknown;
+  off(signal: ShutdownSignal, listener: () => void): unknown;
+};
+
+/** Register exactly one shared callback for each supported process signal. */
+export function registerShutdownSignals(
+  signals: ShutdownSignalSource,
+  shutdown: () => Promise<void>,
+): () => void {
+  let registered = true;
+  const unregister = () => {
+    if (!registered) return;
+    registered = false;
+    signals.off("SIGINT", onSignal);
+    signals.off("SIGTERM", onSignal);
+  };
+  const onSignal = () => {
+    void shutdown().finally(unregister);
+  };
+  signals.on("SIGINT", onSignal);
+  signals.on("SIGTERM", onSignal);
+  return unregister;
+}
+
+type ManagedChannelsControl = ChannelsActivation & StoppableChannels;
+
+export type ManagedChannelHostOptions<WebHost> = {
+  startWeb(): WebHost;
+  stopWeb(host: WebHost): void | Promise<void>;
+  channels?: ManagedChannelsControl;
+  signals: ShutdownSignalSource;
+  stopOthers: ReadonlyArray<() => void | Promise<void>>;
+  exit(): void;
+  reportActivationFailure?: (error: unknown) => void;
+};
+
+/** Start HTTP first, install shutdown handling, then wait for non-fatal Channel activation. */
+export async function startManagedChannelHost<WebHost>({
+  startWeb,
+  stopWeb,
+  channels,
+  signals,
+  stopOthers,
+  exit,
+  reportActivationFailure,
+}: ManagedChannelHostOptions<WebHost>): Promise<WebHost> {
+  const web = startWeb();
+  const shutdown = createGracefulShutdown({
+    channels,
+    stopOthers: [() => stopWeb(web), ...stopOthers],
+    exit,
+  });
+  registerShutdownSignals(signals, shutdown);
+  await activateManagedChannels(channels, reportActivationFailure);
+  return web;
 }

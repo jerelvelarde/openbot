@@ -271,6 +271,7 @@ describe("Typefully", () => {
       "remove_media",
       "schedule_draft",
       "delete_draft",
+      "prepare_publication",
     ]);
     for (const name of entry?.writeTools ?? []) {
       expect(classifyTool(entry, name, true)).toBe("write");

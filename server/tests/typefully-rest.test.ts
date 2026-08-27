@@ -86,8 +86,11 @@ describe("the reviewed Typefully tool surface", () => {
       "remove_media",
       "schedule_draft",
       "delete_draft",
+      "prepare_publication",
     ]);
-    expect(tools.some((tool) => /publish/i.test(tool.name))).toBe(false);
+    expect(
+      tools.some((tool) => ["publish", "publish_now"].includes(tool.name)),
+    ).toBe(false);
     const removeMedia = tools.find((tool) => tool.name === "remove_media");
     expect(removeMedia?.description).toContain(
       `${TYPEFULLY_REMOVE_MEDIA_MAX_DRAFT_BYTES / 1_000_000} MB`,

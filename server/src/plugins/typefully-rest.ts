@@ -1,3 +1,7 @@
+import type {
+  PublicationOutcome,
+  PublicationVendor,
+} from "../typefully/publication";
 import { MAX_RESULT_CHARS, type McpCallResult, type McpTool } from "./mcp";
 import {
   inputSchemaFor,
@@ -58,6 +62,8 @@ const TOOL_DESCRIPTIONS: Record<TypefullyToolName, string> = {
   schedule_draft:
     'Schedule a draft for a future ISO 8601 datetime or the next free slot. "now" is always refused.',
   delete_draft: "Delete one Typefully draft.",
+  prepare_publication:
+    "Prepare an immutable, expiring review proposal for one fully synchronized local draft. This never publishes.",
 };
 
 function deepFreeze<T>(value: T): T {
@@ -281,6 +287,10 @@ function buildRequest(
         method: "DELETE",
         path: `/social-sets/${call.args.socialSetId}/drafts/${call.args.draftId}`,
       };
+    case "prepare_publication":
+      throw new Error(
+        "prepare_publication is a local review operation and cannot be sent to Typefully.",
+      );
   }
 }
 
@@ -843,6 +853,13 @@ export function createTypefullyRestTransport(
     ): Promise<McpCallResult> {
       const parsed = parseTypefullyCall(toolName, args);
       if (!parsed.ok) return safeFailure(parsed.message);
+      if (parsed.call.toolName === "prepare_publication") {
+        return failure(
+          "prepare_publication is a local review operation and cannot be sent to Typefully.",
+          false,
+          "definitely_not_applied",
+        );
+      }
       if (!connection.token) {
         return failure(
           "No personal Typefully credential was available for this call. Connect your Typefully account and try again.",
@@ -877,4 +894,105 @@ export async function callTool(
     toolName,
     args,
   );
+}
+
+function publicationOutcomeFromBody(
+  body: string,
+  fallbackId: number,
+): Pick<PublicationOutcome, "vendorResultId" | "publishedUrl"> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return { vendorResultId: String(fallbackId) };
+  }
+  if (!isRecord(parsed)) return { vendorResultId: String(fallbackId) };
+  const rawId = parsed.id ?? parsed.draft_id;
+  const rawUrl = parsed.published_url ?? parsed.url ?? parsed.share_url;
+  return {
+    vendorResultId:
+      typeof rawId === "string" || typeof rawId === "number"
+        ? String(rawId)
+        : String(fallbackId),
+    ...(typeof rawUrl === "string" ? { publishedUrl: rawUrl } : {}),
+  };
+}
+
+/** Dedicated server-only publication transport. It is deliberately absent from `listTools`. */
+export function createTypefullyPublicationVendor(
+  fetchImplementation: FetchImplementation = globalThis.fetch,
+  options: { timeoutMs?: number } = {},
+): PublicationVendor {
+  const timeoutMs = options.timeoutMs ?? REQUEST_TIMEOUT_MS;
+
+  async function get(input: {
+    token: string;
+    socialSetId: number;
+    remoteDraftId: number;
+  }) {
+    const raw = await requestTypefully(
+      fetchImplementation,
+      timeoutMs,
+      input.token,
+      {
+        method: "GET",
+        path: `/social-sets/${input.socialSetId}/drafts/${input.remoteDraftId}`,
+      },
+      { maxBytes: TYPEFULLY_REMOVE_MEDIA_MAX_DRAFT_BYTES },
+    );
+    const result = "response" in raw ? responseResult(raw, input.token) : raw;
+    if (result.isError) throw new Error(result.text);
+    try {
+      return JSON.parse(result.text) as unknown;
+    } catch {
+      throw new Error("Typefully returned an unreadable draft.");
+    }
+  }
+
+  return {
+    fetchDraft: async (input) => ({ document: await get(input) }),
+    publishDraft: async (input) => {
+      const raw = await requestTypefully(
+        fetchImplementation,
+        timeoutMs,
+        input.token,
+        {
+          method: "PATCH",
+          path: `/social-sets/${input.socialSetId}/drafts/${input.remoteDraftId}`,
+          body: { publish_at: "now" },
+        },
+      );
+      const result = "response" in raw ? responseResult(raw, input.token) : raw;
+      if (result.isError) {
+        return {
+          outcome:
+            result.sideEffectOutcome === "definitely_not_applied"
+              ? "failed"
+              : "unknown",
+          detail: result.text,
+        };
+      }
+      return {
+        outcome: "published",
+        ...publicationOutcomeFromBody(result.text, input.remoteDraftId),
+      };
+    },
+    reconcileDraft: async (input) => {
+      const document = await get(input);
+      if (!isRecord(document)) return { outcome: "unknown" };
+      const published =
+        document.status === "published" ||
+        typeof document.published_at === "string" ||
+        typeof document.published_url === "string";
+      return published
+        ? {
+            outcome: "published",
+            ...publicationOutcomeFromBody(
+              JSON.stringify(document),
+              input.remoteDraftId,
+            ),
+          }
+        : { outcome: "unknown" };
+    },
+  };
 }

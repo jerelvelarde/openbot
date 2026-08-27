@@ -218,6 +218,7 @@ export const CATALOGUE: readonly CatalogueEntry[] = Object.freeze([
       "remove_media",
       "schedule_draft",
       "delete_draft",
+      "prepare_publication",
     ]),
     docsUrl: "https://typefully.com/docs/api",
   } satisfies CatalogueEntry),

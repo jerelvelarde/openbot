@@ -23,8 +23,19 @@ import {
   canonicalizeDraft,
   type DraftSyncStatus,
   draftSummary,
+  proposalStatusSchema,
   syncStatusSchema,
 } from "./document";
+import {
+  changedProposalError,
+  ProposalStateError,
+  type PublicationOutcome,
+  type PublicationProposal,
+  type PublicationVendor,
+  proposalSummary,
+  remoteMatchesSnapshot,
+  safePublicationOutcome,
+} from "./publication";
 
 const LAST_ERROR_MAX_LENGTH = 500;
 const DEFAULT_VENDOR_ID = "typefully";
@@ -47,6 +58,16 @@ type AuthorizationSurface = {
     botId: string;
     actorId: string;
   }): Promise<PluginCallResult>;
+  authorizeOperation?(input: {
+    requiredGrantRef: string;
+    ref: string;
+    botId: string;
+    actorId: string;
+    context: {
+      intent: "write_tool";
+      mcp: { server: string; tool: string; effect: "write" };
+    };
+  }): Promise<{ token: string; decision: unknown }>;
 };
 
 type VendorIdentity =
@@ -192,6 +213,54 @@ const draftSelection = {
   createdAt: typefullyDrafts.createdAt,
   updatedAt: typefullyDrafts.updatedAt,
 };
+
+const proposalSelection = {
+  id: typefullyPublicationProposals.id,
+  draftId: typefullyPublicationProposals.draftId,
+  ownerUserId: typefullyPublicationProposals.ownerUserId,
+  botId: typefullyPublicationProposals.botId,
+  channelId: typefullyPublicationProposals.channelId,
+  draftVersion: typefullyPublicationProposals.draftVersion,
+  contentHash: typefullyPublicationProposals.contentHash,
+  snapshot: typefullyPublicationProposals.snapshot,
+  status: typefullyPublicationProposals.status,
+  expiresAt: typefullyPublicationProposals.expiresAt,
+  decidedAt: typefullyPublicationProposals.decidedAt,
+  completedAt: typefullyPublicationProposals.completedAt,
+  vendorResultId: typefullyPublicationProposals.vendorResultId,
+  publishedUrl: typefullyPublicationProposals.publishedUrl,
+  failureDetail: typefullyPublicationProposals.failureDetail,
+  createdAt: typefullyPublicationProposals.createdAt,
+  updatedAt: typefullyPublicationProposals.updatedAt,
+};
+
+type SelectedProposal = typeof typefullyPublicationProposals.$inferSelect;
+
+function asProposal(row: SelectedProposal): PublicationProposal {
+  const snapshot = canonicalizeDraft(row.snapshot).document;
+  return {
+    ...proposalSummary({
+      id: row.id,
+      draftId: row.draftId,
+      draftVersion: row.draftVersion,
+      snapshot,
+      expiresAt: row.expiresAt,
+      status: proposalStatusSchema.parse(row.status),
+    }),
+    ownerUserId: row.ownerUserId,
+    botId: row.botId,
+    channelId: row.channelId,
+    contentHash: row.contentHash,
+    snapshot,
+    decidedAt: row.decidedAt?.toISOString() ?? null,
+    completedAt: row.completedAt?.toISOString() ?? null,
+    vendorResultId: row.vendorResultId,
+    publishedUrl: row.publishedUrl,
+    failureDetail: row.failureDetail,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
+  };
+}
 
 type SelectedDraft = {
   id: string;
@@ -385,6 +454,65 @@ async function lockedOwnedDraft(
   return asDraft(row);
 }
 
+async function ownedProposal(
+  executor: Database | AuditTransaction,
+  proposalId: string,
+  actorId: string,
+): Promise<PublicationProposal> {
+  const [row] = await executor
+    .select(proposalSelection)
+    .from(typefullyPublicationProposals)
+    .innerJoin(
+      channelMemberships,
+      and(
+        eq(
+          channelMemberships.channelId,
+          typefullyPublicationProposals.channelId,
+        ),
+        eq(channelMemberships.userId, actorId),
+      ),
+    )
+    .where(
+      and(
+        eq(typefullyPublicationProposals.id, proposalId),
+        eq(typefullyPublicationProposals.ownerUserId, actorId),
+      ),
+    )
+    .limit(1);
+  if (!row) throw new DraftNotFoundError();
+  return asProposal(row as SelectedProposal);
+}
+
+async function lockedOwnedProposal(
+  transaction: AuditTransaction,
+  proposalId: string,
+  actorId: string,
+): Promise<PublicationProposal> {
+  const [row] = await transaction
+    .select(proposalSelection)
+    .from(typefullyPublicationProposals)
+    .innerJoin(
+      channelMemberships,
+      and(
+        eq(
+          channelMemberships.channelId,
+          typefullyPublicationProposals.channelId,
+        ),
+        eq(channelMemberships.userId, actorId),
+      ),
+    )
+    .where(
+      and(
+        eq(typefullyPublicationProposals.id, proposalId),
+        eq(typefullyPublicationProposals.ownerUserId, actorId),
+      ),
+    )
+    .limit(1)
+    .for("update", { of: typefullyPublicationProposals });
+  if (!row) throw new DraftNotFoundError();
+  return asProposal(row as SelectedProposal);
+}
+
 async function isBotAttached(
   executor: Database | AuditTransaction,
   channelId: string,
@@ -477,11 +605,15 @@ export function createTypefullyStore(options: {
   vendor?: VendorIdentity;
   now?: () => Date;
   attemptLeaseMs?: number;
+  publicationVendor?: PublicationVendor;
+  proposalTtlMs?: number;
 }) {
   const { database, plugin, auditStore } = options;
   const serverId = serverIdFor(options.vendor);
   const now = options.now ?? (() => new Date());
   const attemptLeaseMs = options.attemptLeaseMs ?? DEFAULT_ATTEMPT_LEASE_MS;
+  const proposalTtlMs = options.proposalTtlMs ?? 15 * 60_000;
+  const publicationVendor = options.publicationVendor;
   const grantRef = (operation: RemoteDraftOperation) =>
     `${serverId}/${operation}`;
 
@@ -501,6 +633,44 @@ export function createTypefullyStore(options: {
   ): Promise<boolean> {
     const decision = await plugin().decide("mcp", grantRef(operation), botId);
     return decision.allowed;
+  }
+
+  async function authorizePublication(input: {
+    botId: string;
+    actorId: string;
+    operation: "prepare_publication" | "publish_now";
+  }): Promise<{ token: string }> {
+    const authorizeOperation = plugin().authorizeOperation;
+    if (!authorizeOperation) {
+      throw new GrantRequiredError(
+        `${serverId}/prepare_publication`,
+        "Typefully publication authorization is unavailable.",
+      );
+    }
+    return authorizeOperation({
+      requiredGrantRef: `${serverId}/prepare_publication`,
+      ref: `${serverId}/${input.operation}`,
+      botId: input.botId,
+      actorId: input.actorId,
+      context: {
+        intent: "write_tool",
+        mcp: { server: serverId, tool: input.operation, effect: "write" },
+      },
+    });
+  }
+
+  function remotePublicationIdentity(draft: TypefullyDraft) {
+    const socialSetId = Number(draft.document.socialSetId);
+    const remoteDraftId = Number(draft.remoteDraftId);
+    if (
+      !Number.isSafeInteger(socialSetId) ||
+      socialSetId <= 0 ||
+      !Number.isSafeInteger(remoteDraftId) ||
+      remoteDraftId <= 0
+    ) {
+      throw changedProposalError();
+    }
+    return { socialSetId, remoteDraftId };
   }
 
   function remoteArgs(draft: TypefullyDraft): Record<string, unknown> {
@@ -749,7 +919,505 @@ export function createTypefullyStore(options: {
           isError: false,
         };
       }
+      if (input.toolName === "prepare_publication") {
+        const parsed = typefullyBotContracts.prepare_publication.safeParse(
+          input.args,
+        );
+        if (!parsed.success) {
+          return {
+            text:
+              parsed.error.issues[0]?.message ??
+              "Invalid publication proposal arguments",
+            isError: true,
+          };
+        }
+        const proposal = await store.prepareProposal({
+          draftId: parsed.data.draftId,
+          actorId: input.actorId,
+          expectedVersion: parsed.data.expectedVersion,
+          requiredBotId: input.botId,
+        });
+        return { text: JSON.stringify(proposal), isError: false };
+      }
       return null;
+    },
+
+    async prepareProposal(input: {
+      draftId: string;
+      actorId: string;
+      expectedVersion: number;
+      requiredBotId?: string;
+    }) {
+      const visible = await ownedDraft(database, input.draftId, input.actorId);
+      if (
+        visible.version !== input.expectedVersion ||
+        !isCurrentRevisionConfirmed(visible) ||
+        visible.syncStatus !== "synced" ||
+        (input.requiredBotId !== undefined &&
+          visible.botId !== input.requiredBotId)
+      ) {
+        throw changedProposalError();
+      }
+      if (
+        visible.document.destinations.length === 0 ||
+        visible.document.destinations.some(
+          (destination) => destination !== "x" && destination !== "linkedin",
+        )
+      ) {
+        throw changedProposalError();
+      }
+      await authorizePublication({
+        botId: visible.botId,
+        actorId: input.actorId,
+        operation: "prepare_publication",
+      });
+
+      return database.transaction(async (transaction) => {
+        const draft = await lockedOwnedDraft(
+          transaction,
+          input.draftId,
+          input.actorId,
+        );
+        if (
+          draft.version !== input.expectedVersion ||
+          draft.contentHash !== visible.contentHash ||
+          !isCurrentRevisionConfirmed(draft) ||
+          draft.syncStatus !== "synced" ||
+          (input.requiredBotId !== undefined &&
+            draft.botId !== input.requiredBotId)
+        ) {
+          throw changedProposalError();
+        }
+        if (
+          !(await lockMembership(
+            transaction,
+            draft.channelId,
+            input.actorId,
+          )) ||
+          !(await lockBotAttachment(transaction, draft.channelId, draft.botId))
+        ) {
+          throw new DraftNotFoundError();
+        }
+        const instant = now();
+        await transaction
+          .update(typefullyPublicationProposals)
+          .set({
+            status: "expired",
+            decidedAt: instant,
+            completedAt: instant,
+            failureDetail: "Superseded by a newer review proposal.",
+            updatedAt: instant,
+          })
+          .where(
+            and(
+              eq(typefullyPublicationProposals.draftId, draft.id),
+              eq(typefullyPublicationProposals.status, "pending"),
+            ),
+          );
+        const [row] = await transaction
+          .insert(typefullyPublicationProposals)
+          .values({
+            draftId: draft.id,
+            ownerUserId: draft.ownerUserId,
+            botId: draft.botId,
+            channelId: draft.channelId,
+            draftVersion: draft.version,
+            contentHash: draft.contentHash,
+            snapshot: draft.document,
+            status: "pending",
+            expiresAt: new Date(instant.getTime() + Math.max(1, proposalTtlMs)),
+          })
+          .returning(proposalSelection);
+        if (!row) throw new Error("The publication proposal was not stored.");
+        const proposal = asProposal(row as SelectedProposal);
+        await recordAuditEvent(auditStore.inTransaction(transaction), {
+          eventType: "configuration.changed",
+          targetType: "typefully_publication_proposal",
+          targetId: proposal.id,
+          actorUserId: input.actorId,
+          payload: {
+            draftId: proposal.draftId,
+            botId: proposal.botId,
+            channelId: proposal.channelId,
+            version: proposal.version,
+            hash: proposal.contentHash,
+            destinations: proposal.destinations,
+            decision: "prepared",
+          },
+        });
+        return proposalSummary({
+          id: row.id,
+          draftId: row.draftId,
+          draftVersion: row.draftVersion,
+          snapshot: proposal.snapshot,
+          expiresAt: row.expiresAt,
+          status: proposal.status,
+        });
+      });
+    },
+
+    async readProposal(proposalId: string, actorId: string) {
+      return ownedProposal(database, proposalId, actorId);
+    },
+
+    async declineProposal(proposalId: string, actorId: string) {
+      return database.transaction(async (transaction) => {
+        const proposal = await lockedOwnedProposal(
+          transaction,
+          proposalId,
+          actorId,
+        );
+        if (proposal.status !== "pending") {
+          throw new ProposalStateError(
+            "proposal_not_pending",
+            "This proposal is no longer pending.",
+          );
+        }
+        const instant = now();
+        const [row] = await transaction
+          .update(typefullyPublicationProposals)
+          .set({
+            status: "declined",
+            decidedAt: instant,
+            completedAt: instant,
+            updatedAt: instant,
+          })
+          .where(
+            and(
+              eq(typefullyPublicationProposals.id, proposal.id),
+              eq(typefullyPublicationProposals.status, "pending"),
+            ),
+          )
+          .returning(proposalSelection);
+        if (!row) {
+          throw new ProposalStateError(
+            "proposal_not_pending",
+            "This proposal is no longer pending.",
+          );
+        }
+        await recordAuditEvent(auditStore.inTransaction(transaction), {
+          eventType: "configuration.changed",
+          targetType: "typefully_publication_proposal",
+          targetId: proposal.id,
+          actorUserId: actorId,
+          payload: {
+            draftId: proposal.draftId,
+            botId: proposal.botId,
+            channelId: proposal.channelId,
+            version: proposal.version,
+            hash: proposal.contentHash,
+            destinations: proposal.destinations,
+            decision: "declined",
+          },
+        });
+        return asProposal(row as SelectedProposal);
+      });
+    },
+
+    async approveAndPublish(input: { proposalId: string; actorId: string }) {
+      if (!publicationVendor) {
+        throw new Error("Typefully publication is unavailable.");
+      }
+      let proposal = await ownedProposal(
+        database,
+        input.proposalId,
+        input.actorId,
+      );
+      if (proposal.status !== "pending") {
+        if (
+          proposal.status === "expired" &&
+          proposal.failureDetail === "Draft changed after proposal creation."
+        ) {
+          throw changedProposalError();
+        }
+        throw new ProposalStateError(
+          "proposal_not_pending",
+          "This proposal is no longer pending.",
+        );
+      }
+      if (new Date(proposal.expiresAt).getTime() <= now().getTime()) {
+        await database
+          .update(typefullyPublicationProposals)
+          .set({
+            status: "expired",
+            decidedAt: now(),
+            completedAt: now(),
+            failureDetail: "The review proposal expired.",
+            updatedAt: now(),
+          })
+          .where(
+            and(
+              eq(typefullyPublicationProposals.id, proposal.id),
+              eq(typefullyPublicationProposals.status, "pending"),
+            ),
+          );
+        throw new ProposalStateError(
+          "proposal_expired",
+          "This proposal expired. Review the draft again.",
+        );
+      }
+      let draft = await ownedDraft(database, proposal.draftId, input.actorId);
+      if (
+        draft.version !== proposal.version ||
+        draft.contentHash !== proposal.contentHash ||
+        !isCurrentRevisionConfirmed(draft)
+      ) {
+        throw changedProposalError();
+      }
+      const authorized = await authorizePublication({
+        botId: proposal.botId,
+        actorId: input.actorId,
+        operation: "publish_now",
+      });
+      const identity = remotePublicationIdentity(draft);
+      const remote = await publicationVendor.fetchDraft({
+        token: authorized.token,
+        ...identity,
+      });
+      if (
+        !remoteMatchesSnapshot(
+          remote.document,
+          proposal.snapshot,
+          proposal.contentHash,
+        )
+      ) {
+        await database
+          .update(typefullyPublicationProposals)
+          .set({
+            status: "expired",
+            decidedAt: now(),
+            completedAt: now(),
+            failureDetail: "The remote draft changed after review.",
+            updatedAt: now(),
+          })
+          .where(
+            and(
+              eq(typefullyPublicationProposals.id, proposal.id),
+              eq(typefullyPublicationProposals.status, "pending"),
+            ),
+          );
+        throw changedProposalError();
+      }
+
+      proposal = await database.transaction(async (transaction) => {
+        // Draft before proposal is the global mutation lock order. `saveDraft` already holds the
+        // draft before it invalidates proposals; reversing that order here deadlocks an edit racing
+        // the approval claim.
+        draft = await lockedOwnedDraft(
+          transaction,
+          proposal.draftId,
+          input.actorId,
+        );
+        const locked = await lockedOwnedProposal(
+          transaction,
+          input.proposalId,
+          input.actorId,
+        );
+        if (locked.status !== "pending") {
+          throw new ProposalStateError(
+            "proposal_not_pending",
+            "This proposal is no longer pending.",
+          );
+        }
+        if (new Date(locked.expiresAt).getTime() <= now().getTime()) {
+          throw new ProposalStateError(
+            "proposal_expired",
+            "This proposal expired. Review the draft again.",
+          );
+        }
+        if (
+          draft.version !== locked.version ||
+          draft.contentHash !== locked.contentHash ||
+          !isCurrentRevisionConfirmed(draft) ||
+          !(await lockBotAttachment(
+            transaction,
+            locked.channelId,
+            locked.botId,
+          ))
+        ) {
+          throw changedProposalError();
+        }
+        const instant = now();
+        const [claimed] = await transaction
+          .update(typefullyPublicationProposals)
+          .set({
+            // `unknown` is the durable fence. A crash after this commit is never automatically
+            // retried; reconciliation must prove the vendor state first.
+            status: "unknown",
+            decidedAt: instant,
+            completedAt: instant,
+            failureDetail: "Publishing status unknown.",
+            updatedAt: instant,
+          })
+          .where(
+            and(
+              eq(typefullyPublicationProposals.id, locked.id),
+              eq(typefullyPublicationProposals.status, "pending"),
+            ),
+          )
+          .returning(proposalSelection);
+        if (!claimed) {
+          throw new ProposalStateError(
+            "proposal_not_pending",
+            "This proposal is no longer pending.",
+          );
+        }
+        await recordAuditEvent(auditStore.inTransaction(transaction), {
+          eventType: "configuration.changed",
+          targetType: "typefully_publication_proposal",
+          targetId: locked.id,
+          actorUserId: input.actorId,
+          payload: {
+            draftId: locked.draftId,
+            botId: locked.botId,
+            channelId: locked.channelId,
+            version: locked.version,
+            hash: locked.contentHash,
+            destinations: locked.destinations,
+            decision: "approved",
+            outcome: "unknown",
+          },
+        });
+        return asProposal(claimed as SelectedProposal);
+      });
+
+      let outcome: PublicationOutcome;
+      try {
+        outcome = safePublicationOutcome(
+          await publicationVendor.publishDraft({
+            token: authorized.token,
+            ...identity,
+          }),
+        );
+      } catch (error) {
+        outcome = {
+          outcome: "unknown" as const,
+          detail: boundedError(error),
+        };
+      }
+      const instant = now();
+      const status = outcome.outcome;
+      return database.transaction(async (transaction) => {
+        const [completed] = await transaction
+          .update(typefullyPublicationProposals)
+          .set({
+            status,
+            completedAt: instant,
+            vendorResultId: outcome.vendorResultId ?? null,
+            publishedUrl: outcome.publishedUrl ?? null,
+            failureDetail:
+              status === "published"
+                ? null
+                : (outcome.detail ??
+                  (status === "unknown"
+                    ? "Publishing status unknown."
+                    : "Typefully refused publication.")),
+            updatedAt: instant,
+          })
+          .where(
+            and(
+              eq(typefullyPublicationProposals.id, proposal.id),
+              eq(typefullyPublicationProposals.status, "unknown"),
+            ),
+          )
+          .returning(proposalSelection);
+        if (!completed) {
+          throw new ProposalStateError(
+            "proposal_not_pending",
+            "This proposal is no longer pending.",
+          );
+        }
+        await recordAuditEvent(auditStore.inTransaction(transaction), {
+          eventType: "configuration.changed",
+          targetType: "typefully_publication_proposal",
+          targetId: proposal.id,
+          actorUserId: input.actorId,
+          payload: {
+            draftId: proposal.draftId,
+            botId: proposal.botId,
+            channelId: proposal.channelId,
+            version: proposal.version,
+            hash: proposal.contentHash,
+            destinations: proposal.destinations,
+            decision: "approved",
+            outcome: status,
+          },
+        });
+        return asProposal(completed as SelectedProposal);
+      });
+    },
+
+    async reconcileProposal(input: { proposalId: string; actorId: string }) {
+      if (!publicationVendor) {
+        throw new Error("Typefully publication is unavailable.");
+      }
+      const proposal = await ownedProposal(
+        database,
+        input.proposalId,
+        input.actorId,
+      );
+      if (proposal.status !== "unknown") {
+        throw new ProposalStateError(
+          "proposal_not_reconcilable",
+          "Only an unknown publication outcome can be reconciled.",
+        );
+      }
+      const draft = await ownedDraft(database, proposal.draftId, input.actorId);
+      const authorized = await authorizePublication({
+        botId: proposal.botId,
+        actorId: input.actorId,
+        operation: "publish_now",
+      });
+      const outcome = safePublicationOutcome(
+        await publicationVendor.reconcileDraft({
+          token: authorized.token,
+          ...remotePublicationIdentity(draft),
+        }),
+      );
+      if (outcome.outcome === "unknown") return proposal;
+      const instant = now();
+      return database.transaction(async (transaction) => {
+        const [row] = await transaction
+          .update(typefullyPublicationProposals)
+          .set({
+            status: outcome.outcome,
+            completedAt: instant,
+            vendorResultId: outcome.vendorResultId ?? null,
+            publishedUrl: outcome.publishedUrl ?? null,
+            failureDetail:
+              outcome.outcome === "published"
+                ? null
+                : (outcome.detail ?? "Typefully reports publication failed."),
+            updatedAt: instant,
+          })
+          .where(
+            and(
+              eq(typefullyPublicationProposals.id, proposal.id),
+              eq(typefullyPublicationProposals.status, "unknown"),
+            ),
+          )
+          .returning(proposalSelection);
+        if (!row) {
+          return ownedProposal(transaction, proposal.id, input.actorId);
+        }
+        await recordAuditEvent(auditStore.inTransaction(transaction), {
+          eventType: "configuration.changed",
+          targetType: "typefully_publication_proposal",
+          targetId: proposal.id,
+          actorUserId: input.actorId,
+          payload: {
+            draftId: proposal.draftId,
+            botId: proposal.botId,
+            channelId: proposal.channelId,
+            version: proposal.version,
+            hash: proposal.contentHash,
+            destinations: proposal.destinations,
+            decision: "reconciled",
+            outcome: outcome.outcome,
+          },
+        });
+        return asProposal(row as SelectedProposal);
+      });
     },
 
     async createDraft(input: {
@@ -844,6 +1512,19 @@ export function createTypefullyStore(options: {
           input.draftId,
           input.actorId,
         );
+        const [unresolvedPublication] = await transaction
+          .select({ id: typefullyPublicationProposals.id })
+          .from(typefullyPublicationProposals)
+          .where(
+            and(
+              eq(typefullyPublicationProposals.draftId, current.id),
+              eq(typefullyPublicationProposals.status, "unknown"),
+            ),
+          )
+          .limit(1);
+        if (unresolvedPublication) {
+          throw new ReconciliationRequiredError(current.id);
+        }
         if (
           !(await lockMembership(transaction, current.channelId, input.actorId))
         ) {
