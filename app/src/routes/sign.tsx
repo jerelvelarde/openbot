@@ -14,8 +14,8 @@ import {
 } from "@/lib/auth/client";
 import { appConfig } from "@/lib/generated/application-config";
 import {
-  consumePendingSlackReturn,
-  signedInSlackRedirect,
+  consumePendingAuthReturn,
+  signedInReturnRedirect,
 } from "../lib/auth/pending-return";
 import {
   type AuthProviderId,
@@ -36,8 +36,8 @@ export const Route = createFileRoute("/sign")({
     );
     if (user) {
       if (typeof window !== "undefined") {
-        const pendingReturn = consumePendingSlackReturn(window.sessionStorage);
-        const returnTo = signedInSlackRedirect(location.href, pendingReturn);
+        const pendingReturn = consumePendingAuthReturn(window.sessionStorage);
+        const returnTo = signedInReturnRedirect(location.href, pendingReturn);
         if (returnTo) throw redirect({ href: returnTo });
       }
       throw redirect({ to: "/" });

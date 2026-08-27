@@ -2,7 +2,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { PageSection, PageShell } from "@/components/layout/page-shell";
 import { Button } from "@/components/ui/button";
-import { savePendingSlackReturn } from "@/lib/auth/pending-return";
+import { savePendingAuthReturn } from "@/lib/auth/pending-return";
 import { tryClient } from "@/lib/client";
 
 type SlackClaim = { workspace: string; user: string; email?: string };
@@ -133,7 +133,7 @@ function SlackLinkPage() {
   const { token } = Route.useSearch();
   const reauthenticate = useCallback(() => {
     if (!token) return;
-    savePendingSlackReturn(
+    savePendingAuthReturn(
       `/link/slack?token=${encodeURIComponent(token)}`,
       window.sessionStorage,
     );

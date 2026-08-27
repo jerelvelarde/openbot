@@ -1,8 +1,8 @@
 import { createFileRoute, Outlet, redirect } from "@tanstack/react-router";
 import {
-  consumePendingSlackReturn,
-  savePendingSlackReturn,
-  signedInSlackRedirect,
+  consumePendingAuthReturn,
+  savePendingAuthReturn,
+  signedInReturnRedirect,
 } from "../lib/auth/pending-return";
 import { currentUserQueryOptions } from "../lib/auth/queries";
 import { CopilotProvider } from "../lib/copilot/provider";
@@ -14,13 +14,13 @@ export const Route = createFileRoute("/_authed")({
     );
     if (!user) {
       if (typeof window !== "undefined") {
-        savePendingSlackReturn(location.href, window.sessionStorage);
+        savePendingAuthReturn(location.href, window.sessionStorage);
       }
       throw redirect({ to: "/sign" });
     }
     if (typeof window !== "undefined") {
-      const pendingReturn = consumePendingSlackReturn(window.sessionStorage);
-      const returnTo = signedInSlackRedirect(location.href, pendingReturn);
+      const pendingReturn = consumePendingAuthReturn(window.sessionStorage);
+      const returnTo = signedInReturnRedirect(location.href, pendingReturn);
       if (returnTo) throw redirect({ href: returnTo });
     }
   },

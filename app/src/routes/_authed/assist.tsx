@@ -48,6 +48,28 @@ export function assistanceResponseOutcome(
   return { kind: "ready", href: `/bot?agent=${encodeURIComponent(agentId)}` };
 }
 
+/** Strip a validated sealed claim from visible history without accepting another route shape. */
+export function assistanceHistoryPath(
+  currentHref: string,
+  expectedToken: string,
+): string | null {
+  try {
+    const url = new URL(currentHref, "https://openbot.invalid");
+    if (
+      url.pathname !== "/assist" ||
+      url.hash ||
+      [...url.searchParams.keys()].length !== 1 ||
+      url.searchParams.getAll("token").length !== 1 ||
+      url.searchParams.get("token") !== expectedToken
+    ) {
+      return null;
+    }
+    return "/assist";
+  } catch {
+    return null;
+  }
+}
+
 async function loadAssistance(
   token: string,
   signal: AbortSignal,
@@ -82,7 +104,18 @@ function AssistanceLoader({ token }: { token: string }) {
     setOutcome({ kind: "loading" });
     loadAssistance(token, controller.signal).then(
       (loaded) => {
-        if (!controller.signal.aborted) setOutcome(loaded);
+        if (!controller.signal.aborted) {
+          setOutcome(loaded);
+          if (loaded.kind !== "error") {
+            const cleanPath = assistanceHistoryPath(
+              window.location.href,
+              token,
+            );
+            if (cleanPath) {
+              window.history.replaceState(window.history.state, "", cleanPath);
+            }
+          }
+        }
       },
       () => undefined,
     );

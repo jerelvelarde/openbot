@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test";
 import {
-  consumePendingSlackReturn,
-  pendingSlackReturnPath,
-  savePendingSlackReturn,
-  signedInSlackRedirect,
+  consumePendingAuthReturn,
+  pendingAuthReturnPath,
+  savePendingAuthReturn,
+  signedInReturnRedirect,
 } from "@/lib/auth/pending-return";
 
 function storage() {
@@ -15,11 +15,14 @@ function storage() {
   };
 }
 
-test("accepts only a same-origin Slack link with one non-empty token", () => {
-  expect(pendingSlackReturnPath("/link/slack?token=claim")).toBe(
+test("accepts only the two auth-return routes with one non-empty token", () => {
+  expect(pendingAuthReturnPath("/link/slack?token=claim")).toBe(
     "/link/slack?token=claim",
   );
-  expect(pendingSlackReturnPath("/link/slack?token= claim ")).toBe(
+  expect(pendingAuthReturnPath("/assist?token=control-claim")).toBe(
+    "/assist?token=control-claim",
+  );
+  expect(pendingAuthReturnPath("/link/slack?token= claim ")).toBe(
     "/link/slack?token=claim",
   );
 
@@ -31,35 +34,55 @@ test("accepts only a same-origin Slack link with one non-empty token", () => {
     "/link/slack?token=",
     "/link/slack?token=one&token=two",
     "/link/slack?token=claim#fragment",
+    "/assist?token=claim&extra=1",
+    "/assist?token=claim#fragment",
+    "https://openbot.invalid/assist?token=claim",
+    "/%2f%2fevil.example/assist?token=claim",
   ]) {
-    expect(pendingSlackReturnPath(rejected)).toBeNull();
+    expect(pendingAuthReturnPath(rejected)).toBeNull();
   }
 });
 
 test("saves an expiring one-time Slack return and consumes it after auth", () => {
   const session = storage();
-  expect(savePendingSlackReturn("/link/slack?token=claim", session, 100)).toBe(
+  expect(savePendingAuthReturn("/link/slack?token=claim", session, 100)).toBe(
     true,
   );
-  expect(consumePendingSlackReturn(session, 100 + 60_000)).toBe(
+  expect(consumePendingAuthReturn(session, 100 + 60_000)).toBe(
     "/link/slack?token=claim",
   );
-  expect(consumePendingSlackReturn(session, 100 + 60_000)).toBeNull();
+  expect(consumePendingAuthReturn(session, 100 + 60_000)).toBeNull();
 });
 
 test("rejects and deletes expired or malformed saved returns", () => {
   const session = storage();
-  savePendingSlackReturn("/link/slack?token=claim", session, 0);
-  expect(consumePendingSlackReturn(session, 10 * 60_000 + 1)).toBeNull();
-  expect(consumePendingSlackReturn(session, 10 * 60_000 + 1)).toBeNull();
+  savePendingAuthReturn("/link/slack?token=claim", session, 0);
+  expect(consumePendingAuthReturn(session, 10 * 60_000 + 1)).toBeNull();
+  expect(consumePendingAuthReturn(session, 10 * 60_000 + 1)).toBeNull();
 });
 
 test("redirects a signed-in person only to a consumed Slack return", () => {
-  expect(signedInSlackRedirect("/", "/link/slack?token=claim")).toBe(
+  expect(signedInReturnRedirect("/", "/link/slack?token=claim")).toBe(
     "/link/slack?token=claim",
   );
   expect(
-    signedInSlackRedirect("/link/slack?token=claim", "/link/slack?token=claim"),
+    signedInReturnRedirect(
+      "https://openbot.test/link/slack?token=claim",
+      "/link/slack?token=claim",
+    ),
   ).toBeNull();
-  expect(signedInSlackRedirect("/", null)).toBeNull();
+  expect(signedInReturnRedirect("/", null)).toBeNull();
+});
+
+test("preserves an exact assistance return across signed-out sign-in", () => {
+  const session = storage();
+  expect(
+    savePendingAuthReturn("/assist?token=sealed-control", session, 100),
+  ).toBe(true);
+
+  const consumed = consumePendingAuthReturn(session, 200);
+  expect(signedInReturnRedirect("/sign", consumed)).toBe(
+    "/assist?token=sealed-control",
+  );
+  expect(consumePendingAuthReturn(session, 200)).toBeNull();
 });

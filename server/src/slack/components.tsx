@@ -16,6 +16,7 @@ export const ApprovalCard = defineChannelComponent({
         <Section>{question}</Section>
         <Actions>
           <Button
+            key="approval-approve"
             onClick={async ({ thread }) => {
               await thread.resume({ approved: true });
             }}
@@ -24,6 +25,7 @@ export const ApprovalCard = defineChannelComponent({
             Approve
           </Button>
           <Button
+            key="approval-reject"
             onClick={async ({ thread }) => {
               await thread.resume({ approved: false });
             }}

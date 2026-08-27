@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  assistanceHistoryPath,
   assistanceResponseOutcome,
   assistanceToken,
 } from "../src/routes/_authed/assist";
@@ -33,5 +34,22 @@ describe("Slack assistance route status mapping", () => {
     expect(assistanceResponseOutcome(500, { agentId: "leaked" })).toEqual({
       kind: "error",
     });
+  });
+
+  test("removes a captured token from visible history only for its exact assistance URL", () => {
+    expect(
+      assistanceHistoryPath(
+        "https://openbot.test/assist?token=sealed-control",
+        "sealed-control",
+      ),
+    ).toBe("/assist");
+    for (const href of [
+      "https://openbot.test/assist?token=other",
+      "https://openbot.test/assist?token=sealed-control&extra=1",
+      "https://openbot.test/assist?token=sealed-control#fragment",
+      "https://openbot.test/bot?token=sealed-control",
+    ]) {
+      expect(assistanceHistoryPath(href, "sealed-control")).toBeNull();
+    }
   });
 });

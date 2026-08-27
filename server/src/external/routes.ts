@@ -100,6 +100,11 @@ export function createExternalLinkRoutes({
     return context.json({ linked: true });
   });
 
+  routes.use("/assistance", async (context, next) => {
+    context.header("Cache-Control", "no-store");
+    await next();
+  });
+
   routes.get("/assistance", requireUser, async (context) => {
     let claim: AssistanceClaim;
     try {
@@ -116,9 +121,18 @@ export function createExternalLinkRoutes({
       return context.json({ error: ASSISTANCE_FORBIDDEN_MESSAGE }, 403);
     }
 
-    const profile = await agentProfileStore
-      .get({ id: actor.id, role: actor.role }, claim.agentId)
-      .catch(() => null);
+    let profile: Awaited<ReturnType<AgentProfileStore["get"]>>;
+    try {
+      profile = await agentProfileStore.get(
+        { id: actor.id, role: actor.role },
+        claim.agentId,
+      );
+    } catch {
+      return context.json(
+        { error: "This assistance request could not be checked right now." },
+        503,
+      );
+    }
     if (!profile) {
       return context.json({ error: ASSISTANCE_FORBIDDEN_MESSAGE }, 403);
     }
