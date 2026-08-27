@@ -419,6 +419,7 @@ function copyOptionalString(
 ): boolean {
   if (!Object.hasOwn(source, sourceKey)) return true;
   const value = source[sourceKey];
+  if (value === null) return true;
   if (typeof value !== "string" || Array.from(value).length > maxCharacters) {
     return false;
   }
@@ -433,6 +434,7 @@ function copyOptionalBoolean(
 ): boolean {
   if (!Object.hasOwn(source, key)) return true;
   const value = source[key];
+  if (value === null) return true;
   if (typeof value !== "boolean") return false;
   target[key] = value;
   return true;
@@ -453,7 +455,7 @@ function normalizeResponsePost(
     return { ok: false };
   }
   const post: Record<string, unknown> = { text: rawPost.text };
-  if (Object.hasOwn(rawPost, "media_ids")) {
+  if (Object.hasOwn(rawPost, "media_ids") && rawPost.media_ids !== null) {
     if (
       !Array.isArray(rawPost.media_ids) ||
       rawPost.media_ids.length > 10 ||
@@ -552,7 +554,7 @@ function normalizeSelectedPlatform(
   } else if (rawPlatform.enabled) {
     return { ok: false };
   }
-  if (Object.hasOwn(rawPlatform, "settings")) {
+  if (Object.hasOwn(rawPlatform, "settings") && rawPlatform.settings !== null) {
     const normalized = normalizeResponseSettings(
       platformName,
       rawPlatform.settings,

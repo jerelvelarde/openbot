@@ -512,13 +512,109 @@ describe("v2 request mapping", () => {
     });
   });
 
+  test("remove_media omits nullable optional X and LinkedIn response fields", async () => {
+    const cases = [
+      {
+        platform: "x",
+        responsePlatform: {
+          enabled: true,
+          settings: null,
+          posts: [
+            {
+              text: "Keep X text",
+              media_ids: ["target-media", "keep-media"],
+              quote_post_url: null,
+              subscribers_only: null,
+              paid_partnership: null,
+              made_with_ai: null,
+              hide_link_preview: null,
+            },
+            { text: "No media response", media_ids: null },
+          ],
+        },
+        expectedPlatform: {
+          enabled: true,
+          posts: [
+            { text: "Keep X text", media_ids: ["keep-media"] },
+            { text: "No media response" },
+          ],
+        },
+      },
+      {
+        platform: "linkedin",
+        responsePlatform: {
+          enabled: true,
+          settings: null,
+          posts: [
+            {
+              text: "Keep LinkedIn text",
+              media_ids: ["target-media", "keep-media"],
+              linkedin_reshare_urn: null,
+              hide_link_preview: null,
+            },
+          ],
+        },
+        expectedPlatform: {
+          enabled: true,
+          posts: [{ text: "Keep LinkedIn text", media_ids: ["keep-media"] }],
+        },
+      },
+    ] as const;
+
+    for (const item of cases) {
+      const calls: FetchCall[] = [];
+      const fetch = (async (
+        requestInput: string | URL | Request,
+        init?: RequestInit,
+      ) => {
+        const headers = new Headers(init?.headers);
+        calls.push({
+          url: String(requestInput),
+          method: init?.method ?? "GET",
+          authorization: headers.get("authorization"),
+          contentType: headers.get("content-type"),
+          body: typeof init?.body === "string" ? init.body : null,
+          signal: init?.signal ?? null,
+        });
+        return calls.length === 1
+          ? new Response(
+              JSON.stringify({
+                platforms: { [item.platform]: item.responsePlatform },
+              }),
+            )
+          : new Response(JSON.stringify({ ok: true }));
+      }) as typeof globalThis.fetch;
+      const transport = createTypefullyRestTransport(fetch);
+
+      const result = await transport.callTool(connection, "remove_media", {
+        socialSetId: 12,
+        draftId: 34,
+        platform: item.platform,
+        postIndex: 0,
+        mediaId: "target-media",
+      });
+
+      expect(result.isError).toBe(false);
+      expect(calls).toHaveLength(2);
+      expect(JSON.parse(calls[1]?.body ?? "null")).toEqual({
+        platforms: { [item.platform]: item.expectedPlatform },
+      });
+    }
+  });
+
   test("remove_media refuses malformed selected-platform responses without PATCHing", async () => {
     const { fetch, calls } = recordingFetch({
       body: {
         platforms: {
           x: {
             enabled: true,
-            posts: [{ text: 42, media_ids: ["target-media", "keep-media"] }],
+            posts: [
+              {
+                text: "Valid text",
+                media_ids: ["target-media", "keep-media"],
+                quote_post_url: 42,
+              },
+            ],
           },
         },
       },
