@@ -28,6 +28,11 @@ import {
   providerThreadIdFromIdentity,
   SlackIngressRegistry,
 } from "./ingress-registry";
+import {
+  defaultSlackTurnFailureLogger,
+  runSlackPhase,
+  type SlackTurnFailureLogger,
+} from "./turn-phase";
 
 export type OpenBotSlackChannelDependencies = {
   identityLinker: Pick<SlackIdentityLinker, "resolve">;
@@ -35,6 +40,8 @@ export type OpenBotSlackChannelDependencies = {
   ingressRegistry?: SlackIngressRegistry;
   computerGateway?: ComputerGateway;
   assistance?: SlackAssistanceOptions;
+  logTurnFailure?: SlackTurnFailureLogger;
+  prepareExecution?: SlackExecutionPreparer;
 };
 
 function linkCard(linkUrl: string) {
@@ -99,11 +106,15 @@ function executionFor(
   };
 }
 
+type SlackExecutionPreparer = typeof executionFor;
+
 /** Declare the managed OpenBot Slack Channel. The Copilot runtime attaches its adapter. */
 export function createOpenBotSlackChannel(
   deps: OpenBotSlackChannelDependencies,
 ): Channel {
   const ingress = deps.ingressRegistry ?? new SlackIngressRegistry();
+  const logTurnFailure = deps.logTurnFailure ?? defaultSlackTurnFailureLogger;
+  const prepareExecution = deps.prepareExecution ?? executionFor;
   configureApprovalInteractionBridge(ingress);
   const tools: SlackComputerTool[] = deps.computerGateway
     ? createSlackComputerTools(deps.computerGateway, deps.assistance)
@@ -112,11 +123,20 @@ export function createOpenBotSlackChannel(
     name: "openbot",
     identifyUser: async (context) => {
       if (context.actor.kind !== "human") return null;
-      const identityResult = await deps.identityLinker.resolve(context);
-      ingress.remember(eventId(context), {
-        identityContext: context,
-        identityResult,
-      });
+      const identityResult = await runSlackPhase(
+        "identity.resolve",
+        () => deps.identityLinker.resolve(context),
+        logTurnFailure,
+      );
+      await runSlackPhase(
+        "ingress.remember",
+        () =>
+          ingress.remember(eventId(context), {
+            identityContext: context,
+            identityResult,
+          }),
+        logTurnFailure,
+      );
       return identityResult.kind === "linked" ? identityResult.user : null;
     },
     agent: (threadId) => new OpenBotChannelAgent(threadId, deps.agentDeps),
@@ -136,34 +156,78 @@ export function createOpenBotSlackChannel(
     subscribe: boolean;
   }): Promise<void> {
     if (message.actor.kind !== "human" || !isNewMessage(message)) return;
-    const remembered = ingress.take(message.eventId, {
-      provider: "slack",
-      providerActorId: message.actor.id,
-      applicationUserId: message.user?.id ?? null,
-    });
-    if (!remembered || !validRememberedPrincipal(remembered, message)) {
-      throw new Error("Managed Slack ingress identity is no longer available.");
-    }
-    if (remembered.identityResult.kind === "unlinked") {
-      await thread.post(linkCard(remembered.identityResult.linkUrl));
+    const remembered = await runSlackPhase(
+      "ingress.take",
+      () =>
+        ingress.take(message.eventId, {
+          provider: "slack",
+          providerActorId: message.actor.id,
+          applicationUserId: message.user?.id ?? null,
+        }),
+      logTurnFailure,
+    );
+    await runSlackPhase(
+      "identity.validate",
+      () => {
+        if (!remembered || !validRememberedPrincipal(remembered, message)) {
+          throw new Error(
+            "Managed Slack ingress identity is no longer available.",
+          );
+        }
+      },
+      logTurnFailure,
+    );
+    if (!remembered) return;
+    const identityResult = remembered.identityResult;
+    if (identityResult.kind === "unlinked") {
+      await runSlackPhase(
+        "link_card.post",
+        () => thread.post(linkCard(identityResult.linkUrl)),
+        logTurnFailure,
+      );
       return;
     }
     if (!message.user) {
-      throw new Error("Managed Slack ingress identity did not match its user.");
+      await runSlackPhase(
+        "identity.validate",
+        () => {
+          throw new Error(
+            "Managed Slack ingress identity did not match its user.",
+          );
+        },
+        logTurnFailure,
+      );
+      return;
     }
-    if (subscribe) await thread.subscribe();
-    const execution = executionFor(
-      remembered.identityContext,
-      remembered.identityResult,
-      thread.conversationKey,
-      message.text,
+    if (subscribe) {
+      await runSlackPhase(
+        "thread.subscribe",
+        () => thread.subscribe(),
+        logTurnFailure,
+      );
+    }
+    const execution = await runSlackPhase(
+      "execution.prepare",
+      () =>
+        prepareExecution(
+          remembered.identityContext,
+          identityResult,
+          thread.conversationKey,
+          message.text,
+        ),
+      logTurnFailure,
     );
-    await runWithSlackExecution(execution, () =>
-      thread.runAgent(
-        message.contentParts?.length
-          ? { prompt: message.contentParts }
-          : undefined,
-      ),
+    await runSlackPhase(
+      "agent.run",
+      () =>
+        runWithSlackExecution(execution, () =>
+          thread.runAgent(
+            message.contentParts?.length
+              ? { prompt: message.contentParts }
+              : undefined,
+          ),
+        ),
+      logTurnFailure,
     );
   }
 
