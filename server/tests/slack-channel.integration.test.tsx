@@ -36,6 +36,10 @@ import {
 import { configureApprovalDecisionStore } from "../src/slack/components";
 import type { SlackIdentityResult } from "../src/slack/identity-linker";
 import { SlackIngressRegistry } from "../src/slack/ingress-registry";
+import type {
+  SlackTurnFailureEvent,
+  SlackTurnFailureLogger,
+} from "../src/slack/turn-phase";
 
 type SharedRunState = {
   inputs: RunAgentInput[];
@@ -364,11 +368,16 @@ function harness(
     bindings?: Map<string, ExternalThreadBinding>;
     identityLinker?: OpenBotSlackChannelDependencies["identityLinker"];
     ingressRegistry?: SlackIngressRegistry;
+    logTurnFailure?: SlackTurnFailureLogger;
     resolver?: ActorAgentResolver;
     agentId?: string;
+    failPost?: boolean;
+    failSubscribe?: boolean;
+    failExecutionPrepare?: boolean;
   } = {},
 ) {
   const adapter = new FakeAdapter({ platform: "slack", messageEvents: true });
+  const events: SlackTurnFailureEvent[] = [];
   adapter.getCanonicalThreadId = (target) => {
     const id = (target as { canonicalThreadId?: unknown }).canonicalThreadId;
     if (typeof id !== "string" || !id) {
@@ -382,6 +391,27 @@ function harness(
     makeAgent,
   ) => ({ agent: makeAgent(adapter.getCanonicalThreadId!(replyTarget)) });
   adapter.stateStore = options.stateStore;
+  if (options.failSubscribe) {
+    const backing = new MemoryStore();
+    adapter.stateStore = {
+      kv: {
+        ...backing.kv,
+        async set(key, value, ttlMs) {
+          if (key.startsWith("sub:")) throw new Error("subscribe failed");
+          await backing.kv.set(key, value, ttlMs);
+        },
+      },
+      list: backing.list,
+      lock: backing.lock,
+      dedup: backing.dedup,
+      queue: backing.queue,
+    };
+  }
+  if (options.failPost) {
+    adapter.post = async () => {
+      throw new Error("post failed");
+    };
+  }
   const filePosts: Parameters<NonNullable<PlatformAdapter["postFile"]>>[] = [];
   adapter.postFile = async (...args) => {
     filePosts.push(args);
@@ -494,10 +524,25 @@ function harness(
     agentDeps: { routing, store, resolver: options.resolver ?? resolver },
     ingressRegistry: options.ingressRegistry,
     computerGateway: options.computerGateway,
+    logTurnFailure: options.logTurnFailure ?? ((event) => events.push(event)),
+    prepareExecution: options.failExecutionPrepare
+      ? () => {
+          throw new Error("prepare failed");
+        }
+      : undefined,
   };
   const channel = createOpenBotSlackChannel(deps);
   channel.ɵruntime.addAdapter(adapter);
-  return { adapter, channel, bindings, bindCalls, shared, actors, filePosts };
+  return {
+    adapter,
+    channel,
+    bindings,
+    bindCalls,
+    shared,
+    actors,
+    filePosts,
+    events,
+  };
 }
 
 function toolResult(shared: SharedRunState): Record<string, unknown> {
@@ -511,6 +556,69 @@ function toolResult(shared: SharedRunState): Record<string, unknown> {
 }
 
 describe("managed OpenBot Slack channel", () => {
+  test("reports identity.resolve without leaking the error", async () => {
+    const identityLinker: OpenBotSlackChannelDependencies["identityLinker"] = {
+      async resolve() {
+        throw new Error("secret identity detail");
+      },
+    };
+    const { adapter, channel, events } = harness({ identityLinker });
+    await channel.ɵruntime.start();
+
+    await expect(
+      adapter.getSink().onTurn(turn("E-resolve-fail", "hello")),
+    ).rejects.toThrow("Channel identifyUser failed");
+
+    expect(events).toEqual([
+      { type: "slack-turn-failed", phase: "identity.resolve" },
+    ]);
+    expect(JSON.stringify(events)).not.toContain("secret identity detail");
+  });
+
+  test("reports ingress.remember without leaking the error", async () => {
+    class FailingRememberRegistry extends SlackIngressRegistry {
+      override remember(): void {
+        throw new Error("remember failed");
+      }
+    }
+
+    const { adapter, channel, events } = harness({
+      ingressRegistry: new FailingRememberRegistry(),
+    });
+    await channel.ɵruntime.start();
+
+    await expect(
+      adapter.getSink().onTurn(turn("E-remember-fail", "hello")),
+    ).rejects.toThrow("Channel identifyUser failed");
+
+    expect(events).toEqual([
+      { type: "slack-turn-failed", phase: "ingress.remember" },
+    ]);
+  });
+
+  test("reports ingress.take without binding or running", async () => {
+    class FailingTakeRegistry extends SlackIngressRegistry {
+      override take(): never {
+        throw new Error("take failed");
+      }
+    }
+
+    const { adapter, channel, bindCalls, events, shared } = harness({
+      ingressRegistry: new FailingTakeRegistry(),
+    });
+    await channel.ɵruntime.start();
+
+    await expect(
+      adapter.getSink().onTurn(turn("E-take-fail", "hello")),
+    ).rejects.toThrow("take failed");
+
+    expect(events).toEqual([
+      { type: "slack-turn-failed", phase: "ingress.take" },
+    ]);
+    expect(bindCalls).toEqual([]);
+    expect(shared.inputs).toEqual([]);
+  });
+
   test("an unlinked mention posts a link without running or binding", async () => {
     const { adapter, channel, bindCalls, shared } = harness();
     await channel.ɵruntime.start();
@@ -522,6 +630,82 @@ describe("managed OpenBot Slack channel", () => {
     expect(postedText(adapter)).toContain("Link OpenBot account");
     expect(postedText(adapter)).toContain("opaque");
     expect(bindCalls).toEqual([]);
+    expect(shared.inputs).toEqual([]);
+  });
+
+  test("reports link_card.post without binding or running", async () => {
+    const { adapter, channel, bindCalls, events, shared } = harness({
+      failPost: true,
+    });
+    await channel.ɵruntime.start();
+
+    await expect(
+      adapter
+        .getSink()
+        .onTurn(
+          turn("E-link-card-post-fail", "hello", { actorId: "UNLINKED" }),
+        ),
+    ).rejects.toThrow("post failed");
+
+    expect(events).toEqual([
+      { type: "slack-turn-failed", phase: "link_card.post" },
+    ]);
+    expect(bindCalls).toEqual([]);
+    expect(shared.inputs).toEqual([]);
+  });
+
+  test("reports thread.subscribe without binding or running", async () => {
+    const { adapter, channel, bindCalls, events, shared } = harness({
+      failSubscribe: true,
+    });
+    await channel.ɵruntime.start();
+
+    await expect(
+      adapter.getSink().onTurn(turn("E-thread-subscribe-fail", "hello")),
+    ).rejects.toThrow("subscribe failed");
+
+    expect(events).toEqual([
+      { type: "slack-turn-failed", phase: "thread.subscribe" },
+    ]);
+    expect(bindCalls).toEqual([]);
+    expect(shared.inputs).toEqual([]);
+  });
+
+  test("reports execution.prepare without binding or running", async () => {
+    const { adapter, channel, bindCalls, events, shared } = harness({
+      failExecutionPrepare: true,
+    });
+    await channel.ɵruntime.start();
+
+    await expect(
+      adapter.getSink().onTurn(turn("E-execution-prepare-fail", "hello")),
+    ).rejects.toThrow("prepare failed");
+
+    expect(events).toEqual([
+      { type: "slack-turn-failed", phase: "execution.prepare" },
+    ]);
+    expect(bindCalls).toEqual([]);
+    expect(shared.inputs).toEqual([]);
+  });
+
+  test("reports agent.run without serializing sensitive resolver details", async () => {
+    const resolver: ActorAgentResolver = {
+      async resolveAgentsForActor() {
+        return {};
+      },
+      async resolveAgentForActor() {
+        throw new Error("secret delegated run detail");
+      },
+    };
+    const { adapter, channel, events, shared } = harness({ resolver });
+    await channel.ɵruntime.start();
+
+    await expect(
+      adapter.getSink().onTurn(turn("E-agent-run-fail", "hello")),
+    ).rejects.toThrow("secret delegated run detail");
+
+    expect(events).toEqual([{ type: "slack-turn-failed", phase: "agent.run" }]);
+    expect(JSON.stringify(events)).not.toContain("secret delegated run detail");
     expect(shared.inputs).toEqual([]);
   });
 
@@ -661,7 +845,9 @@ describe("managed OpenBot Slack channel", () => {
         };
       },
     };
-    const { adapter, channel, bindCalls, shared } = harness({ identityLinker });
+    const { adapter, channel, bindCalls, events, shared } = harness({
+      identityLinker,
+    });
     await channel.ɵruntime.start();
 
     await expect(
@@ -674,6 +860,9 @@ describe("managed OpenBot Slack channel", () => {
     expect(bindCalls).toEqual([]);
     expect(shared.inputs).toEqual([]);
     expect(adapter.posted).toEqual([]);
+    expect(events).toEqual([
+      { type: "slack-turn-failed", phase: "identity.validate" },
+    ]);
   });
 
   test("passes multimodal content parts and serializes overlapping thread turns", async () => {
