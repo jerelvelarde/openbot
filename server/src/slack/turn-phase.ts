@@ -18,7 +18,10 @@ export type SlackTurnFailureEvent = {
 export type SlackTurnFailureLogger = (event: SlackTurnFailureEvent) => void;
 
 const SLACK_TURN_FAILURE_REASONS = new Set([
-  "slack_identity_context_invalid",
+  "slack_identity_provider_invalid",
+  "slack_identity_actor_kind_invalid",
+  "slack_identity_tenant_invalid",
+  "slack_identity_actor_invalid",
   "slack_identity_link_lookup_failed",
   "slack_identity_user_lookup_failed",
   "slack_identity_email_lookup_failed",
@@ -27,7 +30,10 @@ const SLACK_TURN_FAILURE_REASONS = new Set([
 ]);
 
 type SlackTurnFailureReason =
-  | "slack_identity_context_invalid"
+  | "slack_identity_provider_invalid"
+  | "slack_identity_actor_kind_invalid"
+  | "slack_identity_tenant_invalid"
+  | "slack_identity_actor_invalid"
   | "slack_identity_link_lookup_failed"
   | "slack_identity_user_lookup_failed"
   | "slack_identity_email_lookup_failed"

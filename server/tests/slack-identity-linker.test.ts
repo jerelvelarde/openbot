@@ -288,12 +288,35 @@ describe("SlackIdentityLinker", () => {
         ),
       ).rejects.toMatchObject({
         message: "Slack identity requires a known tenant and actor id.",
-        code: "slack_identity_context_invalid",
+        code: expect.stringMatching(
+          /^slack_identity_(provider|actor_kind|tenant|actor)_invalid$/,
+        ),
       });
       expect(store.findKeys).toEqual([]);
       expect(store.verifiedEmails).toEqual([]);
       expect(store.linkedWith).toEqual([]);
       expect(store.activeIds).toEqual([]);
+    }
+  });
+
+  test("classifies each invalid canonical identity field separately", async () => {
+    const cases = [
+      [context({ provider: "discord" }), "slack_identity_provider_invalid"],
+      [
+        context({ actor: { id: "U1", kind: "unknown" } }),
+        "slack_identity_actor_kind_invalid",
+      ],
+      [context({ tenant: { id: "unknown" } }), "slack_identity_tenant_invalid"],
+      [
+        context({ actor: { id: "unknown", kind: "human" } }),
+        "slack_identity_actor_invalid",
+      ],
+    ] as const;
+
+    for (const [identityContext, code] of cases) {
+      await expect(
+        linker(storeFor()).resolve(identityContext),
+      ).rejects.toMatchObject({ code });
     }
   });
 

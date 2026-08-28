@@ -31,7 +31,10 @@ const LINK_CONFLICT_ERROR = "That Slack identity is already linked.";
 const IDENTITY_ERROR = "Slack identity requires a known tenant and actor id.";
 
 type SlackIdentityFailureCode =
-  | "slack_identity_context_invalid"
+  | "slack_identity_provider_invalid"
+  | "slack_identity_actor_kind_invalid"
+  | "slack_identity_tenant_invalid"
+  | "slack_identity_actor_invalid"
   | "slack_identity_link_lookup_failed"
   | "slack_identity_user_lookup_failed"
   | "slack_identity_email_lookup_failed"
@@ -94,13 +97,14 @@ function identityFor(
 ): ExternalProviderIdentity {
   const tenantId = canonicalId(context.tenant.id);
   const actorId = canonicalId(context.actor.id);
-  if (
-    context.provider !== "slack" ||
-    context.actor.kind !== "human" ||
-    !tenantId ||
-    !actorId
-  )
-    throw identityFailure("slack_identity_context_invalid", IDENTITY_ERROR);
+  if (context.provider !== "slack")
+    throw identityFailure("slack_identity_provider_invalid", IDENTITY_ERROR);
+  if (context.actor.kind !== "human")
+    throw identityFailure("slack_identity_actor_kind_invalid", IDENTITY_ERROR);
+  if (!tenantId)
+    throw identityFailure("slack_identity_tenant_invalid", IDENTITY_ERROR);
+  if (!actorId)
+    throw identityFailure("slack_identity_actor_invalid", IDENTITY_ERROR);
   return {
     provider: "slack",
     providerTenantId: tenantId,
