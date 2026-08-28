@@ -28,6 +28,7 @@ import {
   providerThreadIdFromIdentity,
   SlackIngressRegistry,
 } from "./ingress-registry";
+import { normalizeSlackTenantContext } from "./tenant-context";
 import {
   defaultSlackTurnFailureLogger,
   runSlackPhase,
@@ -36,6 +37,7 @@ import {
 
 export type OpenBotSlackChannelDependencies = {
   identityLinker: Pick<SlackIdentityLinker, "resolve">;
+  configuredTenantId?: string;
   agentDeps: OpenBotChannelAgentDependencies;
   ingressRegistry?: SlackIngressRegistry;
   computerGateway?: ComputerGateway;
@@ -123,16 +125,24 @@ export function createOpenBotSlackChannel(
     name: "openbot",
     identifyUser: async (context) => {
       if (context.actor.kind !== "human") return null;
-      const identityResult = await runSlackPhase(
+      const { identityContext, identityResult } = await runSlackPhase(
         "identity.resolve",
-        () => deps.identityLinker.resolve(context),
+        async () => {
+          const identityContext = normalizeSlackTenantContext(
+            context,
+            deps.configuredTenantId,
+          );
+          const identityResult =
+            await deps.identityLinker.resolve(identityContext);
+          return { identityContext, identityResult };
+        },
         logTurnFailure,
       );
       await runSlackPhase(
         "ingress.remember",
         () =>
-          ingress.remember(eventId(context), {
-            identityContext: context,
+          ingress.remember(eventId(identityContext), {
+            identityContext,
             identityResult,
           }),
         logTurnFailure,
