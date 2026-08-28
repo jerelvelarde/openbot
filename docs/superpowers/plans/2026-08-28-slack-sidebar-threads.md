@@ -772,7 +772,13 @@ git commit -m "feat: show Slack threads in sidebar"
 ### Task 5: Full verification and acceptance readiness
 
 **Files:**
-- Verify only; no migration or generated route-tree change is expected.
+- Verify only; no generated route-tree change is expected.
+- Inspect: `server/drizzle/0023_youthful_talisman.sql`
+- Inspect: `server/drizzle/meta/0023_snapshot.json`
+- Inspect: `server/drizzle/meta/_journal.json`
+- Inspect: `server/src/db/schema/core.ts`
+- Inspect: `server/tests/schema.test.ts`
+- Inspect: `server/tests/migration-journal.test.ts`
 
 - [ ] **Step 1: Run formatting and static checks**
 
@@ -806,15 +812,24 @@ bun run build
 
 Expected: app, server, and worker builds exit 0.
 
-- [ ] **Step 4: Confirm no schema migration was introduced**
+- [ ] **Step 4: Confirm the schema migration is index-only and consistent**
 
 Run:
 
 ```bash
-git diff origin/main -- server/drizzle server/src/db/schema
+cat server/drizzle/0023_youthful_talisman.sql
+git diff origin/main -- server/drizzle/meta/_journal.json server/drizzle/meta/0023_snapshot.json server/src/db/schema/core.ts
+bun test server/tests/schema.test.ts server/tests/migration-journal.test.ts
 ```
 
-Expected: no output. The feature reads the existing external binding and message tables.
+Expected: migration `0023_youthful_talisman` contains exactly the two external-thread summary indexes:
+
+```sql
+CREATE INDEX "external_thread_bindings_creator_thread_idx" ON "external_thread_bindings" USING btree ("created_by_user_id","channels_thread_id");
+CREATE INDEX "external_thread_messages_thread_sequence_idx" ON "external_thread_messages" USING btree ("channels_thread_id","sequence" DESC NULLS LAST);
+```
+
+The journal has the `0023_youthful_talisman` entry, the snapshot records the same two indexes without data-model changes, `server/src/db/schema/core.ts` declares the same indexes, and the schema plus migration-journal tests pass.
 
 - [ ] **Step 5: Inspect the final branch state**
 
