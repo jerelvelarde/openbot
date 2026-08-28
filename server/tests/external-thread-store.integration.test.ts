@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { createDatabase } from "../src/db/client";
-import { agents, users } from "../src/db/schema";
+import { agents, externalThreadMessages, users } from "../src/db/schema";
 import {
   createExternalThreadStore,
   type ExternalThreadBindingInput,
@@ -19,6 +19,7 @@ const store = createExternalThreadStore(database);
 const suite = randomUUID().slice(0, 8);
 const creatorId = `external_thread_creator_${suite}`;
 const otherCreatorId = `external_thread_other_creator_${suite}`;
+const paginationCreatorId = `external_thread_page_creator_${suite}`;
 const foreignKeyCreatorId = `external_thread_fk_creator_${suite}`;
 const riskAgentId = `external_thread_risk_${suite}`;
 const knowledgeAgentId = `external_thread_knowledge_${suite}`;
@@ -121,6 +122,10 @@ beforeAll(async () => {
     { id: creatorId, email: `${creatorId}@example.test` },
     { id: otherCreatorId, email: `${otherCreatorId}@example.test` },
     {
+      id: paginationCreatorId,
+      email: `${paginationCreatorId}@example.test`,
+    },
+    {
       id: foreignKeyCreatorId,
       email: `${foreignKeyCreatorId}@example.test`,
     },
@@ -155,7 +160,7 @@ afterAll(async () => {
       sql`ALTER TABLE "external_thread_bindings" DISABLE TRIGGER USER`,
     );
     await transaction.execute(
-      sql`DELETE FROM "external_thread_bindings" WHERE "created_by_user_id" IN (${creatorId}, ${otherCreatorId}, ${foreignKeyCreatorId})`,
+      sql`DELETE FROM "external_thread_bindings" WHERE "created_by_user_id" IN (${creatorId}, ${otherCreatorId}, ${paginationCreatorId}, ${foreignKeyCreatorId})`,
     );
     await transaction.execute(
       sql`ALTER TABLE "external_thread_bindings" ENABLE TRIGGER USER`,
@@ -166,6 +171,7 @@ afterAll(async () => {
   await database.delete(agents).where(eq(agents.id, foreignKeyAgentId));
   await database.delete(users).where(eq(users.id, creatorId));
   await database.delete(users).where(eq(users.id, otherCreatorId));
+  await database.delete(users).where(eq(users.id, paginationCreatorId));
   await database.delete(users).where(eq(users.id, foreignKeyCreatorId));
   await database.$client.end();
 });
@@ -200,6 +206,129 @@ describe("external thread bindings", () => {
       turn.user,
       turn.assistant,
     ]);
+  });
+
+  test("lists only the creator's Slack threads with latest activity first", async () => {
+    const older = binding("list_older");
+    const newer = binding("list_newer");
+    const foreign = binding("list_foreign", {
+      createdByUserId: otherCreatorId,
+    });
+    await store.bind(older);
+    await store.bind(newer);
+    await store.bind(foreign);
+    await database.insert(externalThreadMessages).values([
+      {
+        channelsThreadId: older.channelsThreadId,
+        messageId: "older-user",
+        role: "user",
+        content: "old line",
+        createdAt: new Date("2099-08-28T10:00:00.000Z"),
+      },
+      {
+        channelsThreadId: newer.channelsThreadId,
+        messageId: "newer-user",
+        role: "user",
+        content: "newest\nline",
+        createdAt: new Date("2099-08-28T11:00:00.000Z"),
+      },
+      {
+        channelsThreadId: foreign.channelsThreadId,
+        messageId: "foreign-user",
+        role: "user",
+        content: "must stay private",
+        createdAt: new Date("2099-08-28T12:00:00.000Z"),
+      },
+    ]);
+
+    const page = await store.listForCreator(creatorId, { limit: 20 });
+
+    const listed = page.threads.filter((thread) =>
+      [older.channelsThreadId, newer.channelsThreadId].includes(
+        thread.threadId,
+      ),
+    );
+    expect(listed.map((thread) => thread.threadId)).toEqual([
+      newer.channelsThreadId,
+      older.channelsThreadId,
+    ]);
+    expect(listed[0]?.lastMessage).toBe("newest line");
+    expect(
+      page.threads.some(
+        (thread) => thread.threadId === foreign.channelsThreadId,
+      ),
+    ).toBe(false);
+  });
+
+  test("paginates Slack thread summaries with an opaque malformed-safe cursor", async () => {
+    const first = binding("page_first", {
+      createdByUserId: paginationCreatorId,
+    });
+    const second = binding("page_second", {
+      createdByUserId: paginationCreatorId,
+    });
+    const third = binding("page_third", {
+      createdByUserId: paginationCreatorId,
+    });
+    await store.bind(first);
+    await store.bind(second);
+    await store.bind(third);
+    await database.insert(externalThreadMessages).values([
+      {
+        channelsThreadId: first.channelsThreadId,
+        messageId: "page-first-user",
+        role: "user",
+        content: "first page first",
+        createdAt: new Date("2099-08-29T13:00:00.000Z"),
+      },
+      {
+        channelsThreadId: second.channelsThreadId,
+        messageId: "page-second-user",
+        role: "user",
+        content: "first page second",
+        createdAt: new Date("2099-08-29T12:00:00.000Z"),
+      },
+      {
+        channelsThreadId: third.channelsThreadId,
+        messageId: "page-third-user",
+        role: "user",
+        content: "second page",
+        createdAt: new Date("2099-08-29T11:00:00.000Z"),
+      },
+    ]);
+
+    const pageOne = await store.listForCreator(paginationCreatorId, {
+      limit: 2,
+    });
+    const pageTwo = await store.listForCreator(paginationCreatorId, {
+      limit: 2,
+      cursor: pageOne.nextCursor ?? undefined,
+    });
+    const malformedCursorPage = await store.listForCreator(
+      paginationCreatorId,
+      {
+        limit: 2,
+        cursor: "malformed",
+      },
+    );
+
+    expect(pageOne.threads.map((thread) => thread.threadId)).toEqual([
+      first.channelsThreadId,
+      second.channelsThreadId,
+    ]);
+    expect(pageOne.nextCursor).not.toBeNull();
+    expect(pageTwo.threads.map((thread) => thread.threadId)).toEqual([
+      third.channelsThreadId,
+    ]);
+    expect(
+      new Set([
+        ...pageOne.threads.map((thread) => thread.threadId),
+        ...pageTwo.threads.map((thread) => thread.threadId),
+      ]).size,
+    ).toBe(pageOne.threads.length + pageTwo.threads.length);
+    expect(
+      malformedCursorPage.threads.map((thread) => thread.threadId),
+    ).toEqual(pageOne.threads.map((thread) => thread.threadId));
   });
 
   test("reloads a binding by its provider thread identity", async () => {

@@ -1,4 +1,4 @@
-import { and, asc, eq, or } from "drizzle-orm";
+import { and, asc, desc, eq, or, sql } from "drizzle-orm";
 import type { Database } from "../db/client";
 import {
   agents,
@@ -32,6 +32,26 @@ export type ExternalThreadBinding = Omit<
   createdAt: Date;
 };
 
+export type ExternalThreadSummary = {
+  threadId: string;
+  provider: "slack";
+  agentId: string;
+  agentName: string;
+  lastMessage: string | null;
+  lastMessageAt: Date | null;
+  createdAt: Date;
+};
+
+export type ExternalThreadPage = {
+  threads: ExternalThreadSummary[];
+  nextCursor: string | null;
+};
+
+export type ExternalThreadListQuery = {
+  cursor?: string;
+  limit?: number;
+};
+
 /** An established Slack thread cannot be switched to another coworker. */
 export class ExternalThreadConflictError extends Error {
   readonly agentName: string;
@@ -44,6 +64,10 @@ export class ExternalThreadConflictError extends Error {
 }
 
 export type ExternalThreadStore = {
+  listForCreator: (
+    creatorId: string,
+    query?: ExternalThreadListQuery,
+  ) => Promise<ExternalThreadPage>;
   getByChannelsThreadId: (id: string) => Promise<ExternalThreadBinding | null>;
   getByProviderThread: (
     identity: Pick<
@@ -77,6 +101,28 @@ const bindingColumns = {
   createdByUserId: externalThreadBindings.createdByUserId,
   createdAt: externalThreadBindings.createdAt,
 };
+
+const DEFAULT_EXTERNAL_THREAD_PAGE = 50;
+const MAX_EXTERNAL_THREAD_PAGE = 200;
+const MAX_PREVIEW_CODE_POINTS = 200;
+
+type ExternalThreadCursor = { recency: string; threadId: string };
+
+const latestMessageAt = sql<Date | null>`(
+  select ${externalThreadMessages.createdAt}
+  from ${externalThreadMessages}
+  where ${externalThreadMessages.channelsThreadId} = ${externalThreadBindings.channelsThreadId}
+  order by ${externalThreadMessages.sequence} desc
+  limit 1
+)`;
+const latestMessageContent = sql<string | null>`(
+  select ${externalThreadMessages.content}
+  from ${externalThreadMessages}
+  where ${externalThreadMessages.channelsThreadId} = ${externalThreadBindings.channelsThreadId}
+  order by ${externalThreadMessages.sequence} desc
+  limit 1
+)`;
+const externalRecency = sql<Date>`coalesce(${latestMessageAt}, ${externalThreadBindings.createdAt})`;
 
 function asBinding(
   row: Omit<ExternalThreadBinding, "provider"> & { provider: string },
@@ -151,9 +197,101 @@ function integrityError(): Error {
   return new Error("External thread bindings have conflicting identities.");
 }
 
+function encodeExternalThreadCursor(cursor: ExternalThreadCursor): string {
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+
+function decodeExternalThreadCursor(
+  value: string | undefined,
+): ExternalThreadCursor | undefined {
+  if (!value) return undefined;
+  try {
+    const parsed = JSON.parse(
+      Buffer.from(value, "base64url").toString("utf8"),
+    ) as ExternalThreadCursor;
+    if (
+      typeof parsed?.recency !== "string" ||
+      Number.isNaN(Date.parse(parsed.recency)) ||
+      typeof parsed?.threadId !== "string"
+    ) {
+      return undefined;
+    }
+    return parsed;
+  } catch {
+    return undefined;
+  }
+}
+
+function previewOf(text: string): string {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping them is the point.
+  const flattened = text.replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").trim();
+  const collapsed = flattened.replace(/\s+/g, " ");
+  const codePoints = Array.from(collapsed);
+  if (codePoints.length <= MAX_PREVIEW_CODE_POINTS) return collapsed;
+  return `${codePoints.slice(0, MAX_PREVIEW_CODE_POINTS - 1).join("")}\u2026`;
+}
+
 export function createExternalThreadStore(
   database: Database,
 ): ExternalThreadStore {
+  async function listForCreator(
+    creatorId: string,
+    query: ExternalThreadListQuery = {},
+  ): Promise<ExternalThreadPage> {
+    const limit = Math.min(
+      Math.max(query.limit ?? DEFAULT_EXTERNAL_THREAD_PAGE, 1),
+      MAX_EXTERNAL_THREAD_PAGE,
+    );
+    const cursor = decodeExternalThreadCursor(query.cursor);
+    const rows = await database
+      .select({
+        threadId: externalThreadBindings.channelsThreadId,
+        agentId: externalThreadBindings.agentId,
+        agentName: agents.name,
+        lastMessage: latestMessageContent,
+        lastMessageAt: latestMessageAt,
+        createdAt: externalThreadBindings.createdAt,
+        recency: externalRecency,
+      })
+      .from(externalThreadBindings)
+      .innerJoin(agents, eq(externalThreadBindings.agentId, agents.id))
+      .where(
+        and(
+          eq(externalThreadBindings.createdByUserId, creatorId),
+          cursor
+            ? sql`(${externalRecency}, ${externalThreadBindings.channelsThreadId}) < (${cursor.recency}::timestamptz, ${cursor.threadId})`
+            : undefined,
+        ),
+      )
+      .orderBy(
+        sql`${externalRecency} desc`,
+        desc(externalThreadBindings.channelsThreadId),
+      )
+      .limit(limit + 1);
+
+    const wanted = rows.slice(0, limit);
+    const last = wanted.at(-1);
+    return {
+      threads: wanted.map((row) => ({
+        threadId: row.threadId,
+        provider: "slack" as const,
+        agentId: row.agentId,
+        agentName: row.agentName,
+        lastMessage:
+          row.lastMessage === null ? null : previewOf(row.lastMessage),
+        lastMessageAt: row.lastMessageAt,
+        createdAt: row.createdAt,
+      })),
+      nextCursor:
+        rows.length > limit && last
+          ? encodeExternalThreadCursor({
+              recency: new Date(last.recency).toISOString(),
+              threadId: last.threadId,
+            })
+          : null,
+    };
+  }
+
   async function lookup(
     reader: BindingReader,
     input: Pick<
@@ -339,6 +477,7 @@ export function createExternalThreadStore(
   }
 
   return {
+    listForCreator,
     getByChannelsThreadId,
     getByProviderThread,
     bind,
