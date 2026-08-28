@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import {
   ActionRegistry,
   type ChannelTool,
@@ -37,6 +37,48 @@ const UNAVAILABLE = {
   ok: false,
   reason: "The assistant's computer could not be reached.",
 };
+const CONTEXT_UNAVAILABLE = {
+  ok: false,
+  reason:
+    "The computer action could not start because its Slack context was unavailable.",
+};
+const ACTION_FAILED = {
+  ok: false,
+  reason: "The computer action failed.",
+};
+
+type LoggedComputerFailure = {
+  type?: unknown;
+  error?: unknown;
+  context?: {
+    integration?: unknown;
+    operation?: unknown;
+    errorCategory?: unknown;
+  };
+  timestamp?: unknown;
+};
+
+function isLoggedComputerFailure(
+  value: unknown,
+): value is LoggedComputerFailure {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "type" in value &&
+    value.type === "slack-computer-tool-failed"
+  );
+}
+
+function capturedComputerFailures(calls: unknown[][]): LoggedComputerFailure[] {
+  return calls.flatMap(([value]) => {
+    try {
+      const parsed: unknown = JSON.parse(String(value));
+      return isLoggedComputerFailure(parsed) ? [parsed] : [];
+    } catch {
+      return [];
+    }
+  });
+}
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -517,7 +559,7 @@ describe("Slack computer ChannelTools", () => {
     );
 
     expect(gateway.requestHelpCalls).toEqual([]);
-    expect(result).toEqual(UNAVAILABLE);
+    expect(result).toEqual(ACTION_FAILED);
   });
 
   for (const toolName of [
@@ -1117,13 +1159,37 @@ describe("Slack computer ChannelTools", () => {
   test("fails safely outside Slack execution without touching the gateway", async () => {
     const gateway = new FakeComputerGateway();
     const tool = toolsByName(gateway).get("computer_click")!;
-    const result = await invoke(
-      tool,
-      { ref: "e4", snapshotId: 9 },
-      channelContext(new FileAdapter()),
-    );
-    expect(result).toEqual(UNAVAILABLE);
-    expect(gateway.clickCalls).toHaveLength(0);
+    const logged = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const result = await invoke(
+        tool,
+        { ref: "e4", snapshotId: 9 },
+        channelContext(new FileAdapter()),
+      );
+      expect(result).toEqual(CONTEXT_UNAVAILABLE);
+      const event = capturedComputerFailures(logged.mock.calls).find(
+        ({ context }) => context?.errorCategory === "execution-context",
+      );
+      expect(event).toMatchObject({
+        type: "slack-computer-tool-failed",
+        error: "SlackComputerContextError",
+        context: {
+          integration: "slack",
+          operation: "computer-tool",
+          errorCategory: "execution-context",
+        },
+      });
+      expect(
+        Number.isNaN(
+          Date.parse(
+            typeof event?.timestamp === "string" ? event.timestamp : "",
+          ),
+        ),
+      ).toBe(false);
+      expect(gateway.clickCalls).toHaveLength(0);
+    } finally {
+      logged.mockRestore();
+    }
   });
 
   test("fails safely when no coworker is pinned without touching the gateway", async () => {
@@ -1138,7 +1204,7 @@ describe("Slack computer ChannelTools", () => {
         ),
       { agentId: undefined },
     );
-    expect(result).toEqual(UNAVAILABLE);
+    expect(result).toEqual(CONTEXT_UNAVAILABLE);
     expect(gateway.clickCalls).toHaveLength(0);
   });
 
@@ -1250,26 +1316,59 @@ describe("Slack computer ChannelTools", () => {
       ),
     );
 
-    expect(result).toEqual(UNAVAILABLE);
+    expect(result).toEqual(ACTION_FAILED);
   });
 
   test("hides unavailable and unknown error details and never retries", async () => {
     const gateway = new FakeComputerGateway();
     const tool = toolsByName(gateway).get("computer_click")!;
-    for (const error of [
-      new ComputerUnavailableError("host token=secret did not answer"),
-      new Error("socket token=secret internal stack detail"),
-    ]) {
-      gateway.nextError = error;
-      const result = await inSlack(() =>
-        invoke(
-          tool,
-          { ref: "e4", snapshotId: 9 },
-          channelContext(new FileAdapter()),
-        ),
+    const logged = spyOn(console, "error").mockImplementation(() => {});
+    const unknown = new Error("socket token=secret internal stack detail");
+    unknown.name = "token=secret";
+    try {
+      for (const error of [
+        new ComputerUnavailableError("host token=secret did not answer"),
+        unknown,
+      ]) {
+        gateway.nextError = error;
+        const result = await inSlack(() =>
+          invoke(
+            tool,
+            { ref: "e4", snapshotId: 9 },
+            channelContext(new FileAdapter()),
+          ),
+        );
+        expect(result).toEqual(
+          error instanceof ComputerUnavailableError
+            ? UNAVAILABLE
+            : ACTION_FAILED,
+        );
+        expect(JSON.stringify(result)).not.toContain("secret");
+      }
+      const failures = capturedComputerFailures(logged.mock.calls);
+      expect(JSON.stringify(failures)).not.toContain("secret");
+      const event = failures.find(
+        ({ context, error }) =>
+          context?.errorCategory === "unknown" && error === "UnknownError",
       );
-      expect(result).toEqual(UNAVAILABLE);
-      expect(JSON.stringify(result)).not.toContain("secret");
+      expect(event).toMatchObject({
+        type: "slack-computer-tool-failed",
+        error: "UnknownError",
+        context: {
+          integration: "slack",
+          operation: "computer-tool",
+          errorCategory: "unknown",
+        },
+      });
+      expect(
+        Number.isNaN(
+          Date.parse(
+            typeof event?.timestamp === "string" ? event.timestamp : "",
+          ),
+        ),
+      ).toBe(false);
+    } finally {
+      logged.mockRestore();
     }
     expect(gateway.clickCalls).toHaveLength(2);
   });
@@ -1395,7 +1494,7 @@ describe("Slack computer ChannelTools", () => {
         ),
       );
 
-      expect(result).toEqual(UNAVAILABLE);
+      expect(result).toEqual(ACTION_FAILED);
       expect(JSON.stringify(result)).not.toContain("private-state");
     }
   });

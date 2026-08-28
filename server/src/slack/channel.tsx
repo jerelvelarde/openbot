@@ -147,6 +147,11 @@ export function createOpenBotSlackChannel(
   const logTurnFailure = deps.logTurnFailure ?? defaultSlackTurnFailureLogger;
   const prepareExecution = deps.prepareExecution ?? executionFor;
   const pendingExecutions = new Map<string, SlackExecution[]>();
+  function pendingExecutionFor(
+    conversationKey: string,
+  ): SlackExecution | undefined {
+    return pendingExecutions.get(conversationKey)?.[0];
+  }
   async function runWithPendingExecution<T>(
     conversationKey: string,
     execution: SlackExecution,
@@ -170,7 +175,11 @@ export function createOpenBotSlackChannel(
   configureApprovalInteractionBridge(ingress);
   configureApprovalExecutionBridge({ run: runWithPendingExecution });
   const tools: SlackComputerTool[] = deps.computerGateway
-    ? createSlackComputerTools(deps.computerGateway, deps.assistance)
+    ? createSlackComputerTools(
+        deps.computerGateway,
+        deps.assistance,
+        pendingExecutionFor,
+      )
     : [];
   const channel = createChannel({
     name: "openbot",
@@ -200,17 +209,12 @@ export function createOpenBotSlackChannel(
       );
       return identityResult.kind === "linked" ? identityResult.user : null;
     },
-    agent: (threadId) => {
-      const queue = pendingExecutions.get(threadId);
-      const execution = queue?.shift();
-      if (queue?.length === 0) pendingExecutions.delete(threadId);
-      if (!execution) {
-        throw new Error(
-          "A Slack agent run requires a private execution context.",
-        );
-      }
-      return new OpenBotChannelAgent(threadId, deps.agentDeps, execution);
-    },
+    // Channels caches an agent by conversation, so execution lookup must happen on every run. The
+    // queue bridges detached managed-delivery operations where AsyncLocalStorage is unavailable.
+    agent: (threadId) =>
+      new OpenBotChannelAgent(threadId, deps.agentDeps, undefined, () =>
+        pendingExecutionFor(threadId),
+      ),
     tools,
     components: [ApprovalCard],
     showToolStatus: true,
