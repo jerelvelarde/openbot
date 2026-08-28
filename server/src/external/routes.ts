@@ -53,6 +53,32 @@ function externalThreadLimit(value: string | undefined): number | undefined {
   return limit;
 }
 
+type ExternalThreadSummary = Awaited<
+  ReturnType<ExternalThreadStore["listForCreator"]>
+>["threads"][number];
+
+async function authorizedExternalThreadSummary(
+  actor: AppVariables["actor"],
+  agentProfileStore: Pick<AgentProfileStore, "get">,
+  thread: ExternalThreadSummary,
+) {
+  const profile = await agentProfileStore.get(
+    { id: actor.id, role: actor.role },
+    thread.agentId,
+  );
+  if (!profile) return null;
+  return {
+    threadId: thread.threadId,
+    provider: thread.provider,
+    agentId: profile.id,
+    agentName: profile.name,
+    lastMessage: thread.lastMessage,
+    lastMessageAt: thread.lastMessageAt?.toISOString() ?? null,
+    createdAt: thread.createdAt.toISOString(),
+    readOnly: true,
+  };
+}
+
 export function createExternalLinkRoutes({
   store,
   encryptionKey,
@@ -135,33 +161,45 @@ export function createExternalLinkRoutes({
     }
 
     const actor = context.var.actor;
-    const page = await threadStore.listForCreator(actor.id, {
-      cursor: context.req.query("cursor"),
-      limit,
-    });
-    const threads = (
-      await Promise.all(
-        page.threads.map(async (thread) => {
-          const profile = await agentProfileStore.get(
-            { id: actor.id, role: actor.role },
-            thread.agentId,
-          );
-          if (!profile) return null;
-          return {
-            threadId: thread.threadId,
-            provider: thread.provider,
-            agentId: profile.id,
-            agentName: profile.name,
-            lastMessage: thread.lastMessage,
-            lastMessageAt: thread.lastMessageAt?.toISOString() ?? null,
-            createdAt: thread.createdAt.toISOString(),
-            readOnly: true,
-          };
-        }),
-      )
-    ).filter((thread) => thread !== null);
+    const requestedLimit = limit ?? 50;
+    const threads: NonNullable<
+      Awaited<ReturnType<typeof authorizedExternalThreadSummary>>
+    >[] = [];
+    let cursor = context.req.query("cursor");
+    let nextCursor: string | null = null;
+    const seenCursors = new Set<string>();
+    if (cursor !== undefined) {
+      seenCursors.add(cursor);
+    }
 
-    return context.json({ threads, nextCursor: page.nextCursor });
+    while (threads.length < requestedLimit) {
+      const page = await threadStore.listForCreator(actor.id, {
+        cursor,
+        limit: requestedLimit - threads.length,
+      });
+
+      const authorizedThreads = await Promise.all(
+        page.threads.map((thread) =>
+          authorizedExternalThreadSummary(actor, agentProfileStore, thread),
+        ),
+      );
+      for (const thread of authorizedThreads) {
+        if (!thread) continue;
+        threads.push(thread);
+      }
+
+      nextCursor = page.nextCursor;
+      if (!nextCursor) break;
+      if (seenCursors.has(nextCursor)) {
+        nextCursor = null;
+        break;
+      }
+      if (threads.length >= requestedLimit) break;
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    }
+
+    return context.json({ threads, nextCursor });
   });
 
   routes.get("/threads/:threadId", requireUser, async (context) => {

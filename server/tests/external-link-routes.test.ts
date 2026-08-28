@@ -91,6 +91,28 @@ function fakeThreadStore(
   };
 }
 
+function fakePagedThreadStore(
+  pages: ExternalThreadPage[],
+): ExternalThreadStore & {
+  listCalls: Parameters<ExternalThreadStore["listForCreator"]>[];
+} {
+  const threadStore = fakeThreadStore();
+  let pageIndex = 0;
+  return {
+    ...threadStore,
+    listCalls: threadStore.listCalls,
+    listForCreator: async (...args) => {
+      threadStore.listCalls.push(args);
+      return (
+        pages[Math.min(pageIndex++, pages.length - 1)] ?? {
+          threads: [],
+          nextCursor: null,
+        }
+      );
+    },
+  };
+}
+
 function authenticatedAs(
   authenticatedActor = actor,
 ): MiddlewareHandler<{ Variables: AppVariables }> {
@@ -232,7 +254,7 @@ describe("external Slack link confirmation routes", () => {
     );
 
     const response = await app.request(
-      "http://openbot.test/api/external-links/threads?limit=25&cursor=opaque-cursor",
+      "http://openbot.test/api/external-links/threads?limit=1&cursor=opaque-cursor",
     );
 
     expect(response.status).toBe(200);
@@ -336,6 +358,166 @@ describe("external Slack link confirmation routes", () => {
       ],
       nextCursor: null,
     });
+  });
+
+  test("GET /threads continues through store cursors until requested authorized rows are filled", async () => {
+    const authorizedSecond = {
+      ...externalThreadSummary,
+      threadId: "channels-thread-2",
+      lastMessage: "Check the second queue",
+    };
+    const threadStore = fakePagedThreadStore([
+      {
+        threads: [
+          {
+            ...externalThreadSummary,
+            threadId: "channels-thread-revoked",
+            agentId: "revoked",
+            agentName: "Former Agent",
+          },
+          externalThreadSummary,
+        ],
+        nextCursor: "after-first-page",
+      },
+      {
+        threads: [authorizedSecond],
+        nextCursor: "after-second-page",
+      },
+    ]);
+    const { app } = appFor(
+      fakeStore(),
+      authenticatedAs(),
+      [],
+      undefined,
+      threadStore,
+    );
+
+    const response = await app.request(
+      "http://openbot.test/api/external-links/threads?limit=2",
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      threads: [
+        {
+          threadId: "channels-thread-1",
+          provider: "slack",
+          agentId: "risk",
+          agentName: "Risk Analyst",
+          lastMessage: "Review the queue",
+          lastMessageAt: new Date(NOW + 1_000).toISOString(),
+          createdAt: new Date(NOW).toISOString(),
+          readOnly: true,
+        },
+        {
+          threadId: "channels-thread-2",
+          provider: "slack",
+          agentId: "risk",
+          agentName: "Risk Analyst",
+          lastMessage: "Check the second queue",
+          lastMessageAt: new Date(NOW + 1_000).toISOString(),
+          createdAt: new Date(NOW).toISOString(),
+          readOnly: true,
+        },
+      ],
+      nextCursor: "after-second-page",
+    });
+    expect(threadStore.listCalls).toEqual([
+      [actor.id, { cursor: undefined, limit: 2 }],
+      [actor.id, { cursor: "after-first-page", limit: 1 }],
+    ]);
+  });
+
+  test("GET /threads skips all-revoked pages before returning an authorized row", async () => {
+    const threadStore = fakePagedThreadStore([
+      {
+        threads: [
+          {
+            ...externalThreadSummary,
+            threadId: "channels-thread-revoked",
+            agentId: "revoked",
+            agentName: "Former Agent",
+          },
+        ],
+        nextCursor: "after-revoked-page",
+      },
+      {
+        threads: [externalThreadSummary],
+        nextCursor: "after-authorized-page",
+      },
+    ]);
+    const { app } = appFor(
+      fakeStore(),
+      authenticatedAs(),
+      [],
+      undefined,
+      threadStore,
+    );
+
+    const response = await app.request(
+      "http://openbot.test/api/external-links/threads?limit=1",
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      threads: [
+        {
+          threadId: "channels-thread-1",
+          provider: "slack",
+          agentId: "risk",
+          agentName: "Risk Analyst",
+          lastMessage: "Review the queue",
+          lastMessageAt: new Date(NOW + 1_000).toISOString(),
+          createdAt: new Date(NOW).toISOString(),
+          readOnly: true,
+        },
+      ],
+      nextCursor: "after-authorized-page",
+    });
+    expect(threadStore.listCalls).toEqual([
+      [actor.id, { cursor: undefined, limit: 1 }],
+      [actor.id, { cursor: "after-revoked-page", limit: 1 }],
+    ]);
+  });
+
+  test("GET /threads stops on repeated store cursors without returning a repeat cursor", async () => {
+    const threadStore = fakePagedThreadStore([
+      {
+        threads: [externalThreadSummary],
+        nextCursor: "same-cursor",
+      },
+    ]);
+    const { app } = appFor(
+      fakeStore(),
+      authenticatedAs(),
+      [],
+      undefined,
+      threadStore,
+    );
+
+    const response = await app.request(
+      "http://openbot.test/api/external-links/threads?limit=2&cursor=same-cursor",
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      threads: [
+        {
+          threadId: "channels-thread-1",
+          provider: "slack",
+          agentId: "risk",
+          agentName: "Risk Analyst",
+          lastMessage: "Review the queue",
+          lastMessageAt: new Date(NOW + 1_000).toISOString(),
+          createdAt: new Date(NOW).toISOString(),
+          readOnly: true,
+        },
+      ],
+      nextCursor: null,
+    });
+    expect(threadStore.listCalls).toEqual([
+      [actor.id, { cursor: "same-cursor", limit: 2 }],
+    ]);
   });
 
   test("GET /threads rejects invalid limit values", async () => {
