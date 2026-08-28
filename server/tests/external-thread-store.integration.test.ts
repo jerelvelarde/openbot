@@ -20,6 +20,7 @@ const suite = randomUUID().slice(0, 8);
 const creatorId = `external_thread_creator_${suite}`;
 const otherCreatorId = `external_thread_other_creator_${suite}`;
 const paginationCreatorId = `external_thread_page_creator_${suite}`;
+const previewCreatorId = `external_thread_preview_creator_${suite}`;
 const foreignKeyCreatorId = `external_thread_fk_creator_${suite}`;
 const riskAgentId = `external_thread_risk_${suite}`;
 const knowledgeAgentId = `external_thread_knowledge_${suite}`;
@@ -126,6 +127,10 @@ beforeAll(async () => {
       email: `${paginationCreatorId}@example.test`,
     },
     {
+      id: previewCreatorId,
+      email: `${previewCreatorId}@example.test`,
+    },
+    {
       id: foreignKeyCreatorId,
       email: `${foreignKeyCreatorId}@example.test`,
     },
@@ -160,7 +165,7 @@ afterAll(async () => {
       sql`ALTER TABLE "external_thread_bindings" DISABLE TRIGGER USER`,
     );
     await transaction.execute(
-      sql`DELETE FROM "external_thread_bindings" WHERE "created_by_user_id" IN (${creatorId}, ${otherCreatorId}, ${paginationCreatorId}, ${foreignKeyCreatorId})`,
+      sql`DELETE FROM "external_thread_bindings" WHERE "created_by_user_id" IN (${creatorId}, ${otherCreatorId}, ${paginationCreatorId}, ${previewCreatorId}, ${foreignKeyCreatorId})`,
     );
     await transaction.execute(
       sql`ALTER TABLE "external_thread_bindings" ENABLE TRIGGER USER`,
@@ -172,6 +177,7 @@ afterAll(async () => {
   await database.delete(users).where(eq(users.id, creatorId));
   await database.delete(users).where(eq(users.id, otherCreatorId));
   await database.delete(users).where(eq(users.id, paginationCreatorId));
+  await database.delete(users).where(eq(users.id, previewCreatorId));
   await database.delete(users).where(eq(users.id, foreignKeyCreatorId));
   await database.$client.end();
 });
@@ -227,8 +233,15 @@ describe("external thread bindings", () => {
       },
       {
         channelsThreadId: newer.channelsThreadId,
-        messageId: "newer-user",
+        messageId: "newer-lower-sequence-later-time",
         role: "user",
+        content: "wrong by timestamp",
+        createdAt: new Date("2099-08-28T12:00:00.000Z"),
+      },
+      {
+        channelsThreadId: newer.channelsThreadId,
+        messageId: "newer-higher-sequence-earlier-time",
+        role: "assistant",
         content: "newest\nline",
         createdAt: new Date("2099-08-28T11:00:00.000Z"),
       },
@@ -253,6 +266,9 @@ describe("external thread bindings", () => {
       older.channelsThreadId,
     ]);
     expect(listed[0]?.lastMessage).toBe("newest line");
+    expect(listed[0]?.lastMessageAt).toEqual(
+      new Date("2099-08-28T11:00:00.000Z"),
+    );
     expect(
       page.threads.some(
         (thread) => thread.threadId === foreign.channelsThreadId,
@@ -329,6 +345,29 @@ describe("external thread bindings", () => {
     expect(
       malformedCursorPage.threads.map((thread) => thread.threadId),
     ).toEqual(pageOne.threads.map((thread) => thread.threadId));
+  });
+
+  test("sanitizes Slack thread previews to a 200-code-point one-line cap", async () => {
+    const input = binding("preview_cap", {
+      createdByUserId: previewCreatorId,
+    });
+    await store.bind(input);
+    await database.insert(externalThreadMessages).values({
+      channelsThreadId: input.channelsThreadId,
+      messageId: "preview-cap-user",
+      role: "user",
+      content: `Start\u0001\t\n${"💬".repeat(205)} tail`,
+      createdAt: new Date("2099-08-30T10:00:00.000Z"),
+    });
+
+    const page = await store.listForCreator(previewCreatorId, { limit: 1 });
+
+    const preview = page.threads[0]?.lastMessage;
+    expect(preview).toBe(`Start ${"💬".repeat(193)}…`);
+    expect(preview).not.toContain("\u0001");
+    expect(preview).not.toContain("\n");
+    expect(preview).not.toContain("\t");
+    expect(Array.from(preview ?? "")).toHaveLength(200);
   });
 
   test("reloads a binding by its provider thread identity", async () => {
