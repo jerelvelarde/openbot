@@ -1,4 +1,4 @@
-import { queryOptions } from "@tanstack/react-query";
+import { infiniteQueryOptions, queryOptions } from "@tanstack/react-query";
 import { client } from "@/lib/client";
 import type { Message } from "@ag-ui/core";
 
@@ -10,24 +10,115 @@ export type ExternalThreadTarget = {
   readOnly: true;
 };
 
+export type ExternalThreadSummary = ExternalThreadTarget & {
+  lastMessage: string | null;
+  lastMessageAt: string | null;
+  createdAt: string;
+};
+
+export type ExternalThreadPage = {
+  threads: ExternalThreadSummary[];
+  nextCursor: string | null;
+};
+
+export const externalThreadKeys = {
+  all: ["external-threads"] as const,
+  list: () => ["external-threads", "list"] as const,
+  detail: (threadId: string) =>
+    ["external-threads", "detail", threadId] as const,
+};
+
+const EXTERNAL_THREAD_ERROR = "Could not load this Slack conversation.";
+const EXTERNAL_THREAD_LIST_ERROR = "Could not load Slack conversations.";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function isTimestamp(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.includes("T") &&
+    Number.isFinite(new Date(value).getTime())
+  );
+}
+
 export function externalThreadTarget(value: unknown): ExternalThreadTarget {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("Could not load this Slack conversation.");
+  if (!isRecord(value)) {
+    throw new Error(EXTERNAL_THREAD_ERROR);
   }
   const target = value as Partial<ExternalThreadTarget>;
   if (
-    typeof target.threadId !== "string" ||
-    target.threadId.length === 0 ||
-    typeof target.agentId !== "string" ||
-    target.agentId.length === 0 ||
-    typeof target.agentName !== "string" ||
-    target.agentName.length === 0 ||
+    !isNonEmptyString(target.threadId) ||
+    !isNonEmptyString(target.agentId) ||
+    !isNonEmptyString(target.agentName) ||
     target.provider !== "slack" ||
     target.readOnly !== true
   ) {
-    throw new Error("Could not load this Slack conversation.");
+    throw new Error(EXTERNAL_THREAD_ERROR);
   }
   return target as ExternalThreadTarget;
+}
+
+function externalThreadSummary(value: unknown): ExternalThreadSummary {
+  let target: ExternalThreadTarget;
+  try {
+    target = externalThreadTarget(value);
+  } catch {
+    throw new Error(EXTERNAL_THREAD_LIST_ERROR);
+  }
+  const summary = value as Partial<ExternalThreadSummary>;
+  if (
+    (summary.lastMessage !== null && typeof summary.lastMessage !== "string") ||
+    (summary.lastMessageAt !== null && !isTimestamp(summary.lastMessageAt)) ||
+    !isTimestamp(summary.createdAt)
+  ) {
+    throw new Error(EXTERNAL_THREAD_LIST_ERROR);
+  }
+  return {
+    ...target,
+    lastMessage: summary.lastMessage,
+    lastMessageAt: summary.lastMessageAt,
+    createdAt: summary.createdAt,
+  };
+}
+
+export function externalThreadPage(value: unknown): ExternalThreadPage {
+  if (!isRecord(value) || !Array.isArray(value.threads)) {
+    throw new Error(EXTERNAL_THREAD_LIST_ERROR);
+  }
+  const nextCursor = value.nextCursor;
+  if (nextCursor !== null && typeof nextCursor !== "string") {
+    throw new Error(EXTERNAL_THREAD_LIST_ERROR);
+  }
+  return {
+    threads: value.threads.map(externalThreadSummary),
+    nextCursor,
+  };
+}
+
+export function externalThreadListQueryOptions() {
+  return infiniteQueryOptions({
+    queryKey: externalThreadKeys.list(),
+    initialPageParam: "",
+    queryFn: async ({ pageParam }): Promise<ExternalThreadPage> => {
+      const suffix = pageParam
+        ? `?cursor=${encodeURIComponent(pageParam as string)}`
+        : "";
+      const response = await client(`/api/external-links/threads${suffix}`, {
+        fallback: EXTERNAL_THREAD_LIST_ERROR,
+      });
+      return externalThreadPage(await response.json());
+    },
+    getNextPageParam: (page: ExternalThreadPage) =>
+      page.nextCursor ?? undefined,
+    select: (data): ExternalThreadSummary[] =>
+      data.pages.flatMap((page) => page.threads),
+  });
 }
 
 export async function readExternalThreadMessages(
@@ -43,11 +134,11 @@ export async function readExternalThreadMessages(
 
 export function externalThreadQueryOptions(threadId: string) {
   return queryOptions({
-    queryKey: ["external-threads", threadId],
+    queryKey: externalThreadKeys.detail(threadId),
     queryFn: async () => {
       const response = await client(
         `/api/external-links/threads/${encodeURIComponent(threadId)}`,
-        { fallback: "Could not load this Slack conversation" },
+        { fallback: EXTERNAL_THREAD_ERROR },
       );
       return externalThreadTarget(await response.json());
     },
