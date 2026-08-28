@@ -42,6 +42,7 @@ import {
 
 export type OpenBotSlackChannelDependencies = {
   identityLinker: Pick<SlackIdentityLinker, "resolve">;
+  appUrl?: string;
   configuredTenantId?: string;
   agentDeps: OpenBotChannelAgentDependencies;
   ingressRegistry?: SlackIngressRegistry;
@@ -64,6 +65,29 @@ function linkCard(linkUrl: string) {
       </Actions>
     </Message>
   );
+}
+
+function transcriptCard(transcriptUrl: string) {
+  return (
+    <Message
+      fallbackText={`Open this conversation in OpenBot: ${transcriptUrl}`}
+    >
+      <Section>
+        View this canonical Slack conversation on the OpenBot domain. Continue
+        chatting here in Slack.
+      </Section>
+      <Actions>
+        <Button url={transcriptUrl}>Open in OpenBot</Button>
+      </Actions>
+    </Message>
+  );
+}
+
+function transcriptUrl(appUrl: string, channelsThreadId: string): string {
+  return new URL(
+    `/slack/thread/${encodeURIComponent(channelsThreadId)}`,
+    appUrl,
+  ).toString();
 }
 
 function eventId(context: ChannelIdentityContext): string | undefined {
@@ -276,6 +300,34 @@ export function createOpenBotSlackChannel(
         ),
       logTurnFailure,
     );
+    const appUrl = deps.appUrl;
+    if (subscribe && appUrl) {
+      try {
+        await runSlackPhase(
+          "transcript_link.post",
+          async () => {
+            const binding = await deps.agentDeps.store.getByProviderThread({
+              provider: execution.provider,
+              providerTenantId: execution.providerTenantId,
+              providerConversationId: execution.providerConversationId,
+              providerThreadId: execution.providerThreadId,
+            });
+            if (!binding) {
+              throw new Error(
+                "The canonical Slack conversation binding is unavailable.",
+              );
+            }
+            await thread.post(
+              transcriptCard(transcriptUrl(appUrl, binding.channelsThreadId)),
+            );
+          },
+          logTurnFailure,
+        );
+      } catch {
+        // The agent reply already succeeded. The dedicated phase log keeps this optional demo link
+        // observable without turning a completed Slack answer into a provider-visible failure.
+      }
+    }
   }
 
   channel.onMention(({ message, thread }) =>

@@ -7,6 +7,7 @@ export const SLACK_TURN_PHASES = [
   "thread.subscribe",
   "execution.prepare",
   "agent.run",
+  "transcript_link.post",
 ] as const;
 
 export type SlackTurnPhase = (typeof SLACK_TURN_PHASES)[number];

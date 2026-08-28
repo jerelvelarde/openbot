@@ -32,6 +32,7 @@ import {
 } from "../src/slack/execution-context";
 
 const CANONICAL_THREAD_ID = "channels-thread-1";
+const CONVERSATION_KEY = "slack:T1:C1:message-1";
 const ACTOR = { id: "alice", role: "user" } as const;
 
 function execution(overrides: Partial<SlackExecution> = {}): SlackExecution {
@@ -49,7 +50,7 @@ function execution(overrides: Partial<SlackExecution> = {}): SlackExecution {
 
 function input(): RunAgentInput {
   return {
-    threadId: "runtime-thread",
+    threadId: CANONICAL_THREAD_ID,
     runId: "run-1",
     state: { existing: true },
     messages: [{ id: "message-1", role: "user", content: "original input" }],
@@ -165,7 +166,7 @@ function harness(
   const deps: OpenBotChannelAgentDependencies = { routing, store, resolver };
 
   return {
-    agent: new OpenBotChannelAgent(CANONICAL_THREAD_ID, deps),
+    agent: new OpenBotChannelAgent(CONVERSATION_KEY, deps),
     target,
     getCalls,
     bindCalls,
@@ -184,11 +185,7 @@ async function collect(agent: OpenBotChannelAgent, runInput = input()) {
 describe("OpenBotChannelAgent", () => {
   test("uses private execution bound before Channels invokes the agent", async () => {
     const { deps } = harness();
-    const agent = new OpenBotChannelAgent(
-      CANONICAL_THREAD_ID,
-      deps,
-      execution(),
-    );
+    const agent = new OpenBotChannelAgent(CONVERSATION_KEY, deps, execution());
 
     const events = await lastValueFrom(agent.run(input()).pipe(toArray()));
 
