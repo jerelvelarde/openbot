@@ -167,7 +167,8 @@ and the final assistant message it observed. The server:
 1. authorizes the caller's active channel membership;
 2. resolves the external binding through the channel's unique Intelligence thread mapping;
 3. verifies that the binding owner is the caller and the bound agent belongs to the channel;
-4. reads those message IDs from the canonical Intelligence thread using the bound agent and caller;
+4. reads those message IDs from the canonical Intelligence thread scoped to the caller, while the
+   channel-agent relationship independently proves which coworker is pinned;
 5. derives roles and text from the canonical records, rejecting missing, swapped, empty, or
    non-text messages; and
 6. creates the two ordered delivery records in one transaction.
