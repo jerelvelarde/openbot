@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { createDatabase } from "../src/db/client";
-import { agents, users } from "../src/db/schema";
+import { agents, externalThreadMessages, users } from "../src/db/schema";
 import {
   createExternalThreadStore,
   type ExternalThreadBindingInput,
@@ -19,10 +19,17 @@ const store = createExternalThreadStore(database);
 const suite = randomUUID().slice(0, 8);
 const creatorId = `external_thread_creator_${suite}`;
 const otherCreatorId = `external_thread_other_creator_${suite}`;
+const paginationCreatorId = `external_thread_page_creator_${suite}`;
+const accessFilterCreatorId = `external_thread_access_creator_${suite}`;
+const previewCreatorId = `external_thread_preview_creator_${suite}`;
 const foreignKeyCreatorId = `external_thread_fk_creator_${suite}`;
 const riskAgentId = `external_thread_risk_${suite}`;
 const knowledgeAgentId = `external_thread_knowledge_${suite}`;
 const foreignKeyAgentId = `external_thread_fk_agent_${suite}`;
+
+function encodeCursor(cursor: { recency: string; threadId: string }): string {
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
 
 function binding(
   label: string,
@@ -121,6 +128,18 @@ beforeAll(async () => {
     { id: creatorId, email: `${creatorId}@example.test` },
     { id: otherCreatorId, email: `${otherCreatorId}@example.test` },
     {
+      id: paginationCreatorId,
+      email: `${paginationCreatorId}@example.test`,
+    },
+    {
+      id: accessFilterCreatorId,
+      email: `${accessFilterCreatorId}@example.test`,
+    },
+    {
+      id: previewCreatorId,
+      email: `${previewCreatorId}@example.test`,
+    },
+    {
       id: foreignKeyCreatorId,
       email: `${foreignKeyCreatorId}@example.test`,
     },
@@ -154,9 +173,17 @@ afterAll(async () => {
     await transaction.execute(
       sql`ALTER TABLE "external_thread_bindings" DISABLE TRIGGER USER`,
     );
-    await transaction.execute(
-      sql`DELETE FROM "external_thread_bindings" WHERE "created_by_user_id" IN (${creatorId}, ${otherCreatorId}, ${foreignKeyCreatorId})`,
-    );
+    await transaction.execute(sql`
+      DELETE FROM "external_thread_bindings"
+      WHERE "created_by_user_id" IN (
+        ${creatorId},
+        ${otherCreatorId},
+        ${paginationCreatorId},
+        ${accessFilterCreatorId},
+        ${previewCreatorId},
+        ${foreignKeyCreatorId}
+      )
+    `);
     await transaction.execute(
       sql`ALTER TABLE "external_thread_bindings" ENABLE TRIGGER USER`,
     );
@@ -166,6 +193,9 @@ afterAll(async () => {
   await database.delete(agents).where(eq(agents.id, foreignKeyAgentId));
   await database.delete(users).where(eq(users.id, creatorId));
   await database.delete(users).where(eq(users.id, otherCreatorId));
+  await database.delete(users).where(eq(users.id, paginationCreatorId));
+  await database.delete(users).where(eq(users.id, accessFilterCreatorId));
+  await database.delete(users).where(eq(users.id, previewCreatorId));
   await database.delete(users).where(eq(users.id, foreignKeyCreatorId));
   await database.$client.end();
 });
@@ -200,6 +230,371 @@ describe("external thread bindings", () => {
       turn.user,
       turn.assistant,
     ]);
+  });
+
+  test("lists only the creator's Slack threads with latest activity first", async () => {
+    const older = binding("list_older");
+    const newer = binding("list_newer");
+    const foreign = binding("list_foreign", {
+      createdByUserId: otherCreatorId,
+    });
+    await store.bind(older);
+    await store.bind(newer);
+    await store.bind(foreign);
+    await database.insert(externalThreadMessages).values([
+      {
+        channelsThreadId: older.channelsThreadId,
+        messageId: "older-user",
+        role: "user",
+        content: "old line",
+        createdAt: new Date("2099-08-28T10:00:00.000Z"),
+      },
+      {
+        channelsThreadId: newer.channelsThreadId,
+        messageId: "newer-lower-sequence-later-time",
+        role: "user",
+        content: "wrong by timestamp",
+        createdAt: new Date("2099-08-28T12:00:00.000Z"),
+      },
+      {
+        channelsThreadId: newer.channelsThreadId,
+        messageId: "newer-higher-sequence-earlier-time",
+        role: "assistant",
+        content: "newest\nline",
+        createdAt: new Date("2099-08-28T11:00:00.000Z"),
+      },
+      {
+        channelsThreadId: foreign.channelsThreadId,
+        messageId: "foreign-user",
+        role: "user",
+        content: "must stay private",
+        createdAt: new Date("2099-08-28T12:00:00.000Z"),
+      },
+    ]);
+
+    const page = await store.listForCreator(creatorId, { limit: 20 });
+
+    const listed = page.threads.filter((thread) =>
+      [older.channelsThreadId, newer.channelsThreadId].includes(
+        thread.threadId,
+      ),
+    );
+    expect(listed.map((thread) => thread.threadId)).toEqual([
+      newer.channelsThreadId,
+      older.channelsThreadId,
+    ]);
+    expect(listed[0]?.lastMessage).toBe("newest line");
+    expect(listed[0]?.lastMessageAt).toEqual(
+      new Date("2099-08-28T11:00:00.000Z"),
+    );
+    expect(
+      page.threads.some(
+        (thread) => thread.threadId === foreign.channelsThreadId,
+      ),
+    ).toBe(false);
+  });
+
+  test("paginates Slack thread summaries with an opaque malformed-safe cursor", async () => {
+    const first = binding("page_first", {
+      createdByUserId: paginationCreatorId,
+    });
+    const second = binding("page_second", {
+      createdByUserId: paginationCreatorId,
+    });
+    const third = binding("page_third", {
+      createdByUserId: paginationCreatorId,
+    });
+    await store.bind(first);
+    await store.bind(second);
+    await store.bind(third);
+    await database.insert(externalThreadMessages).values([
+      {
+        channelsThreadId: first.channelsThreadId,
+        messageId: "page-first-user",
+        role: "user",
+        content: "first page first",
+        createdAt: new Date("2099-08-29T13:00:00.000Z"),
+      },
+      {
+        channelsThreadId: second.channelsThreadId,
+        messageId: "page-second-user",
+        role: "user",
+        content: "first page second",
+        createdAt: new Date("2099-08-29T12:00:00.000Z"),
+      },
+      {
+        channelsThreadId: third.channelsThreadId,
+        messageId: "page-third-user",
+        role: "user",
+        content: "second page",
+        createdAt: new Date("2099-08-29T11:00:00.000Z"),
+      },
+    ]);
+
+    const pageOne = await store.listForCreator(paginationCreatorId, {
+      limit: 2,
+    });
+    const pageTwo = await store.listForCreator(paginationCreatorId, {
+      limit: 2,
+      cursor: pageOne.nextCursor ?? undefined,
+    });
+    const malformedCursorPage = await store.listForCreator(
+      paginationCreatorId,
+      {
+        limit: 2,
+        cursor: "malformed",
+      },
+    );
+
+    expect(pageOne.threads.map((thread) => thread.threadId)).toEqual([
+      first.channelsThreadId,
+      second.channelsThreadId,
+    ]);
+    expect(pageOne.nextCursor).not.toBeNull();
+    expect(pageTwo.threads.map((thread) => thread.threadId)).toEqual([
+      third.channelsThreadId,
+    ]);
+    expect(
+      new Set([
+        ...pageOne.threads.map((thread) => thread.threadId),
+        ...pageTwo.threads.map((thread) => thread.threadId),
+      ]).size,
+    ).toBe(pageOne.threads.length + pageTwo.threads.length);
+    expect(
+      malformedCursorPage.threads.map((thread) => thread.threadId),
+    ).toEqual(pageOne.threads.map((thread) => thread.threadId));
+  });
+
+  test("filters allowed agent ids before applying the page limit", async () => {
+    const allowed = binding("allowed_agent_before_limit", {
+      createdByUserId: accessFilterCreatorId,
+      agentId: riskAgentId,
+      agentName: "Risk Analyst",
+    });
+    const blocked = binding("blocked_agent_before_limit", {
+      createdByUserId: accessFilterCreatorId,
+      agentId: knowledgeAgentId,
+      agentName: "Knowledge Analyst",
+    });
+    await store.bind(allowed);
+    await store.bind(blocked);
+    await database.insert(externalThreadMessages).values([
+      {
+        channelsThreadId: blocked.channelsThreadId,
+        messageId: "blocked-agent-before-limit-user",
+        role: "user",
+        content: "blocked newest",
+        createdAt: new Date("2099-09-02T12:00:00.000Z"),
+      },
+      {
+        channelsThreadId: allowed.channelsThreadId,
+        messageId: "allowed-agent-before-limit-user",
+        role: "user",
+        content: "allowed older",
+        createdAt: new Date("2099-09-02T11:00:00.000Z"),
+      },
+    ]);
+
+    const page = await store.listForCreator(accessFilterCreatorId, {
+      agentIds: [riskAgentId],
+      limit: 1,
+    });
+
+    expect(page.threads.map((thread) => thread.threadId)).toEqual([
+      allowed.channelsThreadId,
+    ]);
+    expect(page.nextCursor).toBeNull();
+  });
+
+  test("returns an empty page when the allowed agent id set is empty", async () => {
+    const page = await store.listForCreator(accessFilterCreatorId, {
+      agentIds: [],
+      limit: 1,
+    });
+
+    expect(page).toEqual({ threads: [], nextCursor: null });
+  });
+
+  test("treats noncanonical parseable cursor dates as the first page", async () => {
+    const first = binding("noncanonical_cursor_first", {
+      createdByUserId: paginationCreatorId,
+    });
+    const second = binding("noncanonical_cursor_second", {
+      createdByUserId: paginationCreatorId,
+    });
+    await store.bind(first);
+    await store.bind(second);
+    await database.insert(externalThreadMessages).values([
+      {
+        channelsThreadId: first.channelsThreadId,
+        messageId: "noncanonical-cursor-first-user",
+        role: "user",
+        content: "first",
+        createdAt: new Date("2099-08-30T12:00:00.000Z"),
+      },
+      {
+        channelsThreadId: second.channelsThreadId,
+        messageId: "noncanonical-cursor-second-user",
+        role: "user",
+        content: "second",
+        createdAt: new Date("2099-08-30T11:00:00.000Z"),
+      },
+    ]);
+
+    const firstPage = await store.listForCreator(paginationCreatorId, {
+      limit: 2,
+    });
+    const tamperedPage = await store.listForCreator(paginationCreatorId, {
+      limit: 2,
+      cursor: encodeCursor({ recency: "0", threadId: first.channelsThreadId }),
+    });
+
+    expect(tamperedPage.threads.map((thread) => thread.threadId)).toEqual(
+      firstPage.threads.map((thread) => thread.threadId),
+    );
+  });
+
+  test("treats signed out-of-range cursor years as the first page", async () => {
+    const first = binding("signed_cursor_first", {
+      createdByUserId: paginationCreatorId,
+    });
+    const second = binding("signed_cursor_second", {
+      createdByUserId: paginationCreatorId,
+    });
+    await store.bind(first);
+    await store.bind(second);
+    await database.insert(externalThreadMessages).values([
+      {
+        channelsThreadId: first.channelsThreadId,
+        messageId: "signed-cursor-first-user",
+        role: "user",
+        content: "first",
+        createdAt: new Date("2099-08-31T12:00:00.000Z"),
+      },
+      {
+        channelsThreadId: second.channelsThreadId,
+        messageId: "signed-cursor-second-user",
+        role: "user",
+        content: "second",
+        createdAt: new Date("2099-08-31T11:00:00.000Z"),
+      },
+    ]);
+
+    const firstPage = await store.listForCreator(paginationCreatorId, {
+      limit: 2,
+    });
+    const tamperedPage = await store.listForCreator(paginationCreatorId, {
+      limit: 2,
+      cursor: encodeCursor({
+        recency: "+275760-09-13T00:00:00.000Z",
+        threadId: first.channelsThreadId,
+      }),
+    });
+
+    expect(tamperedPage.threads.map((thread) => thread.threadId)).toEqual(
+      firstPage.threads.map((thread) => thread.threadId),
+    );
+  });
+
+  test("treats canonical year zero cursor dates as the first page", async () => {
+    const first = binding("year_zero_cursor_first", {
+      createdByUserId: paginationCreatorId,
+    });
+    const second = binding("year_zero_cursor_second", {
+      createdByUserId: paginationCreatorId,
+    });
+    await store.bind(first);
+    await store.bind(second);
+    await database.insert(externalThreadMessages).values([
+      {
+        channelsThreadId: first.channelsThreadId,
+        messageId: "year-zero-cursor-first-user",
+        role: "user",
+        content: "first",
+        createdAt: new Date("2099-09-01T12:00:00.000Z"),
+      },
+      {
+        channelsThreadId: second.channelsThreadId,
+        messageId: "year-zero-cursor-second-user",
+        role: "user",
+        content: "second",
+        createdAt: new Date("2099-09-01T11:00:00.000Z"),
+      },
+    ]);
+
+    const firstPage = await store.listForCreator(paginationCreatorId, {
+      limit: 2,
+    });
+    const tamperedPage = await store.listForCreator(paginationCreatorId, {
+      limit: 2,
+      cursor: encodeCursor({
+        recency: "0000-01-01T00:00:00.000Z",
+        threadId: first.channelsThreadId,
+      }),
+    });
+
+    expect(tamperedPage.threads.map((thread) => thread.threadId)).toEqual(
+      firstPage.threads.map((thread) => thread.threadId),
+    );
+  });
+
+  test("uses binding creation as the activity fallback without transcript messages", async () => {
+    const active = binding("activity_message", {
+      createdByUserId: previewCreatorId,
+    });
+    const empty = binding("activity_empty", {
+      createdByUserId: previewCreatorId,
+    });
+    await store.bind(active);
+    await store.bind(empty);
+    await database.insert(externalThreadMessages).values({
+      channelsThreadId: active.channelsThreadId,
+      messageId: "activity-message-user",
+      role: "user",
+      content: "older transcript activity",
+      createdAt: new Date("2000-01-01T00:00:00.000Z"),
+    });
+
+    const page = await store.listForCreator(previewCreatorId, { limit: 10 });
+
+    const listed = page.threads.filter((thread) =>
+      [empty.channelsThreadId, active.channelsThreadId].includes(
+        thread.threadId,
+      ),
+    );
+    expect(listed.map((thread) => thread.threadId)).toEqual([
+      empty.channelsThreadId,
+      active.channelsThreadId,
+    ]);
+    expect(listed[0]).toMatchObject({
+      threadId: empty.channelsThreadId,
+      lastMessage: null,
+      lastMessageAt: null,
+    });
+    expect(listed[0]?.createdAt).toBeInstanceOf(Date);
+  });
+
+  test("sanitizes Slack thread previews to a 200-code-point one-line cap", async () => {
+    const input = binding("preview_cap", {
+      createdByUserId: previewCreatorId,
+    });
+    await store.bind(input);
+    await database.insert(externalThreadMessages).values({
+      channelsThreadId: input.channelsThreadId,
+      messageId: "preview-cap-user",
+      role: "user",
+      content: `Start\u0001\t\n${"💬".repeat(205)} tail`,
+      createdAt: new Date("2099-08-30T10:00:00.000Z"),
+    });
+
+    const page = await store.listForCreator(previewCreatorId, { limit: 1 });
+
+    const preview = page.threads[0]?.lastMessage;
+    expect(preview).toBe(`Start ${"💬".repeat(193)}…`);
+    expect(preview).not.toContain("\u0001");
+    expect(preview).not.toContain("\n");
+    expect(preview).not.toContain("\t");
+    expect(Array.from(preview ?? "")).toHaveLength(200);
   });
 
   test("reloads a binding by its provider thread identity", async () => {

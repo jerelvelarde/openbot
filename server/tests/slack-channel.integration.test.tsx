@@ -65,6 +65,7 @@ type FakeAdapterInstance = PlatformAdapter & {
 };
 
 class ShareComputerGateway implements ComputerGateway {
+  readonly navigateCalls: Parameters<ComputerGateway["navigate"]>[] = [];
   readonly readFileCalls: Parameters<ComputerGateway["readFile"]>[] = [];
   readFileResult: Awaited<ReturnType<ComputerGateway["readFile"]>> = {
     path: "reports/risk.txt",
@@ -89,8 +90,14 @@ class ShareComputerGateway implements ComputerGateway {
   async read(): Promise<never> {
     throw new Error("unused");
   }
-  async navigate(): Promise<never> {
-    throw new Error("unused");
+  async navigate(...args: Parameters<ComputerGateway["navigate"]>) {
+    this.navigateCalls.push(args);
+    return {
+      url: args[2],
+      title: "CopilotKit",
+      status: 200,
+      elapsedMs: 1,
+    };
   }
   async click(): Promise<never> {
     throw new Error("unused");
@@ -377,6 +384,7 @@ function harness(
     failExecutionPrepare?: boolean;
     configuredTenantId?: string;
     detachThreadOperations?: boolean;
+    cacheAgents?: boolean;
   } = {},
 ) {
   const adapter = new FakeAdapter({ platform: "slack", messageEvents: true });
@@ -388,11 +396,19 @@ function harness(
     }
     return id;
   };
+  const cachedAgents = new Map<string, AbstractAgent>();
   adapter.conversationStore.getOrCreate = async (
     conversationKey,
     _replyTarget,
     makeAgent,
-  ) => ({ agent: makeAgent(conversationKey) });
+  ) => {
+    const cached = options.cacheAgents
+      ? cachedAgents.get(conversationKey)
+      : undefined;
+    const agent = cached ?? makeAgent(conversationKey);
+    if (options.cacheAgents) cachedAgents.set(conversationKey, agent);
+    return { agent };
+  };
   if (options.detachThreadOperations) {
     const detached = new AsyncResource("detached-channel-operation");
     adapter.trackThreadOperation = (_target, operation) =>
@@ -1101,6 +1117,36 @@ describe("managed OpenBot Slack channel", () => {
       shared: true,
       filename: "résumé.txt",
       fileId: "F1",
+    });
+  });
+
+  test("a cached agent uses the current Slack execution for a later computer tool", async () => {
+    const gateway = new ShareComputerGateway();
+    const { adapter, channel, shared } = harness({
+      computerGateway: gateway,
+      cacheAgents: true,
+      detachThreadOperations: true,
+    });
+    await channel.ɵruntime.start();
+
+    await adapter.getSink().onTurn(turn("E-first", "hello"));
+    shared.toolCall = {
+      name: "computer_navigate",
+      args: { url: "https://copilotkit.ai" },
+    };
+    await adapter.getSink().onTurn(
+      turn("E-second", "open it", {
+        actorId: "U2",
+        mentioned: false,
+      }),
+    );
+
+    expect(gateway.navigateCalls).toEqual([
+      ["risk", { id: "u2", userId: "u2" }, "https://copilotkit.ai"],
+    ]);
+    expect(toolResult(shared)).toMatchObject({
+      ok: true,
+      url: "https://copilotkit.ai",
     });
   });
 

@@ -8,11 +8,13 @@ import {
   computerKeyContract,
   computerListFilesContract,
   computerNavigateContract,
+  computerOpenAndShareScreenshotContract,
   computerReadContract,
   computerReadFileContract,
   computerRequestHelpContract,
   computerRequestSecretContract,
   computerRunCommandContract,
+  computerScreenshotContract,
   computerScrollContract,
   computerShareFileContract,
   computerSnapshotContract,
@@ -36,15 +38,33 @@ import {
   requestSlackSecret,
   type SlackAssistanceOptions,
 } from "./assistance";
-import { currentSlackExecution } from "./execution-context";
+import {
+  maybeCurrentSlackExecution,
+  runWithSlackExecution,
+  type SlackExecution,
+} from "./execution-context";
 
 const COMPUTER_UNAVAILABLE =
   "The assistant's computer could not be reached." as const;
+const COMPUTER_CONTEXT_UNAVAILABLE =
+  "The computer action could not start because its Slack context was unavailable." as const;
+const COMPUTER_ACTION_FAILED = "The computer action failed." as const;
+
+class SlackComputerContextError extends Error {
+  constructor() {
+    super("The Slack computer tool is missing its private execution context.");
+    this.name = "SlackComputerContextError";
+  }
+}
 
 type ToolOutcome = Record<string, unknown> & { ok: boolean };
 
 /** The public common type consumed by Channels when registering this heterogeneous tool list. */
 export type SlackComputerTool = ChannelTool;
+
+type SlackExecutionForConversation = (
+  conversationKey: string,
+) => SlackExecution | undefined;
 
 function stopped(): ToolOutcome {
   return { ok: false, stopped: true, reason: "Stopped." };
@@ -178,20 +198,66 @@ async function governed(
     if (error instanceof ComputerUnavailableError) {
       return { ok: false, reason: COMPUTER_UNAVAILABLE };
     }
-    return { ok: false, reason: COMPUTER_UNAVAILABLE };
+    // Do not serialize the error: gateway and configuration failures can contain transport details,
+    // paths, or secrets. The category is enough to distinguish a lost Slack turn from a real host
+    // outage while preserving an opaque tool result.
+    const contextUnavailable = error instanceof SlackComputerContextError;
+    const errorCategory = contextUnavailable ? "execution-context" : "unknown";
+    console.error(
+      JSON.stringify({
+        type: "slack-computer-tool-failed",
+        error: contextUnavailable
+          ? "SlackComputerContextError"
+          : "UnknownError",
+        context: {
+          integration: "slack",
+          operation: "computer-tool",
+          errorCategory,
+        },
+        timestamp: new Date().toISOString(),
+      }),
+    );
+    return {
+      ok: false,
+      reason: contextUnavailable
+        ? COMPUTER_CONTEXT_UNAVAILABLE
+        : COMPUTER_ACTION_FAILED,
+    };
   }
 }
 
 function currentComputer(): { agentId: string; actor: ActionActor } {
-  const execution = currentSlackExecution();
-  if (!execution.agentId) {
-    throw new Error("A Slack computer call requires a pinned coworker.");
+  const execution = maybeCurrentSlackExecution();
+  if (!execution?.agentId) {
+    throw new SlackComputerContextError();
   }
   return {
     agentId: execution.agentId,
     // This is the linked OpenBot principal from private ALS. The provider actor in Channel context is
     // deliberately not authorization identity and never reaches ComputerGateway.
     actor: { id: execution.actor.id, userId: execution.actor.id },
+  };
+}
+
+function bindSlackExecution(
+  tool: SlackComputerTool,
+  executionForConversation?: SlackExecutionForConversation,
+): SlackComputerTool {
+  return {
+    ...tool,
+    handler: (input, context) => {
+      const run = () => tool.handler(input, context);
+      if (maybeCurrentSlackExecution()) return run();
+      const conversationKey =
+        "conversationKey" in context.thread &&
+        typeof context.thread.conversationKey === "string"
+          ? context.thread.conversationKey
+          : undefined;
+      const execution = conversationKey
+        ? executionForConversation?.(conversationKey)
+        : undefined;
+      return execution ? runWithSlackExecution(execution, run) : run();
+    },
   };
 }
 
@@ -249,10 +315,15 @@ function utf8Bytes(value: string): number {
 export function createSlackComputerTools(
   gateway: ComputerGateway,
   assistance?: SlackAssistanceOptions,
+  executionForConversation?: SlackExecutionForConversation,
 ): SlackComputerTool[] {
   const tools: SlackComputerTool[] = [
     defineChannelTool({
       ...computerNavigateContract,
+      description:
+        computerNavigateContract.description +
+        " In Slack, if the request also asks for a screenshot or picture, use " +
+        "computer_open_and_share_screenshot instead.",
       handler: ({ url }, { signal }) =>
         governed(
           signal,
@@ -262,6 +333,15 @@ export function createSlackComputerTools(
           },
           { checkStoppedAfter: false },
         ),
+    }),
+    defineChannelTool({
+      ...computerOpenAndShareScreenshotContract,
+      handler: (input, context) =>
+        openAndShareScreenshot(gateway, input, context),
+    }),
+    defineChannelTool({
+      ...computerScreenshotContract,
+      handler: (input, context) => shareScreenshot(gateway, input, context),
     }),
     defineChannelTool({
       ...computerReadContract,
@@ -410,7 +490,114 @@ export function createSlackComputerTools(
       }),
     );
   }
-  return tools;
+  return tools.map((tool) =>
+    bindSlackExecution(tool, executionForConversation),
+  );
+}
+
+async function openAndShareScreenshot(
+  gateway: ComputerGateway,
+  input: { url: string; filename?: string },
+  context: ChannelToolContext,
+): Promise<ToolOutcome> {
+  return governed(
+    context.signal,
+    async () => {
+      const { agentId, actor } = currentComputer();
+      const navigation = await gateway.navigate(agentId, actor, input.url);
+      throwIfStopped(context.signal);
+      const screenshot = await gateway.screenshot(agentId);
+      throwIfStopped(context.signal);
+
+      const filename = safeFilename(input.filename ?? "screenshot.png");
+      // Intelligence currently accepts a Slack file effect but can reject a later text stream in
+      // the same managed delivery. Put the useful page text first so the person receives both the
+      // answer and the image even when that provider ordering limitation is present.
+      await context.thread.post(pageSummaryMessage(navigation));
+      throwIfStopped(context.signal);
+      const posted = await context.thread.postFile({
+        bytes: Buffer.from(screenshot.base64, "base64"),
+        filename,
+      });
+      if (!posted.ok) {
+        return {
+          ok: false,
+          reason: posted.error ?? "Slack could not share that screenshot.",
+        };
+      }
+      return {
+        ok: true,
+        ...navigation,
+        summaryShared: true,
+        screenshotShared: true,
+        screenshotFilename: filename,
+        screenshotWidth: screenshot.width,
+        screenshotHeight: screenshot.height,
+        ...(posted.fileId ? { fileId: posted.fileId } : {}),
+        ...(posted.assetId ? { assetId: posted.assetId } : {}),
+      };
+    },
+    { checkStoppedAfter: false },
+  );
+}
+
+function pageSummaryMessage(navigation: {
+  url: string;
+  title: string;
+  text: string;
+  truncated: boolean;
+}): string {
+  const readable = navigation.text.replace(/\s+/g, " ").trim();
+  const excerpt = takeUtf8Bytes(readable, 1_200).trim();
+  const summary =
+    excerpt || navigation.title || "The page did not expose readable text.";
+  return [
+    `I opened ${navigation.title || navigation.url}.`,
+    `Summary: ${summary}${navigation.truncated ? " (The page extract was truncated.)" : ""}`,
+    `Source: ${navigation.url}, read just now.`,
+  ].join("\n\n");
+}
+
+async function shareScreenshot(
+  gateway: ComputerGateway,
+  input: { filename?: string },
+  context: ChannelToolContext,
+): Promise<ToolOutcome> {
+  return governed(
+    context.signal,
+    async () => {
+      const { agentId } = currentComputer();
+      // screenshot has no signal parameter today. Check both sides so Stop prevents the upload even
+      // when it arrived while the capture was in flight.
+      throwIfStopped(context.signal);
+      const screenshot = await gateway.screenshot(agentId);
+      throwIfStopped(context.signal);
+
+      const filename = safeFilename(input.filename ?? "screenshot.png");
+      const bytes = Buffer.from(screenshot.base64, "base64");
+      throwIfStopped(context.signal);
+      const posted = await context.thread.postFile({ bytes, filename });
+      // Upload is the irreversible commit point. Once Slack answers, report that exact outcome even
+      // if cancellation raced the response.
+      if (!posted.ok) {
+        return {
+          ok: false,
+          reason: posted.error ?? "Slack could not share that screenshot.",
+        };
+      }
+      return {
+        ok: true,
+        shared: true,
+        filename,
+        width: screenshot.width,
+        height: screenshot.height,
+        ...(screenshot.url ? { url: screenshot.url } : {}),
+        ...(posted.fileId ? { fileId: posted.fileId } : {}),
+        ...(posted.assetId ? { assetId: posted.assetId } : {}),
+      };
+    },
+    { checkStoppedAfter: false },
+  );
 }
 
 async function shareFile(

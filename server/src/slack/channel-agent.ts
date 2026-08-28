@@ -21,7 +21,7 @@ import type {
   CoworkerRoutingService,
 } from "../routing/service";
 import {
-  currentSlackExecution,
+  maybeCurrentSlackExecution,
   runWithSlackExecution,
   type SlackExecution,
 } from "./execution-context";
@@ -54,12 +54,14 @@ export class OpenBotChannelAgent extends AbstractAgent {
   private store: ExternalThreadStore;
   private resolver: ActorAgentResolver;
   private execution?: SlackExecution;
+  private executionForRun?: () => SlackExecution | undefined;
   private active?: ActiveRun;
 
   constructor(
     channelsConversationKey: string,
     deps: OpenBotChannelAgentDependencies,
     execution?: SlackExecution,
+    executionForRun?: () => SlackExecution | undefined,
   ) {
     super({ agentId: "openbot-slack", description: "OpenBot Slack router" });
     this.channelsConversationKey = channelsConversationKey;
@@ -67,10 +69,22 @@ export class OpenBotChannelAgent extends AbstractAgent {
     this.store = deps.store;
     this.resolver = deps.resolver;
     this.execution = execution;
+    this.executionForRun = executionForRun;
   }
 
   run(input: RunAgentInput): Observable<BaseEvent> {
-    const execution = this.execution ?? currentSlackExecution();
+    // Channels caches this agent by conversation. Resolve execution for every run so a detached
+    // managed-delivery boundary can bridge the active turn without retaining the first turn's
+    // mutable context on the cached agent.
+    const execution =
+      maybeCurrentSlackExecution() ??
+      this.executionForRun?.() ??
+      this.execution;
+    if (!execution) {
+      throw new Error(
+        "A Slack agent run requires a private execution context.",
+      );
+    }
     const work = defer(() => {
       if (this.active) {
         return throwError(
@@ -207,6 +221,7 @@ export class OpenBotChannelAgent extends AbstractAgent {
     cloned.store = this.store;
     cloned.resolver = this.resolver;
     cloned.execution = this.execution;
+    cloned.executionForRun = this.executionForRun;
     cloned.active = undefined;
     return cloned;
   }

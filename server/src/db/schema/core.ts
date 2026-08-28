@@ -284,6 +284,10 @@ export const externalThreadBindings = pgTable(
       table.providerConversationId,
       table.providerThreadId,
     ),
+    index("external_thread_bindings_creator_thread_idx").on(
+      table.createdByUserId,
+      table.channelsThreadId,
+    ),
   ],
 );
 
@@ -310,6 +314,10 @@ export const externalThreadMessages = pgTable(
     uniqueIndex("external_thread_messages_thread_message_idx").on(
       table.channelsThreadId,
       table.messageId,
+    ),
+    index("external_thread_messages_thread_sequence_idx").on(
+      table.channelsThreadId,
+      table.sequence.desc(),
     ),
   ],
 );

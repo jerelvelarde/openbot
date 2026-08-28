@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import {
   ActionRegistry,
   type ChannelTool,
@@ -37,6 +37,48 @@ const UNAVAILABLE = {
   ok: false,
   reason: "The assistant's computer could not be reached.",
 };
+const CONTEXT_UNAVAILABLE = {
+  ok: false,
+  reason:
+    "The computer action could not start because its Slack context was unavailable.",
+};
+const ACTION_FAILED = {
+  ok: false,
+  reason: "The computer action failed.",
+};
+
+type LoggedComputerFailure = {
+  type?: unknown;
+  error?: unknown;
+  context?: {
+    integration?: unknown;
+    operation?: unknown;
+    errorCategory?: unknown;
+  };
+  timestamp?: unknown;
+};
+
+function isLoggedComputerFailure(
+  value: unknown,
+): value is LoggedComputerFailure {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "type" in value &&
+    value.type === "slack-computer-tool-failed"
+  );
+}
+
+function capturedComputerFailures(calls: unknown[][]): LoggedComputerFailure[] {
+  return calls.flatMap(([value]) => {
+    try {
+      const parsed: unknown = JSON.parse(String(value));
+      return isLoggedComputerFailure(parsed) ? [parsed] : [];
+    } catch {
+      return [];
+    }
+  });
+}
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -55,6 +97,7 @@ type UploadResult = Awaited<
 
 class FileAdapter extends FakeAdapter {
   readonly uploads: UploadArgs[] = [];
+  readonly effects: Array<"message" | "file"> = [];
   result: UploadResult = { ok: true, fileId: "slack-file-1" };
   afterUpload?: () => void;
   beforePost?: () => void;
@@ -62,6 +105,7 @@ class FileAdapter extends FakeAdapter {
   postGate?: Promise<void>;
 
   override async post(...args: Parameters<PlatformAdapter["post"]>) {
+    this.effects.push("message");
     this.beforePost?.();
     if (this.postError !== undefined) throw this.postError;
     await this.postGate;
@@ -72,6 +116,7 @@ class FileAdapter extends FakeAdapter {
     _target: Parameters<NonNullable<PlatformAdapter["postFile"]>>[0],
     args: UploadArgs,
   ): Promise<UploadResult> {
+    this.effects.push("file");
     this.uploads.push(args);
     this.afterUpload?.();
     return this.result;
@@ -131,6 +176,7 @@ class FakeComputerGateway implements ComputerGateway {
   declare readonly provider: ComputerGateway["provider"];
 
   readonly navigateCalls: Parameters<ComputerGateway["navigate"]>[] = [];
+  readonly screenshotCalls: Parameters<ComputerGateway["screenshot"]>[] = [];
   readonly snapshotCalls: Parameters<ComputerGateway["snapshot"]>[] = [];
   readonly readCalls: Parameters<ComputerGateway["read"]>[] = [];
   readonly clickCalls: Parameters<ComputerGateway["click"]>[] = [];
@@ -191,8 +237,15 @@ class FakeComputerGateway implements ComputerGateway {
   async status(): Promise<never> {
     throw new Error("unused");
   }
-  async screenshot(): Promise<never> {
-    throw new Error("unused");
+  async screenshot(...args: Parameters<ComputerGateway["screenshot"]>) {
+    this.screenshotCalls.push(args);
+    return this.answer({
+      base64: "iVBORw0KGgo=",
+      width: 1440,
+      height: 900,
+      capturedAt: "2026-08-28T12:00:00.000Z",
+      url: "https://copilotkit.ai/",
+    });
   }
   async snapshot(...args: Parameters<ComputerGateway["snapshot"]>) {
     this.snapshotCalls.push(args);
@@ -415,6 +468,8 @@ describe("Slack computer ChannelTools", () => {
     const names = [...toolsByName(new FakeComputerGateway()).keys()];
     expect(names).toEqual([
       "computer_navigate",
+      "computer_open_and_share_screenshot",
+      "computer_screenshot",
       "computer_read",
       "computer_snapshot",
       "computer_type",
@@ -517,7 +572,7 @@ describe("Slack computer ChannelTools", () => {
     );
 
     expect(gateway.requestHelpCalls).toEqual([]);
-    expect(result).toEqual(UNAVAILABLE);
+    expect(result).toEqual(ACTION_FAILED);
   });
 
   for (const toolName of [
@@ -1117,13 +1172,37 @@ describe("Slack computer ChannelTools", () => {
   test("fails safely outside Slack execution without touching the gateway", async () => {
     const gateway = new FakeComputerGateway();
     const tool = toolsByName(gateway).get("computer_click")!;
-    const result = await invoke(
-      tool,
-      { ref: "e4", snapshotId: 9 },
-      channelContext(new FileAdapter()),
-    );
-    expect(result).toEqual(UNAVAILABLE);
-    expect(gateway.clickCalls).toHaveLength(0);
+    const logged = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const result = await invoke(
+        tool,
+        { ref: "e4", snapshotId: 9 },
+        channelContext(new FileAdapter()),
+      );
+      expect(result).toEqual(CONTEXT_UNAVAILABLE);
+      const event = capturedComputerFailures(logged.mock.calls).find(
+        ({ context }) => context?.errorCategory === "execution-context",
+      );
+      expect(event).toMatchObject({
+        type: "slack-computer-tool-failed",
+        error: "SlackComputerContextError",
+        context: {
+          integration: "slack",
+          operation: "computer-tool",
+          errorCategory: "execution-context",
+        },
+      });
+      expect(
+        Number.isNaN(
+          Date.parse(
+            typeof event?.timestamp === "string" ? event.timestamp : "",
+          ),
+        ),
+      ).toBe(false);
+      expect(gateway.clickCalls).toHaveLength(0);
+    } finally {
+      logged.mockRestore();
+    }
   });
 
   test("fails safely when no coworker is pinned without touching the gateway", async () => {
@@ -1138,7 +1217,7 @@ describe("Slack computer ChannelTools", () => {
         ),
       { agentId: undefined },
     );
-    expect(result).toEqual(UNAVAILABLE);
+    expect(result).toEqual(CONTEXT_UNAVAILABLE);
     expect(gateway.clickCalls).toHaveLength(0);
   });
 
@@ -1250,26 +1329,59 @@ describe("Slack computer ChannelTools", () => {
       ),
     );
 
-    expect(result).toEqual(UNAVAILABLE);
+    expect(result).toEqual(ACTION_FAILED);
   });
 
   test("hides unavailable and unknown error details and never retries", async () => {
     const gateway = new FakeComputerGateway();
     const tool = toolsByName(gateway).get("computer_click")!;
-    for (const error of [
-      new ComputerUnavailableError("host token=secret did not answer"),
-      new Error("socket token=secret internal stack detail"),
-    ]) {
-      gateway.nextError = error;
-      const result = await inSlack(() =>
-        invoke(
-          tool,
-          { ref: "e4", snapshotId: 9 },
-          channelContext(new FileAdapter()),
-        ),
+    const logged = spyOn(console, "error").mockImplementation(() => {});
+    const unknown = new Error("socket token=secret internal stack detail");
+    unknown.name = "token=secret";
+    try {
+      for (const error of [
+        new ComputerUnavailableError("host token=secret did not answer"),
+        unknown,
+      ]) {
+        gateway.nextError = error;
+        const result = await inSlack(() =>
+          invoke(
+            tool,
+            { ref: "e4", snapshotId: 9 },
+            channelContext(new FileAdapter()),
+          ),
+        );
+        expect(result).toEqual(
+          error instanceof ComputerUnavailableError
+            ? UNAVAILABLE
+            : ACTION_FAILED,
+        );
+        expect(JSON.stringify(result)).not.toContain("secret");
+      }
+      const failures = capturedComputerFailures(logged.mock.calls);
+      expect(JSON.stringify(failures)).not.toContain("secret");
+      const event = failures.find(
+        ({ context, error }) =>
+          context?.errorCategory === "unknown" && error === "UnknownError",
       );
-      expect(result).toEqual(UNAVAILABLE);
-      expect(JSON.stringify(result)).not.toContain("secret");
+      expect(event).toMatchObject({
+        type: "slack-computer-tool-failed",
+        error: "UnknownError",
+        context: {
+          integration: "slack",
+          operation: "computer-tool",
+          errorCategory: "unknown",
+        },
+      });
+      expect(
+        Number.isNaN(
+          Date.parse(
+            typeof event?.timestamp === "string" ? event.timestamp : "",
+          ),
+        ),
+      ).toBe(false);
+    } finally {
+      logged.mockRestore();
     }
     expect(gateway.clickCalls).toHaveLength(2);
   });
@@ -1395,7 +1507,7 @@ describe("Slack computer ChannelTools", () => {
         ),
       );
 
-      expect(result).toEqual(UNAVAILABLE);
+      expect(result).toEqual(ACTION_FAILED);
       expect(JSON.stringify(result)).not.toContain("private-state");
     }
   });
@@ -1426,6 +1538,76 @@ describe("Slack computer ChannelTools", () => {
       ok: true,
       shared: true,
       filename: "review.txt",
+      fileId: "slack-file-1",
+    });
+  });
+
+  test("captures the current page and shares its PNG in the Slack thread", async () => {
+    const gateway = new FakeComputerGateway();
+    const adapter = new FileAdapter();
+
+    const result = await inSlack(() =>
+      invoke(
+        toolsByName(gateway).get("computer_screenshot")!,
+        { filename: "copilotkit-homepage.png" },
+        channelContext(adapter),
+      ),
+    );
+
+    expect(gateway.screenshotCalls).toEqual([["risk"]]);
+    expect(adapter.uploads).toHaveLength(1);
+    expect(adapter.uploads[0]?.filename).toBe("copilotkit-homepage.png");
+    expect([...adapter.uploads[0]!.bytes]).toEqual([
+      137, 80, 78, 71, 13, 10, 26, 10,
+    ]);
+    expect(result).toEqual({
+      ok: true,
+      shared: true,
+      filename: "copilotkit-homepage.png",
+      fileId: "slack-file-1",
+      width: 1440,
+      height: 900,
+      url: "https://copilotkit.ai/",
+    });
+  });
+
+  test("opens, reads, and shares a website screenshot in one tool round", async () => {
+    const gateway = new FakeComputerGateway();
+    const adapter = new FileAdapter();
+
+    const result = await inSlack(() =>
+      invoke(
+        toolsByName(gateway).get("computer_open_and_share_screenshot")!,
+        {
+          url: "https://copilotkit.ai",
+          filename: "copilotkit-homepage.png",
+        },
+        channelContext(adapter),
+      ),
+    );
+
+    expect(gateway.navigateCalls).toEqual([
+      ["risk", { id: "u1", userId: "u1" }, "https://copilotkit.ai"],
+    ]);
+    expect(gateway.screenshotCalls).toEqual([["risk"]]);
+    expect(adapter.effects).toEqual(["message", "file"]);
+    expect(JSON.stringify(adapter.posted)).toContain("Summary: Page text");
+    expect(JSON.stringify(adapter.posted)).toContain(
+      "Source: https://copilotkit.ai",
+    );
+    expect(adapter.uploads).toHaveLength(1);
+    expect(result).toEqual({
+      ok: true,
+      url: "https://copilotkit.ai",
+      title: "Example",
+      text: "Page text",
+      truncated: false,
+      elapsedMs: 4,
+      summaryShared: true,
+      screenshotShared: true,
+      screenshotFilename: "copilotkit-homepage.png",
+      screenshotWidth: 1440,
+      screenshotHeight: 900,
       fileId: "slack-file-1",
     });
   });

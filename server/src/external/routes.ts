@@ -18,13 +18,14 @@ const INVALID_ASSISTANCE_MESSAGE =
   "This assistance link has expired or is invalid.";
 const ASSISTANCE_FORBIDDEN_MESSAGE =
   "This assistance request is not available to this account.";
+const INVALID_CONVERSATION_PAGE_MESSAGE = "Invalid conversation page.";
 
 type ExternalLinkRoutesOptions = {
   store: ExternalLinkCreationStore;
   encryptionKey: string;
   requireUser: MiddlewareHandler<{ Variables: AppVariables }>;
   auditStore: TransactionalAuditStore;
-  agentProfileStore: Pick<AgentProfileStore, "get">;
+  agentProfileStore: Pick<AgentProfileStore, "get" | "listAccessibleIds">;
   threadStore: ExternalThreadStore;
 };
 
@@ -38,6 +39,35 @@ function tokenFrom(value: unknown): string | undefined {
 
 function invalidLinkResponse(context: Context<{ Variables: AppVariables }>) {
   return context.json({ error: INVALID_LINK_MESSAGE }, 400);
+}
+
+function externalThreadLimit(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  if (!/^\d+$/.test(value)) {
+    throw new Error(INVALID_CONVERSATION_PAGE_MESSAGE);
+  }
+  const limit = Number(value);
+  if (limit < 1 || limit > 200) {
+    throw new Error(INVALID_CONVERSATION_PAGE_MESSAGE);
+  }
+  return limit;
+}
+
+type ExternalThreadSummary = Awaited<
+  ReturnType<ExternalThreadStore["listForCreator"]>
+>["threads"][number];
+
+function externalThreadSummary(thread: ExternalThreadSummary) {
+  return {
+    threadId: thread.threadId,
+    provider: thread.provider,
+    agentId: thread.agentId,
+    agentName: thread.agentName,
+    lastMessage: thread.lastMessage,
+    lastMessageAt: thread.lastMessageAt?.toISOString() ?? null,
+    createdAt: thread.createdAt.toISOString(),
+    readOnly: true,
+  };
 }
 
 export function createExternalLinkRoutes({
@@ -106,6 +136,37 @@ export function createExternalLinkRoutes({
   routes.use("/threads/*", async (context, next) => {
     context.header("Cache-Control", "no-store");
     await next();
+  });
+
+  routes.use("/threads", async (context, next) => {
+    context.header("Cache-Control", "no-store");
+    await next();
+  });
+
+  routes.get("/threads", requireUser, async (context) => {
+    let limit: number | undefined;
+    try {
+      limit = externalThreadLimit(context.req.query("limit"));
+    } catch {
+      return context.json({ error: INVALID_CONVERSATION_PAGE_MESSAGE }, 400);
+    }
+
+    const actor = context.var.actor;
+    const requestedLimit = limit ?? 50;
+    const agentIds = await agentProfileStore.listAccessibleIds({
+      id: actor.id,
+      role: actor.role,
+    });
+    const page = await threadStore.listForCreator(actor.id, {
+      agentIds,
+      cursor: context.req.query("cursor"),
+      limit: requestedLimit,
+    });
+
+    return context.json({
+      threads: page.threads.map(externalThreadSummary),
+      nextCursor: page.nextCursor,
+    });
   });
 
   routes.get("/threads/:threadId", requireUser, async (context) => {
