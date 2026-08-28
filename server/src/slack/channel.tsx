@@ -11,12 +11,17 @@ import {
   OpenBotChannelAgent,
   type OpenBotChannelAgentDependencies,
 } from "./channel-agent";
-import { ApprovalCard, configureApprovalInteractionBridge } from "./components";
+import {
+  ApprovalCard,
+  configureApprovalExecutionBridge,
+  configureApprovalInteractionBridge,
+} from "./components";
 import {
   createSlackComputerTools,
   type SlackComputerTool,
 } from "./computer-tools";
 import {
+  currentSlackExecution,
   runWithSlackExecution,
   type SlackExecution,
 } from "./execution-context";
@@ -117,7 +122,29 @@ export function createOpenBotSlackChannel(
   const ingress = deps.ingressRegistry ?? new SlackIngressRegistry();
   const logTurnFailure = deps.logTurnFailure ?? defaultSlackTurnFailureLogger;
   const prepareExecution = deps.prepareExecution ?? executionFor;
+  const pendingExecutions = new Map<string, SlackExecution[]>();
+  async function runWithPendingExecution<T>(
+    conversationKey: string,
+    execution: SlackExecution,
+    work: () => Promise<T>,
+  ): Promise<T> {
+    return runWithSlackExecution(execution, async () => {
+      const protectedExecution = currentSlackExecution();
+      const queue = pendingExecutions.get(conversationKey) ?? [];
+      queue.push(protectedExecution);
+      pendingExecutions.set(conversationKey, queue);
+      try {
+        return await work();
+      } finally {
+        const remaining = pendingExecutions.get(conversationKey);
+        const index = remaining?.indexOf(protectedExecution) ?? -1;
+        if (remaining && index >= 0) remaining.splice(index, 1);
+        if (remaining?.length === 0) pendingExecutions.delete(conversationKey);
+      }
+    });
+  }
   configureApprovalInteractionBridge(ingress);
+  configureApprovalExecutionBridge({ run: runWithPendingExecution });
   const tools: SlackComputerTool[] = deps.computerGateway
     ? createSlackComputerTools(deps.computerGateway, deps.assistance)
     : [];
@@ -149,7 +176,17 @@ export function createOpenBotSlackChannel(
       );
       return identityResult.kind === "linked" ? identityResult.user : null;
     },
-    agent: (threadId) => new OpenBotChannelAgent(threadId, deps.agentDeps),
+    agent: (threadId) => {
+      const queue = pendingExecutions.get(threadId);
+      const execution = queue?.shift();
+      if (queue?.length === 0) pendingExecutions.delete(threadId);
+      if (!execution) {
+        throw new Error(
+          "A Slack agent run requires a private execution context.",
+        );
+      }
+      return new OpenBotChannelAgent(threadId, deps.agentDeps, execution);
+    },
     tools,
     components: [ApprovalCard],
     showToolStatus: true,
@@ -230,7 +267,7 @@ export function createOpenBotSlackChannel(
     await runSlackPhase(
       "agent.run",
       () =>
-        runWithSlackExecution(execution, () =>
+        runWithPendingExecution(thread.conversationKey, execution, () =>
           thread.runAgent(
             message.contentParts?.length
               ? { prompt: message.contentParts }

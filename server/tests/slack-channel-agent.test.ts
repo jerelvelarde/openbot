@@ -182,6 +182,19 @@ async function collect(agent: OpenBotChannelAgent, runInput = input()) {
 }
 
 describe("OpenBotChannelAgent", () => {
+  test("uses private execution bound before Channels invokes the agent", async () => {
+    const { deps } = harness();
+    const agent = new OpenBotChannelAgent(
+      CANONICAL_THREAD_ID,
+      deps,
+      execution(),
+    );
+
+    const events = await lastValueFrom(agent.run(input()).pipe(toArray()));
+
+    expect(events).toHaveLength(2);
+  });
+
   test("carries private execution into a deferred Channels subscription", async () => {
     const { agent } = harness();
     const deferredRun = runWithSlackExecution(execution(), () =>
