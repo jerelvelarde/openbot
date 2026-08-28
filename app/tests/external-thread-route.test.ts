@@ -25,17 +25,35 @@ describe("external Slack transcript target", () => {
     });
   });
 
-  test("rejects writable or malformed targets", () => {
+  test("accepts a writable target once the managed capability exists", () => {
+    // `readOnly` is a capability the server reports, not a constant. It was
+    // pinned to the literal `true` while no Slack thread could accept a web
+    // turn; rejecting `false` now would reject the very case this surface
+    // exists to enable.
+    expect(
+      externalThreadTarget({
+        threadId: "channels-thread-1",
+        agentId: "risk",
+        agentName: "Risk Analyst",
+        provider: "slack",
+        readOnly: false,
+      }).readOnly,
+    ).toBe(false);
+  });
+
+  test("rejects malformed targets and a missing capability", () => {
     for (const value of [
       null,
       {},
+      // Absent is still refused: a target with no `readOnly` would otherwise
+      // read as writable by omission, which is the wrong way to fail.
       { threadId: "t", agentId: "a", agentName: "A", provider: "slack" },
       {
         threadId: "t",
         agentId: "a",
         agentName: "A",
         provider: "slack",
-        readOnly: false,
+        readOnly: "no",
       },
     ]) {
       expect(() => externalThreadTarget(value)).toThrow(
@@ -82,7 +100,7 @@ describe("external Slack transcript list", () => {
       { threads: [{ ...validThread, agentId: "" }], nextCursor: null },
       { threads: [{ ...validThread, agentName: "" }], nextCursor: null },
       { threads: [{ ...validThread, provider: "teams" }], nextCursor: null },
-      { threads: [{ ...validThread, readOnly: false }], nextCursor: null },
+      { threads: [{ ...validThread, readOnly: "no" }], nextCursor: null },
       { threads: [{ ...validThread, lastMessage: 123 }], nextCursor: null },
       {
         threads: [{ ...validThread, lastMessageAt: "not-a-date" }],

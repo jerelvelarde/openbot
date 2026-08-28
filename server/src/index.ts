@@ -54,6 +54,7 @@ import { createDatabase } from "./db/client";
 import { createExternalLinkStore } from "./external/link-store";
 import { createExternalLinkRoutes } from "./external/routes";
 import { createExternalThreadStore } from "./external/thread-store";
+import { createExternalWebTurnStore } from "./external/web-turn-store";
 import { createPeopleStore } from "./people/store";
 import { redirectUriFor } from "./plugins/oauth";
 import { createPluginStore } from "./plugins/store";
@@ -151,6 +152,7 @@ const agentProfileStore = createAgentProfileStore(
 );
 const approvalLinkStore = createExternalLinkStore(database);
 const approvalThreadStore = createExternalThreadStore(database);
+const externalWebTurnStore = createExternalWebTurnStore(database);
 configureApprovalDecisionStore(createApprovalDecisionStore(database), {
   authorize: createApprovalAuthorizer({
     links: approvalLinkStore,
@@ -603,6 +605,7 @@ const externalLinkRoutes = createExternalLinkRoutes({
   auditStore: bootAuditStore,
   agentProfileStore,
   threadStore: approvalThreadStore,
+  webTurnStore: externalWebTurnStore,
 });
 
 const app = createApp(

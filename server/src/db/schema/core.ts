@@ -322,6 +322,88 @@ export const externalThreadMessages = pgTable(
   ],
 );
 
+/**
+ * The managed conversation reference for a Slack thread, when Intelligence has issued one.
+ *
+ * A sidecar rather than a column on `external_thread_bindings`, because that table carries a
+ * `BEFORE UPDATE OR DELETE` trigger making it append-only: a reference that can be refreshed or
+ * revoked cannot live there without weakening the invariant that a thread's coworker is immutable.
+ *
+ * Presence is the capability check. A thread with no row here cannot accept a web-authored turn,
+ * which is exactly the state every thread is in until the managed upstream support ships — so the
+ * read-only surface stays read-only by default rather than by a flag someone can forget to set.
+ */
+export const externalThreadConversationRefs = pgTable(
+  "external_thread_conversation_refs",
+  {
+    channelsThreadId: text("channels_thread_id")
+      .primaryKey()
+      .references(() => externalThreadBindings.channelsThreadId, {
+        onDelete: "cascade",
+      }),
+    /** Opaque and Intelligence-minted. OpenBot never parses it and must never log it. */
+    conversationRef: text("conversation_ref").notNull(),
+    refreshedAt: updatedAt(),
+    createdAt: createdAt(),
+  },
+  (table) => [
+    check(
+      "external_thread_conversation_refs_ref_present_check",
+      sql`length(${table.conversationRef}) > 0`,
+    ),
+  ],
+);
+
+/**
+ * One web-authored turn, claimed before anything is delivered.
+ *
+ * The claim is what makes a retry safe. A browser that resubmits — a double tap, a flaky network,
+ * a reloaded tab — reuses its idempotency key, hits the unique index, and reads back the original
+ * operation instead of producing a second Slack message and a second agent run.
+ */
+export const externalWebTurns = pgTable(
+  "external_web_turns",
+  {
+    operationId: uuid("operation_id").primaryKey().defaultRandom(),
+    channelsThreadId: text("channels_thread_id")
+      .notNull()
+      .references(() => externalThreadBindings.channelsThreadId, {
+        onDelete: "cascade",
+      }),
+    /** Client-generated and per-submission. The idempotency key, scoped to one thread. */
+    idempotencyKey: text("idempotency_key").notNull(),
+    authorUserId: text("author_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "restrict" }),
+    status: text("status").notNull().default("accepted"),
+    /**
+     * Bounded category, never a provider message or an exception string, so a failed turn can be
+     * shown to its author without leaking provider identifiers into the UI or the logs.
+     */
+    failureCategory: text("failure_category"),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (table) => [
+    check(
+      "external_web_turns_status_check",
+      sql`${table.status} IN ('accepted', 'delivered', 'failed')`,
+    ),
+    check(
+      "external_web_turns_failure_category_check",
+      sql`(${table.status} = 'failed') = (${table.failureCategory} IS NOT NULL)`,
+    ),
+    uniqueIndex("external_web_turns_thread_idempotency_idx").on(
+      table.channelsThreadId,
+      table.idempotencyKey,
+    ),
+    index("external_web_turns_thread_created_idx").on(
+      table.channelsThreadId,
+      table.createdAt.desc(),
+    ),
+  ],
+);
+
 export const channels = pgTable(
   "channels",
   {

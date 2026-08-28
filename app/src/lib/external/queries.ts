@@ -7,7 +7,12 @@ export type ExternalThreadTarget = {
   agentId: string;
   agentName: string;
   provider: "slack";
-  readOnly: true;
+  /**
+   * False only when Intelligence has issued a managed conversation reference for
+   * this thread. The server derives it from that capability, so a deployment
+   * without managed support stays read-only without any client-side flag.
+   */
+  readOnly: boolean;
 };
 
 export type ExternalThreadSummary = ExternalThreadTarget & {
@@ -26,6 +31,8 @@ export const externalThreadKeys = {
   list: () => ["external-threads", "list"] as const,
   detail: (threadId: string) =>
     ["external-threads", "detail", threadId] as const,
+  messages: (threadId: string) =>
+    ["external-threads", "messages", threadId] as const,
 };
 
 const EXTERNAL_THREAD_ERROR = "Could not load this Slack conversation.";
@@ -55,7 +62,7 @@ export function externalThreadTarget(value: unknown): ExternalThreadTarget {
     !isNonEmptyString(target.agentId) ||
     !isNonEmptyString(target.agentName) ||
     target.provider !== "slack" ||
-    target.readOnly !== true
+    typeof target.readOnly !== "boolean"
   ) {
     throw new Error(EXTERNAL_THREAD_ERROR);
   }
@@ -144,4 +151,43 @@ export function externalThreadQueryOptions(threadId: string) {
       return externalThreadTarget(await response.json());
     },
   });
+}
+
+export type ExternalTurnResult = {
+  operationId: string;
+  status: "accepted" | "delivered" | "failed";
+  duplicate?: boolean;
+};
+
+const EXTERNAL_TURN_ERROR = "Could not send this message to Slack.";
+
+/**
+ * Submits one web-authored turn.
+ *
+ * `id` is the idempotency key and must be stable across retries of the same
+ * composed message — the server keys the operation on it, so a regenerated id
+ * would be a second Slack message and a second agent run rather than a retry.
+ */
+export async function submitExternalThreadTurn(
+  threadId: string,
+  turn: { id: string; text: string },
+): Promise<ExternalTurnResult> {
+  const response = await client(
+    `/api/external-links/threads/${encodeURIComponent(threadId)}/messages`,
+    { method: "POST", body: turn, fallback: EXTERNAL_TURN_ERROR },
+  );
+  const value = (await response.json()) as Partial<ExternalTurnResult>;
+  if (
+    typeof value.operationId !== "string" ||
+    (value.status !== "accepted" &&
+      value.status !== "delivered" &&
+      value.status !== "failed")
+  ) {
+    throw new Error(EXTERNAL_TURN_ERROR);
+  }
+  return {
+    operationId: value.operationId,
+    status: value.status,
+    ...(value.duplicate === true ? { duplicate: true } : {}),
+  };
 }
