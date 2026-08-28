@@ -60,8 +60,10 @@ import { Channel } from "./channel";
 import {
   conversationRoster,
   matchingRoster,
+  type RosterSourceStatus,
   rosterKey,
   shouldShowEmptyRoster,
+  shouldShowSearchEmpty,
   type SidebarRosterRow,
 } from "./roster";
 import { SlackChannel, SlackRosterProblem } from "./slack-channel";
@@ -71,6 +73,15 @@ const adminLinkOptions = { to: "/admin" } satisfies LinkOptions;
 const settingsLinkOptions = { to: "/settings" } satisfies LinkOptions;
 
 const userMenuItemClassName = "gap-2 px-2 py-1.5";
+
+function rosterSourceStatus(query: {
+  isError: boolean;
+  isSuccess: boolean;
+}): RosterSourceStatus {
+  if (query.isSuccess) return "success";
+  if (query.isError) return "error";
+  return "pending";
+}
 
 function UserAvatar() {
   const { data: currentUser } = useQuery(currentUserQueryOptions());
@@ -242,6 +253,8 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   const searching = search.trim().length > 0;
   const roster = conversationRoster(channels.data, slackThreads.data);
   const visibleRoster = matchingRoster(roster, search);
+  const channelStatus = rosterSourceStatus(channels);
+  const slackThreadStatus = rosterSourceStatus(slackThreads);
   /*
    * FILTERING DOES NOT ANIMATE. Rows exit and relayout on every keystroke otherwise, which is a
    * list thrashing under somebody who is still typing — and the moving target is the very thing
@@ -293,7 +306,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
             <SidebarMenuItem>
               <InputGroup className="bg-background text-sm rounded-lg h-9">
                 <InputGroupInput
-                  aria-label="Search channels"
+                  aria-label="Search conversations"
                   onChange={(event) => setSearch(event.target.value)}
                   placeholder="Search..."
                   value={search}
@@ -310,7 +323,12 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
              * the box has to say so and quote it back — told "you don't have channels yet" while
              * holding a typo, a person reads their conversations as gone.
              */}
-            {searching && visibleRoster.length === 0 ? (
+            {shouldShowSearchEmpty(
+              visibleRoster,
+              search,
+              channelStatus,
+              slackThreadStatus,
+            ) ? (
               <div className="py-4">
                 <Empty className="border border-dashed min-h-[40dvh]">
                   <EmptyHeader>
@@ -344,6 +362,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
             ) : null}
             {slackThreads.isError ? (
               <SlackRosterProblem
+                isRetrying={slackThreads.isFetching}
                 onRetry={() => {
                   void slackThreads.refetch();
                 }}

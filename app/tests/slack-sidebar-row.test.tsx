@@ -60,3 +60,21 @@ test("Slack roster problem announces the loading failure and retries Slack only"
   fireEvent.click(view.getByRole("button", { name: "Retry" }));
   expect(retryCalls).toBe(1);
 });
+
+test("Slack roster problem disables retry while a retry is already running", () => {
+  let retryCalls = 0;
+  const view = render(
+    <SlackRosterProblem
+      isRetrying
+      onRetry={() => {
+        retryCalls += 1;
+      }}
+    />,
+  );
+
+  const button = view.getByRole("button", { name: "Retrying…" });
+
+  expect((button as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.click(button);
+  expect(retryCalls).toBe(0);
+});

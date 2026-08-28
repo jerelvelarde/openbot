@@ -6,6 +6,8 @@ export type SidebarRosterRow =
   | { kind: "openbot"; channel: ChannelSummary }
   | { kind: "slack"; thread: ExternalThreadSummary };
 
+export type RosterSourceStatus = "pending" | "success" | "error";
+
 const openbotChannelRoute = "/channel/$channelId" as const;
 const slackThreadRoute = "/slack/thread/$threadId" as const;
 
@@ -107,5 +109,19 @@ export function shouldShowEmptyRoster(
     slackThreadsLoaded &&
     channels?.length === 0 &&
     slackThreads?.length === 0
+  );
+}
+
+export function shouldShowSearchEmpty(
+  visibleRows: readonly SidebarRosterRow[],
+  query: string,
+  channelsStatus: RosterSourceStatus,
+  slackThreadsStatus: RosterSourceStatus,
+): boolean {
+  return (
+    query.trim().length > 0 &&
+    channelsStatus === "success" &&
+    slackThreadsStatus === "success" &&
+    visibleRows.length === 0
   );
 }

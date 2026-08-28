@@ -7,6 +7,7 @@ import {
   rosterLastMessage,
   rosterName,
   shouldShowEmptyRoster,
+  shouldShowSearchEmpty,
 } from "../src/components/app-sidebar/roster";
 import type { ChannelSummary } from "../src/lib/channels/queries";
 import type { ExternalThreadSummary } from "../src/lib/external/queries";
@@ -155,5 +156,26 @@ describe("sidebar conversation roster", () => {
     );
     expect(shouldShowEmptyRoster([], [], false, true)).toBe(false);
     expect(shouldShowEmptyRoster([], [], true, false)).toBe(false);
+  });
+
+  test("shows search-empty only once both sources successfully loaded and the merged result is empty", () => {
+    const match = conversationRoster([channel("native")]);
+
+    expect(shouldShowSearchEmpty([], "missing", "success", "pending")).toBe(
+      false,
+    );
+    expect(shouldShowSearchEmpty([], "missing", "pending", "success")).toBe(
+      false,
+    );
+    expect(shouldShowSearchEmpty([], "missing", "success", "error")).toBe(
+      false,
+    );
+    expect(shouldShowSearchEmpty([], "missing", "success", "success")).toBe(
+      true,
+    );
+    expect(shouldShowSearchEmpty(match, "native", "success", "success")).toBe(
+      false,
+    );
+    expect(shouldShowSearchEmpty([], "   ", "success", "success")).toBe(false);
   });
 });

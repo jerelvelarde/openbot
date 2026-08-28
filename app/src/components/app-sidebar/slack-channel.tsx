@@ -65,17 +65,24 @@ export function SlackChannelContent({
   );
 }
 
-export function SlackRosterProblem({ onRetry }: { onRetry: () => void }) {
+export function SlackRosterProblem({
+  isRetrying = false,
+  onRetry,
+}: {
+  isRetrying?: boolean;
+  onRetry: () => void;
+}) {
   return (
     <div className="px-2 py-2 text-xs text-muted-foreground" role="alert">
       <p>Slack conversations could not be loaded.</p>
       <Button
         className="mt-2 h-7 px-2 text-xs"
+        disabled={isRetrying}
         onClick={onRetry}
         size="sm"
         variant="outline"
       >
-        Retry
+        {isRetrying ? "Retrying…" : "Retry"}
       </Button>
     </div>
   );
