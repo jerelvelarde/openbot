@@ -82,8 +82,8 @@ function validRememberedPrincipal(
     identity.providerTenantId === context.tenant.id &&
     identity.providerUserId === context.actor.id &&
     (result.kind === "unlinked" ||
-      !message.user ||
-      (result.user.id === message.user.id &&
+      (!!message.user &&
+        result.user.id === message.user.id &&
         result.actor.id === message.user.id))
   );
 }
