@@ -20,6 +20,7 @@ const suite = randomUUID().slice(0, 8);
 const creatorId = `external_thread_creator_${suite}`;
 const otherCreatorId = `external_thread_other_creator_${suite}`;
 const paginationCreatorId = `external_thread_page_creator_${suite}`;
+const accessFilterCreatorId = `external_thread_access_creator_${suite}`;
 const previewCreatorId = `external_thread_preview_creator_${suite}`;
 const foreignKeyCreatorId = `external_thread_fk_creator_${suite}`;
 const riskAgentId = `external_thread_risk_${suite}`;
@@ -131,6 +132,10 @@ beforeAll(async () => {
       email: `${paginationCreatorId}@example.test`,
     },
     {
+      id: accessFilterCreatorId,
+      email: `${accessFilterCreatorId}@example.test`,
+    },
+    {
       id: previewCreatorId,
       email: `${previewCreatorId}@example.test`,
     },
@@ -168,9 +173,17 @@ afterAll(async () => {
     await transaction.execute(
       sql`ALTER TABLE "external_thread_bindings" DISABLE TRIGGER USER`,
     );
-    await transaction.execute(
-      sql`DELETE FROM "external_thread_bindings" WHERE "created_by_user_id" IN (${creatorId}, ${otherCreatorId}, ${paginationCreatorId}, ${previewCreatorId}, ${foreignKeyCreatorId})`,
-    );
+    await transaction.execute(sql`
+      DELETE FROM "external_thread_bindings"
+      WHERE "created_by_user_id" IN (
+        ${creatorId},
+        ${otherCreatorId},
+        ${paginationCreatorId},
+        ${accessFilterCreatorId},
+        ${previewCreatorId},
+        ${foreignKeyCreatorId}
+      )
+    `);
     await transaction.execute(
       sql`ALTER TABLE "external_thread_bindings" ENABLE TRIGGER USER`,
     );
@@ -181,6 +194,7 @@ afterAll(async () => {
   await database.delete(users).where(eq(users.id, creatorId));
   await database.delete(users).where(eq(users.id, otherCreatorId));
   await database.delete(users).where(eq(users.id, paginationCreatorId));
+  await database.delete(users).where(eq(users.id, accessFilterCreatorId));
   await database.delete(users).where(eq(users.id, previewCreatorId));
   await database.delete(users).where(eq(users.id, foreignKeyCreatorId));
   await database.$client.end();
@@ -349,6 +363,56 @@ describe("external thread bindings", () => {
     expect(
       malformedCursorPage.threads.map((thread) => thread.threadId),
     ).toEqual(pageOne.threads.map((thread) => thread.threadId));
+  });
+
+  test("filters allowed agent ids before applying the page limit", async () => {
+    const allowed = binding("allowed_agent_before_limit", {
+      createdByUserId: accessFilterCreatorId,
+      agentId: riskAgentId,
+      agentName: "Risk Analyst",
+    });
+    const blocked = binding("blocked_agent_before_limit", {
+      createdByUserId: accessFilterCreatorId,
+      agentId: knowledgeAgentId,
+      agentName: "Knowledge Analyst",
+    });
+    await store.bind(allowed);
+    await store.bind(blocked);
+    await database.insert(externalThreadMessages).values([
+      {
+        channelsThreadId: blocked.channelsThreadId,
+        messageId: "blocked-agent-before-limit-user",
+        role: "user",
+        content: "blocked newest",
+        createdAt: new Date("2099-09-02T12:00:00.000Z"),
+      },
+      {
+        channelsThreadId: allowed.channelsThreadId,
+        messageId: "allowed-agent-before-limit-user",
+        role: "user",
+        content: "allowed older",
+        createdAt: new Date("2099-09-02T11:00:00.000Z"),
+      },
+    ]);
+
+    const page = await store.listForCreator(accessFilterCreatorId, {
+      agentIds: [riskAgentId],
+      limit: 1,
+    });
+
+    expect(page.threads.map((thread) => thread.threadId)).toEqual([
+      allowed.channelsThreadId,
+    ]);
+    expect(page.nextCursor).toBeNull();
+  });
+
+  test("returns an empty page when the allowed agent id set is empty", async () => {
+    const page = await store.listForCreator(accessFilterCreatorId, {
+      agentIds: [],
+      limit: 1,
+    });
+
+    expect(page).toEqual({ threads: [], nextCursor: null });
   });
 
   test("treats noncanonical parseable cursor dates as the first page", async () => {

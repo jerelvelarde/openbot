@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, or, sql } from "drizzle-orm";
 import type { Database } from "../db/client";
 import {
   agents,
@@ -48,6 +48,7 @@ export type ExternalThreadPage = {
 };
 
 export type ExternalThreadListQuery = {
+  agentIds?: readonly string[];
   cursor?: string;
   limit?: number;
 };
@@ -247,6 +248,10 @@ export function createExternalThreadStore(
     creatorId: string,
     query: ExternalThreadListQuery = {},
   ): Promise<ExternalThreadPage> {
+    if (query.agentIds?.length === 0) {
+      return { threads: [], nextCursor: null };
+    }
+
     const limit = Math.min(
       Math.max(query.limit ?? DEFAULT_EXTERNAL_THREAD_PAGE, 1),
       MAX_EXTERNAL_THREAD_PAGE,
@@ -267,6 +272,9 @@ export function createExternalThreadStore(
       .where(
         and(
           eq(externalThreadBindings.createdByUserId, creatorId),
+          query.agentIds
+            ? inArray(externalThreadBindings.agentId, query.agentIds)
+            : undefined,
           cursor
             ? sql`(${externalRecency}, ${externalThreadBindings.channelsThreadId}) < (${cursor.recency}::timestamptz, ${cursor.threadId})`
             : undefined,
