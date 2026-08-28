@@ -8,6 +8,7 @@ import {
   computerKeyContract,
   computerListFilesContract,
   computerNavigateContract,
+  computerOpenAndShareScreenshotContract,
   computerReadContract,
   computerReadFileContract,
   computerRequestHelpContract,
@@ -319,6 +320,10 @@ export function createSlackComputerTools(
   const tools: SlackComputerTool[] = [
     defineChannelTool({
       ...computerNavigateContract,
+      description:
+        computerNavigateContract.description +
+        " In Slack, if the request also asks for a screenshot or picture, use " +
+        "computer_open_and_share_screenshot instead.",
       handler: ({ url }, { signal }) =>
         governed(
           signal,
@@ -328,6 +333,11 @@ export function createSlackComputerTools(
           },
           { checkStoppedAfter: false },
         ),
+    }),
+    defineChannelTool({
+      ...computerOpenAndShareScreenshotContract,
+      handler: (input, context) =>
+        openAndShareScreenshot(gateway, input, context),
     }),
     defineChannelTool({
       ...computerScreenshotContract,
@@ -482,6 +492,46 @@ export function createSlackComputerTools(
   }
   return tools.map((tool) =>
     bindSlackExecution(tool, executionForConversation),
+  );
+}
+
+async function openAndShareScreenshot(
+  gateway: ComputerGateway,
+  input: { url: string; filename?: string },
+  context: ChannelToolContext,
+): Promise<ToolOutcome> {
+  return governed(
+    context.signal,
+    async () => {
+      const { agentId, actor } = currentComputer();
+      const navigation = await gateway.navigate(agentId, actor, input.url);
+      throwIfStopped(context.signal);
+      const screenshot = await gateway.screenshot(agentId);
+      throwIfStopped(context.signal);
+
+      const filename = safeFilename(input.filename ?? "screenshot.png");
+      const posted = await context.thread.postFile({
+        bytes: Buffer.from(screenshot.base64, "base64"),
+        filename,
+      });
+      if (!posted.ok) {
+        return {
+          ok: false,
+          reason: posted.error ?? "Slack could not share that screenshot.",
+        };
+      }
+      return {
+        ok: true,
+        ...navigation,
+        screenshotShared: true,
+        screenshotFilename: filename,
+        screenshotWidth: screenshot.width,
+        screenshotHeight: screenshot.height,
+        ...(posted.fileId ? { fileId: posted.fileId } : {}),
+        ...(posted.assetId ? { assetId: posted.assetId } : {}),
+      };
+    },
+    { checkStoppedAfter: false },
   );
 }
 

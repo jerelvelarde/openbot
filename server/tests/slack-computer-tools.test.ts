@@ -465,6 +465,7 @@ describe("Slack computer ChannelTools", () => {
     const names = [...toolsByName(new FakeComputerGateway()).keys()];
     expect(names).toEqual([
       "computer_navigate",
+      "computer_open_and_share_screenshot",
       "computer_screenshot",
       "computer_read",
       "computer_snapshot",
@@ -1564,6 +1565,41 @@ describe("Slack computer ChannelTools", () => {
       width: 1440,
       height: 900,
       url: "https://copilotkit.ai/",
+    });
+  });
+
+  test("opens, reads, and shares a website screenshot in one tool round", async () => {
+    const gateway = new FakeComputerGateway();
+    const adapter = new FileAdapter();
+
+    const result = await inSlack(() =>
+      invoke(
+        toolsByName(gateway).get("computer_open_and_share_screenshot")!,
+        {
+          url: "https://copilotkit.ai",
+          filename: "copilotkit-homepage.png",
+        },
+        channelContext(adapter),
+      ),
+    );
+
+    expect(gateway.navigateCalls).toEqual([
+      ["risk", { id: "u1", userId: "u1" }, "https://copilotkit.ai"],
+    ]);
+    expect(gateway.screenshotCalls).toEqual([["risk"]]);
+    expect(adapter.uploads).toHaveLength(1);
+    expect(result).toEqual({
+      ok: true,
+      url: "https://copilotkit.ai",
+      title: "Example",
+      text: "Page text",
+      truncated: false,
+      elapsedMs: 4,
+      screenshotShared: true,
+      screenshotFilename: "copilotkit-homepage.png",
+      screenshotWidth: 1440,
+      screenshotHeight: 900,
+      fileId: "slack-file-1",
     });
   });
 

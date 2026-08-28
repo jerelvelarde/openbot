@@ -18,6 +18,23 @@ export const computerNavigateContract = {
   }),
 } as const;
 
+/** Channels-only bounded path for a website summary plus visual proof. */
+export const computerOpenAndShareScreenshotContract = {
+  name: "computer_open_and_share_screenshot",
+  description:
+    "Open a website, return its readable text for summarization, and share a current PNG " +
+    "screenshot in this Slack conversation in one operation. Use this instead of separate " +
+    "navigate and screenshot calls whenever the request asks both to inspect or summarize a site " +
+    "and to send a picture.",
+  parameters: z.object({
+    url: z.string().describe("Full web address to open, including https://"),
+    filename: z
+      .string()
+      .optional()
+      .describe("Optional PNG filename to show in Slack"),
+  }),
+} as const;
+
 export const computerReadContract = {
   name: "computer_read",
   description:
