@@ -36,8 +36,9 @@ The production investigation established the following:
 6. A fresh Slack mention still failed before routing after the schema repair.
 7. In the live image, `loadConfig()` resolved the correct HTTPS application URL, token minting succeeded, a real database query succeeded, and `SlackIdentityLinker.resolve()` returned a valid unlinked result for a well-formed managed identity context.
 8. The existing Slack-focused baseline is green: 43 tests pass across identity linking, ingress registry behavior, channel integration, and the migration journal.
+9. A bounded production diagnostic split canonical identity validation by field. The managed delivery reported provider `slack`, a human actor, and a valid actor ID, but supplied tenant ID `unknown`. The public managed-delivery contract permits tenant metadata to be absent; the delivery adapter substitutes `unknown` in that case.
 
-The remaining failure is therefore between managed identity-context receipt and completion of the unlinked link-card or linked routing handoff. The current bounded Channels log intentionally removes the original error message, so a cause-specific fix requires one safe phase signal.
+The remaining failure is therefore a missing canonical workspace ID at managed identity ingress. OpenBot must preserve workspace-scoped authorization without trusting the raw provider payload. For the single-workspace demo deployment, an operator-configured workspace ID supplies that missing trusted boundary. CopilotKit Channels remains responsible for the general upstream fix: managed Slack delivery should populate its canonical tenant metadata.
 
 ## Design
 
@@ -85,22 +86,29 @@ The boundary must distinguish failures without changing control flow. It may wra
 
 The logger is a synchronous `(event) => void` dependency with a production default that serializes the two-field event to `console.error`. Tests inject a collector. A logger failure is caught locally so observability cannot replace the application error being diagnosed.
 
-### 3. Evidence-based cause fix
+### 3. Single-workspace tenant fallback
 
-Deploy the phase-only diagnostic and send one approved test mention in `#openbot-channels`. Use the resulting phase to select exactly one cause branch:
+Add optional configuration `OPENBOT_SLACK_TENANT_ID`. It is the Slack workspace/team ID that the operator attached to this OpenBot Channel. Configuration accepts a non-empty, non-`unknown` canonical ID and rejects invalid values at startup.
 
-- **`identity.resolve`:** inspect only the canonical `ChannelIdentityContext` fields required by the linker. Accept provider-derived identity only when tenant and human actor IDs are present and non-`unknown`. Do not fall back to `raw` or actor email. If the managed SDK omits a required canonical field, adapt from another documented, authenticated canonical field only with a regression test proving the provider binding.
-- **`ingress.remember` or `ingress.take`:** make the registry key agree with Channels' managed message contract while keeping one-use consumption and principal matching. Do not relax actor, tenant, conversation, thread, or application-user checks.
-- **`identity.validate`:** fix a discrepancy between the remembered canonical identity and the message built by Channels. Validation remains fail-closed and must reject cross-principal pairing.
-- **`link_card.post`:** correct the portable Channels UI payload or link-card delivery call. The signed URL remains HTTPS, expiring, and absent from logs. The agent must not run for an unlinked user.
-- **`thread.subscribe`, `execution.prepare`, or `agent.run`:** repair only the indicated linked-user/routing boundary. Existing actor reauthorization and immutable coworker binding remain mandatory.
+Before identity linking or ingress persistence, normalize the immutable `ChannelIdentityContext` through one pure Slack tenant resolver:
 
-If the first diagnostic deployment produces no OpenBot phase before Channels reports failure, the exception is upstream of this application boundary. Stop and update the design rather than broadening the patch speculatively.
+- A known canonical Channels tenant remains authoritative when no fallback is configured.
+- A known canonical Channels tenant must exactly equal the configured tenant when both exist; mismatch fails before every store or agent operation.
+- An absent, blank, or `unknown` canonical tenant may be replaced only by the configured tenant.
+- An absent canonical tenant with no configured tenant still fails closed.
+- Provider, actor, installation, conversation, event, trigger, profile lookup, and raw payload are not changed.
+
+The normalized context, rather than the original incomplete context, is passed to `SlackIdentityLinker` and stored in `SlackIngressRegistry`. This keeps every downstream tenant comparison consistent: account-link tokens, immutable thread bindings, approval reauthorization, execution context, audit identity, and coworker routing all use the same effective workspace ID. No handler may independently repeat the fallback.
+
+This is deliberately a single-workspace bridge. It does not infer tenant identity from `raw`, a channel ID, actor email, actor ID, or the Slack installation ID. Supporting multiple Slack workspaces requires Channels to supply canonical tenant metadata per delivery, or a future administrator-owned mapping keyed by another authenticated managed-delivery capability.
+
+The production OpenBot service is configured with `OPENBOT_SLACK_TENANT_ID=T05QFA4BW9X`. This value is an identifier, not a credential. It may appear in deployment configuration but remains excluded from bounded failure logs to keep diagnostics low-cardinality.
 
 ### 4. Error handling and security invariants
 
 - Database migration failure blocks the new Railway deployment; the previous healthy deployment remains serving.
 - Slack phase logging is best-effort but must not swallow or replace the original exception.
+- A configured Slack tenant is accepted only as an operator-owned fallback for a missing canonical managed tenant; a conflicting known tenant is rejected.
 - Unlinked users receive only the signed account-link card and never create a coworker binding or agent run.
 - Existing links reload the current OpenBot user and role on every turn.
 - A tenant or actor reported as blank or `unknown` remains invalid.
@@ -116,6 +124,7 @@ If the first diagnostic deployment produces no OpenBot phase before Channels rep
 - Phase logs contain only `type` and `phase`.
 - Successful turns emit no failure phase.
 - The selected cause-specific fix has a regression test that fails against the deployed behavior.
+- Tenant normalization covers known/no-config, known/matching-config, known/mismatching-config, unknown/configured, unknown/unconfigured, and malformed configuration.
 - Existing tests continue to prove rejection of blank/unknown tenant and actor IDs, spoofed raw identity, untrusted actor email, cross-principal ingress pairing, and replayed ingress.
 
 ### Integration tests
@@ -131,8 +140,8 @@ If the first diagnostic deployment produces no OpenBot phase before Channels rep
 1. Confirm Railway's OpenBot service has the pre-deploy migration command.
 2. Deploy the diagnostic commit and observe terminal Railway deployment success.
 3. Send one approved `@openbot whatsup` mention in `#openbot-channels`.
-4. Read the bounded phase log and implement the cause-specific regression fix.
-5. Merge and deploy the final patch; observe the migration pre-deploy step and terminal deployment success.
+4. Confirm the bounded reason is `slack_identity_tenant_invalid` and configure the approved single-workspace tenant fallback.
+5. Merge and deploy the tenant-normalization patch; observe the migration pre-deploy step and terminal deployment success.
 6. Send a fresh approved Slack mention.
 7. For an unlinked identity, confirm a working OpenBot account-link card, complete linking through the authenticated OpenBot web surface, then retry.
 8. Confirm the Slack thread receives a non-fallback OpenBot reply and the audit trail records `channel.routed` for the linked OpenBot user and selected coworker.
@@ -147,6 +156,7 @@ The phase diagnostic is additive and can be reverted without data migration. The
 - Railway blocks deployments whose OpenBot migrations fail.
 - Production schema matches the migration journal shipped in the deployed image.
 - A real Slack mention no longer returns `Something went wrong`.
+- An omitted managed tenant is replaced by the configured workspace ID, while a conflicting known tenant remains rejected.
 - An unlinked user can reach and complete the secure account-link flow.
 - A linked user reaches coworker routing and receives a threaded OpenBot response.
 - The relevant focused tests, formatting, lint, typecheck, and build pass.

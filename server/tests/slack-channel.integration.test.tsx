@@ -374,6 +374,7 @@ function harness(
     failPost?: boolean;
     failSubscribe?: boolean;
     failExecutionPrepare?: boolean;
+    configuredTenantId?: string;
   } = {},
 ) {
   const adapter = new FakeAdapter({ platform: "slack", messageEvents: true });
@@ -521,6 +522,7 @@ function harness(
   };
   const deps: OpenBotSlackChannelDependencies = {
     identityLinker: options.identityLinker ?? linker,
+    configuredTenantId: options.configuredTenantId,
     agentDeps: { routing, store, resolver: options.resolver ?? resolver },
     ingressRegistry: options.ingressRegistry,
     computerGateway: options.computerGateway,
@@ -556,6 +558,136 @@ function toolResult(shared: SharedRunState): Record<string, unknown> {
 }
 
 describe("managed OpenBot Slack channel", () => {
+  test("uses the configured tenant once when managed delivery omits it", async () => {
+    let seenContext: ChannelIdentityContext | undefined;
+    const identityLinker: OpenBotSlackChannelDependencies["identityLinker"] = {
+      async resolve(context) {
+        seenContext = context;
+        return {
+          kind: "linked",
+          user: { id: "u1", name: "User" },
+          actor: { id: "u1", role: "user" },
+          identity: {
+            provider: "slack",
+            providerTenantId: context.tenant.id,
+            providerUserId: context.actor.id,
+            providerEmail: null,
+          },
+        };
+      },
+    };
+    const { adapter, bindCalls, channel, events, shared } = harness({
+      configuredTenantId: "T05QFA4BW9X",
+      identityLinker,
+    });
+    await channel.ɵruntime.start();
+
+    await adapter
+      .getSink()
+      .onTurn(turn("E-tenant-fallback", "hello", { tenantId: "unknown" }));
+
+    expect(seenContext?.tenant.id).toBe("T05QFA4BW9X");
+    expect(bindCalls).toEqual([
+      expect.objectContaining({
+        providerTenantId: "T05QFA4BW9X",
+        providerConversationId: "C1",
+      }),
+    ]);
+    expect(shared.inputs).toHaveLength(1);
+    expect(events).toEqual([]);
+  });
+
+  test("rejects a known managed tenant that conflicts with configuration", async () => {
+    const ingressRegistry = new SlackIngressRegistry();
+    let linkerCalls = 0;
+    const identityLinker: OpenBotSlackChannelDependencies["identityLinker"] = {
+      async resolve(context) {
+        linkerCalls += 1;
+        return {
+          kind: "linked",
+          user: { id: "u1", name: "User" },
+          actor: { id: "u1", role: "user" },
+          identity: {
+            provider: "slack",
+            providerTenantId: context.tenant.id,
+            providerUserId: context.actor.id,
+            providerEmail: null,
+          },
+        };
+      },
+    };
+    const { adapter, bindCalls, channel, events, shared } = harness({
+      configuredTenantId: "T1",
+      identityLinker,
+      ingressRegistry,
+    });
+    await channel.ɵruntime.start();
+
+    await expect(
+      adapter
+        .getSink()
+        .onTurn(turn("E-tenant-conflict", "hello", { tenantId: "T2" })),
+    ).rejects.toThrow("Channel identifyUser failed");
+
+    expect(linkerCalls).toBe(0);
+    expect(
+      ingressRegistry.take("E-tenant-conflict", {
+        provider: "slack",
+        providerActorId: "U1",
+        applicationUserId: "u1",
+      }),
+    ).toBeNull();
+    expect(bindCalls).toEqual([]);
+    expect(shared.inputs).toEqual([]);
+    expect(events).toEqual([
+      {
+        type: "slack-turn-failed",
+        phase: "identity.resolve",
+        reason: "slack_identity_tenant_invalid",
+      },
+    ]);
+  });
+
+  test("fails closed when managed delivery omits tenant and no fallback is configured", async () => {
+    const ingressRegistry = new SlackIngressRegistry();
+    let linkerCalls = 0;
+    const identityLinker: OpenBotSlackChannelDependencies["identityLinker"] = {
+      async resolve() {
+        linkerCalls += 1;
+        throw new Error("linker must not run");
+      },
+    };
+    const { adapter, bindCalls, channel, events, shared } = harness({
+      identityLinker,
+      ingressRegistry,
+    });
+    await channel.ɵruntime.start();
+
+    await expect(
+      adapter
+        .getSink()
+        .onTurn(turn("E-tenant-missing", "hello", { tenantId: "unknown" })),
+    ).rejects.toThrow("Channel identifyUser failed");
+
+    expect(linkerCalls).toBe(0);
+    expect(
+      ingressRegistry.take("E-tenant-missing", {
+        provider: "slack",
+        providerActorId: "U1",
+        applicationUserId: null,
+      }),
+    ).toBeNull();
+    expect(bindCalls).toEqual([]);
+    expect(shared.inputs).toEqual([]);
+    expect(events).toEqual([
+      {
+        type: "slack-turn-failed",
+        phase: "identity.resolve",
+        reason: "slack_identity_tenant_invalid",
+      },
+    ]);
+  });
+
   test("reports identity.resolve without leaking the error", async () => {
     const identityLinker: OpenBotSlackChannelDependencies["identityLinker"] = {
       async resolve() {

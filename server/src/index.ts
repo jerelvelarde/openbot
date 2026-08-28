@@ -561,6 +561,7 @@ const slackRouting = createCoworkerRoutingService({
 });
 const slackIngress = new SlackIngressRegistry();
 const openbotSlackChannel = createOpenBotSlackChannel({
+  configuredTenantId: config.slackTenantId,
   identityLinker: new SlackIdentityLinker({
     store: approvalLinkStore,
     encryptionKey: config.keyEncryptionKey,
