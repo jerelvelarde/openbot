@@ -32,12 +32,28 @@ let approvalDependencies: ApprovalDependencies | undefined;
 let approvalInteractionBridge:
   | Pick<SlackIngressRegistry, "takeInteraction">
   | undefined;
+let approvalExecutionBridge:
+  | {
+      run<T>(
+        conversationKey: string,
+        execution: SlackExecution,
+        work: () => Promise<T>,
+      ): Promise<T>;
+    }
+  | undefined;
 
 /** Connect the channel's live identifyUser handoff to durable approval actions. */
 export function configureApprovalInteractionBridge(
   bridge: Pick<SlackIngressRegistry, "takeInteraction">,
 ): void {
   approvalInteractionBridge = bridge;
+}
+
+/** Carry private execution across the deferred Channels resume boundary. */
+export function configureApprovalExecutionBridge(
+  bridge: NonNullable<typeof approvalExecutionBridge>,
+): void {
+  approvalExecutionBridge = bridge;
 }
 
 /** Wire the durable decision store before registering ApprovalCard with a Channel runtime. */
@@ -118,9 +134,10 @@ async function claimAndResume(
     userId,
   );
   if (execution) {
-    await runWithSlackExecution(execution, () =>
-      resume({ approved: decision.approved }),
-    );
+    const work = () => resume({ approved: decision.approved });
+    await (approvalExecutionBridge
+      ? approvalExecutionBridge.run(conversationKey, execution, work)
+      : runWithSlackExecution(execution, work));
   } else {
     // Non-OpenBot Channels may use the component with a boolean authorizer and an agent that does
     // not require Slack execution facts. OpenBot's authorizer always returns the complete subject.

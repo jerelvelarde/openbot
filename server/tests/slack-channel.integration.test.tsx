@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { AsyncResource } from "node:async_hooks";
 import {
   AbstractAgent,
   type BaseEvent,
@@ -375,6 +376,7 @@ function harness(
     failSubscribe?: boolean;
     failExecutionPrepare?: boolean;
     configuredTenantId?: string;
+    detachThreadOperations?: boolean;
   } = {},
 ) {
   const adapter = new FakeAdapter({ platform: "slack", messageEvents: true });
@@ -387,10 +389,15 @@ function harness(
     return id;
   };
   adapter.conversationStore.getOrCreate = async (
-    _conversationKey,
-    replyTarget,
+    conversationKey,
+    _replyTarget,
     makeAgent,
-  ) => ({ agent: makeAgent(adapter.getCanonicalThreadId!(replyTarget)) });
+  ) => ({ agent: makeAgent(conversationKey) });
+  if (options.detachThreadOperations) {
+    const detached = new AsyncResource("detached-channel-operation");
+    adapter.trackThreadOperation = (_target, operation) =>
+      detached.runInAsyncScope(operation);
+  }
   adapter.stateStore = options.stateStore;
   if (options.failSubscribe) {
     const backing = new MemoryStore();
@@ -850,7 +857,7 @@ describe("managed OpenBot Slack channel", () => {
       .onTurn(turn("E1", "ask Risk Analyst to review this"));
 
     expect(bindCalls[0]).toMatchObject({
-      channelsThreadId: "canonical-thread-1",
+      channelsThreadId: "opaque-conversation-C1",
       provider: "slack",
       providerTenantId: "T1",
       providerConversationId: "C1",
@@ -858,6 +865,20 @@ describe("managed OpenBot Slack channel", () => {
       agentId: "risk",
       createdByUserId: "u1",
     });
+    expect(shared.inputs).toHaveLength(1);
+    expect(postedText(adapter)).toContain("review complete");
+  });
+
+  test("carries private execution across the managed delivery operation boundary", async () => {
+    const { adapter, channel, shared } = harness({
+      detachThreadOperations: true,
+    });
+    await channel.ɵruntime.start();
+
+    await adapter
+      .getSink()
+      .onTurn(turn("E-managed-boundary", "review this deployment"));
+
     expect(shared.inputs).toHaveLength(1);
     expect(postedText(adapter)).toContain("review complete");
   });
@@ -877,13 +898,13 @@ describe("managed OpenBot Slack channel", () => {
     );
 
     expect(bindCalls[0]).toMatchObject({
-      channelsThreadId: "opaque-canonical-thread-a921",
+      channelsThreadId: "opaque-conversation-capability-7f31",
       providerTenantId: "T1:attacker-looking-tenant",
       providerConversationId: "C1:attacker-looking-conversation",
       providerThreadId: "P1:attacker-looking-thread",
     });
     expect(JSON.stringify(bindCalls[0])).not.toContain(
-      "opaque-conversation-capability-7f31",
+      "opaque-canonical-thread-a921",
     );
   });
 
@@ -947,12 +968,12 @@ describe("managed OpenBot Slack channel", () => {
       expect(bindCalls).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
-            channelsThreadId: "opaque-canonical-c1",
+            channelsThreadId: "opaque-conversation-c1",
             providerConversationId: "C1",
             createdByUserId: "u1",
           }),
           expect.objectContaining({
-            channelsThreadId: "opaque-canonical-c2",
+            channelsThreadId: "opaque-conversation-c2",
             providerConversationId: "C2",
             createdByUserId: "u2",
           }),
@@ -1344,7 +1365,7 @@ describe("managed OpenBot Slack channel", () => {
     let accessible = true;
     const bindings = new Map<string, ExternalThreadBinding>();
     const authorizationBinding: ExternalThreadBinding = {
-      channelsThreadId: "canonical-thread-1",
+      channelsThreadId: "opaque-conversation-C1",
       provider: "slack",
       providerTenantId: "T1",
       providerConversationId: "C1",

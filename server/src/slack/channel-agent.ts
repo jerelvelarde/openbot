@@ -44,26 +44,33 @@ type ActiveRun = {
 /**
  * A Channels-facing agent that pins a Slack thread to its first selected coworker.
  *
- * Slack identity stays in AsyncLocalStorage: the delegated AG-UI input is exactly the one that
- * Channels gave us, so none of the provider identity is exposed to a coworker or remote endpoint.
+ * Slack identity stays in server-private execution state: the delegated AG-UI input is exactly the
+ * one that Channels gave us, so none of the provider identity is exposed to a coworker or remote
+ * endpoint.
  */
 export class OpenBotChannelAgent extends AbstractAgent {
   private channelsThreadId: string;
   private routing: CoworkerRoutingService;
   private store: ExternalThreadStore;
   private resolver: ActorAgentResolver;
+  private execution?: SlackExecution;
   private active?: ActiveRun;
 
-  constructor(channelsThreadId: string, deps: OpenBotChannelAgentDependencies) {
+  constructor(
+    channelsThreadId: string,
+    deps: OpenBotChannelAgentDependencies,
+    execution?: SlackExecution,
+  ) {
     super({ agentId: "openbot-slack", description: "OpenBot Slack router" });
     this.channelsThreadId = channelsThreadId;
     this.routing = deps.routing;
     this.store = deps.store;
     this.resolver = deps.resolver;
+    this.execution = execution;
   }
 
   run(input: RunAgentInput): Observable<BaseEvent> {
-    const execution = currentSlackExecution();
+    const execution = this.execution ?? currentSlackExecution();
     const work = defer(() => {
       if (this.active) {
         return throwError(
@@ -126,6 +133,7 @@ export class OpenBotChannelAgent extends AbstractAgent {
     cloned.routing = this.routing;
     cloned.store = this.store;
     cloned.resolver = this.resolver;
+    cloned.execution = this.execution;
     cloned.active = undefined;
     return cloned;
   }
