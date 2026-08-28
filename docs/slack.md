@@ -128,6 +128,21 @@ Slack workspace id, or actor id. Interpret common states as follows:
 observable but deliberately non-fatal, so use `/api/capabilities` and `channels status` to decide
 whether Slack is ready.
 
+### Configure the single-workspace tenant bridge when required
+
+Managed Channels 0.9 may deliver Slack identity context with its canonical tenant omitted and
+represented as `unknown`. A deployment serving exactly one attached Slack workspace can set
+`OPENBOT_SLACK_TENANT_ID` to that workspace/team ID. The value is an operator-owned identifier, not
+a Slack credential.
+
+OpenBot uses this setting only when the managed tenant is absent, blank, or `unknown`. A known
+managed tenant remains authoritative and must exactly match configuration; a conflict fails before
+identity linking, ingress persistence, thread binding, or coworker execution. OpenBot never derives
+the workspace boundary from `raw` provider data, a Slack channel, actor ID, actor email, or
+installation ID. Supporting multiple workspaces requires canonical tenant metadata from Channels
+or a future administrator-owned authenticated mapping. Remove the bridge when Channels supplies a
+canonical tenant on every managed delivery.
+
 ## Link Slack people to OpenBot
 
 The reliable current path is the explicit authenticated link: `@OpenBot` posts a sealed link to the
@@ -213,6 +228,10 @@ assistance request completed, expired, was cancelled, or needs operator checking
   trustworthy verified email and exactly one active, verified, non-revoked OpenBot user matches it.
 - **The link opens the wrong host or is refused:** set `OPENBOT_APP_URL` to the public HTTPS browser
   app origin, restart OpenBot, and request a new link. Old links expire after ten minutes.
+- **A mention returns `slack_identity_tenant_invalid`:** for a deployment attached to exactly one
+  workspace, set `OPENBOT_SLACK_TENANT_ID` to that operator-verified workspace/team ID and restart.
+  Do not copy a tenant out of raw event data. If Channels supplied a different known tenant, stop:
+  the configured workspace and attached provider conflict.
 - **A reply names a different coworker but the old one runs:** this is expected. Coworker assignment
   is immutable per Slack thread; start a new thread.
 - **A second participant is refused:** link that participant, then grant their OpenBot account access

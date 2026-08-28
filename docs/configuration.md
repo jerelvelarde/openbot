@@ -74,6 +74,14 @@ to Slack. It must be HTTPS outside local development; loopback HTTP is accepted 
 absent or unusable, Slack can connect but people who cannot be linked automatically cannot finish
 linking, and secure human-assistance tools are unavailable.
 
+`OPENBOT_SLACK_TENANT_ID` is a non-secret, operator-owned Slack workspace/team ID for a
+single-workspace deployment. Set it only when managed Channels omits canonical tenant metadata from
+deliveries. OpenBot uses it for an absent, blank, or `unknown` managed tenant; it never overrides a
+different known tenant, and a conflict is refused before identity linking or storage. It is not
+derived from raw Slack payloads, actors, email addresses, channels, or installation IDs. One value
+supports one workspace per OpenBot deployment. Remove it once Channels supplies canonical tenant
+metadata for every managed delivery.
+
 See [Slack](slack.md) for the manifest capability review, account-link flow, operating limits,
 security rules, troubleshooting, and release smoke test.
 
@@ -92,6 +100,7 @@ at `agent-langgraph` on a laptop.
 | `NODE_ENV`           | unset                              | `production` refuses the example `KEY_ENCRYPTION_KEY`. It does not decide whether sign-in is required; see `OPENBOT_SINGLE_USER`. |
 | `TENANT_PACKAGE_DIR` | `../examples/fintech`              | Tenant package directory, resolved from `server/`.                  |
 | `DEPLOYMENT_ID`      | the tenant package's id            | Names this deployment inside a shared Intelligence project.          |
+| `OPENBOT_SLACK_TENANT_ID` | unset                         | Single-workspace fallback used only when managed Slack omits canonical tenant metadata. |
 | `OPENAI_API_KEY`     | unset                              | Default model key for built-in agents and both shipped Bots.        |
 | `OPENAI_BASE_URL`    | unset                              | OpenAI-compatible endpoint that key is spent against. See below.    |
 | `BOT_PROVIDER`       | `openai`                           | Provider for `agent-langgraph`: `openai`, `anthropic`, or `google`. |
