@@ -561,6 +561,7 @@ const slackRouting = createCoworkerRoutingService({
 });
 const slackIngress = new SlackIngressRegistry();
 const openbotSlackChannel = createOpenBotSlackChannel({
+  appUrl: config.appUrl,
   configuredTenantId: config.slackTenantId,
   identityLinker: new SlackIdentityLinker({
     store: approvalLinkStore,
@@ -601,6 +602,7 @@ const externalLinkRoutes = createExternalLinkRoutes({
   requireUser: requireExternalUser,
   auditStore: bootAuditStore,
   agentProfileStore,
+  threadStore: approvalThreadStore,
 });
 
 const app = createApp(

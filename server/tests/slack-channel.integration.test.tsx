@@ -493,8 +493,17 @@ function harness(
     async getByChannelsThreadId(id) {
       return bindings.get(id) ?? null;
     },
-    async getByProviderThread() {
-      return null;
+    async getByProviderThread(identity) {
+      return (
+        [...bindings.values()].find(
+          (binding) =>
+            binding.provider === identity.provider &&
+            binding.providerTenantId === identity.providerTenantId &&
+            binding.providerConversationId ===
+              identity.providerConversationId &&
+            binding.providerThreadId === identity.providerThreadId,
+        ) ?? null
+      );
     },
     async bind(input) {
       bindCalls.push(input);
@@ -528,6 +537,7 @@ function harness(
     },
   };
   const deps: OpenBotSlackChannelDependencies = {
+    appUrl: "https://openbot.test",
     identityLinker: options.identityLinker ?? linker,
     configuredTenantId: options.configuredTenantId,
     agentDeps: { routing, store, resolver: options.resolver ?? resolver },
@@ -867,6 +877,10 @@ describe("managed OpenBot Slack channel", () => {
     });
     expect(shared.inputs).toHaveLength(1);
     expect(postedText(adapter)).toContain("review complete");
+    expect(postedText(adapter)).toContain(
+      "https://openbot.test/slack/thread/opaque-conversation-C1",
+    );
+    expect(postedText(adapter)).toContain("Open in OpenBot");
   });
 
   test("carries private execution across the managed delivery operation boundary", async () => {

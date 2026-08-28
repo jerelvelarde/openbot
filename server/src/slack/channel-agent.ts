@@ -49,7 +49,7 @@ type ActiveRun = {
  * endpoint.
  */
 export class OpenBotChannelAgent extends AbstractAgent {
-  private channelsThreadId: string;
+  private channelsConversationKey: string;
   private routing: CoworkerRoutingService;
   private store: ExternalThreadStore;
   private resolver: ActorAgentResolver;
@@ -57,12 +57,12 @@ export class OpenBotChannelAgent extends AbstractAgent {
   private active?: ActiveRun;
 
   constructor(
-    channelsThreadId: string,
+    channelsConversationKey: string,
     deps: OpenBotChannelAgentDependencies,
     execution?: SlackExecution,
   ) {
     super({ agentId: "openbot-slack", description: "OpenBot Slack router" });
-    this.channelsThreadId = channelsThreadId;
+    this.channelsConversationKey = channelsConversationKey;
     this.routing = deps.routing;
     this.store = deps.store;
     this.resolver = deps.resolver;
@@ -77,7 +77,8 @@ export class OpenBotChannelAgent extends AbstractAgent {
           () => new Error("OpenBot Slack agent is already running."),
         );
       }
-      execution.channelsThreadId = this.channelsThreadId;
+      const channelsThreadId = input.threadId;
+      execution.channelsThreadId = channelsThreadId;
       const active: ActiveRun = {
         started: false,
         cancelled: false,
@@ -85,7 +86,7 @@ export class OpenBotChannelAgent extends AbstractAgent {
       };
       this.active = active;
 
-      const work = from(this.resolve(execution)).pipe(
+      const work = from(this.resolve(execution, channelsThreadId)).pipe(
         switchMap((target) => {
           if (active.cancelled || this.active !== active) return EMPTY;
           active.inner = target;
@@ -129,7 +130,7 @@ export class OpenBotChannelAgent extends AbstractAgent {
 
   clone(): OpenBotChannelAgent {
     const cloned = super.clone() as OpenBotChannelAgent;
-    cloned.channelsThreadId = this.channelsThreadId;
+    cloned.channelsConversationKey = this.channelsConversationKey;
     cloned.routing = this.routing;
     cloned.store = this.store;
     cloned.resolver = this.resolver;
@@ -152,14 +153,21 @@ export class OpenBotChannelAgent extends AbstractAgent {
     active.cancellation.complete();
   }
 
-  private async resolve(execution: SlackExecution): Promise<AbstractAgent> {
-    let binding = await this.store.getByChannelsThreadId(this.channelsThreadId);
+  private async resolve(
+    execution: SlackExecution,
+    channelsThreadId: string,
+  ): Promise<AbstractAgent> {
+    let binding = await this.store.getByChannelsThreadId(channelsThreadId);
     if (!binding) {
       const route = await this.routing.route({
         actor: execution.actor,
         text: execution.messageText,
       });
-      binding = await this.bindSelectedRoute(execution, route);
+      binding = await this.bindSelectedRoute(
+        execution,
+        channelsThreadId,
+        route,
+      );
     }
 
     execution.agentId = binding.agentId;
@@ -168,6 +176,7 @@ export class OpenBotChannelAgent extends AbstractAgent {
 
   private async bindSelectedRoute(
     execution: SlackExecution,
+    channelsThreadId: string,
     route: CoworkerRouteResult,
   ): Promise<ExternalThreadBinding> {
     if (route.kind === "none") {
@@ -178,7 +187,7 @@ export class OpenBotChannelAgent extends AbstractAgent {
     }
 
     return this.store.bind({
-      channelsThreadId: this.channelsThreadId,
+      channelsThreadId,
       provider: execution.provider,
       providerTenantId: execution.providerTenantId,
       providerConversationId: execution.providerConversationId,

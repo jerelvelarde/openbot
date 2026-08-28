@@ -702,6 +702,13 @@ function assistanceRoutes(
         inTransaction: () => ({ insert: async () => undefined }),
       } satisfies TransactionalAuditStore,
       agentProfileStore: { get: getProfile },
+      threadStore: {
+        getByChannelsThreadId: async () => null,
+        getByProviderThread: async () => null,
+        bind: async () => {
+          throw new Error("unused");
+        },
+      },
     }),
   );
   return app;

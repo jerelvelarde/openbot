@@ -10,6 +10,7 @@ import {
 import type { ExternalLinkCreationStore } from "./link-store";
 import { readExternalLinkToken } from "./link-token";
 import type { ExternalProviderIdentity } from "./schema-types";
+import type { ExternalThreadStore } from "./thread-store";
 
 const INVALID_LINK_MESSAGE = "This Slack link has expired or is invalid.";
 const LINK_CONFLICT_MESSAGE = "That Slack identity is already linked.";
@@ -24,6 +25,7 @@ type ExternalLinkRoutesOptions = {
   requireUser: MiddlewareHandler<{ Variables: AppVariables }>;
   auditStore: TransactionalAuditStore;
   agentProfileStore: Pick<AgentProfileStore, "get">;
+  threadStore: ExternalThreadStore;
 };
 
 function tokenFrom(value: unknown): string | undefined {
@@ -44,6 +46,7 @@ export function createExternalLinkRoutes({
   requireUser,
   auditStore,
   agentProfileStore,
+  threadStore,
 }: ExternalLinkRoutesOptions) {
   const routes = new Hono<{ Variables: AppVariables }>();
 
@@ -98,6 +101,37 @@ export function createExternalLinkRoutes({
     }
 
     return context.json({ linked: true });
+  });
+
+  routes.use("/threads/*", async (context, next) => {
+    context.header("Cache-Control", "no-store");
+    await next();
+  });
+
+  routes.get("/threads/:threadId", requireUser, async (context) => {
+    const actor = context.var.actor;
+    const binding = await threadStore.getByChannelsThreadId(
+      context.req.param("threadId"),
+    );
+    if (!binding || binding.createdByUserId !== actor.id) {
+      return context.json({ error: "Conversation not found." }, 404);
+    }
+
+    const profile = await agentProfileStore.get(
+      { id: actor.id, role: actor.role },
+      binding.agentId,
+    );
+    if (!profile) {
+      return context.json({ error: "Conversation not found." }, 404);
+    }
+
+    return context.json({
+      threadId: binding.channelsThreadId,
+      agentId: profile.id,
+      agentName: profile.name,
+      provider: binding.provider,
+      readOnly: true,
+    });
   });
 
   routes.use("/assistance", async (context, next) => {

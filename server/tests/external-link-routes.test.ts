@@ -12,6 +12,10 @@ import type {
 } from "../src/external/link-store";
 import { mintExternalLinkToken } from "../src/external/link-token";
 import { createExternalLinkRoutes } from "../src/external/routes";
+import type {
+  ExternalThreadBinding,
+  ExternalThreadStore,
+} from "../src/external/thread-store";
 import { testEnvironment } from "./support/environment";
 
 const KEY = "external-link-routes-test-key";
@@ -31,8 +35,38 @@ const actor = {
 } as const;
 
 const agentProfileStore: Pick<AgentProfileStore, "get"> = {
-  get: async () => null,
+  get: async (_actor, id) =>
+    id === "risk"
+      ? ({ id: "risk", name: "Risk Analyst" } as Awaited<
+          ReturnType<AgentProfileStore["get"]>
+        >)
+      : null,
 };
+
+const externalThread: ExternalThreadBinding = {
+  channelsThreadId: "channels-thread-1",
+  provider: "slack",
+  providerTenantId: "T1",
+  providerConversationId: "C1",
+  providerThreadId: "1712345.6789",
+  agentId: "risk",
+  agentName: "Risk Analyst",
+  createdByUserId: actor.id,
+  createdAt: new Date(NOW),
+};
+
+function fakeThreadStore(
+  found: ExternalThreadBinding | null = externalThread,
+): ExternalThreadStore {
+  return {
+    getByChannelsThreadId: async (id) =>
+      id === found?.channelsThreadId ? found : null,
+    getByProviderThread: async () => null,
+    bind: async () => {
+      throw new Error("unused");
+    },
+  };
+}
 
 function authenticatedAs(
   authenticatedActor = actor,
@@ -123,6 +157,7 @@ function appFor(
     insert: async (event) => void rows.push(event),
     inTransaction: () => ({ insert: async (event) => void rows.push(event) }),
   },
+  threadStore: ExternalThreadStore = fakeThreadStore(),
 ) {
   const app = new Hono<{ Variables: AppVariables }>();
   app.route(
@@ -133,6 +168,7 @@ function appFor(
       requireUser,
       auditStore,
       agentProfileStore,
+      threadStore,
     }),
   );
   return { app, rows, store };
@@ -153,6 +189,52 @@ async function liveToken() {
 }
 
 describe("external Slack link confirmation routes", () => {
+  test("GET returns an authenticated creator's canonical Slack transcript target", async () => {
+    const { app } = appFor();
+
+    const response = await app.request(
+      "http://openbot.test/api/external-links/threads/channels-thread-1",
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(await response.json()).toEqual({
+      threadId: "channels-thread-1",
+      agentId: "risk",
+      agentName: "Risk Analyst",
+      provider: "slack",
+      readOnly: true,
+    });
+  });
+
+  test("GET hides external transcripts from other users and revoked coworkers", async () => {
+    const otherUser = { ...actor, id: "openbot-user-2" } as const;
+    const otherUserApp = appFor(fakeStore(), authenticatedAs(otherUser)).app;
+    expect(
+      (
+        await otherUserApp.request(
+          "http://openbot.test/api/external-links/threads/channels-thread-1",
+        )
+      ).status,
+    ).toBe(404);
+
+    const revoked = { ...externalThread, agentId: "revoked" };
+    const revokedApp = appFor(
+      fakeStore(),
+      authenticatedAs(),
+      [],
+      undefined,
+      fakeThreadStore(revoked),
+    ).app;
+    expect(
+      (
+        await revokedApp.request(
+          "http://openbot.test/api/external-links/threads/channels-thread-1",
+        )
+      ).status,
+    ).toBe(404);
+  });
+
   test("GET shows only the safe Slack display metadata after authentication", async () => {
     const { app } = appFor();
     const token = await liveToken();
@@ -351,6 +433,7 @@ describe("external Slack link confirmation routes", () => {
         inTransaction: () => ({ insert: async () => undefined }),
       },
       agentProfileStore,
+      threadStore: fakeThreadStore(),
     });
     const app = createApp(
       loadConfig(testEnvironment()),
