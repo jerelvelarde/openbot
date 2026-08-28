@@ -156,7 +156,8 @@ export class OpenBotChannelAgent extends AbstractAgent {
           ) {
             assistantId = candidate.messageId;
           } else if (
-            candidate.type === "TEXT_MESSAGE_CONTENT" &&
+            (candidate.type === "TEXT_MESSAGE_CONTENT" ||
+              candidate.type === "TEXT_MESSAGE_CHUNK") &&
             typeof candidate.delta === "string" &&
             (assistantId === undefined ||
               candidate.messageId === undefined ||
@@ -168,7 +169,7 @@ export class OpenBotChannelAgent extends AbstractAgent {
         },
         error: (error) => subscriber.error(error),
         complete: () => {
-          if (!assistantId || assistantContent.length === 0) {
+          if (assistantContent.length === 0) {
             subscriber.complete();
             return;
           }
@@ -184,7 +185,7 @@ export class OpenBotChannelAgent extends AbstractAgent {
                 content: execution.messageText,
               },
               assistant: {
-                id: assistantId,
+                id: assistantId ?? crypto.randomUUID(),
                 role: "assistant",
                 content: assistantContent,
               },
