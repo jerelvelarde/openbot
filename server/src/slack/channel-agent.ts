@@ -22,6 +22,7 @@ import type {
 } from "../routing/service";
 import {
   currentSlackExecution,
+  runWithSlackExecution,
   type SlackExecution,
 } from "./execution-context";
 
@@ -62,13 +63,13 @@ export class OpenBotChannelAgent extends AbstractAgent {
   }
 
   run(input: RunAgentInput): Observable<BaseEvent> {
-    return defer(() => {
+    const execution = currentSlackExecution();
+    const work = defer(() => {
       if (this.active) {
         return throwError(
           () => new Error("OpenBot Slack agent is already running."),
         );
       }
-      const execution = currentSlackExecution();
       execution.channelsThreadId = this.channelsThreadId;
       const active: ActiveRun = {
         started: false,
@@ -111,6 +112,12 @@ export class OpenBotChannelAgent extends AbstractAgent {
         };
       });
     });
+    return new Observable<BaseEvent>((subscriber) =>
+      runWithSlackExecution(execution, () => {
+        const subscription = work.subscribe(subscriber);
+        return () => subscription.unsubscribe();
+      }),
+    );
   }
 
   clone(): OpenBotChannelAgent {

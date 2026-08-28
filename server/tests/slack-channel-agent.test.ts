@@ -182,6 +182,17 @@ async function collect(agent: OpenBotChannelAgent, runInput = input()) {
 }
 
 describe("OpenBotChannelAgent", () => {
+  test("carries private execution into a deferred Channels subscription", async () => {
+    const { agent } = harness();
+    const deferredRun = runWithSlackExecution(execution(), () =>
+      agent.run(input()),
+    );
+
+    const events = await lastValueFrom(deferredRun.pipe(toArray()));
+
+    expect(events).toHaveLength(2);
+  });
+
   test("routes a first Slack turn, binds its trusted identity, and forwards events", async () => {
     const { agent, target, getCalls, bindCalls, routeCalls, resolveCalls } =
       harness();
