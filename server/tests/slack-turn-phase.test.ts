@@ -39,6 +39,46 @@ describe("Slack turn phase diagnostics", () => {
     expect(events).toEqual([]);
   });
 
+  test("logs only allowlisted identity failure codes", async () => {
+    const events: SlackTurnFailureEvent[] = [];
+    const coded = Object.assign(new Error("sensitive database detail"), {
+      code: "slack_identity_link_lookup_failed",
+    });
+
+    await expect(
+      runSlackPhase(
+        "identity.resolve",
+        async () => {
+          throw coded;
+        },
+        (event) => events.push(event),
+      ),
+    ).rejects.toBe(coded);
+
+    expect(events).toEqual([
+      {
+        type: "slack-turn-failed",
+        phase: "identity.resolve",
+        reason: "slack_identity_link_lookup_failed",
+      },
+    ]);
+    expect(JSON.stringify(events)).not.toContain("sensitive");
+
+    const untrustedEvents: SlackTurnFailureEvent[] = [];
+    await expect(
+      runSlackPhase(
+        "identity.resolve",
+        async () => {
+          throw Object.assign(new Error("secret"), { code: "secret" });
+        },
+        (event) => untrustedEvents.push(event),
+      ),
+    ).rejects.toThrow("secret");
+    expect(untrustedEvents).toEqual([
+      { type: "slack-turn-failed", phase: "identity.resolve" },
+    ]);
+  });
+
   test("logger failure cannot replace the application error", async () => {
     const original = new Error("application failure");
     await expect(

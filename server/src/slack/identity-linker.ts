@@ -30,7 +30,41 @@ const APP_URL_ERROR = "Slack link setup requires an absolute OPENBOT_APP_URL.";
 const LINK_CONFLICT_ERROR = "That Slack identity is already linked.";
 const IDENTITY_ERROR = "Slack identity requires a known tenant and actor id.";
 
-function canonicalId(value: string): string | null {
+type SlackIdentityFailureCode =
+  | "slack_identity_context_invalid"
+  | "slack_identity_link_lookup_failed"
+  | "slack_identity_user_lookup_failed"
+  | "slack_identity_email_lookup_failed"
+  | "slack_identity_link_write_failed"
+  | "slack_identity_link_token_failed";
+
+function identityFailure(
+  code: SlackIdentityFailureCode,
+  message: string,
+  cause?: unknown,
+): Error & { code: SlackIdentityFailureCode } {
+  return Object.assign(
+    new Error(message, cause === undefined ? undefined : { cause }),
+    {
+      code,
+    },
+  );
+}
+
+async function resolutionStep<T>(
+  code: SlackIdentityFailureCode,
+  message: string,
+  operation: () => T | Promise<T>,
+): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    throw identityFailure(code, message, error);
+  }
+}
+
+function canonicalId(value: unknown): string | null {
+  if (typeof value !== "string") return null;
   const normalized = value.trim();
   return normalized && normalized.toLowerCase() !== "unknown"
     ? normalized
@@ -66,7 +100,7 @@ function identityFor(
     !tenantId ||
     !actorId
   )
-    throw new Error(IDENTITY_ERROR);
+    throw identityFailure("slack_identity_context_invalid", IDENTITY_ERROR);
   return {
     provider: "slack",
     providerTenantId: tenantId,
@@ -117,14 +151,21 @@ export class SlackIdentityLinker {
 
   async resolve(context: ChannelIdentityContext): Promise<SlackIdentityResult> {
     const baseIdentity = identityFor(context, null);
-    const existing = await this.options.store.find(
-      baseIdentity.provider,
-      baseIdentity.providerTenantId,
-      baseIdentity.providerUserId,
+    const existing = await resolutionStep(
+      "slack_identity_link_lookup_failed",
+      "Slack identity link lookup failed.",
+      () =>
+        this.options.store.find(
+          baseIdentity.provider,
+          baseIdentity.providerTenantId,
+          baseIdentity.providerUserId,
+        ),
     );
     if (existing) {
-      const active = await this.options.store.resolveActiveUser(
-        existing.openbotUserId,
+      const active = await resolutionStep(
+        "slack_identity_user_lookup_failed",
+        "Slack identity user lookup failed.",
+        () => this.options.store.resolveActiveUser(existing.openbotUserId),
       );
       if (active) return linkedResult(existing, active);
       return this.unlinked(existing);
@@ -137,11 +178,16 @@ export class SlackIdentityLinker {
     const identity = { ...baseIdentity, providerEmail: profileEmail };
     if (!profileEmail) return this.unlinked(identity);
 
-    const matched =
-      await this.options.store.findVerifiedUserByEmail(profileEmail);
+    const matched = await resolutionStep(
+      "slack_identity_email_lookup_failed",
+      "Slack identity email lookup failed.",
+      () => this.options.store.findVerifiedUserByEmail(profileEmail),
+    );
     if (!matched) return this.unlinked(identity);
-    const matchedActive = await this.options.store.resolveActiveUser(
-      matched.id,
+    const matchedActive = await resolutionStep(
+      "slack_identity_user_lookup_failed",
+      "Slack identity user lookup failed.",
+      () => this.options.store.resolveActiveUser(matched.id),
     );
     if (!matchedActive) return this.unlinked(identity);
 
@@ -152,19 +198,32 @@ export class SlackIdentityLinker {
         openbotUserId: matched.id,
       });
     } catch (error) {
-      if (!isLinkConflict(error)) throw error;
+      if (!isLinkConflict(error)) {
+        throw identityFailure(
+          "slack_identity_link_write_failed",
+          "Slack identity link write failed.",
+          error,
+        );
+      }
     }
 
-    const winner = await this.options.store.find(
-      identity.provider,
-      identity.providerTenantId,
-      identity.providerUserId,
+    const winner = await resolutionStep(
+      "slack_identity_link_lookup_failed",
+      "Slack identity link lookup failed.",
+      () =>
+        this.options.store.find(
+          identity.provider,
+          identity.providerTenantId,
+          identity.providerUserId,
+        ),
     );
     const current = winner ?? linked;
     if (!current) return this.unlinked(identity);
 
-    const active = await this.options.store.resolveActiveUser(
-      current.openbotUserId,
+    const active = await resolutionStep(
+      "slack_identity_user_lookup_failed",
+      "Slack identity user lookup failed.",
+      () => this.options.store.resolveActiveUser(current.openbotUserId),
     );
     if (!active) return this.unlinked(identity);
     return linkedResult(current, active);
@@ -174,10 +233,12 @@ export class SlackIdentityLinker {
     identity: ExternalProviderIdentity,
   ): Promise<SlackIdentityResult> {
     const url = new URL("/link/slack", configuredAppUrl(this.options.appUrl));
-    url.searchParams.set(
-      "token",
-      await mintExternalLinkToken(identity, this.options.encryptionKey),
+    const token = await resolutionStep(
+      "slack_identity_link_token_failed",
+      "Slack identity link token creation failed.",
+      () => mintExternalLinkToken(identity, this.options.encryptionKey),
     );
+    url.searchParams.set("token", token);
     return { kind: "unlinked", linkUrl: url.toString(), identity };
   }
 }
