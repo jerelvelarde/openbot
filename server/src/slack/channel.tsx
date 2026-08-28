@@ -217,7 +217,9 @@ export function createOpenBotSlackChannel(
       ),
     tools,
     components: [ApprovalCard],
-    showToolStatus: true,
+    // Managed Slack native streams can strand the final reply when a task chunk
+    // opens the stream before any assistant text. Composer status remains active.
+    showToolStatus: false,
     store: { concurrency: "serial", actionRetentionMs: 10 * 60_000 },
   });
 
