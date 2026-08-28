@@ -162,6 +162,13 @@
       "when": 1787909306170,
       "tag": "0022_flat_lord_hawal",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1787925413917,
+      "tag": "0023_youthful_talisman",
+      "breakpoints": true
     }
   ]
 }

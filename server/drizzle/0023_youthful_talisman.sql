@@ -1,0 +1,2 @@
+CREATE INDEX "external_thread_bindings_creator_thread_idx" ON "external_thread_bindings" USING btree ("created_by_user_id","channels_thread_id");--> statement-breakpoint
+CREATE INDEX "external_thread_messages_thread_sequence_idx" ON "external_thread_messages" USING btree ("channels_thread_id","sequence" DESC NULLS LAST);

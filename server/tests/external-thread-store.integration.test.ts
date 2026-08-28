@@ -26,6 +26,10 @@ const riskAgentId = `external_thread_risk_${suite}`;
 const knowledgeAgentId = `external_thread_knowledge_${suite}`;
 const foreignKeyAgentId = `external_thread_fk_agent_${suite}`;
 
+function encodeCursor(cursor: { recency: string; threadId: string }): string {
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+
 function binding(
   label: string,
   overrides: Partial<ExternalThreadBindingInput> = {},
@@ -345,6 +349,123 @@ describe("external thread bindings", () => {
     expect(
       malformedCursorPage.threads.map((thread) => thread.threadId),
     ).toEqual(pageOne.threads.map((thread) => thread.threadId));
+  });
+
+  test("treats noncanonical parseable cursor dates as the first page", async () => {
+    const first = binding("noncanonical_cursor_first", {
+      createdByUserId: paginationCreatorId,
+    });
+    const second = binding("noncanonical_cursor_second", {
+      createdByUserId: paginationCreatorId,
+    });
+    await store.bind(first);
+    await store.bind(second);
+    await database.insert(externalThreadMessages).values([
+      {
+        channelsThreadId: first.channelsThreadId,
+        messageId: "noncanonical-cursor-first-user",
+        role: "user",
+        content: "first",
+        createdAt: new Date("2099-08-30T12:00:00.000Z"),
+      },
+      {
+        channelsThreadId: second.channelsThreadId,
+        messageId: "noncanonical-cursor-second-user",
+        role: "user",
+        content: "second",
+        createdAt: new Date("2099-08-30T11:00:00.000Z"),
+      },
+    ]);
+
+    const firstPage = await store.listForCreator(paginationCreatorId, {
+      limit: 2,
+    });
+    const tamperedPage = await store.listForCreator(paginationCreatorId, {
+      limit: 2,
+      cursor: encodeCursor({ recency: "0", threadId: first.channelsThreadId }),
+    });
+
+    expect(tamperedPage.threads.map((thread) => thread.threadId)).toEqual(
+      firstPage.threads.map((thread) => thread.threadId),
+    );
+  });
+
+  test("treats signed out-of-range cursor years as the first page", async () => {
+    const first = binding("signed_cursor_first", {
+      createdByUserId: paginationCreatorId,
+    });
+    const second = binding("signed_cursor_second", {
+      createdByUserId: paginationCreatorId,
+    });
+    await store.bind(first);
+    await store.bind(second);
+    await database.insert(externalThreadMessages).values([
+      {
+        channelsThreadId: first.channelsThreadId,
+        messageId: "signed-cursor-first-user",
+        role: "user",
+        content: "first",
+        createdAt: new Date("2099-08-31T12:00:00.000Z"),
+      },
+      {
+        channelsThreadId: second.channelsThreadId,
+        messageId: "signed-cursor-second-user",
+        role: "user",
+        content: "second",
+        createdAt: new Date("2099-08-31T11:00:00.000Z"),
+      },
+    ]);
+
+    const firstPage = await store.listForCreator(paginationCreatorId, {
+      limit: 2,
+    });
+    const tamperedPage = await store.listForCreator(paginationCreatorId, {
+      limit: 2,
+      cursor: encodeCursor({
+        recency: "+275760-09-13T00:00:00.000Z",
+        threadId: first.channelsThreadId,
+      }),
+    });
+
+    expect(tamperedPage.threads.map((thread) => thread.threadId)).toEqual(
+      firstPage.threads.map((thread) => thread.threadId),
+    );
+  });
+
+  test("uses binding creation as the activity fallback without transcript messages", async () => {
+    const active = binding("activity_message", {
+      createdByUserId: previewCreatorId,
+    });
+    const empty = binding("activity_empty", {
+      createdByUserId: previewCreatorId,
+    });
+    await store.bind(active);
+    await store.bind(empty);
+    await database.insert(externalThreadMessages).values({
+      channelsThreadId: active.channelsThreadId,
+      messageId: "activity-message-user",
+      role: "user",
+      content: "older transcript activity",
+      createdAt: new Date("2000-01-01T00:00:00.000Z"),
+    });
+
+    const page = await store.listForCreator(previewCreatorId, { limit: 10 });
+
+    const listed = page.threads.filter((thread) =>
+      [empty.channelsThreadId, active.channelsThreadId].includes(
+        thread.threadId,
+      ),
+    );
+    expect(listed.map((thread) => thread.threadId)).toEqual([
+      empty.channelsThreadId,
+      active.channelsThreadId,
+    ]);
+    expect(listed[0]).toMatchObject({
+      threadId: empty.channelsThreadId,
+      lastMessage: null,
+      lastMessageAt: null,
+    });
+    expect(listed[0]?.createdAt).toBeInstanceOf(Date);
   });
 
   test("sanitizes Slack thread previews to a 200-code-point one-line cap", async () => {

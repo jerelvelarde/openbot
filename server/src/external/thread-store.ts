@@ -211,8 +211,15 @@ function decodeExternalThreadCursor(
     ) as ExternalThreadCursor;
     if (
       typeof parsed?.recency !== "string" ||
-      Number.isNaN(Date.parse(parsed.recency)) ||
+      !/^\d{4}-/.test(parsed.recency) ||
       typeof parsed?.threadId !== "string"
+    ) {
+      return undefined;
+    }
+    const recency = new Date(parsed.recency);
+    if (
+      Number.isNaN(recency.getTime()) ||
+      recency.toISOString() !== parsed.recency
     ) {
       return undefined;
     }
