@@ -76,6 +76,7 @@ describe("external Slack transcript list", () => {
       {},
       { threads: [] },
       { threads: "not-array", nextCursor: null },
+      { threads: [], nextCursor: "" },
       { threads: [], nextCursor: 42 },
       { threads: [{ ...validThread, threadId: "" }], nextCursor: null },
       { threads: [{ ...validThread, agentId: "" }], nextCursor: null },

@@ -92,7 +92,10 @@ export function externalThreadPage(value: unknown): ExternalThreadPage {
     throw new Error(EXTERNAL_THREAD_LIST_ERROR);
   }
   const nextCursor = value.nextCursor;
-  if (nextCursor !== null && typeof nextCursor !== "string") {
+  if (
+    nextCursor !== null &&
+    (typeof nextCursor !== "string" || nextCursor.length === 0)
+  ) {
     throw new Error(EXTERNAL_THREAD_LIST_ERROR);
   }
   return {
