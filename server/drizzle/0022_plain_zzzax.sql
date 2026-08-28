@@ -13,10 +13,19 @@ CREATE TABLE "typefully_drafts" (
 	"remote_hash" text,
 	"sync_status" text NOT NULL,
 	"last_error" text,
+	"attempt_id" uuid,
+	"attempt_kind" text,
+	"attempt_state" text,
+	"attempt_version" integer,
+	"attempt_hash" text,
+	"attempt_remote_draft_id" text,
+	"attempt_lease_expires_at" timestamp with time zone,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL,
 	CONSTRAINT "typefully_drafts_identity_key" UNIQUE("id","owner_user_id","bot_id","channel_id"),
-	CONSTRAINT "typefully_drafts_version_positive" CHECK ("typefully_drafts"."version" > 0)
+	CONSTRAINT "typefully_drafts_version_positive" CHECK ("typefully_drafts"."version" > 0),
+	CONSTRAINT "typefully_drafts_attempt_complete" CHECK (("typefully_drafts"."attempt_id" IS NULL AND "typefully_drafts"."attempt_kind" IS NULL AND "typefully_drafts"."attempt_state" IS NULL AND "typefully_drafts"."attempt_version" IS NULL AND "typefully_drafts"."attempt_hash" IS NULL AND "typefully_drafts"."attempt_lease_expires_at" IS NULL) OR ("typefully_drafts"."attempt_id" IS NOT NULL AND "typefully_drafts"."attempt_kind" IS NOT NULL AND "typefully_drafts"."attempt_state" IS NOT NULL AND "typefully_drafts"."attempt_version" IS NOT NULL AND "typefully_drafts"."attempt_hash" IS NOT NULL AND "typefully_drafts"."attempt_lease_expires_at" IS NOT NULL)),
+	CONSTRAINT "typefully_drafts_attempt_state_valid" CHECK ("typefully_drafts"."attempt_state" IS NULL OR "typefully_drafts"."attempt_state" IN ('in_flight', 'outcome_uncertain'))
 );
 --> statement-breakpoint
 CREATE TABLE "typefully_publication_proposals" (
@@ -35,17 +44,19 @@ CREATE TABLE "typefully_publication_proposals" (
 	"vendor_result_id" text,
 	"published_url" text,
 	"failure_detail" text,
+	"attempt_id" uuid,
+	"attempt_lease_expires_at" timestamp with time zone,
+	"vendor_write_started_at" timestamp with time zone,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL,
 	CONSTRAINT "typefully_proposals_draft_version_positive" CHECK ("typefully_publication_proposals"."draft_version" > 0),
-	CONSTRAINT "typefully_proposals_status_valid" CHECK ("typefully_publication_proposals"."status" IN ('pending', 'declined', 'expired', 'published', 'failed', 'unknown'))
+	CONSTRAINT "typefully_proposals_status_valid" CHECK ("typefully_publication_proposals"."status" IN ('pending', 'in_flight', 'declined', 'expired', 'published', 'failed', 'unknown')),
+	CONSTRAINT "typefully_proposals_attempt_complete" CHECK (("typefully_publication_proposals"."status" <> 'in_flight' AND "typefully_publication_proposals"."attempt_id" IS NULL AND "typefully_publication_proposals"."attempt_lease_expires_at" IS NULL AND "typefully_publication_proposals"."vendor_write_started_at" IS NULL) OR ("typefully_publication_proposals"."attempt_id" IS NOT NULL AND "typefully_publication_proposals"."attempt_lease_expires_at" IS NOT NULL AND ("typefully_publication_proposals"."status" = 'in_flight' OR ("typefully_publication_proposals"."status" = 'unknown' AND "typefully_publication_proposals"."vendor_write_started_at" IS NOT NULL))))
 );
 --> statement-breakpoint
 ALTER TABLE "mcp_user_credentials" ALTER COLUMN "scope" DROP NOT NULL;--> statement-breakpoint
-ALTER TABLE "mcp_user_credentials" ADD COLUMN "auth_method" "mcp_user_auth_method";--> statement-breakpoint
-UPDATE "mcp_user_credentials" SET "auth_method" = 'oauth' WHERE "auth_method" IS NULL;--> statement-breakpoint
-ALTER TABLE "mcp_user_credentials" ALTER COLUMN "auth_method" SET DEFAULT 'oauth';--> statement-breakpoint
-ALTER TABLE "mcp_user_credentials" ALTER COLUMN "auth_method" SET NOT NULL;--> statement-breakpoint
+ALTER TABLE "components" ADD COLUMN "grant_mode" text DEFAULT 'open' NOT NULL;--> statement-breakpoint
+ALTER TABLE "mcp_user_credentials" ADD COLUMN "auth_method" "mcp_user_auth_method" DEFAULT 'oauth' NOT NULL;--> statement-breakpoint
 ALTER TABLE "typefully_drafts" ADD CONSTRAINT "typefully_drafts_owner_user_id_users_id_fk" FOREIGN KEY ("owner_user_id") REFERENCES "public"."users"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "typefully_drafts" ADD CONSTRAINT "typefully_drafts_channel_id_channels_id_fk" FOREIGN KEY ("channel_id") REFERENCES "public"."channels"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "typefully_drafts" ADD CONSTRAINT "typefully_drafts_bot_id_agents_id_fk" FOREIGN KEY ("bot_id") REFERENCES "public"."agents"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
@@ -80,4 +91,26 @@ $$;--> statement-breakpoint
 CREATE TRIGGER "typefully_proposals_immutable_review_data"
 BEFORE UPDATE ON "typefully_publication_proposals"
 FOR EACH ROW
-EXECUTE FUNCTION "reject_typefully_proposal_review_data_update"();
+EXECUTE FUNCTION "reject_typefully_proposal_review_data_update"();--> statement-breakpoint
+DELETE FROM "plugin_grants" WHERE "kind" = 'mcp' AND "ref" IN ('typefully/schedule_draft', 'typefully/schedule', 'typefully/publish', 'typefully/publish_now');--> statement-breakpoint
+DELETE FROM "mcp_tools" WHERE "server_id" = 'typefully' AND "name" IN ('schedule_draft', 'schedule', 'publish', 'publish_now');--> statement-breakpoint
+DELETE FROM "component_exclusions" WHERE "component_name" = 'connectTypefullyAccount';--> statement-breakpoint
+UPDATE "components"
+SET "grant_mode" = 'explicit',
+    "published" = false,
+    "published_description" = NULL,
+    "published_at" = NULL,
+    "updated_by" = 'security migration',
+    "updated_at" = now()
+WHERE "name" = 'connectTypefullyAccount';--> statement-breakpoint
+-- Rows written while this component was treated as open are exclusions. Under explicit governance
+-- the same rows mean grants, so retaining them would invert an old denial into publication access.
+DELETE FROM "component_exclusions" WHERE "component_name" = 'approveTypefullyPublication';--> statement-breakpoint
+UPDATE "components"
+SET "grant_mode" = 'explicit',
+    "published" = false,
+    "published_description" = NULL,
+    "published_at" = NULL,
+    "updated_by" = 'security migration',
+    "updated_at" = now()
+WHERE "name" = 'approveTypefullyPublication';

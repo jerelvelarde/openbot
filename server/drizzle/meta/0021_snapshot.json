@@ -1,5 +1,5 @@
 {
-  "id": "0c76cb03-dfea-4357-8ed9-679f804c1c61",
+  "id": "3e502b51-5939-456e-a3f1-5e7cf6602635",
   "prevId": "77ac2143-c594-48d7-9a86-c16c51e0b728",
   "version": "7",
   "dialect": "postgresql",
@@ -200,6 +200,133 @@
           "columnsFrom": ["package_id"],
           "columnsTo": ["id"],
           "onDelete": "set null",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.approval_decisions": {
+      "name": "approval_decisions",
+      "schema": "",
+      "columns": {
+        "presentation_id": {
+          "name": "presentation_id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "channels_thread_id": {
+          "name": "channels_thread_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "conversation_key": {
+          "name": "conversation_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "agent_id": {
+          "name": "agent_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_by_user_id": {
+          "name": "created_by_user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "action_id": {
+          "name": "action_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "approved": {
+          "name": "approved",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "decided_by_user_id": {
+          "name": "decided_by_user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "completed_at": {
+          "name": "completed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "approval_decisions_created_at_idx": {
+          "name": "approval_decisions_created_at_idx",
+          "columns": [
+            {
+              "expression": "created_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "approval_decisions_channels_thread_id_external_thread_bindings_channels_thread_id_fk": {
+          "name": "approval_decisions_channels_thread_id_external_thread_bindings_channels_thread_id_fk",
+          "tableFrom": "approval_decisions",
+          "tableTo": "external_thread_bindings",
+          "columnsFrom": ["channels_thread_id"],
+          "columnsTo": ["channels_thread_id"],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "approval_decisions_agent_id_agents_id_fk": {
+          "name": "approval_decisions_agent_id_agents_id_fk",
+          "tableFrom": "approval_decisions",
+          "tableTo": "agents",
+          "columnsFrom": ["agent_id"],
+          "columnsTo": ["id"],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "approval_decisions_created_by_user_id_users_id_fk": {
+          "name": "approval_decisions_created_by_user_id_users_id_fk",
+          "tableFrom": "approval_decisions",
+          "tableTo": "users",
+          "columnsFrom": ["created_by_user_id"],
+          "columnsTo": ["id"],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "approval_decisions_decided_by_user_id_users_id_fk": {
+          "name": "approval_decisions_decided_by_user_id_users_id_fk",
+          "tableFrom": "approval_decisions",
+          "tableTo": "users",
+          "columnsFrom": ["decided_by_user_id"],
+          "columnsTo": ["id"],
+          "onDelete": "restrict",
           "onUpdate": "no action"
         }
       },
@@ -772,6 +899,126 @@
       },
       "policies": {},
       "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.external_thread_bindings": {
+      "name": "external_thread_bindings",
+      "schema": "",
+      "columns": {
+        "channels_thread_id": {
+          "name": "channels_thread_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "provider": {
+          "name": "provider",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "provider_tenant_id": {
+          "name": "provider_tenant_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "provider_conversation_id": {
+          "name": "provider_conversation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "provider_thread_id": {
+          "name": "provider_thread_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "agent_id": {
+          "name": "agent_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_by_user_id": {
+          "name": "created_by_user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "external_thread_bindings_provider_thread_idx": {
+          "name": "external_thread_bindings_provider_thread_idx",
+          "columns": [
+            {
+              "expression": "provider",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "provider_tenant_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "provider_conversation_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "provider_thread_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "external_thread_bindings_agent_id_agents_id_fk": {
+          "name": "external_thread_bindings_agent_id_agents_id_fk",
+          "tableFrom": "external_thread_bindings",
+          "tableTo": "agents",
+          "columnsFrom": ["agent_id"],
+          "columnsTo": ["id"],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "external_thread_bindings_created_by_user_id_users_id_fk": {
+          "name": "external_thread_bindings_created_by_user_id_users_id_fk",
+          "tableFrom": "external_thread_bindings",
+          "tableTo": "users",
+          "columnsFrom": ["created_by_user_id"],
+          "columnsTo": ["id"],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "external_thread_bindings_provider_slack_check": {
+          "name": "external_thread_bindings_provider_slack_check",
+          "value": "\"external_thread_bindings\".\"provider\" = 'slack'"
+        }
+      },
       "isRLSEnabled": false
     },
     "public.external_user_links": {
@@ -2046,19 +2293,11 @@
           "primaryKey": false,
           "notNull": true
         },
-        "auth_method": {
-          "name": "auth_method",
-          "type": "mcp_user_auth_method",
-          "typeSchema": "public",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "'oauth'"
-        },
         "scope": {
           "name": "scope",
           "type": "text",
           "primaryKey": false,
-          "notNull": false
+          "notNull": true
         },
         "connected_at": {
           "name": "connected_at",
@@ -2537,354 +2776,6 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
-    "public.typefully_drafts": {
-      "name": "typefully_drafts",
-      "schema": "",
-      "columns": {
-        "id": {
-          "name": "id",
-          "type": "uuid",
-          "primaryKey": true,
-          "notNull": true,
-          "default": "gen_random_uuid()"
-        },
-        "owner_user_id": {
-          "name": "owner_user_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "channel_id": {
-          "name": "channel_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "bot_id": {
-          "name": "bot_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "remote_draft_id": {
-          "name": "remote_draft_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "document": {
-          "name": "document",
-          "type": "jsonb",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "version": {
-          "name": "version",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "default": 1
-        },
-        "content_hash": {
-          "name": "content_hash",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "remote_version": {
-          "name": "remote_version",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "remote_hash": {
-          "name": "remote_hash",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "sync_status": {
-          "name": "sync_status",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "last_error": {
-          "name": "last_error",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "now()"
-        },
-        "updated_at": {
-          "name": "updated_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "now()"
-        }
-      },
-      "indexes": {
-        "typefully_drafts_owner_channel_idx": {
-          "name": "typefully_drafts_owner_channel_idx",
-          "columns": [
-            {
-              "expression": "owner_user_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "channel_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        }
-      },
-      "foreignKeys": {
-        "typefully_drafts_owner_user_id_users_id_fk": {
-          "name": "typefully_drafts_owner_user_id_users_id_fk",
-          "tableFrom": "typefully_drafts",
-          "tableTo": "users",
-          "columnsFrom": ["owner_user_id"],
-          "columnsTo": ["id"],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        },
-        "typefully_drafts_channel_id_channels_id_fk": {
-          "name": "typefully_drafts_channel_id_channels_id_fk",
-          "tableFrom": "typefully_drafts",
-          "tableTo": "channels",
-          "columnsFrom": ["channel_id"],
-          "columnsTo": ["id"],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        },
-        "typefully_drafts_bot_id_agents_id_fk": {
-          "name": "typefully_drafts_bot_id_agents_id_fk",
-          "tableFrom": "typefully_drafts",
-          "tableTo": "agents",
-          "columnsFrom": ["bot_id"],
-          "columnsTo": ["id"],
-          "onDelete": "restrict",
-          "onUpdate": "no action"
-        }
-      },
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {
-        "typefully_drafts_identity_key": {
-          "name": "typefully_drafts_identity_key",
-          "nullsNotDistinct": false,
-          "columns": ["id", "owner_user_id", "bot_id", "channel_id"]
-        }
-      },
-      "policies": {},
-      "checkConstraints": {
-        "typefully_drafts_version_positive": {
-          "name": "typefully_drafts_version_positive",
-          "value": "\"typefully_drafts\".\"version\" > 0"
-        }
-      },
-      "isRLSEnabled": false
-    },
-    "public.typefully_publication_proposals": {
-      "name": "typefully_publication_proposals",
-      "schema": "",
-      "columns": {
-        "id": {
-          "name": "id",
-          "type": "uuid",
-          "primaryKey": true,
-          "notNull": true,
-          "default": "gen_random_uuid()"
-        },
-        "draft_id": {
-          "name": "draft_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "owner_user_id": {
-          "name": "owner_user_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "bot_id": {
-          "name": "bot_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "channel_id": {
-          "name": "channel_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "draft_version": {
-          "name": "draft_version",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "content_hash": {
-          "name": "content_hash",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "snapshot": {
-          "name": "snapshot",
-          "type": "jsonb",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "status": {
-          "name": "status",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "expires_at": {
-          "name": "expires_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "decided_at": {
-          "name": "decided_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "completed_at": {
-          "name": "completed_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "vendor_result_id": {
-          "name": "vendor_result_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "published_url": {
-          "name": "published_url",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "failure_detail": {
-          "name": "failure_detail",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "now()"
-        },
-        "updated_at": {
-          "name": "updated_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "now()"
-        }
-      },
-      "indexes": {
-        "typefully_proposals_draft_status_idx": {
-          "name": "typefully_proposals_draft_status_idx",
-          "columns": [
-            {
-              "expression": "draft_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "status",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        }
-      },
-      "foreignKeys": {
-        "typefully_publication_proposals_owner_user_id_users_id_fk": {
-          "name": "typefully_publication_proposals_owner_user_id_users_id_fk",
-          "tableFrom": "typefully_publication_proposals",
-          "tableTo": "users",
-          "columnsFrom": ["owner_user_id"],
-          "columnsTo": ["id"],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        },
-        "typefully_publication_proposals_bot_id_agents_id_fk": {
-          "name": "typefully_publication_proposals_bot_id_agents_id_fk",
-          "tableFrom": "typefully_publication_proposals",
-          "tableTo": "agents",
-          "columnsFrom": ["bot_id"],
-          "columnsTo": ["id"],
-          "onDelete": "restrict",
-          "onUpdate": "no action"
-        },
-        "typefully_publication_proposals_channel_id_channels_id_fk": {
-          "name": "typefully_publication_proposals_channel_id_channels_id_fk",
-          "tableFrom": "typefully_publication_proposals",
-          "tableTo": "channels",
-          "columnsFrom": ["channel_id"],
-          "columnsTo": ["id"],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        },
-        "typefully_proposals_draft_identity_fk": {
-          "name": "typefully_proposals_draft_identity_fk",
-          "tableFrom": "typefully_publication_proposals",
-          "tableTo": "typefully_drafts",
-          "columnsFrom": ["draft_id", "owner_user_id", "bot_id", "channel_id"],
-          "columnsTo": ["id", "owner_user_id", "bot_id", "channel_id"],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        }
-      },
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "policies": {},
-      "checkConstraints": {
-        "typefully_proposals_draft_version_positive": {
-          "name": "typefully_proposals_draft_version_positive",
-          "value": "\"typefully_publication_proposals\".\"draft_version\" > 0"
-        },
-        "typefully_proposals_status_valid": {
-          "name": "typefully_proposals_status_valid",
-          "value": "\"typefully_publication_proposals\".\"status\" IN ('pending', 'declined', 'expired', 'published', 'failed', 'unknown')"
-        }
-      },
-      "isRLSEnabled": false
-    },
     "public.work_items": {
       "name": "work_items",
       "schema": "",
@@ -3012,8 +2903,7 @@
         "agent",
         "mcp",
         "mcp_oauth_client",
-        "mcp_user_token",
-        "mcp_user_api_key"
+        "mcp_user_token"
       ]
     },
     "public.role": {
@@ -3025,11 +2915,6 @@
       "name": "agent_visibility",
       "schema": "public",
       "values": ["public", "private"]
-    },
-    "public.mcp_user_auth_method": {
-      "name": "mcp_user_auth_method",
-      "schema": "public",
-      "values": ["oauth", "api_key"]
     }
   },
   "schemas": {},

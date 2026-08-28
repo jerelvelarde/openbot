@@ -1,6 +1,6 @@
 {
-  "id": "75d6d9f9-f760-406a-9d0e-72558496c23d",
-  "prevId": "0c76cb03-dfea-4357-8ed9-679f804c1c61",
+  "id": "01281382-081f-4884-bc92-1bdfe82a3d68",
+  "prevId": "3e502b51-5939-456e-a3f1-5e7cf6602635",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -200,6 +200,133 @@
           "columnsFrom": ["package_id"],
           "columnsTo": ["id"],
           "onDelete": "set null",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.approval_decisions": {
+      "name": "approval_decisions",
+      "schema": "",
+      "columns": {
+        "presentation_id": {
+          "name": "presentation_id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "channels_thread_id": {
+          "name": "channels_thread_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "conversation_key": {
+          "name": "conversation_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "agent_id": {
+          "name": "agent_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_by_user_id": {
+          "name": "created_by_user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "action_id": {
+          "name": "action_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "approved": {
+          "name": "approved",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "decided_by_user_id": {
+          "name": "decided_by_user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "completed_at": {
+          "name": "completed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "approval_decisions_created_at_idx": {
+          "name": "approval_decisions_created_at_idx",
+          "columns": [
+            {
+              "expression": "created_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "approval_decisions_channels_thread_id_external_thread_bindings_channels_thread_id_fk": {
+          "name": "approval_decisions_channels_thread_id_external_thread_bindings_channels_thread_id_fk",
+          "tableFrom": "approval_decisions",
+          "tableTo": "external_thread_bindings",
+          "columnsFrom": ["channels_thread_id"],
+          "columnsTo": ["channels_thread_id"],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "approval_decisions_agent_id_agents_id_fk": {
+          "name": "approval_decisions_agent_id_agents_id_fk",
+          "tableFrom": "approval_decisions",
+          "tableTo": "agents",
+          "columnsFrom": ["agent_id"],
+          "columnsTo": ["id"],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "approval_decisions_created_by_user_id_users_id_fk": {
+          "name": "approval_decisions_created_by_user_id_users_id_fk",
+          "tableFrom": "approval_decisions",
+          "tableTo": "users",
+          "columnsFrom": ["created_by_user_id"],
+          "columnsTo": ["id"],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "approval_decisions_decided_by_user_id_users_id_fk": {
+          "name": "approval_decisions_decided_by_user_id_users_id_fk",
+          "tableFrom": "approval_decisions",
+          "tableTo": "users",
+          "columnsFrom": ["decided_by_user_id"],
+          "columnsTo": ["id"],
+          "onDelete": "restrict",
           "onUpdate": "no action"
         }
       },
@@ -886,7 +1013,12 @@
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "policies": {},
-      "checkConstraints": {},
+      "checkConstraints": {
+        "external_thread_bindings_provider_slack_check": {
+          "name": "external_thread_bindings_provider_slack_check",
+          "value": "\"external_thread_bindings\".\"provider\" = 'slack'"
+        }
+      },
       "isRLSEnabled": false
     },
     "public.external_user_links": {
@@ -1944,6 +2076,13 @@
           "primaryKey": false,
           "notNull": false
         },
+        "grant_mode": {
+          "name": "grant_mode",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'open'"
+        },
         "published": {
           "name": "published",
           "type": "boolean",
@@ -2730,6 +2869,48 @@
           "primaryKey": false,
           "notNull": false
         },
+        "attempt_id": {
+          "name": "attempt_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "attempt_kind": {
+          "name": "attempt_kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "attempt_state": {
+          "name": "attempt_state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "attempt_version": {
+          "name": "attempt_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "attempt_hash": {
+          "name": "attempt_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "attempt_remote_draft_id": {
+          "name": "attempt_remote_draft_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "attempt_lease_expires_at": {
+          "name": "attempt_lease_expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
         "created_at": {
           "name": "created_at",
           "type": "timestamp with time zone",
@@ -2810,6 +2991,14 @@
         "typefully_drafts_version_positive": {
           "name": "typefully_drafts_version_positive",
           "value": "\"typefully_drafts\".\"version\" > 0"
+        },
+        "typefully_drafts_attempt_complete": {
+          "name": "typefully_drafts_attempt_complete",
+          "value": "(\"typefully_drafts\".\"attempt_id\" IS NULL AND \"typefully_drafts\".\"attempt_kind\" IS NULL AND \"typefully_drafts\".\"attempt_state\" IS NULL AND \"typefully_drafts\".\"attempt_version\" IS NULL AND \"typefully_drafts\".\"attempt_hash\" IS NULL AND \"typefully_drafts\".\"attempt_lease_expires_at\" IS NULL) OR (\"typefully_drafts\".\"attempt_id\" IS NOT NULL AND \"typefully_drafts\".\"attempt_kind\" IS NOT NULL AND \"typefully_drafts\".\"attempt_state\" IS NOT NULL AND \"typefully_drafts\".\"attempt_version\" IS NOT NULL AND \"typefully_drafts\".\"attempt_hash\" IS NOT NULL AND \"typefully_drafts\".\"attempt_lease_expires_at\" IS NOT NULL)"
+        },
+        "typefully_drafts_attempt_state_valid": {
+          "name": "typefully_drafts_attempt_state_valid",
+          "value": "\"typefully_drafts\".\"attempt_state\" IS NULL OR \"typefully_drafts\".\"attempt_state\" IN ('in_flight', 'outcome_uncertain')"
         }
       },
       "isRLSEnabled": false
@@ -2909,6 +3098,24 @@
           "primaryKey": false,
           "notNull": false
         },
+        "attempt_id": {
+          "name": "attempt_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "attempt_lease_expires_at": {
+          "name": "attempt_lease_expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "vendor_write_started_at": {
+          "name": "vendor_write_started_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
         "created_at": {
           "name": "created_at",
           "type": "timestamp with time zone",
@@ -2995,7 +3202,11 @@
         },
         "typefully_proposals_status_valid": {
           "name": "typefully_proposals_status_valid",
-          "value": "\"typefully_publication_proposals\".\"status\" IN ('pending', 'declined', 'expired', 'published', 'failed', 'unknown')"
+          "value": "\"typefully_publication_proposals\".\"status\" IN ('pending', 'in_flight', 'declined', 'expired', 'published', 'failed', 'unknown')"
+        },
+        "typefully_proposals_attempt_complete": {
+          "name": "typefully_proposals_attempt_complete",
+          "value": "(\"typefully_publication_proposals\".\"status\" <> 'in_flight' AND \"typefully_publication_proposals\".\"attempt_id\" IS NULL AND \"typefully_publication_proposals\".\"attempt_lease_expires_at\" IS NULL AND \"typefully_publication_proposals\".\"vendor_write_started_at\" IS NULL) OR (\"typefully_publication_proposals\".\"attempt_id\" IS NOT NULL AND \"typefully_publication_proposals\".\"attempt_lease_expires_at\" IS NOT NULL AND (\"typefully_publication_proposals\".\"status\" = 'in_flight' OR (\"typefully_publication_proposals\".\"status\" = 'unknown' AND \"typefully_publication_proposals\".\"vendor_write_started_at\" IS NOT NULL)))"
         }
       },
       "isRLSEnabled": false
