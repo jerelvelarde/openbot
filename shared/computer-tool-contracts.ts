@@ -219,6 +219,21 @@ export const computerScrollContract = {
   }),
 } as const;
 
+/** Channels-only capture and delivery of the current browser viewport. */
+export const computerScreenshotContract = {
+  name: "computer_screenshot",
+  description:
+    "Capture the web page currently open on your computer and share the PNG in this Slack " +
+    "conversation. Use this after navigating when someone asks for a picture or screenshot of a " +
+    "website. Optionally provide the filename people should see.",
+  parameters: z.object({
+    filename: z
+      .string()
+      .optional()
+      .describe("Optional PNG filename to show in Slack"),
+  }),
+} as const;
+
 /** Channels-only delivery of an existing complete workspace text file. */
 export const computerShareFileContract = {
   name: "computer_share_file",

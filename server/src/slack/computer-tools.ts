@@ -13,6 +13,7 @@ import {
   computerRequestHelpContract,
   computerRequestSecretContract,
   computerRunCommandContract,
+  computerScreenshotContract,
   computerScrollContract,
   computerShareFileContract,
   computerSnapshotContract,
@@ -329,6 +330,10 @@ export function createSlackComputerTools(
         ),
     }),
     defineChannelTool({
+      ...computerScreenshotContract,
+      handler: (input, context) => shareScreenshot(gateway, input, context),
+    }),
+    defineChannelTool({
       ...computerReadContract,
       handler: (_input, { signal }) =>
         governed(
@@ -477,6 +482,48 @@ export function createSlackComputerTools(
   }
   return tools.map((tool) =>
     bindSlackExecution(tool, executionForConversation),
+  );
+}
+
+async function shareScreenshot(
+  gateway: ComputerGateway,
+  input: { filename?: string },
+  context: ChannelToolContext,
+): Promise<ToolOutcome> {
+  return governed(
+    context.signal,
+    async () => {
+      const { agentId } = currentComputer();
+      // screenshot has no signal parameter today. Check both sides so Stop prevents the upload even
+      // when it arrived while the capture was in flight.
+      throwIfStopped(context.signal);
+      const screenshot = await gateway.screenshot(agentId);
+      throwIfStopped(context.signal);
+
+      const filename = safeFilename(input.filename ?? "screenshot.png");
+      const bytes = Buffer.from(screenshot.base64, "base64");
+      throwIfStopped(context.signal);
+      const posted = await context.thread.postFile({ bytes, filename });
+      // Upload is the irreversible commit point. Once Slack answers, report that exact outcome even
+      // if cancellation raced the response.
+      if (!posted.ok) {
+        return {
+          ok: false,
+          reason: posted.error ?? "Slack could not share that screenshot.",
+        };
+      }
+      return {
+        ok: true,
+        shared: true,
+        filename,
+        width: screenshot.width,
+        height: screenshot.height,
+        ...(screenshot.url ? { url: screenshot.url } : {}),
+        ...(posted.fileId ? { fileId: posted.fileId } : {}),
+        ...(posted.assetId ? { assetId: posted.assetId } : {}),
+      };
+    },
+    { checkStoppedAfter: false },
   );
 }
 

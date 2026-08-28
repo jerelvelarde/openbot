@@ -173,6 +173,7 @@ class FakeComputerGateway implements ComputerGateway {
   declare readonly provider: ComputerGateway["provider"];
 
   readonly navigateCalls: Parameters<ComputerGateway["navigate"]>[] = [];
+  readonly screenshotCalls: Parameters<ComputerGateway["screenshot"]>[] = [];
   readonly snapshotCalls: Parameters<ComputerGateway["snapshot"]>[] = [];
   readonly readCalls: Parameters<ComputerGateway["read"]>[] = [];
   readonly clickCalls: Parameters<ComputerGateway["click"]>[] = [];
@@ -233,8 +234,15 @@ class FakeComputerGateway implements ComputerGateway {
   async status(): Promise<never> {
     throw new Error("unused");
   }
-  async screenshot(): Promise<never> {
-    throw new Error("unused");
+  async screenshot(...args: Parameters<ComputerGateway["screenshot"]>) {
+    this.screenshotCalls.push(args);
+    return this.answer({
+      base64: "iVBORw0KGgo=",
+      width: 1440,
+      height: 900,
+      capturedAt: "2026-08-28T12:00:00.000Z",
+      url: "https://copilotkit.ai/",
+    });
   }
   async snapshot(...args: Parameters<ComputerGateway["snapshot"]>) {
     this.snapshotCalls.push(args);
@@ -457,6 +465,7 @@ describe("Slack computer ChannelTools", () => {
     const names = [...toolsByName(new FakeComputerGateway()).keys()];
     expect(names).toEqual([
       "computer_navigate",
+      "computer_screenshot",
       "computer_read",
       "computer_snapshot",
       "computer_type",
@@ -1526,6 +1535,35 @@ describe("Slack computer ChannelTools", () => {
       shared: true,
       filename: "review.txt",
       fileId: "slack-file-1",
+    });
+  });
+
+  test("captures the current page and shares its PNG in the Slack thread", async () => {
+    const gateway = new FakeComputerGateway();
+    const adapter = new FileAdapter();
+
+    const result = await inSlack(() =>
+      invoke(
+        toolsByName(gateway).get("computer_screenshot")!,
+        { filename: "copilotkit-homepage.png" },
+        channelContext(adapter),
+      ),
+    );
+
+    expect(gateway.screenshotCalls).toEqual([["risk"]]);
+    expect(adapter.uploads).toHaveLength(1);
+    expect(adapter.uploads[0]?.filename).toBe("copilotkit-homepage.png");
+    expect([...adapter.uploads[0]!.bytes]).toEqual([
+      137, 80, 78, 71, 13, 10, 26, 10,
+    ]);
+    expect(result).toEqual({
+      ok: true,
+      shared: true,
+      filename: "copilotkit-homepage.png",
+      fileId: "slack-file-1",
+      width: 1440,
+      height: 900,
+      url: "https://copilotkit.ai/",
     });
   });
 
