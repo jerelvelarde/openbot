@@ -216,6 +216,8 @@ function decodeExternalThreadCursor(
     ) {
       return undefined;
     }
+    const year = Number(parsed.recency.slice(0, 4));
+    if (year < 1) return undefined;
     const recency = new Date(parsed.recency);
     if (
       Number.isNaN(recency.getTime()) ||

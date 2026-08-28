@@ -432,6 +432,48 @@ describe("external thread bindings", () => {
     );
   });
 
+  test("treats canonical year zero cursor dates as the first page", async () => {
+    const first = binding("year_zero_cursor_first", {
+      createdByUserId: paginationCreatorId,
+    });
+    const second = binding("year_zero_cursor_second", {
+      createdByUserId: paginationCreatorId,
+    });
+    await store.bind(first);
+    await store.bind(second);
+    await database.insert(externalThreadMessages).values([
+      {
+        channelsThreadId: first.channelsThreadId,
+        messageId: "year-zero-cursor-first-user",
+        role: "user",
+        content: "first",
+        createdAt: new Date("2099-09-01T12:00:00.000Z"),
+      },
+      {
+        channelsThreadId: second.channelsThreadId,
+        messageId: "year-zero-cursor-second-user",
+        role: "user",
+        content: "second",
+        createdAt: new Date("2099-09-01T11:00:00.000Z"),
+      },
+    ]);
+
+    const firstPage = await store.listForCreator(paginationCreatorId, {
+      limit: 2,
+    });
+    const tamperedPage = await store.listForCreator(paginationCreatorId, {
+      limit: 2,
+      cursor: encodeCursor({
+        recency: "0000-01-01T00:00:00.000Z",
+        threadId: first.channelsThreadId,
+      }),
+    });
+
+    expect(tamperedPage.threads.map((thread) => thread.threadId)).toEqual(
+      firstPage.threads.map((thread) => thread.threadId),
+    );
+  });
+
   test("uses binding creation as the activity fallback without transcript messages", async () => {
     const active = binding("activity_message", {
       createdByUserId: previewCreatorId,
