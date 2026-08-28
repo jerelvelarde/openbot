@@ -349,6 +349,7 @@ describe("learning what a build ships", () => {
   });
 
   test("the publication governance migration removes inverted legacy assignments and republishes nothing", async () => {
+    await store.syncCatalogue([publicationOptIn]);
     await database
       .update(components)
       .set({
@@ -368,14 +369,17 @@ describe("learning what a build ships", () => {
       .onConflictDoNothing();
 
     const migration = await readFile(
-      new URL(
-        "../drizzle/0029_lock_typefully_publication_component.sql",
-        import.meta.url,
-      ),
+      new URL("../drizzle/0022_plain_zzzax.sql", import.meta.url),
       "utf8",
     );
-    for (const statement of migration.split("--> statement-breakpoint")) {
-      if (statement.trim()) await database.execute(sql.raw(statement));
+    const governanceStatements = migration
+      .split("--> statement-breakpoint")
+      .filter((statement) =>
+        statement.includes("'approveTypefullyPublication'"),
+      );
+    expect(governanceStatements).toHaveLength(2);
+    for (const statement of governanceStatements) {
+      await database.execute(sql.raw(statement));
     }
 
     expect(
