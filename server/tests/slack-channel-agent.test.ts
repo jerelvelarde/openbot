@@ -281,6 +281,25 @@ describe("OpenBotChannelAgent", () => {
     ]);
   });
 
+  test("records the compact text chunk form emitted by built-in agents", async () => {
+    const reply = new ScriptedAgent(() =>
+      of({ type: "TEXT_MESSAGE_CHUNK", delta: "Compact reply" } as BaseEvent),
+    );
+    const { agent, transcriptCalls } = harness({
+      resolve: async () => reply,
+    });
+
+    await collect(agent);
+
+    expect(transcriptCalls).toHaveLength(1);
+    expect(transcriptCalls[0]).toMatchObject({
+      channelsThreadId: CANONICAL_THREAD_ID,
+      user: { id: "message-1", content: "Please review this risk." },
+      assistant: { role: "assistant", content: "Compact reply" },
+    });
+    expect(transcriptCalls[0]?.assistant.id).toBeString();
+  });
+
   test("uses an established binding and resolves it freshly for the current speaker", async () => {
     const { agent, bindCalls, routeCalls, resolveCalls } = harness({
       existing: binding({ agentId: "knowledge", agentName: "Knowledge" }),
