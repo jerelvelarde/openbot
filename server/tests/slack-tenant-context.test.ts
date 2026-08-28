@@ -74,7 +74,10 @@ describe("managed Slack tenant context", () => {
 
   test("rejects a conflict between managed and configured tenants", () => {
     expect(() => normalizeSlackTenantContext(identity("T2"), "T1")).toThrow(
-      MANAGED_SLACK_TENANT_ERROR,
+      expect.objectContaining({
+        message: MANAGED_SLACK_TENANT_ERROR,
+        code: "slack_identity_tenant_invalid",
+      }),
     );
   });
 
@@ -82,7 +85,10 @@ describe("managed Slack tenant context", () => {
     "fails closed for missing canonical tenant %j without configuration",
     (tenantId) => {
       expect(() => normalizeSlackTenantContext(identity(tenantId))).toThrow(
-        MANAGED_SLACK_TENANT_ERROR,
+        expect.objectContaining({
+          message: MANAGED_SLACK_TENANT_ERROR,
+          code: "slack_identity_tenant_invalid",
+        }),
       );
     },
   );

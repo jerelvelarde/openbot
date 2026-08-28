@@ -640,7 +640,11 @@ describe("managed OpenBot Slack channel", () => {
     expect(bindCalls).toEqual([]);
     expect(shared.inputs).toEqual([]);
     expect(events).toEqual([
-      { type: "slack-turn-failed", phase: "identity.resolve" },
+      {
+        type: "slack-turn-failed",
+        phase: "identity.resolve",
+        reason: "slack_identity_tenant_invalid",
+      },
     ]);
   });
 
@@ -676,7 +680,11 @@ describe("managed OpenBot Slack channel", () => {
     expect(bindCalls).toEqual([]);
     expect(shared.inputs).toEqual([]);
     expect(events).toEqual([
-      { type: "slack-turn-failed", phase: "identity.resolve" },
+      {
+        type: "slack-turn-failed",
+        phase: "identity.resolve",
+        reason: "slack_identity_tenant_invalid",
+      },
     ]);
   });
 
