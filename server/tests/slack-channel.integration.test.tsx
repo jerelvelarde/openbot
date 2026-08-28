@@ -595,6 +595,12 @@ function toolResult(shared: SharedRunState): Record<string, unknown> {
 }
 
 describe("managed OpenBot Slack channel", () => {
+  test("does not emit in-message tool chunks before the assistant reply", () => {
+    const { channel } = harness();
+
+    expect(channel.showToolStatus).toBe(false);
+  });
+
   test("uses the configured tenant once when managed delivery omits it", async () => {
     let seenContext: ChannelIdentityContext | undefined;
     const identityLinker: OpenBotSlackChannelDependencies["identityLinker"] = {
