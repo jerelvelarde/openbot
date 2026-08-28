@@ -180,6 +180,28 @@ describe("external thread bindings", () => {
     ).resolves.toEqual(bound);
   });
 
+  test("appends provider-visible turns idempotently and reads them in order", async () => {
+    const input = binding("transcript");
+    await store.bind(input);
+    const turn = {
+      channelsThreadId: input.channelsThreadId,
+      user: { id: "user-1", role: "user" as const, content: "Hello" },
+      assistant: {
+        id: "reply-1",
+        role: "assistant" as const,
+        content: "Hi there",
+      },
+    };
+
+    await store.appendTranscriptTurn(turn);
+    await store.appendTranscriptTurn(turn);
+
+    await expect(store.getTranscript(input.channelsThreadId)).resolves.toEqual([
+      turn.user,
+      turn.assistant,
+    ]);
+  });
+
   test("reloads a binding by its provider thread identity", async () => {
     const input = binding("provider_lookup");
     const bound = await store.bind(input);

@@ -1,8 +1,10 @@
 import type { Message } from "@ag-ui/core";
 import { useEffect, useState } from "react";
 import { ConversationView } from "@/components/channels/conversation-view";
-import type { ExternalThreadTarget } from "@/lib/external/queries";
-import { readThreadMessages } from "@/lib/copilot/thread-messages";
+import {
+  readExternalThreadMessages,
+  type ExternalThreadTarget,
+} from "@/lib/external/queries";
 
 export function ExternalThreadChat({
   target,
@@ -15,16 +17,16 @@ export function ExternalThreadChat({
 
   useEffect(() => {
     let current = true;
-    void readThreadMessages(target.threadId, target.agentId).then((stored) => {
+    void readExternalThreadMessages(target.threadId).then((stored) => {
       if (!current) return;
-      setMessages(stored.messages);
-      setUnreadable(stored.unreadable);
+      setMessages(stored);
+      setUnreadable(0);
       setRestoring(false);
     });
     return () => {
       current = false;
     };
-  }, [target.agentId, target.threadId]);
+  }, [target.threadId]);
 
   return (
     <ConversationView

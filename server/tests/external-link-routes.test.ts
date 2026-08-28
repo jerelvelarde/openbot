@@ -57,6 +57,7 @@ const externalThread: ExternalThreadBinding = {
 
 function fakeThreadStore(
   found: ExternalThreadBinding | null = externalThread,
+  messages: Awaited<ReturnType<ExternalThreadStore["getTranscript"]>> = [],
 ): ExternalThreadStore {
   return {
     getByChannelsThreadId: async (id) =>
@@ -65,6 +66,8 @@ function fakeThreadStore(
     bind: async () => {
       throw new Error("unused");
     },
+    appendTranscriptTurn: async () => undefined,
+    getTranscript: async () => messages,
   };
 }
 
@@ -205,6 +208,28 @@ describe("external Slack link confirmation routes", () => {
       provider: "slack",
       readOnly: true,
     });
+  });
+
+  test("GET returns the OpenBot-owned durable transcript for an authorized creator", async () => {
+    const messages = [
+      { id: "user-1", role: "user" as const, content: "Hello" },
+      { id: "reply-1", role: "assistant" as const, content: "Hi" },
+    ];
+    const { app } = appFor(
+      fakeStore(),
+      authenticatedAs(),
+      [],
+      undefined,
+      fakeThreadStore(externalThread, messages),
+    );
+
+    const response = await app.request(
+      "http://openbot.test/api/external-links/threads/channels-thread-1/messages",
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(await response.json()).toEqual({ messages });
   });
 
   test("GET hides external transcripts from other users and revoked coworkers", async () => {

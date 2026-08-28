@@ -134,6 +134,25 @@ export function createExternalLinkRoutes({
     });
   });
 
+  routes.get("/threads/:threadId/messages", requireUser, async (context) => {
+    const actor = context.var.actor;
+    const threadId = context.req.param("threadId");
+    const binding = await threadStore.getByChannelsThreadId(threadId);
+    if (!binding || binding.createdByUserId !== actor.id) {
+      return context.json({ error: "Conversation not found." }, 404);
+    }
+    const profile = await agentProfileStore.get(
+      { id: actor.id, role: actor.role },
+      binding.agentId,
+    );
+    if (!profile) {
+      return context.json({ error: "Conversation not found." }, 404);
+    }
+    return context.json({
+      messages: await threadStore.getTranscript(threadId),
+    });
+  });
+
   routes.use("/assistance", async (context, next) => {
     context.header("Cache-Control", "no-store");
     await next();

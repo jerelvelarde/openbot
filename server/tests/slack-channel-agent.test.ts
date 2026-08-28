@@ -109,6 +109,9 @@ function harness(
 ) {
   const getCalls: string[] = [];
   const bindCalls: Parameters<ExternalThreadStore["bind"]>[0][] = [];
+  const transcriptCalls: Parameters<
+    ExternalThreadStore["appendTranscriptTurn"]
+  >[0][] = [];
   const routeCalls: Parameters<CoworkerRoutingService["route"]>[0][] = [];
   const resolveCalls: Parameters<ActorAgentResolver["resolveAgentForActor"]>[] =
     [];
@@ -135,6 +138,12 @@ function harness(
           createdAt: new Date("2026-08-27T00:00:00.000Z"),
         })
       );
+    },
+    async appendTranscriptTurn(value) {
+      transcriptCalls.push(value);
+    },
+    async getTranscript() {
+      return [];
     },
   };
   const routing: CoworkerRoutingService = {
@@ -172,6 +181,7 @@ function harness(
     bindCalls,
     routeCalls,
     resolveCalls,
+    transcriptCalls,
     deps,
   };
 }
@@ -229,6 +239,45 @@ describe("OpenBotChannelAgent", () => {
     expect(events).toEqual([
       { type: "CUSTOM", name: "first", value: 1 },
       { type: "CUSTOM", name: "second", value: 2 },
+    ]);
+  });
+
+  test("durably records the provider-visible user and assistant turn before completing", async () => {
+    const reply = new ScriptedAgent(() =>
+      of(
+        {
+          type: "TEXT_MESSAGE_START",
+          messageId: "reply-1",
+          role: "assistant",
+        } as BaseEvent,
+        {
+          type: "TEXT_MESSAGE_CONTENT",
+          messageId: "reply-1",
+          delta: "Recorded reply",
+        } as BaseEvent,
+        { type: "TEXT_MESSAGE_END", messageId: "reply-1" } as BaseEvent,
+      ),
+    );
+    const { agent, transcriptCalls } = harness({
+      resolve: async () => reply,
+    });
+
+    await collect(agent);
+
+    expect(transcriptCalls).toEqual([
+      {
+        channelsThreadId: CANONICAL_THREAD_ID,
+        user: {
+          id: "message-1",
+          role: "user",
+          content: "Please review this risk.",
+        },
+        assistant: {
+          id: "reply-1",
+          role: "assistant",
+          content: "Recorded reply",
+        },
+      },
     ]);
   });
 
