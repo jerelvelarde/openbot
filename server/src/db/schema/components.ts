@@ -45,6 +45,9 @@ export const components = pgTable("components", {
   /** Null until first published. Null means the model is never offered this component. */
   publishedDescription: text("published_description"),
 
+  /** Sensitive components are deny-by-default and require a per-Bot grant. */
+  grantMode: text("grant_mode").notNull().default("open"),
+
   published: boolean("published").notNull().default(false),
   publishedAt: timestamp("published_at", { withTimezone: true }),
   /** Who last changed anything about this component. An email, because that is what a reader knows. */
@@ -54,8 +57,9 @@ export const components = pgTable("components", {
 });
 
 /**
- * One Bot held back from one component. A published component is available to every Bot; a row here
- * is the exception.
+ * One Bot-specific component assignment. For ordinary open components a row is a withholding; for
+ * explicit opt-in components a row is the grant. The component's immutable grant mode disambiguates
+ * the meaning and lets existing open components retain their fail-open presentation semantics.
  *
  * Open by default because a component is a way of answering, not a way of reaching anything. What a
  * component may READ is {@link componentFunctions}, which is strict: no row, no call.

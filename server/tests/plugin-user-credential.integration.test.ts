@@ -1,12 +1,13 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray, isNull } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull } from "drizzle-orm";
 import { createAuditStore } from "../src/audit";
 import type { ActionPolicy } from "../src/computer/policy";
 import { encryptSecret } from "../src/credentials";
 import { createDatabase } from "../src/db/client";
 import {
   agents,
+  auditEvents,
   credentials,
   mcpServers,
   mcpTools,
@@ -41,9 +42,19 @@ const suite = randomUUID().slice(0, 8);
 const botId = `agent_oauth_bot_${suite}`;
 const askerId = `user_oauth_asker_${suite}`;
 const otherId = `user_oauth_other_${suite}`;
+const apiKeyUserId = `user_api_key_${suite}`;
+const brokenOauthUserId = `user_oauth_no_scope_${suite}`;
+const listingOauthUserId = `user_oauth_listing_${suite}`;
+const listingApiKeyUserId = `user_api_key_listing_${suite}`;
+const noScopeListingOauthUserId = `user_oauth_no_scope_listing_${suite}`;
+const mismatchedCatalogueUserId = `user_catalogue_mismatch_${suite}`;
 const serverId = "google-drive";
 const toolName = "search_files";
 const ref = `${serverId}/${toolName}`;
+const typefullyServerId = "typefully";
+const unknownCatalogueServerId = `unknown-catalogue-${suite}`;
+const typefullyToolName = "list_social_sets";
+const typefullyRef = `${typefullyServerId}/${typefullyToolName}`;
 
 // 32 zero bytes in base64. A real AES-256 key length, unlike `"x".repeat(44)`, which decodes to 33
 // bytes and makes `importKey` throw — the existing plugin store test gets away with it only because
@@ -93,6 +104,9 @@ let clientBefore: string | null = null;
  * row; never deleting leaves a fixture that reads on screen as a tool the vendor offers.
  */
 let toolWasAlreadyAdvertised = false;
+let typefullyServerWasAlreadyConfigured = false;
+let typefullyToolWasAlreadyAdvertised = false;
+let typefullyCredentialBefore: string | null = null;
 const credentialIds: string[] = [];
 
 const store = createPluginStore({
@@ -112,6 +126,15 @@ const store = createPluginStore({
     // This suite writes its rows directly, so that what is under test is the selection rather than
     // the connect flow. Loud rather than absent, so a call here shows up instead of passing quietly.
     create: async () => {
+      throw new Error("this suite writes credentials directly");
+    },
+    rotate: async () => {
+      throw new Error("this suite writes credentials directly");
+    },
+    isLive: async () => {
+      throw new Error("this suite reads credential liveness directly");
+    },
+    findLiveByKey: async () => {
       throw new Error("this suite writes credentials directly");
     },
     // Google does not rotate, so no exchange here ever reaches the in-place update. Loud, so that
@@ -169,7 +192,7 @@ const store = createPluginStore({
  * second test to call either helper meets the index instead of the behaviour it came to check.
  */
 async function retireLive(
-  kind: "mcp_oauth_client" | "mcp_user_token",
+  kind: "mcp_oauth_client" | "mcp_user_token" | "mcp_user_api_key",
   keyId: string,
 ) {
   const revokedAt = new Date();
@@ -241,6 +264,56 @@ async function connect(userId: string, refreshToken: string) {
   return credential.id;
 }
 
+async function connectFixture(input: {
+  userId: string;
+  kind: "mcp_user_token" | "mcp_user_api_key";
+  authMethod: "oauth" | "api_key";
+  scope: string | null;
+  connectionServerId?: string;
+  credentialProvider?: string;
+  credentialKeyId?: string;
+  secret?: string;
+}) {
+  const connectionServerId = input.connectionServerId ?? serverId;
+  const credentialProvider = input.credentialProvider ?? connectionServerId;
+  const credentialKeyId = input.credentialKeyId ?? input.userId;
+  const revokedAt = new Date();
+  await database
+    .update(credentials)
+    .set({ revokedAt, updatedAt: revokedAt })
+    .where(
+      and(
+        eq(credentials.kind, input.kind),
+        eq(credentials.provider, credentialProvider),
+        eq(credentials.keyId, credentialKeyId),
+        isNull(credentials.revokedAt),
+      ),
+    );
+  const [credential] = await database
+    .insert(credentials)
+    .values({
+      kind: input.kind,
+      provider: credentialProvider,
+      keyId: credentialKeyId,
+      metadata: {},
+      encryptedValue: await encryptSecret(
+        ENCRYPTION_KEY,
+        input.secret ?? `fixture-${input.authMethod}-${suite}`,
+      ),
+    })
+    .returning({ id: credentials.id });
+  if (!credential) throw new Error("connection fixture was not stored");
+  credentialIds.push(credential.id);
+  await database.insert(mcpUserCredentials).values({
+    serverId: connectionServerId,
+    userId: input.userId,
+    credentialId: credential.id,
+    authMethod: input.authMethod,
+    scope: input.scope,
+  });
+  return credential.id;
+}
+
 beforeAll(async () => {
   await database
     .insert(agents)
@@ -250,6 +323,12 @@ beforeAll(async () => {
   for (const [id, email] of [
     [askerId, `${askerId}@openbot.test`],
     [otherId, `${otherId}@openbot.test`],
+    [apiKeyUserId, `${apiKeyUserId}@openbot.test`],
+    [brokenOauthUserId, `${brokenOauthUserId}@openbot.test`],
+    [listingOauthUserId, `${listingOauthUserId}@openbot.test`],
+    [listingApiKeyUserId, `${listingApiKeyUserId}@openbot.test`],
+    [noScopeListingOauthUserId, `${noScopeListingOauthUserId}@openbot.test`],
+    [mismatchedCatalogueUserId, `${mismatchedCatalogueUserId}@openbot.test`],
   ]) {
     await database
       .insert(users)
@@ -272,6 +351,27 @@ beforeAll(async () => {
         )
     ).length > 0;
   clientBefore = existing?.credentialId ?? null;
+  const [existingTypefully] = await database
+    .select({
+      id: mcpServers.id,
+      credentialId: mcpServers.credentialId,
+    })
+    .from(mcpServers)
+    .where(eq(mcpServers.id, typefullyServerId));
+  typefullyServerWasAlreadyConfigured = existingTypefully !== undefined;
+  typefullyCredentialBefore = existingTypefully?.credentialId ?? null;
+  typefullyToolWasAlreadyAdvertised =
+    (
+      await database
+        .select({ name: mcpTools.name })
+        .from(mcpTools)
+        .where(
+          and(
+            eq(mcpTools.serverId, typefullyServerId),
+            eq(mcpTools.name, typefullyToolName),
+          ),
+        )
+    ).length > 0;
 
   // Written directly, so the test needs no vendor to be reachable. What is under test is which
   // credential gets chosen, not the listing.
@@ -285,9 +385,34 @@ beforeAll(async () => {
       provenance: "first-party",
     })
     .onConflictDoNothing();
+  await database.insert(mcpServers).values({
+    id: unknownCatalogueServerId,
+    title: "Unknown catalogue fixture",
+    vendor: "test",
+    url: "https://example.invalid/mcp",
+    provenance: "custom",
+  });
+  await database
+    .insert(mcpServers)
+    .values({
+      id: typefullyServerId,
+      title: "Typefully",
+      vendor: "Typefully",
+      url: "https://api.typefully.com/v2",
+      provenance: "first-party",
+    })
+    .onConflictDoNothing();
   await database
     .insert(mcpTools)
     .values({ serverId, name: toolName, description: "Search files." })
+    .onConflictDoNothing();
+  await database
+    .insert(mcpTools)
+    .values({
+      serverId: typefullyServerId,
+      name: typefullyToolName,
+      description: "List social sets.",
+    })
     .onConflictDoNothing();
 
   // The Bot holds the tool throughout. Everything here is about the person, not the grant.
@@ -295,11 +420,15 @@ beforeAll(async () => {
     .insert(pluginGrants)
     .values({ kind: "mcp", ref, agentId: botId })
     .onConflictDoNothing();
+  await database
+    .insert(pluginGrants)
+    .values({ kind: "mcp", ref: typefullyRef, agentId: botId })
+    .onConflictDoNothing();
 });
 
 afterAll(async () => {
   /*
-   * The suite's own two people, never every row for this vendor.
+   * The suite's own people, never every row for this vendor.
    *
    * `serverId` here is a real catalogue key, so a deployment somebody uses has real connections
    * under it — and deleting by server id took a person's actual Drive connection with it, after
@@ -309,10 +438,16 @@ afterAll(async () => {
   await database
     .delete(mcpUserCredentials)
     .where(
-      and(
-        eq(mcpUserCredentials.serverId, serverId),
-        inArray(mcpUserCredentials.userId, [askerId, otherId]),
-      ),
+      inArray(mcpUserCredentials.userId, [
+        askerId,
+        otherId,
+        apiKeyUserId,
+        brokenOauthUserId,
+        listingOauthUserId,
+        listingApiKeyUserId,
+        noScopeListingOauthUserId,
+        mismatchedCatalogueUserId,
+      ]),
     );
   /*
    * Put the client pointer back before deleting anything, so a suite that borrowed live
@@ -334,6 +469,13 @@ afterAll(async () => {
     .update(mcpServers)
     .set({ credentialId: clientBefore })
     .where(eq(mcpServers.id, serverId));
+  await database
+    .update(mcpServers)
+    .set({ credentialId: typefullyCredentialBefore })
+    .where(eq(mcpServers.id, typefullyServerId));
+  await database
+    .delete(mcpServers)
+    .where(eq(mcpServers.id, unknownCatalogueServerId));
   for (const id of credentialIds) {
     await database.delete(credentials).where(eq(credentials.id, id));
   }
@@ -345,6 +487,11 @@ afterAll(async () => {
   await database
     .delete(pluginGrants)
     .where(and(eq(pluginGrants.ref, ref), eq(pluginGrants.agentId, botId)));
+  await database
+    .delete(pluginGrants)
+    .where(
+      and(eq(pluginGrants.ref, typefullyRef), eq(pluginGrants.agentId, botId)),
+    );
   // The fixture tool goes whether or not this suite owns the server, but only if it put it there.
   if (!toolWasAlreadyAdvertised) {
     await database
@@ -355,9 +502,283 @@ afterAll(async () => {
     await database.delete(mcpTools).where(eq(mcpTools.serverId, serverId));
     await database.delete(mcpServers).where(eq(mcpServers.id, serverId));
   }
+  if (!typefullyToolWasAlreadyAdvertised) {
+    await database
+      .delete(mcpTools)
+      .where(
+        and(
+          eq(mcpTools.serverId, typefullyServerId),
+          eq(mcpTools.name, typefullyToolName),
+        ),
+      );
+  }
+  if (!typefullyServerWasAlreadyConfigured) {
+    await database
+      .delete(mcpTools)
+      .where(eq(mcpTools.serverId, typefullyServerId));
+    await database
+      .delete(mcpServers)
+      .where(eq(mcpServers.id, typefullyServerId));
+  }
   await database.delete(agents).where(eq(agents.id, botId));
-  await database.delete(users).where(eq(users.id, askerId));
-  await database.delete(users).where(eq(users.id, otherId));
+  await database
+    .delete(users)
+    .where(
+      inArray(users.id, [
+        askerId,
+        otherId,
+        apiKeyUserId,
+        brokenOauthUserId,
+        listingOauthUserId,
+        listingApiKeyUserId,
+        noScopeListingOauthUserId,
+        mismatchedCatalogueUserId,
+      ]),
+    );
+});
+
+describe("a Typefully call without a personal API key", () => {
+  test("refuses before vendor access and never falls back to a deployment credential", async () => {
+    const [credential] = await database
+      .insert(credentials)
+      .values({
+        kind: "mcp_oauth_client",
+        provider: typefullyServerId,
+        keyId: `typefully-deployment-fixture-${suite}`,
+        metadata: {},
+        encryptedValue: await encryptSecret(
+          ENCRYPTION_KEY,
+          "must-never-reach-typefully",
+        ),
+      })
+      .returning({ id: credentials.id });
+    if (!credential) throw new Error("Typefully fixture was not stored");
+    credentialIds.push(credential.id);
+    await database
+      .update(mcpServers)
+      .set({ credentialId: credential.id })
+      .where(eq(mcpServers.id, typefullyServerId));
+
+    decrypted.length = 0;
+    await expect(
+      store.callTool({
+        ref: typefullyRef,
+        args: {},
+        botId,
+        actorId: askerId,
+      }),
+    ).rejects.toMatchObject({
+      code: "connection_required",
+      serverId: typefullyServerId,
+      connectPath: "/settings/connected-accounts/typefully",
+    });
+    expect(decrypted).toEqual([]);
+
+    const [failure] = await database
+      .select({ payload: auditEvents.payload })
+      .from(auditEvents)
+      .where(
+        and(
+          eq(auditEvents.eventType, "mcp.call_failed"),
+          eq(auditEvents.targetId, typefullyRef),
+        ),
+      )
+      .orderBy(desc(auditEvents.createdAt))
+      .limit(1);
+    expect((failure?.payload as { reachedAs?: unknown })?.reachedAs).toBe(
+      askerId,
+    );
+  });
+});
+
+describe("personal Typefully API-key selection", () => {
+  test("two people using the same Bot send their own distinct keys", async () => {
+    const askerKey = `typefully-asker-${suite}`;
+    const otherKey = `typefully-other-${suite}`;
+    await connectFixture({
+      userId: askerId,
+      kind: "mcp_user_api_key",
+      authMethod: "api_key",
+      scope: null,
+      connectionServerId: typefullyServerId,
+      secret: askerKey,
+    });
+    await connectFixture({
+      userId: otherId,
+      kind: "mcp_user_api_key",
+      authMethod: "api_key",
+      scope: null,
+      connectionServerId: typefullyServerId,
+      secret: otherKey,
+    });
+    decrypted.length = 0;
+
+    await store.callTool({
+      ref: typefullyRef,
+      args: {},
+      botId,
+      actorId: askerId,
+    });
+    await store.callTool({
+      ref: typefullyRef,
+      args: {},
+      botId,
+      actorId: otherId,
+    });
+
+    expect(decrypted).toEqual([askerKey, otherKey]);
+  });
+
+  test("rejects an OAuth credential on the API-key path", async () => {
+    await database
+      .delete(mcpUserCredentials)
+      .where(
+        and(
+          eq(mcpUserCredentials.serverId, typefullyServerId),
+          eq(mcpUserCredentials.userId, apiKeyUserId),
+        ),
+      );
+    await connectFixture({
+      userId: apiKeyUserId,
+      kind: "mcp_user_token",
+      authMethod: "api_key",
+      scope: null,
+      connectionServerId: typefullyServerId,
+    });
+    decrypted.length = 0;
+
+    await expect(
+      store.callTool({
+        ref: typefullyRef,
+        args: {},
+        botId,
+        actorId: apiKeyUserId,
+      }),
+    ).rejects.toBeInstanceOf(PluginRefusedError);
+    expect(decrypted).toEqual([]);
+  });
+
+  test("rejects an API key on the OAuth path", async () => {
+    await database
+      .delete(mcpUserCredentials)
+      .where(
+        and(
+          eq(mcpUserCredentials.serverId, serverId),
+          eq(mcpUserCredentials.userId, brokenOauthUserId),
+        ),
+      );
+    await connectFixture({
+      userId: brokenOauthUserId,
+      kind: "mcp_user_api_key",
+      authMethod: "oauth",
+      scope: "https://www.googleapis.com/auth/drive.readonly",
+    });
+    decrypted.length = 0;
+
+    await expect(
+      store.callTool({ ref, args: {}, botId, actorId: brokenOauthUserId }),
+    ).rejects.toBeInstanceOf(PluginRefusedError);
+    expect(decrypted).toEqual([]);
+  });
+
+  test("refuses corrupt API-key associations before vendor access", async () => {
+    const cases: {
+      name: string;
+      authMethod: "oauth" | "api_key";
+      scope: string | null;
+      credentialProvider?: string;
+      credentialKeyId?: string;
+    }[] = [
+      {
+        name: "auth method",
+        authMethod: "oauth" as const,
+        scope: "scope",
+      },
+      {
+        name: "scope",
+        authMethod: "api_key" as const,
+        scope: "scope",
+      },
+      {
+        name: "provider",
+        authMethod: "api_key" as const,
+        scope: null,
+        credentialProvider: serverId,
+      },
+      {
+        name: "owner",
+        authMethod: "api_key" as const,
+        scope: null,
+        credentialKeyId: brokenOauthUserId,
+      },
+    ];
+
+    for (const corrupt of cases) {
+      await database
+        .delete(mcpUserCredentials)
+        .where(
+          and(
+            eq(mcpUserCredentials.serverId, typefullyServerId),
+            eq(mcpUserCredentials.userId, apiKeyUserId),
+          ),
+        );
+      const credentialId = await connectFixture({
+        userId: apiKeyUserId,
+        kind: "mcp_user_api_key",
+        authMethod: corrupt.authMethod,
+        scope: corrupt.scope,
+        connectionServerId: typefullyServerId,
+        credentialProvider: corrupt.credentialProvider,
+        credentialKeyId: corrupt.credentialKeyId,
+        secret: `corrupt-${corrupt.name}-${suite}`,
+      });
+      decrypted.length = 0;
+
+      await expect(
+        store.callTool({
+          ref: typefullyRef,
+          args: {},
+          botId,
+          actorId: apiKeyUserId,
+        }),
+      ).rejects.toBeInstanceOf(PluginRefusedError);
+      expect(decrypted).toEqual([]);
+      await database
+        .update(credentials)
+        .set({ revokedAt: new Date() })
+        .where(eq(credentials.id, credentialId));
+    }
+
+    await database
+      .delete(mcpUserCredentials)
+      .where(
+        and(
+          eq(mcpUserCredentials.serverId, typefullyServerId),
+          eq(mcpUserCredentials.userId, apiKeyUserId),
+        ),
+      );
+    const revokedId = await connectFixture({
+      userId: apiKeyUserId,
+      kind: "mcp_user_api_key",
+      authMethod: "api_key",
+      scope: null,
+      connectionServerId: typefullyServerId,
+      secret: `revoked-${suite}`,
+    });
+    await database
+      .update(credentials)
+      .set({ revokedAt: new Date() })
+      .where(eq(credentials.id, revokedId));
+    await expect(
+      store.callTool({
+        ref: typefullyRef,
+        args: {},
+        botId,
+        actorId: apiKeyUserId,
+      }),
+    ).rejects.toBeInstanceOf(PluginRefusedError);
+    expect(decrypted).toEqual([]);
+  });
 });
 
 describe("a person who has not connected", () => {
@@ -493,6 +914,88 @@ describe("a person who has connected", () => {
       store.callTool({ ref, args: {}, botId, actorId: askerId }),
     ).rejects.toThrow(PluginRefusedError);
     expect(decrypted).toEqual([]);
+  });
+});
+
+describe("live connection listing", () => {
+  test("includes safe rows only when the method matches the catalogue", async () => {
+    await connectFixture({
+      userId: listingApiKeyUserId,
+      kind: "mcp_user_api_key",
+      authMethod: "api_key",
+      scope: null,
+      connectionServerId: typefullyServerId,
+    });
+    await connectFixture({
+      userId: listingOauthUserId,
+      kind: "mcp_user_token",
+      authMethod: "oauth",
+      scope: "https://www.googleapis.com/auth/drive.readonly",
+    });
+
+    expect(await store.connectionsFor(listingApiKeyUserId)).toEqual([
+      {
+        serverId: typefullyServerId,
+        authMethod: "api_key",
+        scope: null,
+        accountLabel: null,
+        connectedAt: expect.any(String),
+      },
+    ]);
+    expect(await store.connectionsFor(listingOauthUserId)).toEqual([
+      {
+        serverId,
+        authMethod: "oauth",
+        scope: "https://www.googleapis.com/auth/drive.readonly",
+        accountLabel: null,
+        connectedAt: expect.any(String),
+      },
+    ]);
+  });
+
+  test("excludes structurally valid rows whose method disagrees with the catalogue", async () => {
+    await connectFixture({
+      userId: mismatchedCatalogueUserId,
+      kind: "mcp_user_api_key",
+      authMethod: "api_key",
+      scope: null,
+    });
+    expect(await store.connectionsFor(mismatchedCatalogueUserId)).toEqual([]);
+
+    await database
+      .delete(mcpUserCredentials)
+      .where(eq(mcpUserCredentials.userId, mismatchedCatalogueUserId));
+    await connectFixture({
+      userId: mismatchedCatalogueUserId,
+      kind: "mcp_user_token",
+      authMethod: "oauth",
+      scope: "read",
+      connectionServerId: typefullyServerId,
+    });
+    expect(await store.connectionsFor(mismatchedCatalogueUserId)).toEqual([]);
+
+    await database
+      .delete(mcpUserCredentials)
+      .where(eq(mcpUserCredentials.userId, mismatchedCatalogueUserId));
+    await connectFixture({
+      userId: mismatchedCatalogueUserId,
+      kind: "mcp_user_token",
+      authMethod: "oauth",
+      scope: "read",
+      connectionServerId: unknownCatalogueServerId,
+    });
+    expect(await store.connectionsFor(mismatchedCatalogueUserId)).toEqual([]);
+  });
+
+  test("excludes an OAuth row with no scope", async () => {
+    await connectFixture({
+      userId: noScopeListingOauthUserId,
+      kind: "mcp_user_token",
+      authMethod: "oauth",
+      scope: null,
+    });
+
+    expect(await store.connectionsFor(noScopeListingOauthUserId)).toEqual([]);
   });
 });
 

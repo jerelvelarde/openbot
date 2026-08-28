@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, isNull } from "drizzle-orm";
+import { and, asc, eq, inArray, isNotNull, isNull, or } from "drizzle-orm";
 import type { Database } from "../db/client";
 import {
   componentExclusions,
@@ -19,8 +19,11 @@ export type ComponentRecord = {
   updatedAt: string;
   /** Whether the draft says something the published version does not. */
   hasUnpublishedChanges: boolean;
+  grantMode: "open" | "explicit";
   /** The Bots held back from this. Every other Bot, including ones added later, may use it. */
   withheldFrom: string[];
+  /** Bots explicitly granted this component when grantMode is explicit. */
+  grantedTo: string[];
   /** The data functions this component may call. Empty means it may call none. */
   functions: string[];
 };
@@ -55,6 +58,8 @@ export type CatalogueEntry = {
   title: string;
   kind: string;
   description: string;
+  defaultPublished?: boolean;
+  grantMode?: "open" | "explicit";
 };
 
 export type ComponentStore = {
@@ -103,6 +108,29 @@ export type ComponentStore = {
 const iso = (value: Date | string | null): string | null =>
   value === null ? null : value instanceof Date ? value.toISOString() : value;
 
+const EXPLICIT_COMPONENT_GRANTS = new Set([
+  "connectTypefullyAccount",
+  "approveTypefullyPublication",
+]);
+
+export function requiresExplicitComponentGrant(name: string): boolean {
+  return EXPLICIT_COMPONENT_GRANTS.has(name);
+}
+
+/** Browser catalogue announcements are authenticated user input, not trusted build identity. */
+function initialGovernance(entry: CatalogueEntry): {
+  published: boolean;
+  grantMode: "open" | "explicit";
+} {
+  if (requiresExplicitComponentGrant(entry.name)) {
+    return { published: false, grantMode: "explicit" };
+  }
+  return {
+    published: entry.defaultPublished !== false,
+    grantMode: entry.grantMode ?? "open",
+  };
+}
+
 export function createComponentStore(database: Database): ComponentStore {
   async function requireComponent(name: string) {
     const [row] = await database
@@ -128,17 +156,22 @@ export function createComponentStore(database: Database): ComponentStore {
       const inserted = await database
         .insert(components)
         .values(
-          missing.map((entry) => ({
-            name: entry.name,
-            title: entry.title,
-            kind: entry.kind,
-            draftDescription: entry.description,
-            // Published on arrival, so a fresh install can draw from the moment it starts.
-            publishedDescription: entry.description,
-            published: true,
-            publishedAt: new Date(),
-            updatedBy: "the build",
-          })),
+          missing.map((entry) => {
+            const governance = initialGovernance(entry);
+            return {
+              name: entry.name,
+              title: entry.title,
+              kind: entry.kind,
+              draftDescription: entry.description,
+              publishedDescription: governance.published
+                ? entry.description
+                : null,
+              published: governance.published,
+              publishedAt: governance.published ? new Date() : null,
+              grantMode: governance.grantMode,
+              updatedBy: "the build",
+            };
+          }),
         )
         // Two browsers announcing the same new component at once is ordinary, not a fault: whichever
         // arrives second must be a no-op rather than a duplicate-key error thrown at a page load.
@@ -205,7 +238,15 @@ export function createComponentStore(database: Database): ComponentStore {
         updatedAt: iso(row.updatedAt) as string,
         hasUnpublishedChanges:
           row.draftDescription !== (row.publishedDescription ?? ""),
-        withheldFrom: (byComponent.get(row.name) ?? []).sort(),
+        grantMode: row.grantMode === "explicit" ? "explicit" : "open",
+        withheldFrom:
+          row.grantMode === "explicit"
+            ? []
+            : (byComponent.get(row.name) ?? []).sort(),
+        grantedTo:
+          row.grantMode === "explicit"
+            ? (byComponent.get(row.name) ?? []).sort()
+            : [],
         functions: (functionsByComponent.get(row.name) ?? []).sort(),
       }));
     },
@@ -228,7 +269,16 @@ export function createComponentStore(database: Database): ComponentStore {
         .where(
           and(
             eq(components.published, true),
-            isNull(componentExclusions.agentId),
+            or(
+              and(
+                eq(components.grantMode, "open"),
+                isNull(componentExclusions.agentId),
+              ),
+              and(
+                eq(components.grantMode, "explicit"),
+                isNotNull(componentExclusions.agentId),
+              ),
+            ),
           ),
         )
         .orderBy(asc(components.name));
@@ -248,6 +298,7 @@ export function createComponentStore(database: Database): ComponentStore {
           published: components.published,
           description: components.publishedDescription,
           title: components.title,
+          grantMode: components.grantMode,
           withheldFrom: componentExclusions.agentId,
         })
         .from(components)
@@ -275,7 +326,13 @@ export function createComponentStore(database: Database): ComponentStore {
           reason: `${row.title} is not published in this deployment, so no Bot may use it. Answer in prose instead.`,
         };
       }
-      if (row.withheldFrom) {
+      if (row.grantMode === "explicit" && !row.withheldFrom) {
+        return {
+          allowed: false,
+          reason: `${row.title} has not been granted to this Bot in this deployment. Answer in prose instead.`,
+        };
+      }
+      if (row.grantMode !== "explicit" && row.withheldFrom) {
         return {
           allowed: false,
           reason: `${row.title} has been withheld from this Bot in this deployment, though other Bots may use it. Answer in prose instead.`,
@@ -285,24 +342,42 @@ export function createComponentStore(database: Database): ComponentStore {
     },
 
     async grant(name, agentId) {
-      await requireComponent(name);
-      await database
-        .delete(componentExclusions)
-        .where(
-          and(
-            eq(componentExclusions.componentName, name),
-            eq(componentExclusions.agentId, agentId),
-          ),
-        );
+      const component = await requireComponent(name);
+      if (component.grantMode === "explicit") {
+        await database
+          .insert(componentExclusions)
+          .values({ componentName: name, agentId })
+          .onConflictDoNothing();
+      } else {
+        await database
+          .delete(componentExclusions)
+          .where(
+            and(
+              eq(componentExclusions.componentName, name),
+              eq(componentExclusions.agentId, agentId),
+            ),
+          );
+      }
     },
 
     async revoke(name, agentId, by) {
-      await requireComponent(name);
-      await database
-        .insert(componentExclusions)
-        .values({ componentName: name, agentId, withheldBy: by })
-        // Withholding twice must not move the date.
-        .onConflictDoNothing();
+      const component = await requireComponent(name);
+      if (component.grantMode === "explicit") {
+        await database
+          .delete(componentExclusions)
+          .where(
+            and(
+              eq(componentExclusions.componentName, name),
+              eq(componentExclusions.agentId, agentId),
+            ),
+          );
+      } else {
+        await database
+          .insert(componentExclusions)
+          .values({ componentName: name, agentId, withheldBy: by })
+          // Withholding twice must not move the date.
+          .onConflictDoNothing();
+      }
     },
 
     async publish(name, by) {

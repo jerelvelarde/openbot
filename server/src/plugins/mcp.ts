@@ -252,12 +252,16 @@ export async function listTools(connection: Connection): Promise<McpTool[]> {
   });
 }
 
+export type SideEffectOutcome = "definitely_not_applied" | "uncertain";
+
 export type McpCallResult = {
   /** The result as text, which is what a model reads. Truncated visibly if it was enormous. */
   text: string;
   /** True when the server itself reported the call as an error rather than failing to answer. */
   isError: boolean;
   truncated: boolean;
+  /** Internal write provenance. Present only when retry safety depends on what failed. */
+  sideEffectOutcome?: SideEffectOutcome;
 };
 
 /**

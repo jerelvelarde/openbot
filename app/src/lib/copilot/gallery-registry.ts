@@ -22,6 +22,10 @@ export type GalleryComponent = {
   /** What a person sees in Admin and in a refusal. */
   title: string;
   kind: GalleryKind;
+  /** New catalogue rows publish immediately unless this component is security-sensitive. */
+  defaultPublished?: boolean;
+  /** Most presentation components are open; sensitive decisions require an explicit per-Bot grant. */
+  grantMode?: "open" | "explicit";
   /**
    * What the model reads while deciding whether to call this. A starting value only: a deployment
    * edits and publishes its own, and that is what a running Bot is given.
@@ -59,6 +63,17 @@ export type GalleryComponent = {
 };
 
 /**
+ * Keep a gallery definition checked at its module boundary without widening its literal fields.
+ * The registry still discovers the returned value through `GALLERY`; this helper adds no runtime
+ * registration or data access.
+ */
+export function defineGalleryComponent<T extends GalleryComponent>(
+  component: T,
+): T {
+  return component;
+}
+
+/**
  * Every gallery module, loaded eagerly because the list has to exist before the first render: it
  * decides how many hooks are registered, and a hook count that arrives late is a hook count that
  * changed.
@@ -78,12 +93,25 @@ try {
   modules = {};
 }
 
-/**
- * Stable order is required because this list drives hook registration order.
- */
-export const GALLERY_COMPONENTS: GalleryComponent[] = Object.values(modules)
-  .flatMap((module) => module.GALLERY ?? [])
-  .sort((left, right) => left.name.localeCompare(right.name));
+/** Build the exact production registry and fail before duplicate names can overwrite each other. */
+export function buildGalleryComponents(
+  discovered: Record<string, { GALLERY?: GalleryComponent[] }>,
+): GalleryComponent[] {
+  const components = Object.values(discovered)
+    .flatMap((module) => module.GALLERY ?? [])
+    .sort((left, right) => left.name.localeCompare(right.name));
+  const names = new Set<string>();
+  for (const component of components) {
+    if (names.has(component.name)) {
+      throw new Error(`Duplicate gallery component name: ${component.name}`);
+    }
+    names.add(component.name);
+  }
+  return components;
+}
+
+/** Stable order is required because this list drives hook registration order. */
+export const GALLERY_COMPONENTS = buildGalleryComponents(modules);
 
 /** What the server is told exists. Deliberately not the schema or the renderer: it cannot use either. */
 export type GalleryManifestEntry = {
@@ -91,15 +119,21 @@ export type GalleryManifestEntry = {
   title: string;
   kind: GalleryKind;
   description: string;
+  defaultPublished: boolean;
+  grantMode: "open" | "explicit";
 };
 
 export function galleryManifest(): GalleryManifestEntry[] {
-  return GALLERY_COMPONENTS.map(({ name, title, kind, description }) => ({
-    name,
-    title,
-    kind,
-    description,
-  }));
+  return GALLERY_COMPONENTS.map(
+    ({ name, title, kind, description, defaultPublished, grantMode }) => ({
+      name,
+      title,
+      kind,
+      description,
+      defaultPublished: defaultPublished ?? true,
+      grantMode: grantMode ?? "open",
+    }),
+  );
 }
 
 /** The names this build can actually draw, for telling a catalogue row from a component. */

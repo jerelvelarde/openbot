@@ -84,10 +84,10 @@ export type CatalogueItem = {
    * Whose credential reaches this server.
    *
    * `deployment-bearer` is a token an administrator holds for everybody, and the only one this page
-   * can collect. `user-oauth` is reached as whoever is asking, so each person connects their own
-   * account and there is no token to type here.
+   * can collect. `user-oauth` and `user-api-key` are reached as whoever is asking, so each person
+   * connects their own account and there is no deployment token to type here.
    */
-  auth: "none" | "deployment-bearer" | "user-oauth";
+  auth: "none" | "deployment-bearer" | "user-oauth" | "user-api-key";
   /** True for a vendor that gives every customer their own hostname. */
   perInstance: boolean;
 };
@@ -141,8 +141,10 @@ export const pluginKeys = {
 /** One account this person has connected, from their own point of view. */
 export type PluginConnection = {
   serverId: string;
+  authMethod: "oauth" | "api_key";
   /** What the vendor actually granted, which is not always what was asked for. */
-  scope: string;
+  scope: string | null;
+  accountLabel: string | null;
   connectedAt: string;
 };
 
@@ -150,6 +152,65 @@ export type PluginConnections = {
   connections: PluginConnection[];
   redirectUri: string | null;
 };
+
+function boundedString(value: unknown, limit: number): string | undefined {
+  return typeof value === "string" && Array.from(value).length <= limit
+    ? value
+    : undefined;
+}
+
+function normalizeConnections(value: unknown): PluginConnections {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Your connected accounts could not be loaded.");
+  }
+  const record = value as Record<string, unknown>;
+  if (!Array.isArray(record.connections)) {
+    throw new Error("Your connected accounts could not be loaded.");
+  }
+  const connections = record.connections.map((item): PluginConnection => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error("Your connected accounts could not be loaded.");
+    }
+    const connection = item as Record<string, unknown>;
+    const serverId = boundedString(connection.serverId, 120);
+    const connectedAt = boundedString(connection.connectedAt, 80);
+    const authMethod = connection.authMethod;
+    const scope =
+      connection.scope === null ? null : boundedString(connection.scope, 2_000);
+    const accountLabel =
+      connection.accountLabel === null
+        ? null
+        : boundedString(connection.accountLabel, 160);
+    if (
+      !serverId ||
+      !connectedAt ||
+      (authMethod !== "oauth" && authMethod !== "api_key") ||
+      scope === undefined ||
+      accountLabel === undefined ||
+      (authMethod === "oauth" && scope === null) ||
+      (authMethod === "api_key" && scope !== null)
+    ) {
+      throw new Error("Your connected accounts could not be loaded.");
+    }
+    return { serverId, authMethod, scope, accountLabel, connectedAt };
+  });
+  const redirectUri =
+    record.redirectUri === null ? null : boundedString(record.redirectUri, 500);
+  if (redirectUri === undefined) {
+    throw new Error("Your connected accounts could not be loaded.");
+  }
+  return { connections, redirectUri };
+}
+
+export async function loadConnections(
+  signal?: AbortSignal,
+): Promise<PluginConnections> {
+  const response = await client("/api/plugins/connections", {
+    fallback: "Your connected accounts could not be loaded.",
+    signal,
+  });
+  return normalizeConnections(await response.json());
+}
 
 /**
  * The signed-in person's own connections.
@@ -160,12 +221,8 @@ export type PluginConnections = {
 export function connectionsQueryOptions() {
   return queryOptions({
     queryKey: pluginKeys.connections(),
-    queryFn: async (): Promise<PluginConnections> => {
-      const response = await client("/api/plugins/connections", {
-        fallback: "Your connected accounts could not be loaded.",
-      });
-      return response.json();
-    },
+    queryFn: ({ signal }): Promise<PluginConnections> =>
+      loadConnections(signal),
   });
 }
 

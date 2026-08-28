@@ -56,8 +56,14 @@ import { createExternalLinkRoutes } from "./external/routes";
 import { createExternalThreadStore } from "./external/thread-store";
 import { createPeopleStore } from "./people/store";
 import { redirectUriFor } from "./plugins/oauth";
-import { createPluginStore } from "./plugins/store";
+import { createPluginStore, type PluginStore } from "./plugins/store";
 import { grantedSkills, grantedTools } from "./plugins/tools";
+import {
+  createTypefullyPublicationVendor,
+  createTypefullyRestTransport,
+  createTypefullySmokeFetch,
+  validateTypefullyApiKey,
+} from "./plugins/typefully-rest";
 import { createIntentRouter } from "./routing/classify";
 import { createModelCompleter } from "./routing/model";
 import { createCoworkerRoutingService } from "./routing/service";
@@ -73,6 +79,7 @@ import {
   loadTenantPackage,
   synchronizeTenantPackage,
 } from "./tenant-package";
+import { createTypefullyStore } from "./typefully/store";
 
 /**
  * Who is asking, for a CopilotKit request.
@@ -299,7 +306,24 @@ const computerGateway = computerProvider
  */
 const sandboxedStore = createSandboxedStore(database, bootAuditStore);
 
-const pluginStore = createPluginStore({
+let pluginStore: PluginStore;
+let typefullyVendorDispatch: Parameters<
+  NonNullable<Parameters<typeof createPluginStore>[0]["vendorDispatcherReady"]>
+>[0];
+const typefullyFetch = config.typefullyApiUrl
+  ? createTypefullySmokeFetch(config.typefullyApiUrl)
+  : globalThis.fetch;
+const typefullyStore = createTypefullyStore({
+  database,
+  auditStore: bootAuditStore,
+  publicationVendor: createTypefullyPublicationVendor(typefullyFetch),
+  plugin: () => ({
+    decide: pluginStore.decide.bind(pluginStore),
+    dispatchVendor: typefullyVendorDispatch,
+    authorizeOperation: pluginStore.authorizeOperation.bind(pluginStore),
+  }),
+});
+pluginStore = createPluginStore({
   database,
   auditStore: bootAuditStore,
   credentials: credentialStore,
@@ -314,6 +338,17 @@ const pluginStore = createPluginStore({
    * registering.
    */
   redirectUri: config.publicUrl ? redirectUriFor(config.publicUrl) : undefined,
+  firstPartyTool: typefullyStore.callBotTool,
+  ...(config.typefullyApiUrl
+    ? {
+        callVendor: createTypefullyRestTransport(typefullyFetch).callTool,
+        validateUserApiKey: async ({ apiKey }: { apiKey: string }) =>
+          validateTypefullyApiKey(apiKey, typefullyFetch),
+      }
+    : {}),
+  vendorDispatcherReady: (dispatch) => {
+    typefullyVendorDispatch = dispatch;
+  },
 });
 
 void recordAuditEvent(bootAuditStore, {
@@ -645,8 +680,8 @@ const app = createApp(
   createPageFrameStore(database),
   // External identity confirmation and assistance routes use the same actor and profile boundary.
   externalLinkRoutes,
-  // Preserve the existing positional extension point without enabling an unrelated integration.
-  undefined,
+  // Local-first Typefully drafts share the exact plugin grant, policy, credential and audit boundary.
+  typefullyStore,
   // A narrow public projection: never hand `/api/capabilities` the runtime snapshot itself.
   () => projectSlackStatus(copilotHandler.channels?.status()),
 );

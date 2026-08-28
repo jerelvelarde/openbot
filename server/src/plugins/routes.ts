@@ -7,20 +7,23 @@ import { CATALOGUE, catalogueEntry } from "./catalogue";
 import {
   authorizationUrlFor,
   challengeFor,
+  connectedAccountsUrlFor,
   createVerifier,
   readConnectState,
   redeemAuthorizationCode,
   redirectUriFor,
-  connectedAccountsUrlFor,
   sealConnectState,
 } from "./oauth";
 import {
   CatalogueEntryUnknownError,
+  ConnectionRequiredError,
   CustomServerRefusedError,
   type OAuthClient,
   PluginRefusedError,
   type PluginStore,
+  UserConnectionError,
 } from "./store";
+import { TypefullyApiKeyValidationError } from "./typefully-rest";
 
 /**
  * Whether the person a consent was started for still has access to this deployment.
@@ -351,6 +354,86 @@ export function createPluginRoutes(
     });
   });
 
+  routes.put("/connections/typefully/api-key", requireUser, async (context) => {
+    const body = (await context.req.json().catch(() => null)) as unknown;
+    if (
+      !body ||
+      typeof body !== "object" ||
+      Array.isArray(body) ||
+      Object.keys(body).length !== 1 ||
+      typeof (body as Record<string, unknown>).apiKey !== "string"
+    ) {
+      return context.json(
+        {
+          error: "The request must contain exactly one string apiKey field.",
+          code: "invalid_request",
+        },
+        400,
+      );
+    }
+
+    try {
+      const connection = await store.connectUserApiKey({
+        serverId: "typefully",
+        userId: context.var.actor.id,
+        apiKey: (body as { apiKey: string }).apiKey,
+        by: context.var.actor.id,
+      });
+      return context.json({ connection });
+    } catch (error) {
+      if (error instanceof TypefullyApiKeyValidationError) {
+        const status =
+          error.code === "invalid_api_key"
+            ? 400
+            : error.code === "rate_limited"
+              ? 429
+              : 503;
+        return context.json({ error: error.message, code: error.code }, status);
+      }
+      if (error instanceof UserConnectionError) {
+        const status =
+          error.code === "connector_not_enabled"
+            ? 409
+            : error.code === "access_revoked"
+              ? 403
+              : 404;
+        return context.json({ error: error.message, code: error.code }, status);
+      }
+      if (error instanceof PluginRefusedError) {
+        return context.json(
+          { error: error.message, code: "connection_mismatch" },
+          409,
+        );
+      }
+      throw error;
+    }
+  });
+
+  routes.delete("/connections/typefully", requireUser, async (context) => {
+    try {
+      await store.disconnectUserConnection({
+        serverId: "typefully",
+        userId: context.var.actor.id,
+        by: context.var.actor.id,
+      });
+      return context.json({ ok: true });
+    } catch (error) {
+      if (error instanceof UserConnectionError) {
+        return context.json(
+          { error: error.message, code: error.code },
+          error.code === "connector_not_enabled" ? 409 : 404,
+        );
+      }
+      if (error instanceof PluginRefusedError) {
+        return context.json(
+          { error: error.message, code: "connection_mismatch" },
+          409,
+        );
+      }
+      throw error;
+    }
+  });
+
   /**
    * Begin connecting one person's own account.
    *
@@ -513,12 +596,24 @@ export function createPluginRoutes(
     });
     if (!grant) return context.redirect(failed);
 
-    await store.recordConnection({
-      serverId: state.serverId,
-      userId: state.userId,
-      refreshToken: grant.refreshToken,
-      scope: grant.scope,
-    });
+    try {
+      await store.recordConnection({
+        serverId: state.serverId,
+        userId: state.userId,
+        refreshToken: grant.refreshToken,
+        scope: grant.scope,
+      });
+    } catch (error) {
+      // Access may have been revoked while the authorization code was being redeemed. Keep the
+      // callback's anonymous failure shape and never disclose whether this person is deny-listed.
+      if (
+        error instanceof UserConnectionError &&
+        error.code === "access_revoked"
+      ) {
+        return context.redirect(failed);
+      }
+      throw error;
+    }
 
     return context.redirect(
       connectedAccountsUrlFor(
@@ -766,6 +861,18 @@ export function createPluginRoutes(
       });
       return context.json(result);
     } catch (error) {
+      if (error instanceof ConnectionRequiredError) {
+        return context.json(
+          {
+            error: error.message,
+            rule: error.rule,
+            code: error.code,
+            serverId: error.serverId,
+            connectPath: error.connectPath,
+          },
+          403,
+        );
+      }
       if (error instanceof PluginRefusedError) {
         return context.json({ error: error.message, rule: error.rule }, 403);
       }

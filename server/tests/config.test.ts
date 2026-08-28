@@ -1,5 +1,5 @@
-import { readFileSync } from "node:fs";
 import { describe, expect, spyOn, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { configuredAuthProviders, loadConfig } from "../src/config";
 
 // Intelligence is part of the MINIMUM contract, so it belongs in the base environment every other
@@ -69,6 +69,35 @@ describe("deployment configuration", () => {
       token: "managed-agent-token",
     });
     expect(config.tenantPackageDirectory).toBe("../examples/fintech");
+  });
+
+  test("allows a loopback Typefully transport only for an explicit smoke deployment", () => {
+    const config = loadConfig({
+      ...baseEnvironment,
+      OPENBOT_SMOKE: "1",
+      OPENBOT_TYPEFULLY_SMOKE_API_URL: "http://127.0.0.1:43199/v2",
+    });
+
+    expect(config.typefullyApiUrl).toBe("http://127.0.0.1:43199/v2");
+  });
+
+  test("refuses the Typefully smoke transport outside smoke mode", () => {
+    expect(() =>
+      loadConfig({
+        ...baseEnvironment,
+        OPENBOT_TYPEFULLY_SMOKE_API_URL: "http://127.0.0.1:43199/v2",
+      }),
+    ).toThrow("OPENBOT_TYPEFULLY_SMOKE_API_URL requires OPENBOT_SMOKE=1");
+  });
+
+  test("refuses a non-loopback Typefully smoke transport", () => {
+    expect(() =>
+      loadConfig({
+        ...baseEnvironment,
+        OPENBOT_SMOKE: "1",
+        OPENBOT_TYPEFULLY_SMOKE_API_URL: "https://typefully-proxy.example/v2",
+      }),
+    ).toThrow("must use loopback HTTP");
   });
 
   test("allows deployment without an authentication provider, when asked to", () => {
