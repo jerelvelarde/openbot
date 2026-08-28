@@ -11,6 +11,16 @@ function canonicalTenantId(value: unknown): string | undefined {
     : undefined;
 }
 
+function withTenantId(
+  context: ChannelIdentityContext,
+  tenantId: string,
+): ChannelIdentityContext {
+  return Object.freeze({
+    ...context,
+    tenant: Object.freeze({ ...context.tenant, id: tenantId }),
+  });
+}
+
 /**
  * Supply the operator-owned workspace only when managed Channels omitted its canonical tenant.
  * Every other identity fact remains the adapter's immutable value.
@@ -26,14 +36,13 @@ export function normalizeSlackTenantContext(
     if (fallbackTenantId && managedTenantId !== fallbackTenantId) {
       throw new Error(MANAGED_SLACK_TENANT_ERROR);
     }
-    return context;
+    return context.tenant.id === managedTenantId
+      ? context
+      : withTenantId(context, managedTenantId);
   }
   if (!fallbackTenantId) {
     throw new Error(MANAGED_SLACK_TENANT_ERROR);
   }
 
-  return Object.freeze({
-    ...context,
-    tenant: Object.freeze({ ...context.tenant, id: fallbackTenantId }),
-  });
+  return withTenantId(context, fallbackTenantId);
 }

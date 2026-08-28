@@ -37,6 +37,18 @@ describe("managed Slack tenant context", () => {
     expect(normalizeSlackTenantContext(context, "T1")).toBe(context);
   });
 
+  test("shares one canonical known tenant with linking and ingress", () => {
+    const context = identity(" T1 ");
+
+    const normalized = normalizeSlackTenantContext(context, "T1");
+
+    expect(normalized).not.toBe(context);
+    expect(normalized.tenant).toEqual({ id: "T1", name: "Workspace" });
+    expect(context.tenant.id).toBe(" T1 ");
+    expect(Object.isFrozen(normalized)).toBe(true);
+    expect(Object.isFrozen(normalized.tenant)).toBe(true);
+  });
+
   test.each(["unknown", " UNKNOWN ", "", "   "])(
     "replaces a missing canonical tenant %j with operator configuration",
     (tenantId) => {
