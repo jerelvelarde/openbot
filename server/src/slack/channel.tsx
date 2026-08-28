@@ -28,6 +28,11 @@ import {
   providerThreadIdFromIdentity,
   SlackIngressRegistry,
 } from "./ingress-registry";
+import {
+  defaultSlackTurnFailureLogger,
+  runSlackPhase,
+  type SlackTurnFailureLogger,
+} from "./turn-phase";
 
 export type OpenBotSlackChannelDependencies = {
   identityLinker: Pick<SlackIdentityLinker, "resolve">;
@@ -35,6 +40,7 @@ export type OpenBotSlackChannelDependencies = {
   ingressRegistry?: SlackIngressRegistry;
   computerGateway?: ComputerGateway;
   assistance?: SlackAssistanceOptions;
+  logTurnFailure?: SlackTurnFailureLogger;
 };
 
 function linkCard(linkUrl: string) {
@@ -104,6 +110,7 @@ export function createOpenBotSlackChannel(
   deps: OpenBotSlackChannelDependencies,
 ): Channel {
   const ingress = deps.ingressRegistry ?? new SlackIngressRegistry();
+  const logTurnFailure = deps.logTurnFailure ?? defaultSlackTurnFailureLogger;
   configureApprovalInteractionBridge(ingress);
   const tools: SlackComputerTool[] = deps.computerGateway
     ? createSlackComputerTools(deps.computerGateway, deps.assistance)
@@ -112,11 +119,20 @@ export function createOpenBotSlackChannel(
     name: "openbot",
     identifyUser: async (context) => {
       if (context.actor.kind !== "human") return null;
-      const identityResult = await deps.identityLinker.resolve(context);
-      ingress.remember(eventId(context), {
-        identityContext: context,
-        identityResult,
-      });
+      const identityResult = await runSlackPhase(
+        "identity.resolve",
+        () => deps.identityLinker.resolve(context),
+        logTurnFailure,
+      );
+      await runSlackPhase(
+        "ingress.remember",
+        () =>
+          ingress.remember(eventId(context), {
+            identityContext: context,
+            identityResult,
+          }),
+        logTurnFailure,
+      );
       return identityResult.kind === "linked" ? identityResult.user : null;
     },
     agent: (threadId) => new OpenBotChannelAgent(threadId, deps.agentDeps),
@@ -136,12 +152,28 @@ export function createOpenBotSlackChannel(
     subscribe: boolean;
   }): Promise<void> {
     if (message.actor.kind !== "human" || !isNewMessage(message)) return;
-    const remembered = ingress.take(message.eventId, {
-      provider: "slack",
-      providerActorId: message.actor.id,
-      applicationUserId: message.user?.id ?? null,
-    });
-    if (!remembered || !validRememberedPrincipal(remembered, message)) {
+    const remembered = await runSlackPhase(
+      "ingress.take",
+      () =>
+        ingress.take(message.eventId, {
+          provider: "slack",
+          providerActorId: message.actor.id,
+          applicationUserId: message.user?.id ?? null,
+        }),
+      logTurnFailure,
+    );
+    await runSlackPhase(
+      "identity.validate",
+      () => {
+        if (!remembered || !validRememberedPrincipal(remembered, message)) {
+          throw new Error(
+            "Managed Slack ingress identity is no longer available.",
+          );
+        }
+      },
+      logTurnFailure,
+    );
+    if (!remembered) {
       throw new Error("Managed Slack ingress identity is no longer available.");
     }
     if (remembered.identityResult.kind === "unlinked") {
