@@ -1,0 +1,39 @@
+import type { ChannelIdentityContext } from "@copilotkit/channels";
+
+export const MANAGED_SLACK_TENANT_ERROR =
+  "Managed Slack delivery did not provide the configured canonical tenant.";
+
+function canonicalTenantId(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const tenantId = value.trim();
+  return tenantId && tenantId.toLowerCase() !== "unknown"
+    ? tenantId
+    : undefined;
+}
+
+/**
+ * Supply the operator-owned workspace only when managed Channels omitted its canonical tenant.
+ * Every other identity fact remains the adapter's immutable value.
+ */
+export function normalizeSlackTenantContext(
+  context: ChannelIdentityContext,
+  configuredTenantId?: string,
+): ChannelIdentityContext {
+  const managedTenantId = canonicalTenantId(context.tenant?.id);
+  const fallbackTenantId = canonicalTenantId(configuredTenantId);
+
+  if (managedTenantId) {
+    if (fallbackTenantId && managedTenantId !== fallbackTenantId) {
+      throw new Error(MANAGED_SLACK_TENANT_ERROR);
+    }
+    return context;
+  }
+  if (!fallbackTenantId) {
+    throw new Error(MANAGED_SLACK_TENANT_ERROR);
+  }
+
+  return Object.freeze({
+    ...context,
+    tenant: Object.freeze({ ...context.tenant, id: fallbackTenantId }),
+  });
+}
