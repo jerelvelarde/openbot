@@ -40,11 +40,9 @@ function isNonEmptyString(value: unknown): value is string {
 }
 
 function isTimestamp(value: unknown): value is string {
-  return (
-    typeof value === "string" &&
-    value.includes("T") &&
-    Number.isFinite(new Date(value).getTime())
-  );
+  if (typeof value !== "string") return false;
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) && date.toISOString() === value;
 }
 
 export function externalThreadTarget(value: unknown): ExternalThreadTarget {

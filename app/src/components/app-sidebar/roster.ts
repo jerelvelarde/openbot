@@ -1,10 +1,13 @@
-import type { LinkOptions } from "@tanstack/react-router";
+import { linkOptions, type LinkOptions } from "@tanstack/react-router";
 import type { ChannelSummary } from "@/lib/channels/queries";
 import type { ExternalThreadSummary } from "@/lib/external/queries";
 
 export type SidebarRosterRow =
   | { kind: "openbot"; channel: ChannelSummary }
   | { kind: "slack"; thread: ExternalThreadSummary };
+
+const openbotChannelRoute = "/channel/$channelId" as const;
+const slackThreadRoute = "/slack/thread/$threadId" as const;
 
 export function rosterKey(row: SidebarRosterRow): string {
   return row.kind === "openbot"
@@ -83,11 +86,14 @@ export function rosterLastMessage(row: SidebarRosterRow): string | null {
 
 export function rosterDestination(row: SidebarRosterRow): LinkOptions {
   return row.kind === "openbot"
-    ? { to: "/channel/$channelId", params: { channelId: row.channel.id } }
-    : {
-        to: "/slack/thread/$threadId",
+    ? linkOptions({
+        to: openbotChannelRoute,
+        params: { channelId: row.channel.id },
+      })
+    : linkOptions({
+        to: slackThreadRoute,
         params: { threadId: row.thread.threadId },
-      };
+      });
 }
 
 export function shouldShowEmptyRoster(

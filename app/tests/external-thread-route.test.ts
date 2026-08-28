@@ -89,6 +89,10 @@ describe("external Slack transcript list", () => {
         nextCursor: null,
       },
       {
+        threads: [{ ...validThread, lastMessageAt: "2026-08-25T12:00:00Z" }],
+        nextCursor: null,
+      },
+      {
         threads: [{ ...validThread, createdAt: "not-a-date" }],
         nextCursor: null,
       },
@@ -130,5 +134,45 @@ describe("external Slack transcript list", () => {
         pageParams: ["", "opaque-next"],
       }),
     ).toEqual([validThread, { ...validThread, threadId: "channels-thread-2" }]);
+  });
+
+  test("fetches cursor pages with an encoded opaque cursor and validates the response", async () => {
+    const requests: string[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      requests.push(String(input));
+      expect(init?.credentials).toBe("include");
+      return new Response(
+        JSON.stringify({
+          threads: [validThread],
+          nextCursor: "next cursor",
+        }),
+        {
+          headers: { "content-type": "application/json" },
+          status: 200,
+        },
+      );
+    };
+
+    try {
+      const options = externalThreadListQueryOptions();
+      if (typeof options.queryFn !== "function") {
+        throw new Error("Expected external thread list to have a queryFn");
+      }
+
+      const page = await options.queryFn({
+        pageParam: "cursor value/?",
+      } as Parameters<typeof options.queryFn>[0]);
+
+      expect(requests).toEqual([
+        "/api/external-links/threads?cursor=cursor%20value%2F%3F",
+      ]);
+      expect(page).toEqual({
+        threads: [validThread],
+        nextCursor: "next cursor",
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });
