@@ -8,13 +8,7 @@ import {
   PageSection,
   PageShell,
 } from "@/components/layout/page-shell";
-import {
-  Item,
-  ItemActions,
-  ItemContent,
-  ItemDescription,
-  ItemTitle,
-} from "@/components/ui/item";
+import { ConnectTypefully } from "@/components/typefully/connect-typefully";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -22,6 +16,13 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  Item,
+  ItemActions,
+  ItemContent,
+  ItemDescription,
+  ItemTitle,
+} from "@/components/ui/item";
 import { Separator } from "@/components/ui/separator";
 import { connectAccountMutationOptions } from "@/lib/plugins/mutations";
 import {
@@ -81,7 +82,7 @@ function RouteComponent() {
    * administrator has not enabled cannot be consented to — there is no OAuth client behind it. Both
    * say which it is rather than drawing a switch that cannot work.
    */
-  if (entry?.auth !== "user-oauth") {
+  if (entry?.auth !== "user-oauth" && entry?.auth !== "user-api-key") {
     return (
       <PageShell
         backButton={back}
@@ -93,6 +94,44 @@ function RouteComponent() {
             ? "A Bot reaches this one with a credential the deployment holds, the same for everybody."
             : "This deployment has no connector by that name."}
         </PageEmpty>
+      </PageShell>
+    );
+  }
+
+  if (entry.auth === "user-api-key") {
+    return (
+      <PageShell
+        backButton={back}
+        description={entry.summary}
+        title={entry.title}
+      >
+        {notice ? (
+          <p className="text-sm text-muted-foreground" role="status">
+            {notice}
+          </p>
+        ) : null}
+        <PageSection>
+          {!enabled ? (
+            <PageEmpty>
+              An administrator has not enabled this connector, so there is
+              nothing to connect to yet.
+            </PageEmpty>
+          ) : (
+            <div className="rounded-[8px] border border-border bg-card p-4">
+              <ConnectTypefully
+                connection={connection ?? null}
+                onConnected={() => {
+                  setNotice("Typefully is connected for this account.");
+                }}
+                onDisconnected={() => {
+                  setNotice(
+                    "Typefully is disconnected. Your OpenBot drafts remain available locally.",
+                  );
+                }}
+              />
+            </div>
+          )}
+        </PageSection>
       </PageShell>
     );
   }

@@ -47,6 +47,8 @@ export const credentialKind = pgEnum("credential_kind", [
    * that speaks for the deployment, and one row per person that speaks for them.
    */
   "mcp_user_token",
+  /** One person's API key for an MCP server, stored in the same vault as every other secret. */
+  "mcp_user_api_key",
 ]);
 
 export const users = pgTable("users", {

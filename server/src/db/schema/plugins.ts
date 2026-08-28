@@ -2,6 +2,7 @@ import {
   boolean,
   index,
   integer,
+  pgEnum,
   pgTable,
   primaryKey,
   text,
@@ -16,6 +17,11 @@ const createdAt = () =>
   timestamp("created_at", { withTimezone: true }).notNull().defaultNow();
 const updatedAt = () =>
   timestamp("updated_at", { withTimezone: true }).notNull().defaultNow();
+
+export const mcpUserAuthMethod = pgEnum("mcp_user_auth_method", [
+  "oauth",
+  "api_key",
+]);
 
 /**
  * Schema owned by Plugins: MCP servers a deployment has added, the tools they offer, packaged
@@ -139,11 +145,11 @@ export const mcpUserCredentials = pgTable(
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
     /**
-     * The vault row holding this person's refresh token.
+     * The vault row holding this person's method-dependent secret: an OAuth refresh token or a
+     * static API key.
      *
-     * A real foreign key, unlike {@link mcpServers.credentialId}, which is `text` against a `uuid`
-     * primary key and so references nothing the database will check. The new table does not copy
-     * that.
+     * A real foreign key, like {@link mcpServers.credentialId}, so the database refuses a pointer to
+     * a credential that does not exist.
      *
      * Deliberately not cascading. A revoked credential row is kept for the trail, and deleting the
      * row that says whose it was would take the trail with it.
@@ -151,6 +157,7 @@ export const mcpUserCredentials = pgTable(
     credentialId: uuid("credential_id")
       .notNull()
       .references(() => credentials.id),
+    authMethod: mcpUserAuthMethod("auth_method").notNull().default("oauth"),
     /**
      * What the vendor actually granted, as it said it — not what we asked for.
      *
@@ -158,7 +165,7 @@ export const mcpUserCredentials = pgTable(
      * rather than the request means a tool failing for want of a scope can be explained instead of
      * being a mystery about a permission we assumed we had.
      */
-    scope: text("scope").notNull(),
+    scope: text("scope"),
     /**
      * When this person connected.
      *

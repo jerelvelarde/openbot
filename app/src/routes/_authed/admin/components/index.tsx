@@ -26,7 +26,7 @@ function RouteComponent() {
 
   return (
     <PageShell
-      description="What each Bot may answer with. Every published component is available to every Bot; switch one off here and that Bot is never told about it. Each change and each refusal is a row in Audit."
+      description="What each Bot may answer with. Ordinary published components are open unless withheld; sensitive components require an explicit Bot grant. Each change and each refusal is a row in Audit."
       title="UI Components"
     >
       {/*

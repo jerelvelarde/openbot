@@ -12,18 +12,17 @@ import { and, eq, inArray, like, sql } from "drizzle-orm";
 import { createAuditStore } from "../src/audit";
 import type { ActionPolicy } from "../src/computer/policy";
 import {
-  createCredentialStore,
   type CredentialStoreValue,
+  createCredentialStore,
   decryptSecret,
   encryptSecret,
 } from "../src/credentials";
 import { createDatabase } from "../src/db/client";
-import { TEST_POOL } from "./support/database";
 import {
   agents,
   auditEvents,
-  credentials,
   credentials as credentialRows,
+  credentials,
   mcpServers,
   mcpTools,
   mcpUserCredentials,
@@ -34,8 +33,8 @@ import { catalogueEntry } from "../src/plugins/catalogue";
 import { redirectUriFor } from "../src/plugins/oauth";
 import {
   type AccessToken,
-  createPluginStore,
   CustomServerRefusedError,
+  createPluginStore,
   exchangeRefreshTokenOverHttp,
   INVALID_CLIENT,
   type OAuthClient,
@@ -43,6 +42,7 @@ import {
   TokenRefusedError,
   unlistedAdvertisedTools,
 } from "../src/plugins/store";
+import { TEST_POOL } from "./support/database";
 
 /**
  * The two questions a tool call has to pass, and the row each answer leaves behind.
@@ -412,11 +412,11 @@ describe("the trail says what happened, not what was permitted", () => {
 
     const failed = mine.filter((row) => row.eventType === "mcp.call_failed");
     expect(failed.length).toBe(1);
-    // The reason travels with the row. For a 403 this is where the vendor names the API that is not
-    // enabled, which is the sentence that turns a guess into a fix.
-    expect((failed[0].payload as { failure?: string }).failure).toContain(
-      "connected",
+    // The class travels with the row, while the actor-facing vendor sentence stays out of audit.
+    expect((failed[0].payload as { failureClass?: string }).failureClass).toBe(
+      "refused",
     );
+    expect(JSON.stringify(failed[0].payload)).not.toContain("connected");
 
     // The point of the whole test: nothing claims this worked.
     expect(
@@ -533,34 +533,53 @@ describe("removing an MCP server", () => {
    * from no screen, revoked by no operation, and still a usable grant at the vendor. "We removed the
    * connector" has to be true of the thing that matters, which is the token sitting at Notion.
    */
-  test("revokes every person's grant for the server it removes", async () => {
+  test("revokes every person's OAuth token and API key for the server it removes", async () => {
     const removalServerId = `removal-target-people-${suite}`;
     const connectedUserId = `user_removal_${suite}`;
+    const apiKeyUserId = `user_removal_api_key_${suite}`;
     revokedCredentialIds.length = 0;
 
     await database
       .insert(users)
-      .values({
-        id: connectedUserId,
-        email: `${connectedUserId}@openbot.test`,
-        name: connectedUserId,
-        emailVerified: false,
-      })
+      .values([
+        {
+          id: connectedUserId,
+          email: `${connectedUserId}@openbot.test`,
+          name: connectedUserId,
+          emailVerified: false,
+        },
+        {
+          id: apiKeyUserId,
+          email: `${apiKeyUserId}@openbot.test`,
+          name: apiKeyUserId,
+          emailVerified: false,
+        },
+      ])
       .onConflictDoNothing();
 
-    const [grant] = await database
+    const grants = await database
       .insert(credentialRows)
-      .values({
-        kind: "mcp_user_token",
-        provider: removalServerId,
-        keyId: connectedUserId,
-        encryptedValue: "{}",
-        metadata: {},
-      })
+      .values([
+        {
+          kind: "mcp_user_token" as const,
+          provider: removalServerId,
+          keyId: connectedUserId,
+          encryptedValue: "{}",
+          metadata: {},
+        },
+        {
+          kind: "mcp_user_api_key" as const,
+          provider: removalServerId,
+          keyId: apiKeyUserId,
+          encryptedValue: "{}",
+          metadata: {},
+        },
+      ])
       .returning({ id: credentialRows.id });
-    const grantId = grant?.id;
-    if (!grantId) throw new Error("grant row was not created");
-    issuedCredentialIds.push(grantId);
+    const grantId = grants[0]?.id;
+    const apiKeyId = grants[1]?.id;
+    if (!grantId || !apiKeyId) throw new Error("grant rows were not created");
+    issuedCredentialIds.push(grantId, apiKeyId);
 
     await database.insert(mcpServers).values({
       id: removalServerId,
@@ -569,22 +588,34 @@ describe("removing an MCP server", () => {
       url: "https://example.invalid/mcp",
       provenance: "custom",
     });
-    await database.insert(mcpUserCredentials).values({
-      serverId: removalServerId,
-      userId: connectedUserId,
-      credentialId: grantId,
-      scope: "",
-    });
+    await database.insert(mcpUserCredentials).values([
+      {
+        serverId: removalServerId,
+        userId: connectedUserId,
+        credentialId: grantId,
+        authMethod: "oauth" as const,
+        scope: "scope",
+      },
+      {
+        serverId: removalServerId,
+        userId: apiKeyUserId,
+        credentialId: apiKeyId,
+        authMethod: "api_key" as const,
+        scope: null,
+      },
+    ]);
 
     try {
       await store.removeServer(removalServerId, "admin@openbot.local");
 
-      expect(revokedCredentialIds).toEqual([grantId]);
-      const [row] = await database
+      expect([...revokedCredentialIds].sort()).toEqual(
+        [grantId, apiKeyId].sort(),
+      );
+      const rows = await database
         .select({ revokedAt: credentialRows.revokedAt })
         .from(credentialRows)
-        .where(eq(credentialRows.id, grantId));
-      expect(row?.revokedAt).not.toBeNull();
+        .where(inArray(credentialRows.id, [grantId, apiKeyId]));
+      expect(rows.every((row) => row.revokedAt !== null)).toBe(true);
 
       // And the trail says whose access ended and why, which is the row an auditor reaches for.
       const trail = await database
@@ -601,11 +632,17 @@ describe("removing an MCP server", () => {
             eq(auditEvents.eventType, "mcp.account_disconnected"),
           ),
         );
-      expect(trail).toHaveLength(1);
-      expect(trail[0]?.owner).toBe(connectedUserId);
-      expect(trail[0]?.reason).toBe("mcp_server_removed");
+      expect(trail).toHaveLength(2);
+      expect(trail.map((row) => row.owner).sort()).toEqual(
+        [connectedUserId, apiKeyUserId].sort(),
+      );
+      expect(trail.every((row) => row.reason === "mcp_server_removed")).toBe(
+        true,
+      );
     } finally {
-      await database.delete(users).where(eq(users.id, connectedUserId));
+      await database
+        .delete(users)
+        .where(inArray(users.id, [connectedUserId, apiKeyUserId]));
     }
   });
 

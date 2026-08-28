@@ -307,7 +307,7 @@ describe("tenant YAML validation", () => {
         systemPrompt:
           "You are a helpful general assistant. Give clear, concise, and accurate answers.",
       },
-      skills: [],
+      skills: ["draft-social-posts"],
     });
     // The pairing the shipped package makes, which is the whole reason Knowledge narrows to document
     // tools rather than being offered everything its grants hold.

@@ -15,7 +15,9 @@ const MINIMUM_TESTS = 400;
 
 // `bun run test` rather than `bun test`, so the pretest hook fires and the generated application
 // config exists before route imports need it.
-const proc = Bun.spawn(["bun", "run", "test"], {
+// CI log collectors can terminate a noisy child while it is printing thousands of successful
+// cases. Keep every failure and Bun's countable summary, but do not stream one line per pass.
+const proc = Bun.spawn(["bun", "run", "test", "--only-failures"], {
   stdout: "inherit",
   stderr: "pipe",
 });

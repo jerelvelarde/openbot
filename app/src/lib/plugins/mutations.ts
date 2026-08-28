@@ -1,5 +1,13 @@
 import { mutationOptions, type QueryClient } from "@tanstack/react-query";
 import { client } from "@/lib/client";
+import { connectTypefully } from "@/lib/typefully/mutations";
+import {
+  asLocalTypefullyDraft,
+  type AuthoritativeDraft,
+  typefullyKeys,
+  typefullyRequest,
+} from "@/lib/typefully/queries";
+import type { PluginConnection, PluginConnections } from "./queries";
 import { pluginKeys } from "./queries";
 
 /**
@@ -61,6 +69,58 @@ const FALLBACK = "That did not work.";
  */
 export function invalidatePlugins(queryClient: QueryClient) {
   return queryClient.invalidateQueries({ queryKey: pluginKeys.all });
+}
+
+/**
+ * Connect a personal Typefully key without putting the secret in React Query's mutation cache.
+ */
+export async function connectPersonalTypefully(
+  queryClient: QueryClient,
+  apiKey: string,
+  signal?: AbortSignal,
+): Promise<PluginConnection> {
+  const result = await connectTypefully(apiKey, signal);
+  const connection: PluginConnection = {
+    ...result.connection,
+    scope: null,
+  };
+  await queryClient.invalidateQueries({ queryKey: pluginKeys.connections() });
+  return connection;
+}
+
+/** Disconnect only the signed-in person's key; local drafts are untouched. */
+export async function disconnectPersonalTypefully(queryClient: QueryClient) {
+  await typefullyRequest("/api/plugins/connections/typefully", {
+    method: "DELETE",
+  });
+  queryClient.setQueryData<PluginConnections>(
+    pluginKeys.connections(),
+    (current) => ({
+      connections: (current?.connections ?? []).filter(
+        (connection) => connection.serverId !== "typefully",
+      ),
+      redirectUri: current?.redirectUri ?? null,
+    }),
+  );
+  for (const [key, cached] of queryClient.getQueriesData<{
+    draft: AuthoritativeDraft;
+  }>({ queryKey: typefullyKeys.all })) {
+    if (
+      key[1] !== "draft" ||
+      !cached?.draft ||
+      typeof cached.draft !== "object"
+    )
+      continue;
+    queryClient.setQueryData(key, {
+      draft: asLocalTypefullyDraft(cached.draft),
+    });
+  }
+  queryClient.removeQueries({
+    predicate: (query) =>
+      query.queryKey[0] === typefullyKeys.all[0] &&
+      (query.queryKey[1] !== "draft" || query.getObserversCount() === 0),
+  });
+  await queryClient.invalidateQueries({ queryKey: pluginKeys.connections() });
 }
 
 /**

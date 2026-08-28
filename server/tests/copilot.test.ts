@@ -37,6 +37,69 @@ const riskRow = {
 };
 
 describe("registered Copilot agents", () => {
+  const builtIn = {
+    id: "general-assistant",
+    name: "General Assistant",
+    type: "built_in" as const,
+    systemPrompt: "Be helpful.",
+  };
+
+  test("fails safely when the connected-vendor catalogue is unavailable", async () => {
+    await expect(
+      buildAgents(
+        [builtIn],
+        { provider: "openai", defaultModel: "gpt-5.6-terra" },
+        "openai-secret",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        async () => {
+          throw new Error("relation internal_vendor_catalogue does not exist");
+        },
+      ),
+    ).rejects.toMatchObject({
+      name: "VendorCatalogueUnavailableError",
+      code: "vendor_catalogue_unavailable",
+      message: "Connected vendor catalogue is unavailable.",
+    });
+  });
+
+  test("accepts a genuinely empty connected-vendor catalogue", async () => {
+    const agents = await buildAgents(
+      [builtIn],
+      { provider: "openai", defaultModel: "gpt-5.6-terra" },
+      "openai-secret",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      async () => [],
+    );
+
+    expect(agents["general-assistant"]).toBeInstanceOf(BuiltInAgent);
+  });
+
+  test("accepts a non-empty connected-vendor catalogue", async () => {
+    let loads = 0;
+    const agents = await buildAgents(
+      [builtIn],
+      { provider: "openai", defaultModel: "gpt-5.6-terra" },
+      "openai-secret",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      async () => {
+        loads += 1;
+        return ["google-drive"];
+      },
+    );
+
+    expect(loads).toBe(1);
+    expect(agents["general-assistant"]).toBeInstanceOf(BuiltInAgent);
+  });
+
   test("normalizes built-in and remote rows", () => {
     expect(
       registeredAgentFromRow({

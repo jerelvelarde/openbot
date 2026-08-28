@@ -320,7 +320,9 @@ function RouteComponent() {
           description={
             auth === "user-oauth"
               ? "This vendor answers as whoever is asking. The deployment registers an OAuth client, and each person connects their own account, so a Bot only ever sees what that person can see."
-              : "What this deployment presents to the vendor. One credential, used for everybody."
+              : auth === "user-api-key"
+                ? "This vendor answers as whoever is asking. Each person connects their own API key in Connected accounts; no deployment-wide credential is collected."
+                : "What this deployment presents to the vendor. One credential, used for everybody."
           }
           title="Connection"
         >
@@ -354,6 +356,23 @@ function RouteComponent() {
                     {server?.hasCredential ? "Held" : "Not set"}
                   </span>
                   <IconChevronRight className="size-4 shrink-0 text-muted-foreground" />
+                </ItemActions>
+              </Item>
+            ) : null}
+
+            {auth === "user-api-key" ? (
+              <Item size="sm">
+                <ItemContent>
+                  <ItemTitle>Personal API key</ItemTitle>
+                  <ItemDescription>
+                    Each person will connect their own key in Connected
+                    accounts. Personal API-key setup is not available yet.
+                  </ItemDescription>
+                </ItemContent>
+                <ItemActions>
+                  <span className="text-muted-foreground text-xs">
+                    Not available
+                  </span>
                 </ItemActions>
               </Item>
             ) : null}

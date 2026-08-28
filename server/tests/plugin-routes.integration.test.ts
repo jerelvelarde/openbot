@@ -4,9 +4,15 @@ import { eq, inArray } from "drizzle-orm";
 import { createApp } from "../src/app";
 import { createAuditStore } from "../src/audit";
 import { loadConfig } from "../src/config";
-import { encryptSecret } from "../src/credentials";
+import { createCredentialStore, encryptSecret } from "../src/credentials";
 import { createDatabase } from "../src/db/client";
-import { credentials, mcpServers, mcpTools } from "../src/db/schema";
+import {
+  credentials,
+  mcpServers,
+  mcpTools,
+  mcpUserCredentials,
+  users,
+} from "../src/db/schema";
 import { createPluginStore } from "../src/plugins/store";
 import { TEST_POOL } from "./support/database";
 import { testEnvironment } from "./support/environment";
@@ -28,30 +34,24 @@ const database = createDatabase(
     "postgres://openbot:openbot@localhost:5432/openbot",
   TEST_POOL,
 );
+const suffix = randomUUID().slice(0, 8);
 
 const store = createPluginStore({
   database,
   auditStore: createAuditStore(database),
-  credentials: {
-    // Never read: Drive's tool list is in this deployment's own code, so the add path here reaches
-    // no vault. Loud rather than absent, so a call that starts reaching one is named.
-    readSecret: async () => {
-      throw new Error("this suite does not read credentials");
-    },
-    create: async () => {
-      throw new Error("this suite does not write credentials");
-    },
-    revoke: async () => {
-      throw new Error("this suite does not revoke credentials");
-    },
-  },
-  encryptionKey: "x".repeat(44),
+  credentials: createCredentialStore(database),
+  encryptionKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
   policy: () => ({ mode: "enforce", deny: [], allow: ["true"] }),
+  validateUserApiKey: async () => ({
+    accountId: `route-account-${suffix}`,
+    accountLabel: "Route Typefully",
+    keyLabel: "OpenBot",
+  }),
 });
 
 const ADMIN = {
-  id: "admin-1",
-  email: "admin@openbot.test",
+  id: `route-admin-${suffix}`,
+  email: `route-admin-${suffix}@openbot.test`,
   name: "An Administrator",
   image: null,
 };
@@ -60,6 +60,7 @@ function request(
   body: unknown,
   role: "admin" | "user" = "admin",
   path = "/api/plugins/servers",
+  method = "POST",
 ) {
   const app = createApp(
     loadConfig(testEnvironment()),
@@ -74,14 +75,13 @@ function request(
   );
 
   return app.request(`http://openbot.test${path}`, {
-    method: "POST",
+    method,
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
 }
 
 const serverId = "google-drive";
-const suffix = randomUUID().slice(0, 8);
 const personalCredentialId = randomUUID();
 const customServerId = `route-custom-${suffix}`;
 const foreignCredentialId = randomUUID();
@@ -89,8 +89,28 @@ const ownCredentialId = randomUUID();
 
 /** What this deployment already had, so a database somebody is using is left as it was found. */
 let existing: { credentialId: string | null } | null = null;
+let adminExisted = false;
+let typefullyExisted = false;
 
 beforeAll(async () => {
+  adminExisted =
+    (
+      await database
+        .select({ id: users.id })
+        .from(users)
+        .where(eq(users.id, ADMIN.id))
+    ).length > 0;
+  await database
+    .insert(users)
+    .values({ id: ADMIN.id, email: ADMIN.email, name: ADMIN.name })
+    .onConflictDoNothing();
+  typefullyExisted =
+    (
+      await database
+        .select({ id: mcpServers.id })
+        .from(mcpServers)
+        .where(eq(mcpServers.id, "typefully"))
+    ).length > 0;
   const [row] = await database
     .select({ credentialId: mcpServers.credentialId })
     .from(mcpServers)
@@ -128,6 +148,9 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  await database
+    .delete(mcpUserCredentials)
+    .where(eq(mcpUserCredentials.userId, ADMIN.id));
   if (existing) {
     await database
       .update(mcpServers)
@@ -139,6 +162,7 @@ afterAll(async () => {
   }
   await database.delete(mcpTools).where(eq(mcpTools.serverId, customServerId));
   await database.delete(mcpServers).where(eq(mcpServers.id, customServerId));
+  await database.delete(credentials).where(eq(credentials.keyId, ADMIN.id));
   await database
     .delete(credentials)
     .where(
@@ -148,6 +172,13 @@ afterAll(async () => {
         ownCredentialId,
       ]),
     );
+  if (!typefullyExisted) {
+    await database.delete(mcpTools).where(eq(mcpTools.serverId, "typefully"));
+    await database.delete(mcpServers).where(eq(mcpServers.id, "typefully"));
+  }
+  if (!adminExisted) {
+    await database.delete(users).where(eq(users.id, ADMIN.id));
+  }
 });
 
 async function serverRow() {
@@ -264,5 +295,60 @@ describe("adding a server by URL over HTTP", () => {
       .from(mcpServers)
       .where(eq(mcpServers.id, customServerId));
     expect(row?.url).toBe("https://legit.vendor.example/mcp");
+  });
+});
+
+describe("connecting a personal Typefully key over HTTP", () => {
+  test("stores and returns only the signed-in person's safe connection metadata", async () => {
+    const enabled = await request({ key: "typefully" });
+    expect(enabled.status).toBe(200);
+
+    const secret = `tf-route-${suffix}`;
+    const connected = await request(
+      { apiKey: secret },
+      "user",
+      "/api/plugins/connections/typefully/api-key",
+      "PUT",
+    );
+    expect(connected.status).toBe(200);
+    const responseText = await connected.text();
+    expect(responseText).not.toContain(secret);
+    expect(JSON.parse(responseText)).toMatchObject({
+      connection: {
+        serverId: "typefully",
+        authMethod: "api_key",
+        accountLabel: "Route Typefully",
+      },
+    });
+
+    const [association] = await database
+      .select({
+        userId: mcpUserCredentials.userId,
+        authMethod: mcpUserCredentials.authMethod,
+        scope: mcpUserCredentials.scope,
+      })
+      .from(mcpUserCredentials)
+      .where(eq(mcpUserCredentials.userId, ADMIN.id));
+    expect(association).toEqual({
+      userId: ADMIN.id,
+      authMethod: "api_key",
+      scope: null,
+    });
+
+    const disconnected = await request(
+      {},
+      "user",
+      "/api/plugins/connections/typefully",
+      "DELETE",
+    );
+    expect(disconnected.status).toBe(200);
+    const repeated = await request(
+      {},
+      "user",
+      "/api/plugins/connections/typefully",
+      "DELETE",
+    );
+    expect(repeated.status).toBe(404);
+    expect(await repeated.json()).toMatchObject({ code: "not_connected" });
   });
 });

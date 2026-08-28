@@ -245,6 +245,23 @@ function SheetRow({
  * switched, and the description is the one thing held while it is being typed — which is why it is
  * the only dialog with a Cancel.
  */
+export function componentGrantEnabled(
+  component: Pick<ComponentRecord, "grantMode" | "grantedTo" | "withheldFrom">,
+  agentId: string,
+) {
+  return component.grantMode === "explicit"
+    ? component.grantedTo.includes(agentId)
+    : !component.withheldFrom.includes(agentId);
+}
+
+export function componentGrantDescription(
+  grantMode: ComponentRecord["grantMode"],
+) {
+  return grantMode === "explicit"
+    ? "Sensitive components start unavailable. Switch on an explicit Bot grant to make this component available; switch it off to revoke that grant. Each change takes effect immediately."
+    : "Switch a Bot off and it is never told this component exists, so it cannot ask for it and does not apologise for not having it. Each change takes effect immediately.";
+}
+
 function ComponentDetail({
   component,
   bots,
@@ -264,11 +281,12 @@ function ComponentDetail({
 }) {
   const [sheet, setSheet] = useState<Sheet>(null);
   const [draft, setDraft] = useState(component.draftDescription);
-  const withheld = new Set(component.withheldFrom);
   const heldFunctions = new Set(component.functions);
   const renderable = RENDERABLE_NAMES.has(component.name);
 
-  const granted = bots.filter((bot) => !withheld.has(bot.id));
+  const granted = bots.filter((bot) =>
+    componentGrantEnabled(component, bot.id),
+  );
   const held = dataFunctions.filter((fn) => heldFunctions.has(fn.name));
 
   const grantSummary =
@@ -474,9 +492,7 @@ function ComponentDetail({
           <DialogHeader>
             <DialogTitle>Available to</DialogTitle>
             <DialogDescription>
-              Switch a Bot off and it is never told this component exists, so it
-              cannot ask for it and does not apologise for not having it. Each
-              change takes effect immediately.
+              {componentGrantDescription(component.grantMode)}
             </DialogDescription>
           </DialogHeader>
           <DialogBody className="mt-4">
@@ -487,7 +503,7 @@ function ComponentDetail({
             ) : (
               <div className="flex flex-col">
                 {bots.map((bot, index) => {
-                  const has = !withheld.has(bot.id);
+                  const has = componentGrantEnabled(component, bot.id);
                   return (
                     <div key={bot.id}>
                       {index === 0 ? null : <Separator />}
@@ -500,7 +516,7 @@ function ComponentDetail({
                             aria-label={bot.name}
                             checked={has}
                             data-testid={`grant-${component.name}-${bot.id}`}
-                            onCheckedChange={(next) => onSetGrant(bot.id, next)}
+                            onCheckedChange={() => onSetGrant(bot.id, !has)}
                           />
                         </ItemActions>
                       </Item>

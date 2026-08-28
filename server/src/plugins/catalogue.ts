@@ -37,6 +37,8 @@ export type CatalogueAuth =
   | { kind: "none" }
   /** One token, held by the deployment, used for everybody. */
   | { kind: "deployment-bearer" }
+  /** The asker's own API key, stored and resolved per person. */
+  | { kind: "user-api-key" }
   /**
    * The asker's own grant. The deployment registers an OAuth client; each person consents once and
    * the call runs on their token, so the vendor decides what comes back.
@@ -97,9 +99,9 @@ export type CatalogueEntry = {
    * per-person system means everybody's question is answered from what one account can see. So the
    * shape names it, and every entry states it.
    *
-   * `deployment-bearer` is a token an administrator holds on behalf of everybody. `user-oauth` is
-   * the person's own grant, where the deployment holds only the OAuth client and each person
-   * consents for themselves.
+   * `deployment-bearer` is a token an administrator holds on behalf of everybody. `user-oauth` and
+   * `user-api-key` are actor-owned: the former is a consent grant, while the latter is a personal
+   * key stored and resolved for the asker.
    */
   auth: CatalogueAuth;
   /**
@@ -200,6 +202,25 @@ export const CATALOGUE: readonly CatalogueEntry[] = Object.freeze([
     docsUrl:
       "https://developers.google.com/workspace/guides/configure-mcp-servers",
   },
+  Object.freeze({
+    key: "typefully",
+    title: "Typefully",
+    vendor: "Typefully",
+    summary: "Draft and schedule posts in the account of whoever is asking.",
+    host: "https://api.typefully.com",
+    path: "/v2",
+    transport: "typefully-rest",
+    auth: { kind: "user-api-key" },
+    writeTools: Object.freeze([
+      "create_draft",
+      "update_draft",
+      "upload_media",
+      "remove_media",
+      "delete_draft",
+      "prepare_publication",
+    ]),
+    docsUrl: "https://typefully.com/docs/api",
+  } satisfies CatalogueEntry),
   {
     key: "notion",
     title: "Notion",

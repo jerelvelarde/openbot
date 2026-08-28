@@ -23,6 +23,7 @@ import {
 } from "@/components/ui/item";
 import { Separator } from "@/components/ui/separator";
 import {
+  type CatalogueItem,
   connectionsQueryOptions,
   pluginsPageQueryOptions,
 } from "@/lib/plugins/queries";
@@ -58,6 +59,16 @@ const MARKS: Record<string, React.ComponentType<{ className?: string }>> = {
 
 const markFor = (key: string) => MARKS[key] ?? IconPlug;
 
+export function personalConnectedAccountEntries<
+  T extends Pick<CatalogueItem, "key" | "auth">,
+>(catalogue: readonly T[], added: ReadonlySet<string>): T[] {
+  return catalogue.filter(
+    (entry) =>
+      (entry.auth === "user-oauth" || entry.auth === "user-api-key") &&
+      added.has(entry.key),
+  );
+}
+
 function RouteComponent() {
   const { connected: outcome } = Route.useSearch();
   const plugins = useQuery(pluginsPageQueryOptions());
@@ -75,8 +86,9 @@ function RouteComponent() {
    * so listing it here would offer a choice you do not have. And a vendor nobody has enabled cannot
    * be connected at all, because there is no OAuth client to consent against.
    */
-  const yours = (plugins.data?.catalogue ?? []).filter(
-    (entry) => entry.auth === "user-oauth" && added.has(entry.key),
+  const yours = personalConnectedAccountEntries(
+    plugins.data?.catalogue ?? [],
+    added,
   );
 
   return (

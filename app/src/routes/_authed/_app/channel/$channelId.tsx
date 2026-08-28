@@ -17,6 +17,7 @@ import { ActivityLog } from "@/components/computer/activity-log";
 import { ComputerView } from "@/components/computer/computer-view";
 import { useNeedsYou } from "@/components/computer/needs-you";
 import { DetailPanel } from "@/components/layout/detail-panel";
+import { DraftCanvas } from "@/components/typefully/draft-canvas";
 import { Button } from "@/components/ui/button";
 import { markChannelReadMutationOptions } from "@/lib/channels/mutations";
 import {
@@ -26,11 +27,64 @@ import {
 } from "@/lib/channels/queries";
 import { onComputerActivity } from "@/lib/copilot/computer-activity";
 
-const chatSearchSchema = z.object({
-  settings: z.boolean().optional(),
-  /** Opens the Bot's screen in the shared detail pane. */
-  watch: z.boolean().optional(),
-});
+export type ChannelSearch = {
+  settings?: true;
+  watch?: true;
+  draft?: string;
+};
+
+export const chatSearchSchema = z
+  .object({
+    settings: z.boolean().optional(),
+    /** Opens the Bot's screen in the shared detail pane. */
+    watch: z.boolean().optional(),
+    /** Opens an owned Typefully draft in the shared detail pane. */
+    draft: z.string().uuid().optional(),
+  })
+  .transform((search): ChannelSearch => {
+    // A durable draft link is most specific; the rendered pane already gives watch precedence over
+    // settings when old URLs contain both flags.
+    if (search.draft !== undefined) {
+      return { draft: search.draft, settings: undefined, watch: undefined };
+    }
+    if (search.watch === true) {
+      return { draft: undefined, settings: undefined, watch: true };
+    }
+    if (search.settings === true) {
+      return { draft: undefined, settings: true, watch: undefined };
+    }
+    return { draft: undefined, settings: undefined, watch: undefined };
+  });
+
+export function validateChannelSearch(search: unknown): ChannelSearch {
+  return chatSearchSchema.parse(search);
+}
+export type ChannelPane = "settings" | "watch" | { draft: string } | null;
+
+/** One shared pane means every explicit pane transition clears both alternatives. */
+export function channelPaneSearch(
+  previous: ChannelSearch,
+  next: ChannelPane,
+): ChannelSearch {
+  return {
+    ...previous,
+    settings: next === "settings" ? true : undefined,
+    watch: next === "watch" ? true : undefined,
+    draft: typeof next === "object" && next !== null ? next.draft : undefined,
+  };
+}
+
+/** Automatic screen activity never displaces a pane the person already opened. */
+export function computerActivitySearch(previous: ChannelSearch): ChannelSearch {
+  if (
+    previous.draft !== undefined ||
+    previous.settings === true ||
+    previous.watch === true
+  ) {
+    return previous;
+  }
+  return channelPaneSearch(previous, "watch");
+}
 
 const EASE_OUT = [0.23, 1, 0.32, 1] as const;
 
@@ -39,9 +93,52 @@ const HEADING_ENTRANCE_OFFSET = "translateY(4px)";
 
 /** Shared detail pane width for the live screen view. */
 const SCREEN_PANEL_WIDTH = 400;
+const DRAFT_PANEL_WIDTH = 720;
+
+/** Keeps route-derived layout decisions deterministic and covered without viewport guessing. */
+export function channelDetailPresentation(
+  search: ChannelSearch,
+  agentId: string | undefined,
+): {
+  kind: "draft" | "settings" | "watch" | null;
+  open: boolean;
+  width: number | undefined;
+  collapseAtNarrow: boolean;
+} {
+  if (search.draft !== undefined) {
+    return {
+      kind: "draft",
+      open: true,
+      width: DRAFT_PANEL_WIDTH,
+      collapseAtNarrow: true,
+    };
+  }
+  if (search.watch === true && agentId !== undefined) {
+    return {
+      kind: "watch",
+      open: true,
+      width: SCREEN_PANEL_WIDTH,
+      collapseAtNarrow: false,
+    };
+  }
+  if (search.settings === true && agentId !== undefined) {
+    return {
+      kind: "settings",
+      open: true,
+      width: undefined,
+      collapseAtNarrow: false,
+    };
+  }
+  return {
+    kind: null,
+    open: false,
+    width: undefined,
+    collapseAtNarrow: false,
+  };
+}
 
 export const Route = createFileRoute("/_authed/_app/channel/$channelId")({
-  validateSearch: chatSearchSchema,
+  validateSearch: validateChannelSearch,
   component: RouteComponent,
 });
 
@@ -77,7 +174,7 @@ function ComputerViewPanel({
 
 function RouteComponent() {
   const { channelId } = Route.useParams();
-  const { settings, watch } = Route.useSearch();
+  const { draft, settings, watch } = Route.useSearch();
   const channel = useQuery(channelQueryOptions(channelId));
   const navigate = Route.useNavigate();
   const isSettingsOpen = settings === true;
@@ -87,6 +184,10 @@ function RouteComponent() {
   const agentId = channel.data?.agentIds[0];
   /** Only polled while the screen is closed; the screen panel polls control itself. */
   const needsYou = useNeedsYou(agentId, !isWatching);
+  const detailPresentation = channelDetailPresentation(
+    { draft, settings, watch },
+    agentId,
+  );
 
   const queryClient = useQueryClient();
   const markRead = useMutation(markChannelReadMutationOptions(queryClient));
@@ -123,7 +224,7 @@ function RouteComponent() {
    * screen card in that panel. Nothing about a stuck Bot is actionable until this pane is open.
    */
   useEffect(() => {
-    if (!needsYou) return;
+    if (!needsYou || draft !== undefined) return;
     show("watch");
   });
 
@@ -137,35 +238,40 @@ function RouteComponent() {
       runEpoch.current = activity.epoch;
       if (dismissedEpoch.current === activity.epoch) return;
       navigate({
-        search: (previous) =>
-          previous.watch === true || previous.settings === true
-            ? previous
-            : { ...previous, settings: undefined, watch: true },
+        search: computerActivitySearch,
       });
     });
   }, [agentId, navigate]);
 
-  // Settings and watch share one pane; opening either clears the other URL flag.
-  const show = (next: "settings" | "watch" | null) => {
+  // Draft, settings and watch share one pane; opening either control clears both alternatives.
+  const show = (next: ChannelPane) => {
     // Dismissal applies only to the current browser-activity run.
     if (next !== "watch" && isWatching)
       dismissedEpoch.current = runEpoch.current;
     return navigate({
-      search: (previous) => ({
-        ...previous,
-        settings: next === "settings" ? true : undefined,
-        watch: next === "watch" ? true : undefined,
-      }),
+      search: (previous) => channelPaneSearch(previous, next),
     });
   };
 
   return (
     <DetailPanel
+      collapseAtNarrow={detailPresentation.collapseAtNarrow}
+      focusKey={draft}
       onClose={() => show(null)}
-      open={(isSettingsOpen || isWatching) && agentId !== undefined}
-      detailWidth={isWatching ? SCREEN_PANEL_WIDTH : undefined}
+      open={detailPresentation.open}
+      detailWidth={detailPresentation.width}
+      title={
+        detailPresentation.kind === "draft" ? (
+          <span className="truncate text-sm font-medium">Typefully draft</span>
+        ) : undefined
+      }
       detail={
-        agentId === undefined ? null : isWatching ? (
+        draft !== undefined ? (
+          <DraftCanvas
+            draftId={draft}
+            onDraftCreated={(draftId) => void show({ draft: draftId })}
+          />
+        ) : agentId === undefined ? null : isWatching ? (
           // Manual watch remains active even when there is no current browser action.
           <ComputerViewPanel agentId={agentId} name={channel?.data?.name} />
         ) : (
@@ -176,7 +282,11 @@ function RouteComponent() {
       <div className="flex flex-col">
         <div className="h-12 border-b border-border sticky top-0 flex flex-row items-center justify-between px-3 gap-2">
           {/* Keyed on the displayed name so cold channel loads animate the resolved name, not the id. */}
-          <div className="flex min-w-0 items-center gap-1.5">
+          <div
+            className="flex min-w-0 items-center gap-1.5 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            data-channel-focus-fallback
+            tabIndex={-1}
+          >
             <motion.div
               animate={{ opacity: 1 }}
               className="shrink-0"

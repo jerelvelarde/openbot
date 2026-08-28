@@ -11,7 +11,7 @@ import {
   mcpUserCredentials,
   users,
 } from "../src/db/schema";
-import { createPluginStore } from "../src/plugins/store";
+import { createPluginStore, PluginRefusedError } from "../src/plugins/store";
 import { TEST_POOL } from "./support/database";
 
 /**
@@ -48,7 +48,7 @@ let clientBefore: string | null = null;
 let serverExisted = false;
 
 async function rowsFor(
-  kind: "mcp_oauth_client" | "mcp_user_token",
+  kind: "mcp_oauth_client" | "mcp_user_token" | "mcp_user_api_key",
   keyId: string,
 ) {
   return database
@@ -127,6 +127,7 @@ afterAll(async () => {
     .where(eq(mcpServers.id, serverId));
   const mine = [
     ...(await rowsFor("mcp_user_token", personId)),
+    ...(await rowsFor("mcp_user_api_key", personId)),
     ...(await rowsFor("mcp_oauth_client", `oauth-client-${serverId}`)),
   ].map((row) => row.id);
   if (mine.length) {
@@ -216,5 +217,139 @@ describe("reconnecting the same person to the same server", () => {
         ),
       );
     expect(connection?.credentialId).toBe(live(all)[0]?.id as string);
+  });
+
+  test("refuses to overwrite an API-key association with OAuth", async () => {
+    await database
+      .delete(mcpUserCredentials)
+      .where(eq(mcpUserCredentials.userId, personId));
+    await database
+      .update(credentials)
+      .set({ revokedAt: new Date(), updatedAt: new Date() })
+      .where(
+        and(
+          eq(credentials.kind, "mcp_user_token"),
+          eq(credentials.provider, serverId),
+          eq(credentials.keyId, personId),
+          isNull(credentials.revokedAt),
+        ),
+      );
+    const [apiKey] = await database
+      .insert(credentials)
+      .values({
+        kind: "mcp_user_api_key",
+        provider: serverId,
+        keyId: personId,
+        encryptedValue: "opaque-api-key",
+        metadata: {},
+      })
+      .returning({ id: credentials.id });
+    if (!apiKey) throw new Error("API-key fixture was not created");
+    await database.insert(mcpUserCredentials).values({
+      serverId,
+      userId: personId,
+      credentialId: apiKey.id,
+      authMethod: "api_key",
+      scope: null,
+    });
+
+    await expect(
+      store.recordConnection({
+        serverId,
+        userId: personId,
+        refreshToken: "must-not-replace-api-key",
+        scope: "read",
+      }),
+    ).rejects.toBeInstanceOf(PluginRefusedError);
+
+    expect(live(await rowsFor("mcp_user_api_key", personId))).toEqual([
+      expect.objectContaining({ id: apiKey.id }),
+    ]);
+    expect(live(await rowsFor("mcp_user_token", personId))).toEqual([]);
+    const [association] = await database
+      .select({ credentialId: mcpUserCredentials.credentialId })
+      .from(mcpUserCredentials)
+      .where(eq(mcpUserCredentials.userId, personId));
+    expect(association?.credentialId).toBe(apiKey.id);
+
+    await database
+      .update(mcpUserCredentials)
+      .set({ authMethod: "oauth", scope: "read" })
+      .where(eq(mcpUserCredentials.userId, personId));
+    await expect(
+      store.recordConnection({
+        serverId,
+        userId: personId,
+        refreshToken: "must-not-replace-cross-kind-association",
+        scope: "read",
+      }),
+    ).rejects.toBeInstanceOf(PluginRefusedError);
+    expect(live(await rowsFor("mcp_user_api_key", personId))).toEqual([
+      expect.objectContaining({ id: apiKey.id }),
+    ]);
+    expect(live(await rowsFor("mcp_user_token", personId))).toEqual([]);
+
+    await database
+      .delete(mcpUserCredentials)
+      .where(eq(mcpUserCredentials.userId, personId));
+    await expect(
+      store.recordConnection({
+        serverId,
+        userId: personId,
+        refreshToken: "must-not-ignore-api-key-orphan",
+        scope: "read",
+      }),
+    ).rejects.toBeInstanceOf(PluginRefusedError);
+    expect(live(await rowsFor("mcp_user_api_key", personId))).toEqual([
+      expect.objectContaining({ id: apiKey.id }),
+    ]);
+    expect(live(await rowsFor("mcp_user_token", personId))).toEqual([]);
+  });
+
+  test("refuses a live OAuth token orphan instead of rotating it", async () => {
+    await database
+      .delete(mcpUserCredentials)
+      .where(eq(mcpUserCredentials.userId, personId));
+    await database
+      .update(credentials)
+      .set({ revokedAt: new Date(), updatedAt: new Date() })
+      .where(
+        and(
+          inArray(credentials.kind, ["mcp_user_token", "mcp_user_api_key"]),
+          eq(credentials.provider, serverId),
+          eq(credentials.keyId, personId),
+          isNull(credentials.revokedAt),
+        ),
+      );
+    const [orphan] = await database
+      .insert(credentials)
+      .values({
+        kind: "mcp_user_token",
+        provider: serverId,
+        keyId: personId,
+        encryptedValue: "opaque-refresh-token",
+        metadata: { scope: "read" },
+      })
+      .returning({ id: credentials.id });
+    if (!orphan) throw new Error("OAuth orphan fixture was not created");
+
+    await expect(
+      store.recordConnection({
+        serverId,
+        userId: personId,
+        refreshToken: "must-not-rotate-orphan",
+        scope: "read",
+      }),
+    ).rejects.toBeInstanceOf(PluginRefusedError);
+
+    expect(live(await rowsFor("mcp_user_token", personId))).toEqual([
+      expect.objectContaining({ id: orphan.id }),
+    ]);
+    expect(
+      await database
+        .select({ credentialId: mcpUserCredentials.credentialId })
+        .from(mcpUserCredentials)
+        .where(eq(mcpUserCredentials.userId, personId)),
+    ).toEqual([]);
   });
 });

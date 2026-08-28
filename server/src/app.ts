@@ -35,6 +35,7 @@ import type { PolicyStore } from "./computer/policy-store";
 import { createComputerRoutes } from "./computer/routes";
 import { configuredAuthProviders, type DeploymentConfig } from "./config";
 import type { CredentialAdminService, CredentialInput } from "./credentials";
+import { RequestBodyTooLargeError, readBoundedJson } from "./http/bounded-json";
 import { createIntelligenceClient } from "./intelligence-client";
 import type { PeopleStore } from "./people/store";
 import { createPluginRoutes } from "./plugins/routes";
@@ -45,6 +46,8 @@ import { createRoutingRoutes } from "./routing/routes";
 import { createCoworkerRoutingService } from "./routing/service";
 import type { SlackStatus } from "./slack/status";
 import type { PackageStatusReader } from "./tenant-package";
+import { createTypefullyRoutes } from "./typefully/routes";
+import type { TypefullyStore } from "./typefully/store";
 
 /**
  * One row for something an administrator did to somebody's access.
@@ -176,8 +179,8 @@ export function createApp(
    * user guard, and its audit store before handing the completed surface to the app.
    */
   externalLinkRoutes?: HonoApp<{ Variables: AppVariables }>,
-  /** Reserved to preserve the positional boundary for deployments built from earlier revisions. */
-  _reservedExternalStore?: unknown,
+  /** Authenticated local-first Typefully drafts, appended to preserve positional callers. */
+  typefullyStore?: TypefullyStore,
   /** Credential-free managed Slack readiness, appended to preserve positional callers. */
   slackStatus: () => SlackStatus = () => ({
     status: "stopped",
@@ -737,6 +740,13 @@ export function createApp(
     app.route("/api/external-links", externalLinkRoutes);
   }
 
+  if (typefullyStore) {
+    app.route(
+      "/api/typefully",
+      createTypefullyRoutes(typefullyStore, requireUser),
+    );
+  }
+
   if (componentStore) {
     app.route(
       "/api/components",
@@ -803,7 +813,15 @@ export function createApp(
        * anything holding that token could spend any Bot's grants and write any name into the audit
        * trail. A forgeable trail is worse than no trail, because it is believed.
        */
-      const body = (await context.req.json().catch(() => null)) as {
+      let parsedBody: unknown = null;
+      try {
+        parsedBody = await readBoundedJson(context.req.raw, 12_000_000);
+      } catch (error) {
+        if (error instanceof RequestBodyTooLargeError) {
+          return context.json({ error: "Request body is too large." }, 413);
+        }
+      }
+      const body = parsedBody as {
         name?: string;
         args?: Record<string, unknown>;
         run?: unknown;

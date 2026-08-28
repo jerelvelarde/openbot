@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { eq, inArray } from "drizzle-orm";
+import { readFile } from "node:fs/promises";
+import { eq, inArray, sql } from "drizzle-orm";
 import { DATA_FUNCTIONS } from "../src/components/functions";
 import {
   ComponentNotFoundError,
@@ -8,13 +9,13 @@ import {
   createComponentStore,
 } from "../src/components/store";
 import { createDatabase } from "../src/db/client";
-import { TEST_POOL } from "./support/database";
 import {
   agents,
   componentExclusions,
   componentFunctions,
   components,
 } from "../src/db/schema";
+import { TEST_POOL } from "./support/database";
 
 /**
  * The grant surface, against a real database.
@@ -244,6 +245,24 @@ describe("learning what a build ships", () => {
     kind: "card",
     description: "Arrived from a build rather than from a list on the server.",
   };
+  const optIn = {
+    name: "connectTypefullyAccount",
+    title: "Explicit opt-in",
+    kind: "decision",
+    description: "Requires both publication and a per-Bot grant.",
+    // A signed-in browser is not trusted to weaken the compiled sensitive-component policy.
+    defaultPublished: true,
+    grantMode: "open" as const,
+  };
+  const publicationOptIn = {
+    name: "approveTypefullyPublication",
+    title: "Publication approval",
+    kind: "decision",
+    description: "Approves one immutable Typefully publication proposal.",
+    // A stale or hostile browser announcement cannot publish this decision surface globally.
+    defaultPublished: true,
+    grantMode: "open" as const,
+  };
 
   test("a component the deployment has never seen is added, published and available to every Bot", async () => {
     const { added } = await store.syncCatalogue([announced]);
@@ -261,6 +280,124 @@ describe("learning what a build ships", () => {
   test("announcing again adds nothing", async () => {
     // Runs on every page load, so a second call must be a no-op rather than a duplicate-key crash.
     expect((await store.syncCatalogue([announced])).added).toEqual([]);
+  });
+
+  test("an explicit component stays unavailable until publication and a per-Bot grant", async () => {
+    expect((await store.syncCatalogue([optIn])).added).toEqual([optIn.name]);
+
+    const inserted = (await store.list()).find(
+      (component) => component.name === optIn.name,
+    );
+    expect(inserted).toMatchObject({
+      published: false,
+      grantMode: "explicit",
+      grantedTo: [],
+    });
+    expect(
+      (await store.listForAgent(botA)).map((item) => item.name),
+    ).not.toContain(optIn.name);
+
+    await store.publish(optIn.name, "admin@example.test");
+    expect(
+      (await store.listForAgent(botA)).map((item) => item.name),
+    ).not.toContain(optIn.name);
+    expect(
+      (await store.listForAgent(botB)).map((item) => item.name),
+    ).not.toContain(optIn.name);
+
+    await store.grant(optIn.name, botA);
+    expect((await store.listForAgent(botA)).map((item) => item.name)).toContain(
+      optIn.name,
+    );
+    expect(
+      (await store.listForAgent(botB)).map((item) => item.name),
+    ).not.toContain(optIn.name);
+  });
+
+  test("publication approval ignores malicious open defaults and requires publish plus one explicit grant", async () => {
+    expect((await store.syncCatalogue([publicationOptIn])).added).toEqual([
+      publicationOptIn.name,
+    ]);
+
+    const inserted = (await store.list()).find(
+      (component) => component.name === publicationOptIn.name,
+    );
+    expect(inserted).toMatchObject({
+      published: false,
+      grantMode: "explicit",
+      grantedTo: [],
+    });
+    expect(
+      (await store.listForAgent(botA)).map((item) => item.name),
+    ).not.toContain(publicationOptIn.name);
+
+    await store.publish(publicationOptIn.name, "admin@example.test");
+    expect(
+      (await store.listForAgent(botA)).map((item) => item.name),
+    ).not.toContain(publicationOptIn.name);
+    expect(
+      (await store.listForAgent(botB)).map((item) => item.name),
+    ).not.toContain(publicationOptIn.name);
+
+    await store.grant(publicationOptIn.name, botA);
+    expect((await store.listForAgent(botA)).map((item) => item.name)).toContain(
+      publicationOptIn.name,
+    );
+    expect(
+      (await store.listForAgent(botB)).map((item) => item.name),
+    ).not.toContain(publicationOptIn.name);
+  });
+
+  test("the publication governance migration removes inverted legacy assignments and republishes nothing", async () => {
+    await store.syncCatalogue([publicationOptIn]);
+    await database
+      .update(components)
+      .set({
+        grantMode: "open",
+        published: true,
+        publishedDescription: publicationOptIn.description,
+        publishedAt: new Date(),
+      })
+      .where(eq(components.name, publicationOptIn.name));
+    await database
+      .insert(componentExclusions)
+      .values({
+        componentName: publicationOptIn.name,
+        agentId: botB,
+        withheldBy: "legacy-admin@example.test",
+      })
+      .onConflictDoNothing();
+
+    const migration = await readFile(
+      new URL("../drizzle/0022_plain_zzzax.sql", import.meta.url),
+      "utf8",
+    );
+    const governanceStatements = migration
+      .split("--> statement-breakpoint")
+      .filter((statement) =>
+        statement.includes("'approveTypefullyPublication'"),
+      );
+    expect(governanceStatements).toHaveLength(2);
+    for (const statement of governanceStatements) {
+      await database.execute(sql.raw(statement));
+    }
+
+    expect(
+      (await store.list()).find(
+        (component) => component.name === publicationOptIn.name,
+      ),
+    ).toMatchObject({
+      grantMode: "explicit",
+      published: false,
+      publishedDescription: null,
+      grantedTo: [],
+    });
+    expect(
+      (await store.listForAgent(botA)).map((item) => item.name),
+    ).not.toContain(publicationOptIn.name);
+    expect(
+      (await store.listForAgent(botB)).map((item) => item.name),
+    ).not.toContain(publicationOptIn.name);
   });
 
   test("announcing NEVER overwrites what the deployment decided", async () => {
@@ -325,10 +462,22 @@ describe("learning what a build ships", () => {
   afterAll(async () => {
     await database
       .delete(componentExclusions)
-      .where(eq(componentExclusions.componentName, announced.name));
+      .where(
+        inArray(componentExclusions.componentName, [
+          announced.name,
+          optIn.name,
+          publicationOptIn.name,
+        ]),
+      );
     await database
       .delete(components)
-      .where(eq(components.name, announced.name));
+      .where(
+        inArray(components.name, [
+          announced.name,
+          optIn.name,
+          publicationOptIn.name,
+        ]),
+      );
   });
 });
 

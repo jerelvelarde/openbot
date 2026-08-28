@@ -116,6 +116,8 @@ export type ManagedAgentConfig = {
 export type DeploymentConfig = {
   databaseUrl: string;
   keyEncryptionKey: string;
+  /** Loopback-only fake Typefully origin for the opt-in end-to-end smoke deployment. */
+  typefullyApiUrl?: string;
   /**
    * The Bot in the box, when this deployment has one.
    *
@@ -753,6 +755,31 @@ function agentStallTimeoutMs(environment: Environment): number {
   return milliseconds;
 }
 
+function typefullySmokeApiUrl(environment: Environment): string | undefined {
+  const raw = optional(environment, "OPENBOT_TYPEFULLY_SMOKE_API_URL");
+  if (!raw) return undefined;
+  if (optional(environment, "OPENBOT_SMOKE") !== "1") {
+    throw new Error(
+      "OPENBOT_TYPEFULLY_SMOKE_API_URL requires OPENBOT_SMOKE=1.",
+    );
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error("OPENBOT_TYPEFULLY_SMOKE_API_URL must use loopback HTTP.");
+  }
+  if (
+    parsed.protocol !== "http:" ||
+    !["127.0.0.1", "localhost", "::1"].includes(parsed.hostname) ||
+    parsed.username !== "" ||
+    parsed.password !== ""
+  ) {
+    throw new Error("OPENBOT_TYPEFULLY_SMOKE_API_URL must use loopback HTTP.");
+  }
+  return parsed.href.replace(/\/$/, "");
+}
+
 export function loadConfig(
   environment: Environment = process.env,
 ): DeploymentConfig {
@@ -760,9 +787,11 @@ export function loadConfig(
   const auth = authConfig(environment, google);
   const managedAgent = managedAgentConfig(environment);
 
+  const typefullyApiUrl = typefullySmokeApiUrl(environment);
   return {
     databaseUrl: required(environment, "DATABASE_URL"),
     keyEncryptionKey: keyEncryptionKey(environment),
+    ...(typefullyApiUrl ? { typefullyApiUrl } : {}),
     ...(managedAgent ? { managedAgent } : {}),
     agentEndpointAllowedHosts: agentEndpointAllowedHosts(environment),
     deploymentId: optional(environment, "DEPLOYMENT_ID"),
