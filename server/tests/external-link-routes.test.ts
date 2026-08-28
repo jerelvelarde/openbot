@@ -14,6 +14,7 @@ import { mintExternalLinkToken } from "../src/external/link-token";
 import { createExternalLinkRoutes } from "../src/external/routes";
 import type {
   ExternalThreadBinding,
+  ExternalThreadPage,
   ExternalThreadStore,
 } from "../src/external/thread-store";
 import { testEnvironment } from "./support/environment";
@@ -55,11 +56,30 @@ const externalThread: ExternalThreadBinding = {
   createdAt: new Date(NOW),
 };
 
+const externalThreadSummary: ExternalThreadPage["threads"][number] = {
+  threadId: externalThread.channelsThreadId,
+  provider: "slack",
+  agentId: externalThread.agentId,
+  agentName: externalThread.agentName,
+  lastMessage: "Review the queue",
+  lastMessageAt: new Date(NOW + 1_000),
+  createdAt: externalThread.createdAt,
+};
+
 function fakeThreadStore(
   found: ExternalThreadBinding | null = externalThread,
   messages: Awaited<ReturnType<ExternalThreadStore["getTranscript"]>> = [],
-): ExternalThreadStore {
+  page: ExternalThreadPage = { threads: [], nextCursor: null },
+): ExternalThreadStore & {
+  listCalls: Parameters<ExternalThreadStore["listForCreator"]>[];
+} {
+  const listCalls: Parameters<ExternalThreadStore["listForCreator"]>[] = [];
   return {
+    listCalls,
+    listForCreator: async (...args) => {
+      listCalls.push(args);
+      return page;
+    },
     getByChannelsThreadId: async (id) =>
       id === found?.channelsThreadId ? found : null,
     getByProviderThread: async () => null,
@@ -192,6 +212,146 @@ async function liveToken() {
 }
 
 describe("external Slack link confirmation routes", () => {
+  test("GET /threads returns safe authorized Slack thread summaries", async () => {
+    const unsafeSummary = {
+      ...externalThreadSummary,
+      providerTenantId: "T1",
+      providerConversationId: "C1",
+      providerThreadId: "1712345.6789",
+      createdByUserId: actor.id,
+    };
+    const { app } = appFor(
+      fakeStore(),
+      authenticatedAs(),
+      [],
+      undefined,
+      fakeThreadStore(externalThread, [], {
+        threads: [unsafeSummary],
+        nextCursor: "opaque-next",
+      }),
+    );
+
+    const response = await app.request(
+      "http://openbot.test/api/external-links/threads?limit=25&cursor=opaque-cursor",
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(await response.json()).toEqual({
+      threads: [
+        {
+          threadId: "channels-thread-1",
+          provider: "slack",
+          agentId: "risk",
+          agentName: "Risk Analyst",
+          lastMessage: "Review the queue",
+          lastMessageAt: new Date(NOW + 1_000).toISOString(),
+          createdAt: new Date(NOW).toISOString(),
+          readOnly: true,
+        },
+      ],
+      nextCursor: "opaque-next",
+    });
+  });
+
+  test("GET /threads passes the actor id, validated limit, and opaque cursor to the store", async () => {
+    const threadStore = fakeThreadStore();
+    const { app } = appFor(
+      fakeStore(),
+      authenticatedAs(),
+      [],
+      undefined,
+      threadStore,
+    );
+
+    const response = await app.request(
+      "http://openbot.test/api/external-links/threads?limit=200&cursor=opaque-cursor",
+    );
+
+    expect(response.status).toBe(200);
+    expect(threadStore.listCalls).toEqual([
+      [actor.id, { cursor: "opaque-cursor", limit: 200 }],
+    ]);
+  });
+
+  test("GET /threads rejects unauthenticated callers", async () => {
+    const threadStore = fakeThreadStore(externalThread, [], {
+      threads: [externalThreadSummary],
+      nextCursor: null,
+    });
+    const { app } = appFor(
+      fakeStore(),
+      unauthenticated,
+      [],
+      undefined,
+      threadStore,
+    );
+
+    const response = await app.request(
+      "http://openbot.test/api/external-links/threads",
+    );
+
+    expect(response.status).toBe(401);
+    expect(threadStore.listCalls).toEqual([]);
+  });
+
+  test("GET /threads omits rows for revoked agent access without failing the page", async () => {
+    const { app } = appFor(
+      fakeStore(),
+      authenticatedAs(),
+      [],
+      undefined,
+      fakeThreadStore(externalThread, [], {
+        threads: [
+          externalThreadSummary,
+          {
+            ...externalThreadSummary,
+            threadId: "channels-thread-revoked",
+            agentId: "revoked",
+            agentName: "Former Agent",
+          },
+        ],
+        nextCursor: null,
+      }),
+    );
+
+    const response = await app.request(
+      "http://openbot.test/api/external-links/threads",
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      threads: [
+        {
+          threadId: "channels-thread-1",
+          provider: "slack",
+          agentId: "risk",
+          agentName: "Risk Analyst",
+          lastMessage: "Review the queue",
+          lastMessageAt: new Date(NOW + 1_000).toISOString(),
+          createdAt: new Date(NOW).toISOString(),
+          readOnly: true,
+        },
+      ],
+      nextCursor: null,
+    });
+  });
+
+  test("GET /threads rejects invalid limit values", async () => {
+    const { app } = appFor();
+
+    for (const limit of ["0", "abc", "201"]) {
+      const response = await app.request(
+        `http://openbot.test/api/external-links/threads?limit=${limit}`,
+      );
+
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({
+        error: "Invalid conversation page.",
+      });
+    }
+  });
+
   test("GET returns an authenticated creator's canonical Slack transcript target", async () => {
     const { app } = appFor();
 

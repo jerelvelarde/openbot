@@ -18,6 +18,7 @@ const INVALID_ASSISTANCE_MESSAGE =
   "This assistance link has expired or is invalid.";
 const ASSISTANCE_FORBIDDEN_MESSAGE =
   "This assistance request is not available to this account.";
+const INVALID_CONVERSATION_PAGE_MESSAGE = "Invalid conversation page.";
 
 type ExternalLinkRoutesOptions = {
   store: ExternalLinkCreationStore;
@@ -38,6 +39,18 @@ function tokenFrom(value: unknown): string | undefined {
 
 function invalidLinkResponse(context: Context<{ Variables: AppVariables }>) {
   return context.json({ error: INVALID_LINK_MESSAGE }, 400);
+}
+
+function externalThreadLimit(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  if (!/^\d+$/.test(value)) {
+    throw new Error(INVALID_CONVERSATION_PAGE_MESSAGE);
+  }
+  const limit = Number(value);
+  if (limit < 1 || limit > 200) {
+    throw new Error(INVALID_CONVERSATION_PAGE_MESSAGE);
+  }
+  return limit;
 }
 
 export function createExternalLinkRoutes({
@@ -106,6 +119,45 @@ export function createExternalLinkRoutes({
   routes.use("/threads/*", async (context, next) => {
     context.header("Cache-Control", "no-store");
     await next();
+  });
+
+  routes.get("/threads", requireUser, async (context) => {
+    let limit: number | undefined;
+    try {
+      limit = externalThreadLimit(context.req.query("limit"));
+    } catch {
+      return context.json({ error: INVALID_CONVERSATION_PAGE_MESSAGE }, 400);
+    }
+
+    const actor = context.var.actor;
+    const page = await threadStore.listForCreator(actor.id, {
+      cursor: context.req.query("cursor"),
+      limit,
+    });
+    const threads = (
+      await Promise.all(
+        page.threads.map(async (thread) => {
+          const profile = await agentProfileStore.get(
+            { id: actor.id, role: actor.role },
+            thread.agentId,
+          );
+          if (!profile) return null;
+          return {
+            threadId: thread.threadId,
+            provider: thread.provider,
+            agentId: profile.id,
+            agentName: profile.name,
+            lastMessage: thread.lastMessage,
+            lastMessageAt: thread.lastMessageAt?.toISOString() ?? null,
+            createdAt: thread.createdAt.toISOString(),
+            readOnly: true,
+          };
+        }),
+      )
+    ).filter((thread) => thread !== null);
+
+    context.header("Cache-Control", "no-store");
+    return context.json({ threads, nextCursor: page.nextCursor });
   });
 
   routes.get("/threads/:threadId", requireUser, async (context) => {
