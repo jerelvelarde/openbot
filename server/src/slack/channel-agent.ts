@@ -91,7 +91,12 @@ export class OpenBotChannelAgent extends AbstractAgent {
           if (active.cancelled || this.active !== active) return EMPTY;
           active.inner = target;
           active.started = true;
-          return target.run(input);
+          return this.runAndRemember(
+            target,
+            input,
+            execution,
+            channelsThreadId,
+          );
         }),
         takeUntil(active.cancellation),
         finalize(() => {
@@ -126,6 +131,72 @@ export class OpenBotChannelAgent extends AbstractAgent {
         return () => subscription.unsubscribe();
       }),
     );
+  }
+
+  private runAndRemember(
+    target: AbstractAgent,
+    input: RunAgentInput,
+    execution: SlackExecution,
+    channelsThreadId: string,
+  ): Observable<BaseEvent> {
+    return new Observable<BaseEvent>((subscriber) => {
+      let assistantId: string | undefined;
+      let assistantContent = "";
+      const subscription = target.run(input).subscribe({
+        next: (event) => {
+          const candidate = event as BaseEvent & {
+            messageId?: unknown;
+            role?: unknown;
+            delta?: unknown;
+          };
+          if (
+            candidate.type === "TEXT_MESSAGE_START" &&
+            candidate.role === "assistant" &&
+            typeof candidate.messageId === "string"
+          ) {
+            assistantId = candidate.messageId;
+          } else if (
+            candidate.type === "TEXT_MESSAGE_CONTENT" &&
+            typeof candidate.delta === "string" &&
+            (assistantId === undefined ||
+              candidate.messageId === undefined ||
+              candidate.messageId === assistantId)
+          ) {
+            assistantContent += candidate.delta;
+          }
+          subscriber.next(event);
+        },
+        error: (error) => subscriber.error(error),
+        complete: () => {
+          if (!assistantId || assistantContent.length === 0) {
+            subscriber.complete();
+            return;
+          }
+          const userMessage = [...input.messages]
+            .reverse()
+            .find((message) => message.role === "user");
+          void this.store
+            .appendTranscriptTurn({
+              channelsThreadId,
+              user: {
+                id: userMessage?.id ?? crypto.randomUUID(),
+                role: "user",
+                content: execution.messageText,
+              },
+              assistant: {
+                id: assistantId,
+                role: "assistant",
+                content: assistantContent,
+              },
+            })
+            .then(
+              () => subscriber.complete(),
+              (error) => subscriber.error(error),
+            );
+        },
+      });
+      return () => subscription.unsubscribe();
+    });
   }
 
   clone(): OpenBotChannelAgent {

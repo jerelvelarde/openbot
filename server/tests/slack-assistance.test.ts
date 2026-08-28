@@ -708,6 +708,8 @@ function assistanceRoutes(
         bind: async () => {
           throw new Error("unused");
         },
+        appendTranscriptTurn: async () => undefined,
+        getTranscript: async () => [],
       },
     }),
   );

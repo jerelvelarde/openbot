@@ -1,6 +1,16 @@
-import { and, eq, or } from "drizzle-orm";
+import { and, asc, eq, or } from "drizzle-orm";
 import type { Database } from "../db/client";
-import { agents, externalThreadBindings } from "../db/schema";
+import {
+  agents,
+  externalThreadBindings,
+  externalThreadMessages,
+} from "../db/schema";
+
+export type ExternalTranscriptMessage = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+};
 
 export type ExternalThreadBindingInput = {
   channelsThreadId: string;
@@ -45,6 +55,12 @@ export type ExternalThreadStore = {
     >,
   ) => Promise<ExternalThreadBinding | null>;
   bind: (input: ExternalThreadBindingInput) => Promise<ExternalThreadBinding>;
+  appendTranscriptTurn: (input: {
+    channelsThreadId: string;
+    user: ExternalTranscriptMessage & { role: "user" };
+    assistant: ExternalTranscriptMessage & { role: "assistant" };
+  }) => Promise<void>;
+  getTranscript: (id: string) => Promise<ExternalTranscriptMessage[]>;
 };
 
 type BindingReader = Pick<Database, "select">;
@@ -285,5 +301,48 @@ export function createExternalThreadStore(
     }
   }
 
-  return { getByChannelsThreadId, getByProviderThread, bind };
+  async function appendTranscriptTurn(input: {
+    channelsThreadId: string;
+    user: ExternalTranscriptMessage & { role: "user" };
+    assistant: ExternalTranscriptMessage & { role: "assistant" };
+  }): Promise<void> {
+    await database
+      .insert(externalThreadMessages)
+      .values(
+        [input.user, input.assistant].map((message) => ({
+          channelsThreadId: input.channelsThreadId,
+          messageId: message.id,
+          role: message.role,
+          content: message.content,
+        })),
+      )
+      .onConflictDoNothing();
+  }
+
+  async function getTranscript(
+    id: string,
+  ): Promise<ExternalTranscriptMessage[]> {
+    const rows = await database
+      .select({
+        id: externalThreadMessages.messageId,
+        role: externalThreadMessages.role,
+        content: externalThreadMessages.content,
+      })
+      .from(externalThreadMessages)
+      .where(eq(externalThreadMessages.channelsThreadId, id))
+      .orderBy(asc(externalThreadMessages.sequence));
+    return rows.flatMap((row) =>
+      row.role === "user" || row.role === "assistant"
+        ? [{ ...row, role: row.role }]
+        : [],
+    );
+  }
+
+  return {
+    getByChannelsThreadId,
+    getByProviderThread,
+    bind,
+    appendTranscriptTurn,
+    getTranscript,
+  };
 }

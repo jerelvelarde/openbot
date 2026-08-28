@@ -514,6 +514,10 @@ function harness(
       bindings.set(input.channelsThreadId, value);
       return value;
     },
+    async appendTranscriptTurn() {},
+    async getTranscript() {
+      return [];
+    },
   };
   const routing: CoworkerRoutingService = {
     async route() {

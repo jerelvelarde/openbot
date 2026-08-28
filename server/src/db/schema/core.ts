@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import {
+  bigserial,
   boolean,
   check,
   index,
@@ -282,6 +283,33 @@ export const externalThreadBindings = pgTable(
       table.providerTenantId,
       table.providerConversationId,
       table.providerThreadId,
+    ),
+  ],
+);
+
+/** OpenBot-owned copy of provider-visible turns for the read-only cross-surface transcript. */
+export const externalThreadMessages = pgTable(
+  "external_thread_messages",
+  {
+    sequence: bigserial("sequence", { mode: "number" }).primaryKey(),
+    channelsThreadId: text("channels_thread_id")
+      .notNull()
+      .references(() => externalThreadBindings.channelsThreadId, {
+        onDelete: "cascade",
+      }),
+    messageId: text("message_id").notNull(),
+    role: text("role").notNull(),
+    content: text("content").notNull(),
+    createdAt: createdAt(),
+  },
+  (table) => [
+    check(
+      "external_thread_messages_role_check",
+      sql`${table.role} IN ('user', 'assistant')`,
+    ),
+    uniqueIndex("external_thread_messages_thread_message_idx").on(
+      table.channelsThreadId,
+      table.messageId,
     ),
   ],
 );
