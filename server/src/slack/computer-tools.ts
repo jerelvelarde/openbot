@@ -510,6 +510,11 @@ async function openAndShareScreenshot(
       throwIfStopped(context.signal);
 
       const filename = safeFilename(input.filename ?? "screenshot.png");
+      // Intelligence currently accepts a Slack file effect but can reject a later text stream in
+      // the same managed delivery. Put the useful page text first so the person receives both the
+      // answer and the image even when that provider ordering limitation is present.
+      await context.thread.post(pageSummaryMessage(navigation));
+      throwIfStopped(context.signal);
       const posted = await context.thread.postFile({
         bytes: Buffer.from(screenshot.base64, "base64"),
         filename,
@@ -523,6 +528,7 @@ async function openAndShareScreenshot(
       return {
         ok: true,
         ...navigation,
+        summaryShared: true,
         screenshotShared: true,
         screenshotFilename: filename,
         screenshotWidth: screenshot.width,
@@ -533,6 +539,23 @@ async function openAndShareScreenshot(
     },
     { checkStoppedAfter: false },
   );
+}
+
+function pageSummaryMessage(navigation: {
+  url: string;
+  title: string;
+  text: string;
+  truncated: boolean;
+}): string {
+  const readable = navigation.text.replace(/\s+/g, " ").trim();
+  const excerpt = takeUtf8Bytes(readable, 1_200).trim();
+  const summary =
+    excerpt || navigation.title || "The page did not expose readable text.";
+  return [
+    `I opened ${navigation.title || navigation.url}.`,
+    `Summary: ${summary}${navigation.truncated ? " (The page extract was truncated.)" : ""}`,
+    `Source: ${navigation.url}, read just now.`,
+  ].join("\n\n");
 }
 
 async function shareScreenshot(

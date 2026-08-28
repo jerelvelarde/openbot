@@ -97,6 +97,7 @@ type UploadResult = Awaited<
 
 class FileAdapter extends FakeAdapter {
   readonly uploads: UploadArgs[] = [];
+  readonly effects: Array<"message" | "file"> = [];
   result: UploadResult = { ok: true, fileId: "slack-file-1" };
   afterUpload?: () => void;
   beforePost?: () => void;
@@ -104,6 +105,7 @@ class FileAdapter extends FakeAdapter {
   postGate?: Promise<void>;
 
   override async post(...args: Parameters<PlatformAdapter["post"]>) {
+    this.effects.push("message");
     this.beforePost?.();
     if (this.postError !== undefined) throw this.postError;
     await this.postGate;
@@ -114,6 +116,7 @@ class FileAdapter extends FakeAdapter {
     _target: Parameters<NonNullable<PlatformAdapter["postFile"]>>[0],
     args: UploadArgs,
   ): Promise<UploadResult> {
+    this.effects.push("file");
     this.uploads.push(args);
     this.afterUpload?.();
     return this.result;
@@ -1587,6 +1590,11 @@ describe("Slack computer ChannelTools", () => {
       ["risk", { id: "u1", userId: "u1" }, "https://copilotkit.ai"],
     ]);
     expect(gateway.screenshotCalls).toEqual([["risk"]]);
+    expect(adapter.effects).toEqual(["message", "file"]);
+    expect(JSON.stringify(adapter.posted)).toContain("Summary: Page text");
+    expect(JSON.stringify(adapter.posted)).toContain(
+      "Source: https://copilotkit.ai",
+    );
     expect(adapter.uploads).toHaveLength(1);
     expect(result).toEqual({
       ok: true,
@@ -1595,6 +1603,7 @@ describe("Slack computer ChannelTools", () => {
       text: "Page text",
       truncated: false,
       elapsedMs: 4,
+      summaryShared: true,
       screenshotShared: true,
       screenshotFilename: "copilotkit-homepage.png",
       screenshotWidth: 1440,
