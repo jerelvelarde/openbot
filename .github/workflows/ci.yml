@@ -278,6 +278,15 @@ jobs:
           tags: openbot:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      # Platforms can run an execline lifecycle wrapper before the image entrypoint. s6-overlay's
+      # wrapper binary is addressed directly, but helpers inside its script (such as `ifelse`) are
+      # resolved through the image-wide PATH, so booting through /init would not cover this failure.
+      - name: Platform lifecycle wrappers resolve s6 helpers
+        run: |
+          set -euo pipefail
+          output="$(docker run --rm --entrypoint /command/execlineb openbot:ci \
+            -Pc 'ifelse { /bin/true } { /bin/echo railway-wrapper-ok } { /bin/false }')"
+          test "$output" = "railway-wrapper-ok"
       # Building it says the layers resolve. Running it says the supervision tree comes up and stays
       # up, which is a different claim and the one that has broken before.
       - name: The image boots and serves
