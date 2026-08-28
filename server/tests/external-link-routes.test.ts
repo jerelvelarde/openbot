@@ -292,6 +292,7 @@ describe("external Slack link confirmation routes", () => {
     );
 
     expect(response.status).toBe(401);
+    expect(response.headers.get("cache-control")).toBe("no-store");
     expect(threadStore.listCalls).toEqual([]);
   });
 
@@ -346,6 +347,7 @@ describe("external Slack link confirmation routes", () => {
       );
 
       expect(response.status).toBe(400);
+      expect(response.headers.get("cache-control")).toBe("no-store");
       expect(await response.json()).toEqual({
         error: "Invalid conversation page.",
       });

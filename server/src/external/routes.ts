@@ -121,6 +121,11 @@ export function createExternalLinkRoutes({
     await next();
   });
 
+  routes.use("/threads", async (context, next) => {
+    context.header("Cache-Control", "no-store");
+    await next();
+  });
+
   routes.get("/threads", requireUser, async (context) => {
     let limit: number | undefined;
     try {
@@ -156,7 +161,6 @@ export function createExternalLinkRoutes({
       )
     ).filter((thread) => thread !== null);
 
-    context.header("Cache-Control", "no-store");
     return context.json({ threads, nextCursor: page.nextCursor });
   });
 
