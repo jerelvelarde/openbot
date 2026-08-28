@@ -270,6 +270,8 @@ describe("SlackIdentityLinker", () => {
       { actor: { id: "" } },
       { actor: { id: "  " } },
       { actor: { id: " unknown " } },
+      { actor: { id: undefined as never } },
+      { tenant: { id: undefined as never } },
       { provider: "discord" },
     ]) {
       const store = storeFor();
@@ -284,12 +286,27 @@ describe("SlackIdentityLinker", () => {
             },
           }),
         ),
-      ).rejects.toThrow("Slack identity requires a known tenant and actor id.");
+      ).rejects.toMatchObject({
+        message: "Slack identity requires a known tenant and actor id.",
+        code: "slack_identity_context_invalid",
+      });
       expect(store.findKeys).toEqual([]);
       expect(store.verifiedEmails).toEqual([]);
       expect(store.linkedWith).toEqual([]);
       expect(store.activeIds).toEqual([]);
     }
+  });
+
+  test("classifies link lookup failures without exposing their details", async () => {
+    const store = storeFor();
+    store.find = async () => {
+      throw new Error("postgres host and credential detail");
+    };
+
+    await expect(linker(store).resolve(context())).rejects.toMatchObject({
+      message: "Slack identity link lookup failed.",
+      code: "slack_identity_link_lookup_failed",
+    });
   });
 
   test("uses canonical trimmed tenant and actor ids for every store key and link", async () => {
