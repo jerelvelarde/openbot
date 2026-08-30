@@ -604,18 +604,11 @@ export function createPluginStore(options: PluginStoreOptions) {
    * that it was attempted — and it is only available because the caller handed us the transaction.
    */
   async function recordChange(
-    executor: PluginExecutor,
+    _executor: PluginExecutor,
     event: AuditEventInput,
   ): Promise<void> {
-    if (executor === database) {
-      await recordAuditEvent(auditStore, event);
-      return;
-    }
-
-    await executor.insert(auditEvents).values({
-      ...event,
-      payload: redactAuditPayload(event.payload) as Record<string, unknown>,
-    });
+    // EXPERIMENT: always the injected store, to isolate the connection change.
+    await recordAuditEvent(auditStore, event);
   }
 
   /*
