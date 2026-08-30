@@ -227,7 +227,19 @@ jobs:
         working-directory: server
       # A passing job must include the expected test floor. Import-time failures can otherwise skip
       # files before their tests are registered.
-      - run: bun run test:ci
+      - name: diagnose
+        run: |
+          set +e
+          bun run generate:app-config
+          bun test > /tmp/out.txt 2> /tmp/err.txt
+          echo "CHILD_EXIT=$?"
+          echo "--- counts"
+          grep -E "^ [0-9]+ (pass|fail|skip|errors)|^Ran " /tmp/err.txt
+          echo "--- unhandled error blocks"
+          awk '/Unhandled error/{c=30} c&&c--' /tmp/err.txt | head -60
+          echo "--- fail lines"
+          grep -n "(fail)" /tmp/err.txt | head -20
+          exit 1
 
   build:
     name: build
