@@ -1,5 +1,6 @@
 import {
   IconArrowLeft,
+  IconBrandGithub,
   IconBuildingBank,
   IconCode,
   IconDeviceDesktop,
@@ -60,6 +61,11 @@ const GROUPS: {
         title: "Computers",
         icon: IconDeviceDesktop,
         linkOptions: { to: "/admin/computers" },
+      },
+      {
+        title: "Repositories",
+        icon: IconBrandGithub,
+        linkOptions: { to: "/admin/repositories" },
       },
     ],
   },

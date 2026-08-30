@@ -1,5 +1,6 @@
 import {
   IconBolt,
+  IconGitPullRequest,
   IconBox,
   IconClock,
   IconLogout,
@@ -380,6 +381,26 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
                 <IconClock />
               </div>
               <span className="text-sm trackint-tight">Routines</span>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+          <SidebarMenuItem>
+            {/* Beside Routines for the same reason: a task is work anybody may hand over. */}
+            <SidebarMenuButton
+              className="hover:bg-foreground/5 h-10"
+              render={(props) => (
+                <Link
+                  {...props}
+                  to="/tasks"
+                  activeProps={{
+                    className: "bg-foreground/5",
+                  }}
+                />
+              )}
+            >
+              <div className="size-[28px] flex items-center justify-center">
+                <IconGitPullRequest />
+              </div>
+              <span className="text-sm trackint-tight">Tasks</span>
             </SidebarMenuButton>
           </SidebarMenuItem>
           <SidebarMenuItem>

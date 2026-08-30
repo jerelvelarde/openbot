@@ -1,4 +1,5 @@
 import {
+  IconBrandGithub,
   IconBuildingBank,
   IconChevronRight,
   IconCode,
@@ -73,6 +74,12 @@ const SECTIONS: {
         description: "The machines Bots run their tools on.",
         icon: IconDeviceDesktop,
         linkOptions: { to: "/admin/computers" },
+      },
+      {
+        title: "Repositories",
+        description: "Code a Bot may check out, and whether it may push.",
+        icon: IconBrandGithub,
+        linkOptions: { to: "/admin/repositories" },
       },
     ],
   },
