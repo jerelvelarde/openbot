@@ -52,8 +52,10 @@ import {
 } from "./credentials";
 import { createDatabase } from "./db/client";
 import { createExternalLinkStore } from "./external/link-store";
+import { createIntelligenceConversationClient } from "./external/intelligence-conversations";
 import { createExternalLinkRoutes } from "./external/routes";
 import { createExternalThreadStore } from "./external/thread-store";
+import { createExternalWebTurnStore } from "./external/web-turn-store";
 import { createPeopleStore } from "./people/store";
 import { redirectUriFor } from "./plugins/oauth";
 import { createPluginStore } from "./plugins/store";
@@ -151,6 +153,7 @@ const agentProfileStore = createAgentProfileStore(
 );
 const approvalLinkStore = createExternalLinkStore(database);
 const approvalThreadStore = createExternalThreadStore(database);
+const externalWebTurnStore = createExternalWebTurnStore(database);
 configureApprovalDecisionStore(createApprovalDecisionStore(database), {
   authorize: createApprovalAuthorizer({
     links: approvalLinkStore,
@@ -603,6 +606,15 @@ const externalLinkRoutes = createExternalLinkRoutes({
   auditStore: bootAuditStore,
   agentProfileStore,
   threadStore: approvalThreadStore,
+  webTurnStore: externalWebTurnStore,
+  // The surface name travels with every authored turn and is rendered as
+  // attribution in the provider thread, so it is this deployment's identity
+  // rather than a generic "web".
+  conversations: createIntelligenceConversationClient({
+    apiUrl: config.runtime.intelligence.apiUrl,
+    apiKey: config.runtime.intelligence.apiKey,
+    surface: "openbot",
+  }),
 });
 
 const app = createApp(

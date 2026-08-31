@@ -17,6 +17,7 @@ import type {
   ExternalThreadPage,
   ExternalThreadStore,
 } from "../src/external/thread-store";
+import type { ExternalWebTurnStore } from "../src/external/web-turn-store";
 import { testEnvironment } from "./support/environment";
 
 const KEY = "external-link-routes-test-key";
@@ -192,6 +193,37 @@ function fakeStore(
   );
 }
 
+/**
+ * No thread holds a managed conversation reference by default, which is the
+ * live production state: until the managed upstream support ships, every Slack
+ * conversation is read-only and the POST route refuses.
+ */
+function fakeWebTurnStore(
+  refs: ReadonlyMap<string, string> = new Map(),
+): ExternalWebTurnStore {
+  const claims = new Map<string, string>();
+  return {
+    conversationRef: async (threadId) => refs.get(threadId) ?? null,
+    threadsWithConversationRef: async (threadIds) =>
+      new Set(threadIds.filter((id) => refs.has(id))),
+    claim: async ({ channelsThreadId, idempotencyKey }) => {
+      const key = `${channelsThreadId}\u0000${idempotencyKey}`;
+      const seen = claims.get(key);
+      if (seen) {
+        return {
+          kind: "duplicate",
+          operationId: seen,
+          status: "accepted",
+          failureCategory: null,
+        };
+      }
+      const operationId = `op-${claims.size + 1}`;
+      claims.set(key, operationId);
+      return { kind: "claimed", operationId };
+    },
+  };
+}
+
 function appFor(
   store = fakeStore(),
   requireUser = authenticatedAs(),
@@ -202,6 +234,7 @@ function appFor(
   },
   threadStore: ExternalThreadStore = fakeThreadStore(),
   agentProfileStore = fakeAgentProfileStore(),
+  webTurnStore: ExternalWebTurnStore = fakeWebTurnStore(),
 ) {
   const app = new Hono<{ Variables: AppVariables }>();
   app.route(
@@ -213,9 +246,10 @@ function appFor(
       auditStore,
       agentProfileStore,
       threadStore,
+      webTurnStore,
     }),
   );
-  return { app, agentProfileStore, rows, store };
+  return { app, agentProfileStore, rows, store, webTurnStore };
 }
 
 const baseStore: ExternalLinkStore = {
@@ -408,6 +442,168 @@ describe("external Slack link confirmation routes", () => {
         )
       ).status,
     ).toBe(404);
+  });
+
+  test("POST refuses a web turn while the managed capability is absent", async () => {
+    // The live production state. No thread holds a conversation reference, so
+    // nothing composed here could reach Slack, and the surface stays read-only
+    // rather than accepting a turn it cannot deliver.
+    const { app } = appFor();
+
+    const response = await app.request(
+      "http://openbot.test/api/external-links/threads/channels-thread-1/messages",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id: "turn-1", text: "follow-up" }),
+      },
+    );
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({
+      error: "This Slack conversation cannot accept messages from OpenBot yet.",
+    });
+  });
+
+  test("GET reports the thread writable once a conversation reference exists", async () => {
+    const { app } = appFor(
+      fakeStore(),
+      authenticatedAs(),
+      [],
+      undefined,
+      fakeThreadStore(),
+      fakeAgentProfileStore(),
+      fakeWebTurnStore(new Map([["channels-thread-1", "cref_v1_managed"]])),
+    );
+
+    const response = await app.request(
+      "http://openbot.test/api/external-links/threads/channels-thread-1",
+    );
+
+    expect(await response.json()).toMatchObject({ readOnly: false });
+  });
+
+  test("POST accepts one turn and answers a retry with the same operation", async () => {
+    const rows: AuditEventInput[] = [];
+    const { app } = appFor(
+      fakeStore(),
+      authenticatedAs(),
+      rows,
+      undefined,
+      fakeThreadStore(),
+      fakeAgentProfileStore(),
+      fakeWebTurnStore(new Map([["channels-thread-1", "cref_v1_managed"]])),
+    );
+    const send = () =>
+      app.request(
+        "http://openbot.test/api/external-links/threads/channels-thread-1/messages",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ id: "turn-1", text: "follow-up" }),
+        },
+      );
+
+    const first = await send();
+    expect(first.status).toBe(202);
+    expect(await first.json()).toEqual({
+      operationId: "op-1",
+      status: "accepted",
+    });
+
+    // A double tap, a flaky network, a reloaded tab. The same key must return
+    // the original operation rather than mint a second Slack message and run.
+    const retry = await send();
+    expect(retry.status).toBe(200);
+    expect(await retry.json()).toEqual({
+      operationId: "op-1",
+      status: "accepted",
+      duplicate: true,
+    });
+
+    // One audit record, because only one turn was authored.
+    const authored = rows.filter(
+      (row) => row.eventType === "external_thread.turn_authored",
+    );
+    expect(authored).toHaveLength(1);
+    // The trail says a turn happened; it must not carry what it said.
+    expect(JSON.stringify(authored[0])).not.toContain("follow-up");
+  });
+
+  test("POST hides another user's thread and a revoked coworker behind one refusal", async () => {
+    const refs = new Map([["channels-thread-1", "cref_v1_managed"]]);
+    const body = {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id: "turn-1", text: "follow-up" }),
+    };
+
+    const otherUser = { ...actor, id: "openbot-user-2" } as const;
+    const otherApp = appFor(
+      fakeStore(),
+      authenticatedAs(otherUser),
+      [],
+      undefined,
+      fakeThreadStore(),
+      fakeAgentProfileStore(),
+      fakeWebTurnStore(refs),
+    ).app;
+    const foreign = await otherApp.request(
+      "http://openbot.test/api/external-links/threads/channels-thread-1/messages",
+      body,
+    );
+    expect(foreign.status).toBe(404);
+
+    // Access is re-checked per turn, so losing the coworker stops the sender
+    // even though they started the thread.
+    const revokedApp = appFor(
+      fakeStore(),
+      authenticatedAs(),
+      [],
+      undefined,
+      fakeThreadStore({ ...externalThread, agentId: "revoked" }),
+      fakeAgentProfileStore(),
+      fakeWebTurnStore(refs),
+    ).app;
+    const revoked = await revokedApp.request(
+      "http://openbot.test/api/external-links/threads/channels-thread-1/messages",
+      body,
+    );
+    expect(revoked.status).toBe(404);
+  });
+
+  test("POST bounds the turn before anything is claimed", async () => {
+    const { app } = appFor(
+      fakeStore(),
+      authenticatedAs(),
+      [],
+      undefined,
+      fakeThreadStore(),
+      fakeAgentProfileStore(),
+      fakeWebTurnStore(new Map([["channels-thread-1", "cref_v1_managed"]])),
+    );
+
+    for (const payload of [
+      null,
+      {},
+      { id: "turn-1" },
+      { id: "turn-1", text: "   " },
+      { id: "turn-1", text: "x".repeat(4001) },
+      { text: "hello" },
+      { id: "", text: "hello" },
+      { id: "../escape", text: "hello" },
+      { id: "a".repeat(129), text: "hello" },
+    ]) {
+      const response = await app.request(
+        "http://openbot.test/api/external-links/threads/channels-thread-1/messages",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+        },
+      );
+      expect(response.status).toBe(422);
+    }
   });
 
   test("GET shows only the safe Slack display metadata after authentication", async () => {

@@ -233,6 +233,38 @@ export class SlackIdentityLinker {
     return linkedResult(current, active);
   }
 
+  /**
+   * Resolves the author of a turn composed on the OpenBot web surface.
+   *
+   * A web-authored turn is already attributed to an authenticated OpenBot user,
+   * so there is no Slack identity to discover and nothing to link. Running the
+   * ordinary Slack resolution against it cannot succeed — the actor id is an
+   * OpenBot user id, which no Slack link or profile lookup will ever match — and
+   * the person would be answered with a "link your Slack identity" card in reply
+   * to a message they composed while signed in.
+   *
+   * Returns null when the app user is unknown or deactivated, which the caller
+   * treats as "do not run" rather than as a linking prompt: there is no action
+   * the person could take in Slack to fix it.
+   */
+  async resolveApplicationAuthor(
+    context: ChannelIdentityContext,
+    appUserId: string,
+  ): Promise<Extract<SlackIdentityResult, { kind: "linked" }> | null> {
+    const active = await resolutionStep(
+      "slack_identity_user_lookup_failed",
+      "Slack identity user lookup failed.",
+      () => this.options.store.resolveActiveUser(appUserId),
+    );
+    if (!active) return null;
+    return {
+      kind: "linked",
+      user: { id: active.id, name: active.name },
+      actor: { id: active.id, role: active.role },
+      identity: identityFor(context, null),
+    };
+  }
+
   private async unlinked(
     identity: ExternalProviderIdentity,
   ): Promise<SlackIdentityResult> {

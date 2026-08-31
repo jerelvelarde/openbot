@@ -321,6 +321,15 @@ export const auditEventTypes = [
   "identity_provider.removed",
   "external_identity.linked",
   /*
+   * A turn composed on the web and sent into a Slack thread.
+   *
+   * The trail can already answer "who linked this Slack identity", but a message that appears in a
+   * customer-visible Slack thread was, until now, indistinguishable from one typed in Slack. This
+   * records that a person authored a turn from OpenBot, and deliberately carries neither the text
+   * nor the conversation reference: it says a turn happened, not what it said or how to reach it.
+   */
+  "external_thread.turn_authored",
+  /*
    * What a Bot is and what it may reach.
    *
    * The trail recorded every mouse movement a Bot made and could not answer "who pointed this Bot at
