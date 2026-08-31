@@ -1,7 +1,11 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "@tanstack/react-router";
 import { useEffect } from "react";
-import { type ChannelPage, type ChannelSummary, channelKeys } from "./queries";
+import {
+  type RosterItem,
+  type RosterPage,
+  rosterKeys,
+} from "@/lib/roster/queries";
 
 /**
  * Keep the roster live.
@@ -10,12 +14,21 @@ import { type ChannelPage, type ChannelSummary, channelKeys } from "./queries";
  * list to recover events missed while disconnected.
  */
 
-export type ChannelActivityEvent = {
-  channelId: string;
+export type RosterActivityEvent = {
+  kind: "channel" | "bot_chat";
+  /** The row's id. Globally unique across kinds, so nothing looks a row up by anything else. */
+  id: string;
+  /**
+   * The channel's id, on a channel event from a server that still sends it.
+   *
+   * @deprecated The server carries this alongside `id` for one release, so a rolling deploy cannot
+   * leave old replicas emitting a shape this file cannot read. Nothing here should use it.
+   */
+  channelId?: string;
   lastMessage: string | null;
   lastMessageAt: string | null;
   lastMessageAgentId: string | null;
-  /** The channel is gone from every member's roster. Absent on an ordinary activity event. */
+  /** The row is gone from every member's roster. Absent on an ordinary activity event. */
   deleted?: true;
   /**
    * This member's pin, changed. Absent on an ordinary activity event.
@@ -24,52 +37,73 @@ export type ChannelActivityEvent = {
    * made in another tab or on another replica.
    */
   pinned?: boolean;
+  /** The row's archive state changed, so it has moved between lists. */
+  archived?: boolean;
 };
 
 /** The infinite query's cache, which holds pages rather than one array. */
-type ChannelCache = { pages: ChannelPage[]; pageParams: unknown[] };
+type RosterCache = { pages: RosterPage[]; pageParams: unknown[] };
 
 /**
  * Apply one event to the cached pages.
  *
  * Pure, and exported, because the patching rules are the whole of what a socket event does to the
  * screen and they should be provable without a socket. Returns the cache it was given when nothing
- * changed, so React re-renders nothing, and `"unknown"` when the event names a channel no page
- * holds — which the caller answers with a refetch rather than a patch.
+ * changed, so React re-renders nothing, `"unknown"` when the event names a row no page holds — which
+ * the caller answers with a refetch rather than a patch — and `"refetch"` when the row moved between
+ * lists rather than merely changing a field.
+ *
+ * Rows are found by `activity.id` alone: the server prefixes ids so they are globally unique across
+ * kinds, and `kind` is needed only for rendering, never for locating a row.
  */
-export function applyChannelEvent(
-  data: ChannelCache,
-  activity: ChannelActivityEvent,
-): ChannelCache | "unknown" {
+export function applyRosterEvent(
+  data: RosterCache,
+  activity: RosterActivityEvent,
+): RosterCache | "unknown" | "refetch" {
   const holdingPage = data.pages.findIndex((page) =>
-    page.channels.some((channel) => channel.id === activity.channelId),
+    page.items.some((item) => item.id === activity.id),
   );
 
   // Must run before the patch below, which spreads the event onto the existing row — reaching that
-  // first would stamp `deleted: true` on the row instead of removing it. An unknown channel here is
+  // first would stamp `deleted: true` on the row instead of removing it. An unknown row here is
   // already gone from this cache, so there is nothing to patch or invalidate for, unlike the
-  // "unknown channel" case below for an ordinary event.
+  // "unknown row" case below for an ordinary event.
   if (activity.deleted) {
     if (holdingPage === -1) return data;
-    const page = data.pages[holdingPage] as ChannelPage;
+    const page = data.pages[holdingPage] as RosterPage;
     const pages = data.pages.slice();
     pages[holdingPage] = {
       ...page,
-      channels: page.channels.filter(
-        (channel) => channel.id !== activity.channelId,
-      ),
+      items: page.items.filter((item) => item.id !== activity.id),
     };
     return { ...data, pages };
   }
 
-  // An unknown channel id means the roster is stale; refetch rather than patch.
+  /*
+   * An archive or a restore is a move, not a field change.
+   *
+   * Three statuses mean three cached lists, and this row now belongs to a different set of them.
+   * Patching the field in place would leave it in the list it just left as well as the one it joined,
+   * so the caller refetches instead. That is the same answer the "unknown row" case below gets, for
+   * the same reason: page membership is not something a patch can express.
+   *
+   * Checked before the spread below, which would otherwise carry `archived` onto the row and make it
+   * look handled. And checked even on an activity event, because an event that carries
+   * `archived: false` is a report that restored the conversation — the move matters more than the
+   * preview, and the refetch brings the preview too.
+   */
+  if (activity.archived !== undefined) {
+    // Already absent from this list: nothing to move, and nothing to refetch for.
+    if (holdingPage === -1) return data;
+    return "refetch";
+  }
+
+  // An unknown row id means the roster is stale; refetch rather than patch.
   if (holdingPage === -1) return "unknown";
 
-  const page = data.pages[holdingPage] as ChannelPage;
-  const index = page.channels.findIndex(
-    (channel) => channel.id === activity.channelId,
-  );
-  const previous = page.channels[index];
+  const page = data.pages[holdingPage] as RosterPage;
+  const index = page.items.findIndex((item) => item.id === activity.id);
+  const previous = page.items[index];
   if (!previous) return data;
 
   /*
@@ -81,24 +115,24 @@ export function applyChannelEvent(
    */
   if (activity.pinned !== undefined) {
     if (previous.pinned === activity.pinned) return data;
-    const channels = page.channels.slice();
-    channels[index] = { ...previous, pinned: activity.pinned };
+    const items = page.items.slice();
+    items[index] = { ...previous, pinned: activity.pinned };
     const pages = data.pages.slice();
-    pages[holdingPage] = { ...page, channels };
+    pages[holdingPage] = { ...page, items };
     return { ...data, pages };
   }
 
   // Preserve object identity for unchanged rows so memoized rows do not re-render.
-  const next = page.channels.slice();
+  const next = page.items.slice();
   next[index] = { ...previous, ...activity };
   next.sort(byRecency);
 
   // An event that changes nothing visible, a duplicate, or a report the server ignored as stale,
   // returns the original object, so React re-renders nothing at all.
-  if (next.every((channel, at) => channel === page.channels[at])) return data;
+  if (next.every((item, at) => item === page.items[at])) return data;
 
   const pages = data.pages.slice();
-  pages[holdingPage] = { ...page, channels: next };
+  pages[holdingPage] = { ...page, items: next };
   return { ...data, pages };
 }
 
@@ -111,7 +145,17 @@ function socketUrl() {
   return url.toString();
 }
 
-export function useChannelEvents() {
+const ROSTER_STATUSES = ["active", "archived", "all"] as const;
+
+/**
+ * No status argument.
+ *
+ * The sidebar is not the only reader of the roster — the channel screen reads it too — so the status
+ * the sidebar happens to have on screen is not knowable from inside this hook. Instead every event is
+ * applied to all three cached lists; each one no-ops on a row it never held, so patching the two the
+ * event does not concern is free.
+ */
+export function useRosterEvents() {
   const queryClient = useQueryClient();
   const router = useRouter();
 
@@ -128,11 +172,11 @@ export function useChannelEvents() {
       socket.onopen = () => {
         retryDelay = FIRST_RETRY_MS;
         // Recover events missed while the socket was disconnected.
-        void queryClient.invalidateQueries({ queryKey: channelKeys.list() });
+        void queryClient.invalidateQueries({ queryKey: rosterKeys.all });
       };
 
       socket.onmessage = (message) => {
-        let activity: ChannelActivityEvent;
+        let activity: RosterActivityEvent;
         try {
           activity = JSON.parse(message.data as string);
         } catch {
@@ -142,24 +186,32 @@ export function useChannelEvents() {
         /*
          * The list is paged, so the cache holds pages rather than one array.
          *
-         * The channel is patched inside whichever page holds it and that page is re-sorted. Sorting
-         * across pages is deliberately not attempted: a channel that has just become the most recent
+         * The row is patched inside whichever page holds it and that page is re-sorted. Sorting
+         * across pages is deliberately not attempted: a row that has just become the most recent
          * belongs at the top of page one, and moving a row between pages would fight the cursors the
          * next fetch uses. The page it is on stays correct, and the next refetch puts it in order.
          */
-        queryClient.setQueryData(
-          channelKeys.list(),
-          (data: ChannelCache | undefined) => {
-            if (!data) return data;
-            const patched = applyChannelEvent(data, activity);
-            if (patched !== "unknown") return patched;
-            // An unknown channel id means the roster is stale; refetch rather than patch.
-            void queryClient.invalidateQueries({
-              queryKey: channelKeys.list(),
-            });
-            return data;
-          },
-        );
+        let refetch = false;
+        for (const status of ROSTER_STATUSES) {
+          queryClient.setQueryData(
+            rosterKeys.list(status),
+            (data: RosterCache | undefined) => {
+              if (!data) return data;
+              const patched = applyRosterEvent(data, activity);
+              if (patched === "unknown" || patched === "refetch") {
+                refetch = true;
+                return data;
+              }
+              return patched;
+            },
+          );
+        }
+        if (refetch) {
+          // An unknown row, or one that moved between lists, means the roster is stale; refetch
+          // rather than patch. All three lists share one prefix, so one invalidation reaches whichever
+          // of them the row actually landed in.
+          void queryClient.invalidateQueries({ queryKey: rosterKeys.all });
+        }
 
         /*
          * A tab looking at the channel somebody just deleted in another tab.
@@ -174,7 +226,11 @@ export function useChannelEvents() {
          */
         if (activity.deleted) {
           const { pathname } = router.state.location;
-          if (pathname === `/channel/${activity.channelId}`) {
+          const path =
+            activity.kind === "bot_chat"
+              ? `/bot/${activity.id}`
+              : `/channel/${activity.id}`;
+          if (pathname === path) {
             void router.navigate({ to: "/" });
           }
         }
@@ -207,8 +263,7 @@ export function useChannelEvents() {
  * channels/routes.ts. If these two disagree the list reorders itself the moment an event arrives,
  * which looks like rows jumping for no reason.
  */
-function byRecency(left: ChannelSummary, right: ChannelSummary) {
-  const at = (channel: ChannelSummary) =>
-    channel.lastMessageAt ?? channel.createdAt;
+function byRecency(left: RosterItem, right: RosterItem) {
+  const at = (item: RosterItem) => item.lastMessageAt ?? item.createdAt;
   return at(right).localeCompare(at(left));
 }
