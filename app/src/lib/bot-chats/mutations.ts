@@ -5,7 +5,7 @@ import {
 } from "@tanstack/react-query";
 import { client, tryClient } from "@/lib/client";
 import { rosterKeys, type RosterPage } from "@/lib/roster/queries";
-import type { BotChat } from "./queries";
+import { botChatKeys, type BotChat } from "./queries";
 
 /**
  * Start a new direct conversation with a Bot.
@@ -150,6 +150,12 @@ export function markBotChatReadMutationOptions(queryClient: QueryClient) {
  * Invalidates rather than patches, because the row moves between the Active, Archived, and All lists
  * and a patch would leave it in two of them at once — that is a page-membership change, which a patch
  * to one row's fields cannot express.
+ *
+ * Also invalidates the detail query, unlike delete below: `BotChat` carries `archived`, and the Bot
+ * chat screen renders straight from it, so a tab holding that screen open while the row is archived or
+ * restored elsewhere needs the refetch to stop showing the stale state. Delete cannot afford the same
+ * refetch — the row it would fetch is already gone — but archiving leaves the row exactly where it
+ * was, still readable, so there is no 404 here for a refetch to trip over.
  */
 export function setBotChatArchivedMutationOptions(queryClient: QueryClient) {
   return mutationOptions({
@@ -162,8 +168,12 @@ export function setBotChatArchivedMutationOptions(queryClient: QueryClient) {
           : "Could not restore this conversation",
       });
     },
-    onSuccess: () =>
-      queryClient.invalidateQueries({ queryKey: rosterKeys.all }),
+    onSuccess: (_data, variables) => {
+      void queryClient.invalidateQueries({ queryKey: rosterKeys.all });
+      void queryClient.invalidateQueries({
+        queryKey: botChatKeys.detail(variables.botChatId),
+      });
+    },
   });
 }
 
@@ -176,9 +186,10 @@ export function deleteBotChatMutationOptions(queryClient: QueryClient) {
         fallback: "Could not delete this conversation",
       });
     },
-    // The roster only. The open chat's detail query would refetch into the fresh 404 and flash an
-    // error before the navigate-home lands; left alone, it keeps its cache and the navigation
-    // happens with nothing to complain about.
+    // The roster only, deliberately not the detail query the way archive above does. The open chat's
+    // detail query would refetch into the fresh 404 and flash an error before the navigate-home lands;
+    // left alone, it keeps its cache and the navigation happens with nothing to complain about. Archive
+    // has no such row to lose, which is exactly why it invalidates and this one does not.
     onSuccess: () =>
       queryClient.invalidateQueries({ queryKey: rosterKeys.all }),
   });

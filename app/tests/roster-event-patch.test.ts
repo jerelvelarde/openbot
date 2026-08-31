@@ -240,12 +240,16 @@ describe("applyRosterEvent", () => {
     expect(patched.pages[0]?.items.map((row) => row.id)).toEqual(["channel_2"]);
   });
 
-  test("ignores an archive for a row this cache does not hold", () => {
+  test("refetches an archive for a row this cache does not hold", () => {
     const data = cache([item("channel_1")]);
 
-    // Already absent from this list, so there is nothing to move and nothing to refetch for.
+    /*
+     * The list that must GAIN the row is the one that does not hold it. Returning `data` here was
+     * the bug that made restoring silently not propagate: an archived row is absent from Active by
+     * definition, so a restore refetched nothing and the conversation stayed invisible.
+     */
     expect(
       applyRosterEvent(data, event({ id: "botchat_9", archived: true })),
-    ).toBe(data);
+    ).toBe("refetch");
   });
 });
