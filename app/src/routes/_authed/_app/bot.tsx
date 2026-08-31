@@ -8,7 +8,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useRef } from "react";
 import { agentListQueryOptions } from "@/lib/agents/queries";
 import { createBotChatMutationOptions } from "@/lib/bot-chats/mutations";
-import { rosterListQueryOptions } from "@/lib/roster/queries";
+import { type RosterItem, rosterListQueryOptions } from "@/lib/roster/queries";
 
 export const Route = createFileRoute("/_authed/_app/bot")({
   component: RouteComponent,
@@ -68,6 +68,26 @@ export function resolveBotChat(input: { mostRecent: string | null }) {
     : ({ open: input.mostRecent } as const);
 }
 
+/**
+ * Whether the resolver effect below is clear to act, given what the roster query currently holds
+ * and whether an earlier run already claimed this resolution.
+ *
+ * Pulled out and exported for the same reason `resolveBotChat` is: the defect this replaces —
+ * `roster.isPending` reading `false` the moment a roster load exhausts its retries and moves to
+ * `error`, with `data` still `undefined` — is a fact about a boolean expression, not about a
+ * mounted component, and there is no render harness in this suite to drive that component through
+ * a failed query. `data === undefined` is true for both "still loading" and "gave up and failed
+ * after retrying"; only a roster that actually resolved — even to an empty array, which is the
+ * ordinary shape of a first visit — is allowed through. `started` is `started.current` from the
+ * effect's own ref, passed in rather than read, so this stays a plain function of its inputs.
+ */
+export function shouldResolveBotChat(input: {
+  data: RosterItem[] | undefined;
+  started: boolean;
+}): boolean {
+  return input.data !== undefined && !input.started;
+}
+
 function BotResolver({ agentId }: { agentId: string }) {
   const navigate = Route.useNavigate();
   const queryClient = useQueryClient();
@@ -78,11 +98,21 @@ function BotResolver({ agentId }: { agentId: string }) {
    * `mostRecent`.
    *
    * Read from "active", deliberately not "all": `?agent=` must never reopen a conversation somebody
-   * archived. The store's own `mostRecent` — consulted server-side wherever a fresh visit to a Bot
-   * has to pick a thread — applies the identical active-only filter. Both are stated because either
-   * alone is a rule somebody could quietly remove without the other one catching it.
+   * archived. `BotChatStore.mostRecent` applies the identical active-only filter, but it is not a
+   * second enforcement of this rule yet — no route calls it. It exists as the belt for a
+   * server-side resolver that has not been written; this comment used to claim that resolver
+   * existed, which was not true.
    */
   const roster = useInfiniteQuery(rosterListQueryOptions("active"));
+  /*
+   * Sees only whichever roster pages happen to be cached: nothing in this app calls `fetchNextPage`
+   * on the roster query, so a Bot chat sitting past the first page is invisible here, exactly as if
+   * it did not exist. That gap predates this screen and is app-wide — the sidebar has the same
+   * limit and nobody pages it either. What is new is that acting on it here writes a durable row:
+   * reading `null` for a chat that is merely un-cached creates a duplicate, the same failure a
+   * failed roster load causes by a different route (see `shouldResolveBotChat` above). Not fixed
+   * here — paging the roster from this resolver is a bigger change than this one.
+   */
   const mostRecent =
     roster.data?.find(
       (row) => row.kind === "bot_chat" && row.agentIds.includes(agentId),
@@ -93,14 +123,24 @@ function BotResolver({ agentId }: { agentId: string }) {
    * component is keyed on `agentId` in the parent, so the ref starts fresh whenever the Bot
    * changes, but StrictMode still mounts, cleans up, and mounts this effect again on the very
    * first render — and a re-run that was not guarded would create a second Bot chat nobody asked
-   * for. `roster.isPending` gates the first run so a still-loading roster is never misread as
-   * "nothing to open".
+   * for. `shouldResolveBotChat` gates the first run on `roster.data`, not `roster.isPending`: see
+   * that function's own comment for why `isPending` alone would misread a failed roster load as
+   * "nothing to open" and fork a duplicate `bot_chats` row.
    */
   const started = useRef(false);
   const createBotChatMutate = createBotChat.mutateAsync;
   useEffect(() => {
-    if (roster.isPending || started.current) return;
+    if (!shouldResolveBotChat({ data: roster.data, started: started.current }))
+      return;
     started.current = true;
+    /*
+     * Set once this run commits to acting, and read only in the `.then` below: if the person
+     * navigates away — or this Bot changes, which remounts the whole resolver under a new `key` —
+     * before the create or lookup settles, `navigate` must not fire into a screen nobody is looking
+     * at any more. Same `let current = true` / cleanup pair `useBotThread` in `bot-thread.ts` uses,
+     * for the same reason.
+     */
+    let current = true;
     /*
      * Annotated, rather than left to inference: TypeScript fills each branch of the ternary inside
      * `resolveBotChat` with the other branch's key typed `undefined`, so an inferred type here still
@@ -117,10 +157,42 @@ function BotResolver({ agentId }: { agentId: string }) {
       "open" in resolution
         ? Promise.resolve(resolution.open)
         : createBotChatMutate(agentId).then((created) => created.id);
-    void botChatId.then((id) =>
-      navigate({ to: "/bot/$botChatId", params: { botChatId: id } }),
+    botChatId
+      .then((id) => {
+        if (!current) return;
+        void navigate({ to: "/bot/$botChatId", params: { botChatId: id } });
+      })
+      .catch(() => {
+        // Handled, not ignored: `mutateAsync` rejects on a refused create, and `started.current` is
+        // already `true`, so nothing here retries. Left uncaught, this would be an unhandled
+        // rejection on top of a resolver that then renders `null` forever with no explanation. There
+        // is nothing further to do in the catch itself — `createBotChat.error` is the same state a
+        // caught error would otherwise have to be threaded into by hand, and the render below reads
+        // it directly, the same way `startNew` in `bot_.$botChatId.tsx` leaves its own throw for
+        // `createBotChat.error` to say out loud.
+      });
+    return () => {
+      current = false;
+    };
+  }, [agentId, createBotChatMutate, mostRecent, navigate, roster.data]);
+
+  /*
+   * A sentence instead of nothing when the roster failed to load or a create was refused, for the
+   * same reason the unknown-Bot guard in `RouteComponent` above answers a bad `?agent=` in a
+   * sentence rather than a crash: this app has no toast, so silence here would read as the app
+   * ignoring what happened rather than as the app having tried. Checked ahead of the resolving
+   * state below, not folded into `shouldResolveBotChat`: the effect asks "is it safe to act", this
+   * asks "is there something to say instead of nothing", and a roster that is still failing
+   * answers "no" to the first and "yes" to the second at the same time.
+   */
+  const failure = roster.error ?? createBotChat.error;
+  if (failure) {
+    return (
+      <div className="flex h-screen items-center justify-center p-6">
+        <p className="text-muted-foreground text-sm">{failure.message}</p>
+      </div>
     );
-  }, [agentId, createBotChatMutate, mostRecent, navigate, roster.isPending]);
+  }
 
   /*
    * Nothing to render while this resolves, for the same reason the screen this replaced rendered
