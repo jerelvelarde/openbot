@@ -1,6 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
 import { QueryClient, type InfiniteData } from "@tanstack/react-query";
 import {
+  AdoptConflictError,
+  adoptBotChatMutationOptions,
   markBotChatReadMutationOptions,
   setBotChatArchivedMutationOptions,
 } from "../src/lib/bot-chats/mutations";
@@ -164,4 +166,83 @@ test("archiving invalidates both the roster and the bot chat's own detail query"
     { queryKey: ["roster"] },
     { queryKey: botChatKeys.detail("botchat-1") },
   ]);
+});
+
+/**
+ * `adoptBotChatMutationOptions` goes through `tryClient` rather than `client` specifically so a 409
+ * can be told apart from every other failure by status rather than by matching the server's exact
+ * sentence. These three cases are what that buys: a normal success still comes back as the unwrapped
+ * `BotChat`, a 409 comes back as `AdoptConflictError` (which `useLegacyThreadAdoption` treats as
+ * success — see app/src/lib/copilot/bot-thread.ts), and every other failure status must NOT produce
+ * that type, or a network blip or a real bug would look like "somebody already has this thread" and
+ * the remembered id would be discarded instead of kept for a retry.
+ */
+
+test("adopting a thread returns the unwrapped bot chat and invalidates the roster", async () => {
+  const seen = capturingFetch(200, {
+    botChat: {
+      id: "botchat-1",
+      agentId: "agent-1",
+      threadId: "thread-1",
+      title: null,
+      active: true,
+      archived: false,
+    },
+  });
+  const { queryClient, invalidated } = invalidationRecorder();
+  const options = adoptBotChatMutationOptions(queryClient);
+
+  const botChat = await options.mutationFn?.({
+    agentId: "agent-1",
+    threadId: "thread-1",
+  });
+  await options.onSuccess?.(
+    botChat as never,
+    { agentId: "agent-1", threadId: "thread-1" },
+    undefined as never,
+    undefined as never,
+  );
+
+  expect(seen).toHaveLength(1);
+  expect(seen[0]?.url).toBe("/api/bot-chats/adopt");
+  expect(seen[0]?.init?.method).toBe("POST");
+  expect(botChat).toEqual({
+    id: "botchat-1",
+    agentId: "agent-1",
+    threadId: "thread-1",
+    title: null,
+    active: true,
+    archived: false,
+  });
+  expect(invalidated).toEqual([{ queryKey: rosterKeys.all }]);
+});
+
+test("a 409 on adopt throws AdoptConflictError, not a plain Error the caller has to parse", async () => {
+  capturingFetch(409, { error: "That conversation is no longer available." });
+  const { queryClient } = invalidationRecorder();
+  const options = adoptBotChatMutationOptions(queryClient);
+
+  await expect(
+    options.mutationFn?.({ agentId: "agent-1", threadId: "thread-1" }),
+  ).rejects.toBeInstanceOf(AdoptConflictError);
+});
+
+test("a non-409 failure on adopt does NOT throw AdoptConflictError — the asymmetry the retry loop depends on", async () => {
+  // Any status other than 409 (offline surfaces the same way as a 5xx here: the fetch still resolves
+  // with a non-ok Response in this harness) must leave the remembered thread id alone so the next
+  // visit can try adoption again. If this ever threw AdoptConflictError too, `useLegacyThreadAdoption`
+  // would `forget` the id on a failure that never actually claimed the thread, orphaning it.
+  capturingFetch(500, { error: "Intelligence is unreachable." });
+  const { queryClient } = invalidationRecorder();
+  const options = adoptBotChatMutationOptions(queryClient);
+
+  let caught: unknown;
+  try {
+    await options.mutationFn?.({ agentId: "agent-1", threadId: "thread-1" });
+  } catch (error) {
+    caught = error;
+  }
+
+  expect(caught).toBeInstanceOf(Error);
+  expect(caught).not.toBeInstanceOf(AdoptConflictError);
 });

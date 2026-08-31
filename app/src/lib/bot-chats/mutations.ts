@@ -23,22 +23,67 @@ export function createBotChatMutationOptions(queryClient: QueryClient) {
 }
 
 /**
+ * Thrown by `adoptBotChatMutationOptions` when the server answers `POST /api/bot-chats/adopt` with a
+ * 409 — see `mapStoreError` in server/src/bot-chats/routes.ts, which answers `BotChatThreadTakenError`
+ * with this one status for two different reasons at once (a thread somebody else already owns, and a
+ * thread this same person already owns but soft-deleted), deliberately, so a caller here cannot and
+ * need not tell them apart.
+ *
+ * A dedicated type rather than a plain `Error` because `useLegacyThreadAdoption`
+ * (app/src/lib/copilot/bot-thread.ts) has to treat exactly this one status as a success — somebody
+ * already has the thread, which is the outcome adoption wanted — while every other failure has to keep
+ * the remembered thread id for a retry. `client` (app/src/lib/client.ts) throws a plain `Error` built
+ * only from the response body's message, with no status attached, so telling the two apart used to mean
+ * comparing the server's exact sentence — a check that breaks silently the moment that sentence is
+ * reworded. Going through `tryClient` and constructing this only when `response.status === 409` means
+ * the caller can ask `instanceof AdoptConflictError` and get a real answer instead of a guess.
+ */
+export class AdoptConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AdoptConflictError";
+  }
+}
+
+/**
  * Adopt a thread the browser still remembers from before the roster existed, giving it a chat row.
  *
  * Idempotent on purpose: two tabs holding the same remembered thread both try to adopt it, and the
  * server's unique constraint gives them back the same row rather than minting two.
+ *
+ * Goes through `tryClient` rather than `client`, unlike every other mutation in this file: the caller
+ * needs to know whether a failure was specifically a 409, and `client` never surfaces the status, only
+ * a message built from it. See `AdoptConflictError`.
  */
 export function adoptBotChatMutationOptions(queryClient: QueryClient) {
   return mutationOptions({
-    mutationFn: (variables: {
+    mutationFn: async (variables: {
       agentId: string;
       threadId: string;
-    }): Promise<BotChat> =>
-      client<BotChat>("/api/bot-chats/adopt", "botChat", {
+    }): Promise<BotChat> => {
+      const response = await tryClient("/api/bot-chats/adopt", {
         method: "POST",
         body: variables,
-        fallback: "Could not open this conversation",
-      }),
+      });
+
+      if (response.ok) {
+        return ((await response.json()) as { botChat: BotChat }).botChat;
+      }
+
+      // Same extraction `client` does: the server's own message names the reason, which is worth
+      // surfacing over a generic fallback when it sent one.
+      const message = await response
+        .json()
+        .then((body: { error?: string }) => body.error)
+        .catch(() => undefined);
+
+      if (response.status === 409) {
+        throw new AdoptConflictError(
+          message ?? "That conversation is no longer available.",
+        );
+      }
+      throw new Error(message ?? "Could not open this conversation");
+    },
     onSuccess: () =>
       queryClient.invalidateQueries({ queryKey: rosterKeys.all }),
   });

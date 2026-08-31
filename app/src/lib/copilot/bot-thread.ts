@@ -1,6 +1,9 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
-import { adoptBotChatMutationOptions } from "@/lib/bot-chats/mutations";
+import {
+  adoptBotChatMutationOptions,
+  AdoptConflictError,
+} from "@/lib/bot-chats/mutations";
 import { tryClient } from "@/lib/client";
 
 /**
@@ -127,26 +130,19 @@ export function shouldAdopt(input: {
 }
 
 /**
- * The exact sentence `POST /api/bot-chats/adopt` answers with on a 409 — see `mapStoreError` in
- * server/src/bot-chats/routes.ts, which answers `BotChatThreadTakenError` with this one sentence for
- * two different reasons at once (a thread somebody else already owns, and a thread this same person
- * already owns but soft-deleted), deliberately, so a caller here cannot and need not tell them apart.
+ * This used to be a string match: `adoptBotChatMutationOptions` called `client`, which throws a plain
+ * `Error` built from the response body's message and never surfaces the HTTP status, so the only thing
+ * left to check here was the server's exact sentence — "That conversation is no longer available." A
+ * comparison like that is exact only for as long as nobody rewords the sentence; the day someone does,
+ * a 409 silently stops being recognised and the every-visit retry loop this hook exists to prevent
+ * comes back, with nothing failing loudly to say so.
  *
- * It is also the only thing left here to check against. `client` (app/src/lib/client.ts) — which
- * `adoptBotChatMutationOptions` calls — throws a plain `Error` built from the response body's `error`
- * field, or a fallback sentence when there is none; the HTTP status itself never reaches the caller.
- * So this cannot be `error.status === 409` — there is no such property to read. Matching the sentence
- * is what is left, and it is exact only because this route has no other way to produce it: a 400
- * fails validation before `adopt` runs, a 404 says "Agent not found.", and an uncaught failure falls
- * back to the fallback sentence `adoptBotChatMutationOptions` passes to `client`, not to this one. If
- * the server ever rewords that sentence, this constant has to move with it, or a 409 stops being
- * recognised and the every-visit retry loop `useLegacyThreadAdoption` exists to prevent comes back.
+ * `adoptBotChatMutationOptions` (app/src/lib/bot-chats/mutations.ts) now goes through `tryClient`
+ * instead, reads `response.status` itself, and throws `AdoptConflictError` specifically when it is 409
+ * — see that type's own comment for why the status, not the message, is what a 409 hinges on. So the
+ * check below is an `instanceof`, not a string comparison, and it must stay that way: reinstating a
+ * match against `error.message` would bring back exactly the fragility this replaced.
  */
-const ADOPT_CONFLICT_MESSAGE = "That conversation is no longer available.";
-
-function isAdoptConflict(error: unknown): boolean {
-  return error instanceof Error && error.message === ADOPT_CONFLICT_MESSAGE;
-}
 
 /**
  * Rescue a remembered conversation, once per Bot.
@@ -182,15 +178,15 @@ export function useLegacyThreadAdoption(agentId: string): void {
       try {
         await adoptThread({ agentId, threadId });
       } catch (error) {
-        if (!isAdoptConflict(error)) {
+        if (!(error instanceof AdoptConflictError)) {
           // Any other failure — offline, a 500, the tab closing mid-request — keeps the key: it is
           // the only remaining pointer to this transcript, so the next visit has to be able to try
-          // again. See `ADOPT_CONFLICT_MESSAGE` for why a 409 does not take this branch.
+          // again. See `AdoptConflictError` for why a 409 does not take this branch.
           return;
         }
         // A 409: somebody already has this thread — this same adoption racing from another tab, or
         // this same person having soft-deleted the row adoption would have created (see
-        // `ADOPT_CONFLICT_MESSAGE`). Either way the outcome adoption wanted has already happened, so
+        // `AdoptConflictError`). Either way the outcome adoption wanted has already happened, so
         // this falls through to `forget` exactly as a successful `await` above would have.
       }
 
