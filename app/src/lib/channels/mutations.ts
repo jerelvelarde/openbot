@@ -4,7 +4,8 @@ import {
   type QueryClient,
 } from "@tanstack/react-query";
 import { client, tryClient } from "@/lib/client";
-import { rosterKeys, type RosterPage } from "@/lib/roster/queries";
+import { patchRosterRead } from "@/lib/roster/read-marker";
+import { rosterKeys } from "@/lib/roster/queries";
 import { type AgentChannel, type ChannelPage, channelKeys } from "./queries";
 
 /**
@@ -127,34 +128,7 @@ export function markChannelReadMutationOptions(queryClient: QueryClient) {
             })),
           },
       );
-      for (const status of ["active", "archived", "all"] as const) {
-        queryClient.setQueryData(
-          rosterKeys.list(status),
-          (data: InfiniteData<RosterPage> | undefined) =>
-            data && {
-              ...data,
-              pages: data.pages.map((page) => ({
-                ...page,
-                items: page.items.map((row) =>
-                  row.id === channelId
-                    ? {
-                        ...row,
-                        /*
-                         * The later of now and the row's own lastMessageAt: lastMessageAt comes from
-                         * another clock, and a marker stamped "now" by a clock running behind it
-                         * would leave the row still reading as unseen — and the dot still lit.
-                         */
-                        lastReadAt:
-                          row.lastMessageAt && row.lastMessageAt > now
-                            ? row.lastMessageAt
-                            : now,
-                      }
-                    : row,
-                ),
-              })),
-            },
-        );
-      }
+      patchRosterRead(queryClient, channelId);
     },
   });
 }
