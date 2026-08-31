@@ -4,8 +4,8 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { createFileRoute } from "@tanstack/react-router";
-import { useEffect, useRef } from "react";
+import { createFileRoute, Link } from "@tanstack/react-router";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import { agentListQueryOptions } from "@/lib/agents/queries";
 import {
   adoptBotChatMutationOptions,
@@ -35,28 +35,61 @@ export const Route = createFileRoute("/_authed/_app/bot")({
  */
 function RouteComponent() {
   const { agent } = Route.useSearch();
-  const { data: agents, isPending } = useQuery(agentListQueryOptions());
-  const agentId = agent ?? agents?.[0]?.id;
-  const known = agents?.some((candidate) => candidate.id === agentId) ?? false;
+  const agents = useQuery(agentListQueryOptions());
 
-  if (isPending) return null;
+  /*
+   * Gated on `data === undefined` rather than on `isPending`, which is the same conflation
+   * `shouldResolveBotChat` below was written to avoid, in the one place on this screen that had kept
+   * it. `isPending` reads `false` the moment a load exhausts its retries and moves to `error`, with
+   * `data` still `undefined`, so a guard written on it alone answered a 500 or an offline browser
+   * with "This deployment has no Bots yet." — a request that failed, reported as a settled fact
+   * about the deployment, which is the one reading that leaves nothing to try. Nothing is said about
+   * what the list holds until the list has resolved; a list that resolved and is genuinely empty is
+   * the sentence below, and it means what it says.
+   *
+   * An error alongside data that did resolve — a background refetch that failed — deliberately does
+   * not land here: there is a Bot to open, and this screen's job is to open it.
+   */
+  if (agents.data === undefined) {
+    return agents.error ? <Notice>{agents.error.message}</Notice> : null;
+  }
+
+  const agentId = agent ?? agents.data[0]?.id;
+  const known = agents.data.some((candidate) => candidate.id === agentId);
+
   if (!agentId || !known) {
     return (
-      <div className="flex h-screen items-center justify-center p-6">
-        <p className="text-muted-foreground text-sm">
-          {agent
-            ? `This deployment has no Bot called "${agent}".`
-            : "This deployment has no Bots yet."}
-        </p>
-      </div>
+      <Notice>
+        {agent
+          ? `This deployment has no Bot called "${agent}".`
+          : "This deployment has no Bots yet."}
+      </Notice>
     );
   }
 
   /*
    * Keyed on the Bot, so the hooks below never see it change under them. They cannot be called
-   * conditionally, and the guards above return before any of them run.
+   * conditionally, and the guards above return before any of them run. The key is also what makes
+   * unmount the right thing for the resolver to cancel on: a different Bot is a different instance.
    */
   return <BotResolver agentId={agentId} key={agentId} />;
+}
+
+/**
+ * The one shape for a sentence this screen says instead of a conversation.
+ *
+ * A Bot list that would not load, a deployment with no Bots, a named Bot that does not exist, a
+ * create that was refused, a redirect that has not moved: different news, one way of delivering it,
+ * written once rather than copied per branch. This app has no toast, so a sentence in the middle of
+ * an otherwise empty screen is the entire vocabulary it has for "tried, and here is what happened" —
+ * which is why the branches that reach for it matter more than its markup does.
+ */
+function Notice({ children }: { children: ReactNode }) {
+  return (
+    <div className="flex h-screen items-center justify-center p-6">
+      <p className="text-muted-foreground text-sm">{children}</p>
+    </div>
+  );
 }
 
 /**
@@ -85,10 +118,13 @@ export function resolveBotChat(input: { mostRecent: string | null }) {
  * the maximum by `lastMessageAt ?? createdAt` among the matches instead of the first one, so the two
  * mean the same thing.
  *
- * Until a separate fix lands, nothing calls `recordActivity` for a bot chat (see Task 13's own
- * plan note on this), so `lastMessageAt` is always null here today and every comparison falls back to
- * `createdAt` — newest-created wins, not "most recently talked to." Said here rather than left
- * implied, so this doesn't read as a richer signal than the data currently carries.
+ * Ties go to the greater `id`, because that is the tie-break the server applies — `mostRecent`
+ * orders by recency and then by `id` descending — and not because first-seen or last-seen would be
+ * defensible on its own. A tie is not exotic: `lastMessageAt` is null until somebody speaks in a
+ * conversation, so `createdAt` decides, and two rows sharing a `createdAt` is ordinary for anything
+ * seeded, imported, or created inside one transaction. Ids are `botchat_` followed by a v4 UUID —
+ * one fixed length, lowercase hex, dashes in fixed positions — so comparing them as strings here
+ * picks the row the server's `desc` picks.
  */
 export function mostRecentBotChat(
   rows: RosterItem[],
@@ -97,11 +133,13 @@ export function mostRecentBotChat(
   let best: RosterItem | null = null;
   for (const row of rows) {
     if (row.kind !== "bot_chat" || !row.agentIds.includes(agentId)) continue;
-    if (
-      best === null ||
-      (row.lastMessageAt ?? row.createdAt) >
-        (best.lastMessageAt ?? best.createdAt)
-    ) {
+    if (best === null) {
+      best = row;
+      continue;
+    }
+    const recency = row.lastMessageAt ?? row.createdAt;
+    const incumbent = best.lastMessageAt ?? best.createdAt;
+    if (recency > incumbent || (recency === incumbent && row.id > best.id)) {
       best = row;
     }
   }
@@ -136,18 +174,43 @@ export function shouldAttemptAdoption(input: {
  *
  * Pulled out and exported for the same reason `resolveBotChat` is: the defect this replaces —
  * `roster.isPending` reading `false` the moment a roster load exhausts its retries and moves to
- * `error`, with `data` still `undefined` — is a fact about a boolean expression, not about a
- * mounted component, and there is no render harness in this suite to drive that component through
- * a failed query. `data === undefined` is true for both "still loading" and "gave up and failed
- * after retrying"; only a roster that actually resolved — even to an empty array, which is the
- * ordinary shape of a first visit — is allowed through. `started` is `started.current` from the
- * effect's own ref, passed in rather than read, so this stays a plain function of its inputs.
+ * `error`, with `data` still `undefined` — is a fact about a boolean expression, and stating it as
+ * one says more, and keeps saying it, than the rendered case that also covers it now.
+ * `data === undefined` is true for both "still loading" and "gave up and failed after retrying";
+ * only a roster that actually resolved — even to an empty array, which is the ordinary shape of a
+ * first visit — is allowed through. `started` is `started.current` from the effect's own ref, passed
+ * in rather than read, so this stays a plain function of its inputs.
  */
 export function shouldResolveBotChat(input: {
   data: RosterItem[] | undefined;
   started: boolean;
 }): boolean {
   return input.data !== undefined && !input.started;
+}
+
+/**
+ * What this screen shows while it resolves, and which of those answers wins when two are true.
+ *
+ * Three answers and a precedence, pulled out for the same reason the decisions above are: an
+ * ordering that lives only in the order of two `if`s in a render body is a rule nothing can assert.
+ * `opening` outranks `failed` deliberately. Once an id has been resolved the create worked, and a
+ * roster refetch failing afterwards is not this screen's news — reporting it would replace the way
+ * out of a redirect that has not moved with a sentence about something else, and would say the
+ * conversation failed when it exists. `resolving` is last because it is the absence of the other
+ * two rather than a state of its own.
+ */
+export function resolverView(input: {
+  resolved: string | null;
+  failure: Error | null;
+}):
+  | { kind: "opening"; botChatId: string }
+  | { kind: "failed"; message: string }
+  | { kind: "resolving" } {
+  if (input.resolved !== null) {
+    return { kind: "opening", botChatId: input.resolved };
+  }
+  if (input.failure) return { kind: "failed", message: input.failure.message };
+  return { kind: "resolving" };
 }
 
 function BotResolver({ agentId }: { agentId: string }) {
@@ -189,32 +252,66 @@ function BotResolver({ agentId }: { agentId: string }) {
   const legacyThreadId = remembered(agentId);
 
   /*
-   * Runs once per resolution, guarded by a ref rather than left to the dependency array: this
-   * component is keyed on `agentId` in the parent, so the ref starts fresh whenever the Bot
-   * changes, but StrictMode still mounts, cleans up, and mounts this effect again on the very
-   * first render — and a re-run that was not guarded would create a second Bot chat nobody asked
-   * for. `shouldResolveBotChat` gates the first run on `roster.data`, not `roster.isPending`: see
-   * that function's own comment for why `isPending` alone would misread a failed roster load as
+   * Whether this component is still on screen — and the only thing an in-flight resolution is
+   * allowed to cancel on.
+   *
+   * A ref cleared by its own mount-only effect rather than a `let` declared inside the resolver
+   * effect below, and that difference is the whole of the fix for the defect this replaces. A `let`
+   * per effect run is cleared by that run's cleanup, and an effect's cleanup fires on any dependency
+   * change, not only on unmount. Three of those changes are routine here: `roster.data` moving from
+   * `undefined` to defined is the one the resolver exists to wake up for and so cannot leave the
+   * dependency array; the resolver's own successful create invalidates `rosterKeys.all`, which React
+   * Query awaits inside `onSuccess` and which lands back on `roster.data`; and StrictMode cleans up
+   * and re-runs every effect once on first mount in development. Any of the three, arriving while
+   * `resolve()` was still in flight, cleared the old flag — while the `started` latch below stopped
+   * the re-run from arming a new one — so the `.then` skipped the redirect and nothing ever retried.
+   * A `bot_chats` row was written and the person was left looking at a blank screen with no error to
+   * explain it, precisely because the create had succeeded.
+   *
+   * `[]` deps mean this cleanup runs on unmount — and, in development, once more on the first mount,
+   * where StrictMode's cleanup and re-setup are a single synchronous pass that nothing awaited can
+   * observe a gap in.
+   *
+   * Unmount is also the honest boundary for `attemptAdoption`'s `isCurrent`, which is handed this
+   * same ref below: the thing that must not happen there is `forget()` clearing the remembered
+   * thread on behalf of a screen nobody is looking at any more. A dependency change is not that, and
+   * a different Bot is a different component instance — `RouteComponent` keys this on `agentId` —
+   * which unmounts this one and cancels it correctly.
+   */
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  /*
+   * One create per mounted Bot, and that is now this latch's only job. It used to hold two — "do not
+   * create twice" and "do not navigate twice" — and the second is what made the cancellation above
+   * unrecoverable, because a re-run that returned early on this flag left nothing behind to navigate
+   * with. `shouldResolveBotChat` gates the first run on `roster.data` rather than `roster.isPending`:
+   * see that function's own comment for why `isPending` alone would misread a failed roster load as
    * "nothing to open" and fork a duplicate `bot_chats` row.
    */
   const started = useRef(false);
+  /*
+   * Where a finished resolution is put, rather than being navigated on directly from inside the
+   * `.then`.
+   *
+   * State, for two reasons that are really one. It makes the redirect an effect over a value rather
+   * than a callback inside a settled promise: React re-runs an effect or leaves it alone according to
+   * its dependencies, and neither of those drops it, which is exactly what the `.then` could be made
+   * to do. And it lets the render below say, in a sentence with a link in it, that a conversation was
+   * resolved and this screen is still here — the state that used to render as nothing at all.
+   */
+  const [resolved, setResolved] = useState<string | null>(null);
   const createBotChatMutate = createBotChat.mutateAsync;
   const adoptBotChatMutate = adoptBotChat.mutateAsync;
   useEffect(() => {
     if (!shouldResolveBotChat({ data: roster.data, started: started.current }))
       return;
     started.current = true;
-    /*
-     * Set once this run commits to acting, and read only in the `.then` below: if the person
-     * navigates away — or this Bot changes, which remounts the whole resolver under a new `key` —
-     * before adoption, the open, or the create settles, `navigate` must not fire into a screen
-     * nobody is looking at any more. Same `let current = true` / cleanup pair
-     * `useLegacyThreadAdoption` in `bot-thread.ts` uses, for the same reason — and this exact flag
-     * is handed to `attemptAdoption` below as `isCurrent`, so a Bot change mid-check cancels the
-     * adoption attempt and the create/open decision together rather than the two being able to
-     * drift out of sync.
-     */
-    let current = true;
     async function resolve(): Promise<string> {
       /*
        * Adoption first, and fully awaited before any create decision is made — this is the fix for
@@ -227,10 +324,17 @@ function BotResolver({ agentId }: { agentId: string }) {
        * the chat screen is the belt for a stray key an earlier, incomplete adoption left behind.
        */
       if (shouldAttemptAdoption({ mostRecent, remembered: legacyThreadId })) {
+        /*
+         * `isCurrent` is the mount ref, not a per-run flag: `attemptAdoption` checks it before it
+         * adopts and again before it forgets, and what those checks are protecting against is
+         * committing either on behalf of a screen that is gone. See the ref's own comment above for
+         * why a dependency change is not that, and why treating it as one is what stranded the
+         * redirect.
+         */
         const attempt = await attemptAdoption(
           agentId,
           adoptBotChatMutate,
-          () => current,
+          () => mounted.current,
         );
         if (attempt.adopted !== null) return attempt.adopted;
       }
@@ -252,42 +356,64 @@ function BotResolver({ agentId }: { agentId: string }) {
     }
     resolve()
       .then((id) => {
-        if (!current) return;
-        void navigate({ to: "/bot/$botChatId", params: { botChatId: id } });
+        if (!mounted.current) return;
+        setResolved(id);
       })
       .catch(() => {
         // Handled, not ignored: `mutateAsync` rejects on a refused create, and `started.current` is
-        // already `true`, so nothing here retries. Left uncaught, this would be an unhandled
-        // rejection on top of a resolver that then renders `null` forever with no explanation. There
-        // is nothing further to do in the catch itself — `createBotChat.error` is the same state a
-        // caught error would otherwise have to be threaded into by hand, and the render below reads
-        // it directly, the same way `startNew` in `bot_.$botChatId.tsx` leaves its own throw for
+        // already `true`, so nothing here retries. Left uncaught it would be an unhandled rejection,
+        // and empty it stays, because there is nothing for the body to do that is not already done —
+        // `createBotChat.error` is the same state a caught error would otherwise have to be threaded
+        // into by hand, and the render below reads it directly, the same way `startNew` in
+        // `bot_.$botChatId.tsx` leaves its own throw for
         // `createBotChat.error` to say out loud. `attemptAdoption` never rejects — every failure
         // inside it is caught and folded into `{ adopted: null }`, so a caught rejection here still
         // only ever comes from the create branch, exactly as before this function had adoption in
         // front of it.
       });
-    return () => {
-      current = false;
-    };
+    /*
+     * No cleanup, deliberately, and this effect has nothing left that a cleanup could safely do: the
+     * only cancellation this resolution honours is unmount, which the mount-only effect above owns.
+     * A cleanup here would fire on every dependency change and put the defect back.
+     */
   }, [
     agentId,
     adoptBotChatMutate,
     createBotChatMutate,
     legacyThreadId,
     mostRecent,
-    navigate,
     roster.data,
   ]);
+
+  /*
+   * The redirect, as an effect on the resolved id rather than a call from inside the `.then` above.
+   *
+   * Nothing about the resolution can take it away: `resolved` is state, `navigate` from
+   * `useNavigate` is stable across renders, and an unmounted component runs no effects at all — so
+   * this fires once per resolution, and only for a screen that is still on screen.
+   *
+   * `replace`, not a push, and that is a Back-button fix rather than a preference. `/bot` renders no
+   * conversation of its own; it resolves and redirects. A pushed entry therefore made Back a trap:
+   * back to `/bot`, which resolves and redirects forwards again, leaving no way past it to wherever
+   * the person actually came from.
+   */
+  useEffect(() => {
+    if (resolved === null) return;
+    void navigate({
+      to: "/bot/$botChatId",
+      params: { botChatId: resolved },
+      replace: true,
+    });
+  }, [navigate, resolved]);
 
   /*
    * A sentence instead of nothing when the roster failed to load or a create was refused, for the
    * same reason the unknown-Bot guard in `RouteComponent` above answers a bad `?agent=` in a
    * sentence rather than a crash: this app has no toast, so silence here would read as the app
-   * ignoring what happened rather than as the app having tried. Checked ahead of the resolving
-   * state below, not folded into `shouldResolveBotChat`: the effect asks "is it safe to act", this
-   * asks "is there something to say instead of nothing", and a roster that is still failing
-   * answers "no" to the first and "yes" to the second at the same time.
+   * ignoring what happened rather than as the app having tried. Not folded into
+   * `shouldResolveBotChat`: the effect asks "is it safe to act", this asks "is there something to
+   * say instead of nothing", and a roster that is still failing answers "no" to the first and "yes"
+   * to the second at the same time.
    *
    * `adoptBotChat.error` is deliberately not in this list. A failed adoption is not this screen's
    * failure to report: `resolve` above already falls through to opening or creating when
@@ -296,14 +422,38 @@ function BotResolver({ agentId }: { agentId: string }) {
    * it here would turn a quiet, retryable fallback into a blocking error sentence for a problem that
    * already has a recovery path.
    */
-  const failure = roster.error ?? createBotChat.error;
-  if (failure) {
+  const view = resolverView({
+    resolved,
+    failure: roster.error ?? createBotChat.error,
+  });
+
+  /*
+   * Resolved, and still here. On the ordinary path this is one frame between the redirect being
+   * asked for and the router arriving, which is why it reads as an opening rather than as an alarm.
+   * It exists for the path that is not ordinary: a conversation that was resolved — or created — and
+   * a redirect that did not happen used to render as `null`, indistinguishable from still loading and
+   * from a screen that had given up, with no error to read because nothing had failed. The link is
+   * the way out of that by hand, and it carries the same `replace` for the same reason the effect
+   * above does.
+   */
+  if (view.kind === "opening") {
     return (
-      <div className="flex h-screen items-center justify-center p-6">
-        <p className="text-muted-foreground text-sm">{failure.message}</p>
-      </div>
+      <Notice>
+        Opening this conversation.{" "}
+        <Link
+          className="underline"
+          params={{ botChatId: view.botChatId }}
+          replace
+          to="/bot/$botChatId"
+        >
+          Open it now
+        </Link>{" "}
+        if this screen stays where it is.
+      </Notice>
     );
   }
+
+  if (view.kind === "failed") return <Notice>{view.message}</Notice>;
 
   /*
    * Nothing to render while this resolves, for the same reason the screen this replaced rendered
