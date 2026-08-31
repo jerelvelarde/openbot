@@ -29,6 +29,8 @@ import {
 
 function event(overrides: Partial<ChannelActivityEvent> = {}) {
   return {
+    kind: "channel",
+    id: "channel_1",
     channelId: "channel_1",
     memberIds: ["user-1"],
     lastMessage: "Said something.",

@@ -41,8 +41,8 @@ import {
 } from "../roster/preview";
 import {
   CHANNEL_ACTIVITY_TOPIC,
-  type ChannelActivityEvent,
   type ChannelEventHub,
+  type RosterActivityEvent,
 } from "./events";
 import { upgradeWebSocket } from "./socket";
 import type { ThreadIdentity } from "./thread-identity";
@@ -398,7 +398,9 @@ export function createChannelStore(
            * and nobody else. The hub delivers by that list, which is what carries the pin across
            * this person's own tabs and replicas without putting it on anybody else's roster.
            */
-          const event: ChannelActivityEvent = {
+          const event: RosterActivityEvent = {
+            kind: "channel",
+            id: channelId,
             channelId,
             memberIds: [actor.id],
             lastMessage: null,
@@ -489,7 +491,9 @@ export function createChannelStore(
            * this, a second tab and a second replica keep rendering a row whose channel no longer
            * resolves until something else makes them refetch.
            */
-          const event: ChannelActivityEvent = {
+          const event: RosterActivityEvent = {
+            kind: "channel",
+            id: channelId,
             channelId,
             memberIds: members.map((member) => member.userId),
             lastMessage: null,
@@ -577,7 +581,9 @@ export function createChannelStore(
           // Announced inside the transaction, so it is delivered on commit and a write that rolls
           // back is never announced. The payload carries the members because the writer has already
           // resolved them; NOTIFY caps at 8000 bytes, which a 200-character preview leaves room in.
-          const event: ChannelActivityEvent = {
+          const event: RosterActivityEvent = {
+            kind: "channel",
+            id: channelId,
             channelId,
             memberIds: members.map((member) => member.userId),
             lastMessage,
@@ -602,9 +608,18 @@ export class ChannelNotFoundError extends Error {
 }
 
 export class ChannelPackageOwnedError extends Error {
-  constructor(id: string) {
+  /**
+   * What was refused, for the sentence a person reads.
+   *
+   * Defaulted to `deleted` so the existing delete path and its test are untouched. Archiving refused
+   * with the word "deleted" in it would send somebody looking for a deletion nobody attempted.
+   */
+  readonly act: string;
+
+  constructor(id: string, act = "deleted") {
     super(`Channel ${id} is defined by the deployment package.`);
     this.name = "ChannelPackageOwnedError";
+    this.act = act;
   }
 }
 
@@ -911,8 +926,7 @@ function mapStoreError(context: Context, error: unknown): Response {
   if (error instanceof ChannelPackageOwnedError) {
     return context.json(
       {
-        error:
-          "This channel is defined by the deployment package, so it cannot be deleted here.",
+        error: `This channel is defined by the deployment package, so it cannot be ${error.act} here.`,
       },
       409,
     );
