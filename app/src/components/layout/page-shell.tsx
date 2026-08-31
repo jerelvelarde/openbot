@@ -3,6 +3,7 @@ import { Link, type LinkProps } from "@tanstack/react-router";
 import type * as React from "react";
 import { cn } from "@/lib/utils";
 import { Button } from "../ui/button";
+import { SidebarToggle } from "./sidebar-toggle";
 
 /**
  * The frame every configuration screen sits in.
@@ -77,8 +78,19 @@ export function PageShell({
      * sections reachable and no scrollbar anywhere.
      */
     <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
-      {!!backButton && (
-        <div className="max-w-7xl w-full h-14 flex items-center px-3">
+      {/*
+       * The bar is unconditional. The sidebar toggle has to sit at the pane's left edge in both
+       * states, and the prose column is centred — a toggle inside it would be 400px from the edge it
+       * belongs to on a wide screen. The screens with a Back link already drew exactly this bar, so
+       * this is that bar always rendered rather than a second one above it.
+       *
+       * It sits inside the scroller above, so on a page taller than the window it scrolls away with
+       * the content, exactly as the Back link always has. The shortcut still works, and the sidebar
+       * itself carries no control that a collapse would hide.
+       */}
+      <div className="max-w-7xl w-full h-14 flex items-center gap-1 px-3">
+        <SidebarToggle />
+        {!!backButton && (
           <Button
             variant="ghost"
             render={(props) => <Link {...backButton.linkProps} {...props} />}
@@ -86,12 +98,11 @@ export function PageShell({
             <IconChevronLeft />
             {backButton.label}
           </Button>
-        </div>
-      )}
+        )}
+      </div>
       <div
         className={cn(
-          "mx-auto flex w-full flex-col px-4 py-12",
-          { "pt-8": !!backButton },
+          "mx-auto flex w-full flex-col px-4 pt-8 pb-12",
           WIDTHS[width],
           className,
         )}

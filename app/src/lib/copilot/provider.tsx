@@ -6,6 +6,7 @@ import { EscalationTool } from "./escalation-tool";
 import { GalleryTools } from "./gallery-tools";
 import { HandoffTool } from "./handoff-tool";
 import { SandboxedTools } from "./sandboxed-tools";
+import { SkillTools } from "./skill-tools";
 
 /**
  * The CopilotKit client, wrapped once for the whole authenticated app.
@@ -37,6 +38,8 @@ export function CopilotProvider({ children }: { children: ReactNode }) {
         <GalleryTools />
         {/* Browser-authored components use the same component grants as the compiled gallery. */}
         <SandboxedTools />
+        {/* Offered only on a Bot holding the skill-creator skill; see skill-tools.tsx. */}
+        <SkillTools />
         {children}
       </ActiveBotProvider>
     </CopilotKitProvider>
