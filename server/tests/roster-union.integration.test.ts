@@ -1,6 +1,6 @@
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { createAgentProfileStore } from "../src/agents/profile-store";
 import type { AgentActor } from "../src/agents/profile-types";
 import { createBotChatStore } from "../src/bot-chats/store";
@@ -11,10 +11,12 @@ import {
   agentProfiles,
   agents,
   botChats,
+  channelAgents,
   channels,
   intelligenceChannelMappings,
   users,
 } from "../src/db/schema";
+import { recencyCursorText } from "../src/roster/order";
 import { MAX_ROSTER_PAGE } from "../src/roster/preview";
 import { createRosterStore } from "../src/roster/query";
 import { TEST_POOL } from "./support/database";
@@ -424,5 +426,269 @@ describe("the roster", () => {
     // Both kinds report a retired coworker the same way: the conversation stays readable, and says so.
     expect(page.items).toHaveLength(2);
     expect(page.items.every((item) => item.active === false)).toBe(true);
+  });
+  /**
+   * Move a conversation's recency to an exact instant, microseconds included.
+   *
+   * Written as SQL rather than through a store, because the whole point is a stamp a JS `Date` cannot
+   * hold: handing drizzle a `Date` would round-trip through milliseconds on the way in and the row
+   * would never carry the microseconds the test is about. `last_message_at` is cleared with it so
+   * `coalesce` resolves to the stamp rather than to whatever the store last wrote.
+   */
+  async function setRecency(
+    table: "channels" | "bot_chats",
+    id: string,
+    stamp: string,
+  ) {
+    const target = table === "channels" ? channels : botChats;
+    await database.execute(
+      sql`update ${target} set created_at = ${stamp}::timestamptz, last_message_at = null where id = ${id}`,
+    );
+  }
+
+  test("pages rows whose recency differs by less than a millisecond exactly once", async () => {
+    /*
+     * A JS `Date` cannot hold a microsecond and `timestamptz` can, so a cursor minted from the decoded
+     * `Date` floors the page boundary downward. The next page's strict `<` then excludes every row
+     * inside the floored-off remainder, and because a floor only ever loses rows there is no duplicate
+     * to notice it by: page two came back empty with `nextCursor: null` and two of these three
+     * conversations were reachable from no page at all.
+     */
+    const userId = await seedUser();
+    const actor = actorFor(userId);
+    const agentId = await seedProfile();
+
+    // Newest first, all three inside one millisecond.
+    const stamps = [
+      "2026-08-31T09:00:00.123900Z",
+      "2026-08-31T09:00:00.123500Z",
+      "2026-08-31T09:00:00.123100Z",
+    ];
+    const ids: string[] = [];
+    for (const stamp of stamps) {
+      const chat = await botChatStore.create(actor, agentId);
+      createdBotChatIds.push(chat.id);
+      await setRecency("bot_chats", chat.id, stamp);
+      ids.push(chat.id);
+    }
+
+    expect(await walk(actor, 1)).toEqual(ids);
+  });
+
+  test("pages conversations made in one transaction exactly once", async () => {
+    /*
+     * The production trigger, not a contrivance. `tenant-package.ts` inserts every channel a package
+     * defines inside a single transaction, so `now()` — and with it `created_at`, and with it the
+     * recency of a channel nobody has spoken in — is byte-identical across all of them, microseconds
+     * included. A tenant whose package defines more channels than fit on one page lost the remainder
+     * from its sidebar permanently.
+     */
+    const userId = await seedUser();
+    const actor = actorFor(userId);
+    const agentId = await seedProfile();
+
+    const ids: string[] = [];
+    for (let index = 0; index < 4; index += 1) {
+      const channel = await channelStore.create(actor, [agentId]);
+      createdChannelIds.push(channel.id);
+      ids.push(channel.id);
+      await setRecency("channels", channel.id, "2026-08-31T09:00:00.123456Z");
+    }
+
+    // One shared instant, so `id` breaks every tie and the sort key descends throughout.
+    const expected = [...ids].sort().reverse();
+    expect(await walk(actor, 2)).toEqual(expected);
+  });
+
+  test("carries a cursor timestamp that reparses to the same instant in any session", async () => {
+    /*
+     * `to_char` renders a `timestamptz` in the session's `TimeZone`, and `::text` in its `DateStyle`
+     * as well. Neither is ours to set, and this deployment does not: a cursor that only reparsed
+     * correctly under `UTC`/`ISO` would page correctly on the author's machine and silently
+     * mis-compare on a server configured differently. Asserted against the database rather than
+     * reasoned about, because the claim is about Postgres' formatter and not about ours.
+     */
+    const stamps = [
+      "2026-08-31T12:34:56.123456Z",
+      "2026-08-31T12:34:56.000001Z",
+      "2026-01-02T03:04:05Z",
+      "9999-12-31T23:59:59.999999Z",
+    ];
+
+    for (const zone of [
+      "UTC",
+      "America/New_York",
+      "Asia/Kolkata",
+      "Pacific/Chatham",
+    ]) {
+      for (const dateStyle of [
+        "ISO, MDY",
+        "ISO, DMY",
+        "Postgres, DMY",
+        "SQL, DMY",
+        "German, DMY",
+      ]) {
+        await database.transaction(async (transaction) => {
+          // `set local`, so the settings unwind with the transaction rather than staying on a pooled
+          // connection for whichever test picks it up next.
+          await transaction.execute(sql.raw(`set local time zone '${zone}'`));
+          await transaction.execute(
+            sql.raw(`set local datestyle to '${dateStyle}'`),
+          );
+          for (const stamp of stamps) {
+            const key = recencyCursorText(sql`${stamp}::timestamptz`);
+            const [row] = await transaction.execute(
+              sql`select ${key} as key, (${key})::timestamptz = ${stamp}::timestamptz as same`,
+            );
+            expect(row?.same).toBe(true);
+            expect(row?.key).toBe(
+              stamp.replace("Z", "").includes(".")
+                ? `${stamp.slice(0, -1).padEnd(26, "0")}Z`
+                : `${stamp.slice(0, -1)}.000000Z`,
+            );
+          }
+        });
+      }
+    }
+  });
+
+  test("reads a cursor whose timestamp is not one as the first page", async () => {
+    /*
+     * It reaches Postgres as `'lol'::timestamptz`, which answers `invalid input syntax for type
+     * timestamp with time zone` from inside the read. `roster/routes.ts` registers no `onError`, so
+     * that surfaced as a bare 500 rather than as the first page both docblocks promise.
+     */
+    const userId = await seedUser();
+    const actor = actorFor(userId);
+    const agentId = await seedProfile();
+    const chat = await botChatStore.create(actor, agentId);
+    createdBotChatIds.push(chat.id);
+
+    for (const recency of ["lol", "2026-02-30T00:00:00.000Z", ""]) {
+      const cursor = Buffer.from(
+        JSON.stringify({ pinned: false, recency, id: "channel_x" }),
+        "utf8",
+      ).toString("base64url");
+      const page = await rosterStore.list(actor, { cursor });
+      expect(page.items.map((item) => item.id)).toEqual([chat.id]);
+    }
+  });
+
+  test("keeps a channel on the roster while it has no Bots", async () => {
+    /*
+     * `channel_agents` is deleted and reinserted on every tenant-package sync, so a channel with no
+     * rows there is reachable. Phase 1 chose the page from `channels` and `channel_memberships`
+     * alone while phase 2 inner-joined `channel_agents`, so such a channel was chosen, failed to
+     * hydrate, and was dropped — while still consuming its slot on every page, for good. Four
+     * channels in this state returned an empty roster across two pages.
+     */
+    const userId = await seedUser();
+    const actor = actorFor(userId);
+    const agentId = await seedProfile();
+
+    // The bot chat first, so the channel with no Bots is the newer of the two and therefore the row a
+    // page of one has to hold. A slot the roster wastes is only visible when something is behind it.
+    const other = await botChatStore.create(actor, agentId);
+    createdBotChatIds.push(other.id);
+    const channel = await channelStore.create(actor, [agentId]);
+    createdChannelIds.push(channel.id);
+
+    await database
+      .delete(channelAgents)
+      .where(eq(channelAgents.channelId, channel.id));
+
+    const page = await rosterStore.list(actor, { limit: 1 });
+
+    expect(page.items.map((item) => item.id)).toEqual([channel.id]);
+    expect(page.items[0]?.agentIds).toEqual([]);
+    // Nothing has been retired: a channel with no coworkers in it has none to report as gone.
+    expect(page.items[0]?.active).toBe(true);
+    expect(await walk(actor, 1)).toEqual([channel.id, other.id]);
+  });
+
+  test("names a bot chat after the Bot when its title says nothing", async () => {
+    /*
+     * `??` does not fire on `""`, so a title that flattened to nothing rendered the row nameless
+     * rather than falling back to the Bot's name. Whether `titleOf` can still produce `""` is
+     * `roster/preview.ts`'s business; a row that has one must not go out unnamed either way.
+     */
+    const userId = await seedUser();
+    const actor = actorFor(userId);
+    const agentId = await seedProfile("Risk Analyst");
+    const chat = await botChatStore.create(actor, agentId);
+    createdBotChatIds.push(chat.id);
+
+    await database
+      .update(botChats)
+      .set({ title: "" })
+      .where(eq(botChats.id, chat.id));
+
+    expect((await rosterStore.list(actor)).items[0]?.name).toBe("Risk Analyst");
+  });
+
+  test("pages a list one branch of the union dominates without losing the other", async () => {
+    /*
+     * Each branch of the union now carries the order and the limit, so Postgres reads a bounded top-N
+     * per kind instead of every conversation this person has before discarding all but a page. The
+     * global top-N is always contained in the union of the per-branch top-Ns, so that is exact — but
+     * only if each branch really is ordered and limited on its own rather than the ORDER BY binding
+     * to the whole set operation, which would make each branch's contribution arbitrary. Six channels
+     * ahead of one bot chat is the shape that tells the difference: the bot chat is last in the global
+     * order and first in its own branch's.
+     */
+    const userId = await seedUser();
+    const actor = actorFor(userId);
+    const agentId = await seedProfile();
+
+    const base = Date.now();
+    const ids: string[] = [];
+    for (let index = 0; index < 6; index += 1) {
+      const channel = await channelStore.create(actor, [agentId]);
+      createdChannelIds.push(channel.id);
+      await channelStore.recordActivity(actor, channel.id, {
+        text: `Channel ${index}`,
+        agentId: null,
+        at: new Date(base - index * 1000),
+      });
+      ids.push(channel.id);
+    }
+    const chat = await botChatStore.create(actor, agentId);
+    createdBotChatIds.push(chat.id);
+    await botChatStore.recordActivity(actor, chat.id, {
+      text: "Oldest",
+      agentId: null,
+      at: new Date(base - 60_000),
+    });
+    ids.push(chat.id);
+
+    expect(await walk(actor, 2)).toEqual(ids);
+  });
+
+  test("does not let a channel with no thread mapping consume a page slot", async () => {
+    /*
+     * The other half of the same disagreement. A roster row carries a `threadId`, which
+     * `hydrateChannels` gets from `intelligence_channel_mappings`, so a channel without that row for
+     * this person cannot become a roster item — but phase 1 chose the page without asking, so such a
+     * channel was chosen, dropped, and still counted against the page. `channel-archive.integration
+     * .test.ts` inserts exactly this shape, a membership with no mapping, which is how it got noticed.
+     */
+    const userId = await seedUser();
+    const actor = actorFor(userId);
+    const agentId = await seedProfile();
+
+    const other = await botChatStore.create(actor, agentId);
+    createdBotChatIds.push(other.id);
+    const channel = await channelStore.create(actor, [agentId]);
+    createdChannelIds.push(channel.id);
+
+    await database
+      .delete(intelligenceChannelMappings)
+      .where(eq(intelligenceChannelMappings.channelId, channel.id));
+
+    // The channel is the newer of the two and unbuildable, so a page of one must skip past it to the
+    // bot chat rather than hand back an empty page that claims there is nothing else.
+    const page = await rosterStore.list(actor, { limit: 1 });
+    expect(page.items.map((item) => item.id)).toEqual([other.id]);
+    expect(await walk(actor, 1)).toEqual([other.id]);
   });
 });

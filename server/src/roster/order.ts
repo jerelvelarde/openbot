@@ -7,9 +7,14 @@ import { channels } from "../db/schema";
  *
  * ONE HOME, ON PURPOSE. This rule is mirrored in the browser twice, by `byRecency` in
  * `use-channel-events.ts` and `pinnedFirst` in `app-sidebar.tsx`, and each of those carries a comment
- * saying it must agree with this or the list reorders itself the moment a socket event arrives. Two
- * entity kinds now sort by it. Leaving the SQL half inside `channels/routes.ts` would have left a
- * second server-side definition that bot chats had to be kept in step with by hand.
+ * saying it must agree with this or the list reorders itself the moment a socket event arrives.
+ *
+ * Every piece a server-side reader needs is exported from here: the recency expression, the pin rank,
+ * the ORDER BY, the keyset predicate, and the text the cursor carries. Three reads apply the rule —
+ * `roster/query.ts`'s two union branches and `ChannelStore.list` — and an earlier draft exported only
+ * the first three, which left each of those three spelling out the same row comparison inline. Two
+ * kinds paging by two hand-copied predicates is the failure this module exists to prevent, so the
+ * predicate is a function here rather than a comment asking callers to keep four lines in step.
  */
 
 /**
@@ -18,11 +23,17 @@ import { channels } from "../db/schema";
  * A conversation somebody just made has nothing said in it yet and is the one they are about to type
  * in, so ordering on the message alone would bury it under everything that has one.
  *
- * Written against `channels` because that is where it started and where the matching index is
- * declared. The bot chat branch builds the same expression over its own two columns; the shape is
- * what has to agree, not the identifiers.
+ * Takes the two columns rather than naming one table's, because every table the roster reads keeps
+ * this pair under the same two names and declares its own index on this expression:
+ * `channels_recent_activity_idx` and `bot_chats_recent_activity_idx`. The shape is what has to agree,
+ * not the identifiers, and taking the columns is what makes agreeing the only available option.
  */
-export const RECENCY = sql`coalesce(${channels.lastMessageAt}, ${channels.createdAt})`;
+export function recencyOf(lastMessageAt: PgColumn, createdAt: PgColumn): SQL {
+  return sql`coalesce(${lastMessageAt}, ${createdAt})`;
+}
+
+/** The recency expression over `channels`, which is the table two of the three reads want. */
+export const RECENCY = recencyOf(channels.lastMessageAt, channels.createdAt);
 
 /**
  * A pin as a number, so the whole sort key can descend.
@@ -46,12 +57,44 @@ export function rosterOrder(rank: SQL, recency: SQL, id: PgColumn): SQL[] {
 }
 
 /**
+ * The sort key's timestamp as the cursor carries it: text, at the precision Postgres actually stores.
+ *
+ * A JS `Date` holds milliseconds and `timestamptz` holds microseconds, and the driver decodes one
+ * into the other. `created_at` defaults from `now()`, which carries microseconds, so minting the
+ * cursor from the decoded `Date` floored the page boundary downward; the next page's strict `<` then
+ * excluded every row whose true recency fell inside the discarded remainder. Those rows were served
+ * on no page at all, and because a floor only ever loses rows there was no duplicate to notice it by.
+ *
+ * That is not a contrived race. `tenant-package.ts` inserts every channel a package defines inside
+ * one transaction, so `now()` — and with it `created_at`, and with it the recency of a channel nobody
+ * has spoken in — is byte-identical across all of them. A tenant whose package defines more channels
+ * than fit on one page lost the remainder from its sidebar permanently.
+ *
+ * So the value never becomes a `Date`. Postgres formats it, the string is carried through the cursor
+ * unparsed, and `rosterCursorFilter` hands it back for `::timestamptz` to read again.
+ *
+ * ANCHORED TO UTC, AND STAMPED WITH A LITERAL `Z`, rather than rendered with `OF` or a bare `::text`.
+ * Both of those render in the session's `TimeZone`, and `::text` in its `DateStyle` as well, neither
+ * of which is ours to depend on; `OF` additionally truncates a zone offset to whole minutes, which
+ * loses the seconds an LMT-era offset carries and reparses to a different instant. `at time zone
+ * 'UTC'` fixes the rendering to one zone instead. `roster-union.integration.test.ts` asserts the
+ * round trip against the database under four `TimeZone` values and five `DateStyle` values rather
+ * than taking this paragraph's word for it.
+ */
+export function recencyCursorText(recency: SQL): SQL<string> {
+  return sql<string>`to_char(${recency} at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`;
+}
+
+/**
  * Where a page stopped: every part of the sort, in sort order.
  *
  * `pinned` leads because the ordering does. A keyset cursor has to name the whole sort key or the
  * next page is selected by a different rule than the page it follows, which serves some rows twice
  * and others never. `recency` and `id` are both here for the same reason: two rows can share a
  * timestamp.
+ *
+ * `recency` is a string because it is Postgres' own rendering of the boundary, kept out of JS number
+ * types on purpose. See `recencyCursorText`.
  *
  * No `kind`. Ids are prefixed (`channel_...`, `botchat_...`) and therefore globally unique, so `id`
  * still breaks every tie on its own. That is what lets one cursor page through a mixed list.
@@ -63,10 +106,77 @@ export function encodeRosterCursor(cursor: RosterCursor): string {
 }
 
 /**
+ * Where a page starts, as a predicate over whichever read is asking.
+ *
+ * One row comparison over the whole sort key, which only reads as "everything after the cursor"
+ * because every part of that key descends. See `rosterOrder`.
+ *
+ * Takes the expressions rather than naming columns, for the reason `pinnedRank` gives: the two kinds
+ * keep their pin and their recency in different places.
+ *
+ * The boundary timestamp is bound as the string the cursor carries and cast here, never parsed in
+ * TypeScript on the way past. That is the whole point of `recencyCursorText`, and doing the cast in
+ * this one function is what keeps a caller from undoing it.
+ */
+export function rosterCursorFilter(
+  cursor: RosterCursor | undefined,
+  rank: SQL,
+  recency: SQL,
+  id: PgColumn,
+): SQL | undefined {
+  if (!cursor) return undefined;
+  return sql`(${rank}, ${recency}, ${id}) < (${cursor.pinned ? 1 : 0}::int, ${cursor.recency}::timestamptz, ${cursor.id})`;
+}
+
+/**
+ * A cursor timestamp, shaped as `recencyCursorText` writes it.
+ *
+ * One to six fractional digits, so a cursor minted before that function existed is still accepted:
+ * `Date.prototype.toISOString` wrote three, and a link somebody has open across the deploy names a
+ * real position in an ordering that has not changed.
+ */
+const CURSOR_RECENCY =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,6})?Z$/;
+
+/**
+ * Whether Postgres will read this as a timestamp, decided here rather than by letting it try.
+ *
+ * The shape alone is not enough: `2026-02-30T00:00:00Z` matches it and `timestamptz` answers `date/
+ * time field value out of range`. So the fields are put back together and compared against what came
+ * in, which is what catches a component that rolled over into the following month.
+ *
+ * Built through `setUTCFullYear` rather than `Date.UTC`, which maps years 0 through 99 onto 1900
+ * through 1999 and would therefore reject the year 1 as a rollover it is not.
+ */
+function readsAsTimestamp(value: string): boolean {
+  const parts = CURSOR_RECENCY.exec(value);
+  if (!parts) return false;
+  const [year, month, day, hour, minute, second] = parts
+    .slice(1, 7)
+    .map(Number) as [number, number, number, number, number, number];
+  const at = new Date(0);
+  at.setUTCFullYear(year, month - 1, day);
+  at.setUTCHours(hour, minute, second, 0);
+  return (
+    at.getUTCFullYear() === year &&
+    at.getUTCMonth() === month - 1 &&
+    at.getUTCDate() === day &&
+    at.getUTCHours() === hour &&
+    at.getUTCMinutes() === minute &&
+    at.getUTCSeconds() === second
+  );
+}
+
+/**
  * A malformed cursor reads as the first page, which is the honest answer to a stale link.
  *
  * A cursor minted before part of the sort key existed is malformed by this definition, and
  * deliberately: it describes a position in an ordering this query no longer has.
+ *
+ * `recency` is checked for what it is and not merely for being a string, because it reaches Postgres
+ * as `'...'::timestamptz`. A cursor somebody edited by hand used to fail there, deep inside the read,
+ * with `invalid input syntax for type timestamp with time zone`; `roster/routes.ts` registers no
+ * `onError`, so Hono answered a bare 500 — the opposite of the first page this docblock promises.
  */
 export function decodeRosterCursor(
   value: string | undefined,
@@ -78,6 +188,7 @@ export function decodeRosterCursor(
     ) as RosterCursor;
     return typeof parsed?.id === "string" &&
       typeof parsed?.recency === "string" &&
+      readsAsTimestamp(parsed.recency) &&
       typeof parsed?.pinned === "boolean"
       ? parsed
       : undefined;
