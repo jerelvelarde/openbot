@@ -61,7 +61,35 @@ test("a read marker after the last message means nothing is unseen", () => {
   ).toBe(false);
 });
 
-test("your own last message never counts as unseen", () => {
+test("a read marker stamped at exactly the last message means nothing is unseen", () => {
+  // The boundary is not academic: `patchRosterRead` (app/src/lib/roster/read-marker.ts) deliberately
+  // stamps `lastReadAt` to *exactly* `lastMessageAt` when the writer's clock is ahead of the
+  // reader's, so this is the one comparison the read marker manufactures on purpose. Relax the
+  // predicate's `>` to `>=` and the dot would stay lit forever on precisely the rows that guard
+  // exists to fix — and every other test here would still pass.
+  expect(
+    hasUnseenActivity(
+      channel({
+        lastMessageAt: "2026-08-25T12:00:00.000Z",
+        lastReadAt: "2026-08-25T12:00:00.000Z",
+      }),
+    ),
+  ).toBe(false);
+});
+
+test("a null agent id means a person, and today that person can only be you", () => {
+  /*
+   * NOT "your own message". `lastMessageAgentId` is null for a person — any person: the column
+   * stores which agent spoke and no user id at all (see `Null for a person` on `messages` in
+   * server/src/db/schema/core.ts), while `channel_memberships` is keyed on (channel_id, user_id) and
+   * is multi-member by design, which is why deleting and archiving are worded "for everyone in it".
+   *
+   * So this asserts the predicate's behaviour, not the reading a person would put on it. It happens
+   * to be the same thing today only because the server's one membership insert
+   * (server/src/channels/routes.ts) writes the creator and nobody else, so a channel has exactly one
+   * member. The first time a second member exists, a teammate's message will raise no dot — and this
+   * test is the place to notice that rather than a place that has quietly sanctioned it.
+   */
   expect(hasUnseenActivity(channel({ lastMessageAgentId: null }))).toBe(false);
 });
 

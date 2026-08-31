@@ -21,11 +21,16 @@ function channel(id: string, pinned: boolean): RosterItem {
   };
 }
 
-test("holds pinned channels at the top, newest-activity order preserved within each group", () => {
+test("holds pinned channels at the top, leaving each group in its arrival order", () => {
   /*
    * Interleaved, which is what the cache can hold between refetches: the server hands back
    * pinned-first, and then the socket patches a pin onto a loaded row without moving it, or re-sorts
    * a page by recency alone. This function is the render-level mirror that closes that window.
+   *
+   * A STABLE PARTITION IS ALL THIS CLAIMS. Recency is the server's rule and the socket patcher's; it
+   * is not this function's, and these fixtures could not test it if it were — every row here shares a
+   * `createdAt` and has no `lastMessageAt` at all. What is asserted is that a, c, e come out in that
+   * order and b, d in theirs, which is what "whatever arrived" means.
    */
   const channels = [
     channel("a", false),

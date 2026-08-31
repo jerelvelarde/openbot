@@ -8,7 +8,7 @@ import {
 } from "@tabler/icons-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
-import { memo, useState, type ReactNode } from "react";
+import { memo, type ReactNode, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
   ContextMenu,
@@ -84,6 +84,68 @@ export function menuFor(row: { archived: boolean; pinned: boolean }) {
     "delete",
   ] as const;
 }
+
+/** What a row can say about itself, beside its name and its last line. */
+export type RowMarker = "unread" | "archived" | "pinned";
+
+/**
+ * Which state markers this row shows, in the order they sit on the row.
+ *
+ * ARCHIVED HAS TO BE VISIBLE. `All` holds archived and live rows together, and an archived row that
+ * looks identical to a live one leaves right-clicking it and reading whether the menu offers Archive
+ * or Restore as the only way to tell the two apart — which guts the tab, and the tri-state filter
+ * with it. The row already knew: `archived` arrives on it, and `menuFor` was its only reader.
+ *
+ * Shown in every list rather than only in `All`, because it is a fact about the row and not about
+ * which list the row came in on — which is why `archived` is carried per row at all (see the note on
+ * it in roster/queries.ts). Under `Archived` that repeats what the pressed button says,
+ * the way the pin repeats itself on every pinned row in every list; repetition is not wrongness, and
+ * the alternative is a row whose appearance depends on where it is being looked at.
+ *
+ * State about the message comes before state about the row, so the unread dot sits first.
+ *
+ * Returned as a list and iterated at the render site rather than written out as three conditionals
+ * there, for the same reason `menuFor` is: the rule then has one home, and it is a home a test can
+ * reach without a browser.
+ */
+export function rowMarkers(row: {
+  unread: boolean;
+  archived: boolean;
+  pinned: boolean;
+}): RowMarker[] {
+  const markers: RowMarker[] = [];
+  if (row.unread) markers.push("unread");
+  if (row.archived) markers.push("archived");
+  if (row.pinned) markers.push("pinned");
+  return markers;
+}
+
+/**
+ * What each marker looks like.
+ *
+ * Elements, keyed here, rather than a component per marker: the three have nothing in common — a
+ * dot, a word, an icon — so a shared wrapper would exist only to hold the key, and would add a gap
+ * to the row for every marker it wrapped.
+ */
+const MARKER_META: Record<RowMarker, ReactNode> = {
+  unread: (
+    <span className="size-2 shrink-0 rounded-full bg-primary" key="unread" />
+  ),
+  archived: (
+    <span
+      className="shrink-0 rounded bg-muted-foreground/10 px-1 text-[10px] text-muted-foreground/80 leading-4"
+      key="archived"
+    >
+      Archived
+    </span>
+  ),
+  pinned: (
+    <IconPinFilled
+      className="size-3 shrink-0 text-muted-foreground/70"
+      key="pinned"
+    />
+  ),
+};
 
 /**
  * Label and icon for the two toggle acts `menuFor` can name.
@@ -174,16 +236,23 @@ export const RosterRow = memo(function RosterRow({
 
   const [confirming, setConfirming] = useState(false);
   /**
-   * Why a pin did not take, said on the row it was asked of.
+   * Why the last pin, archive or restore did not take, said on the row it was asked of.
    *
-   * Pinning used to fail in total silence: the menu closed, the pin did not move, and nothing on
-   * screen accounted for it — which reads as the app ignoring the click. There is no toast in this
-   * app, and the row is where the person was looking, so the sentence goes here and is replaced by
-   * the next attempt.
+   * These used to fail in total silence: the menu closed, nothing moved, and nothing on screen
+   * accounted for it — which reads as the app ignoring the click. There is no toast in this app, and
+   * the row is where the person was looking, so the sentence goes here.
+   *
+   * ONE SENTENCE, NOT ONE PER ACT. Pin and archive held a state each, and each was cleared only by
+   * the next attempt at its own act — so a refused pin sat under this row through a successful
+   * archive, through every navigation (the row does not unmount), for the rest of the session, with
+   * nothing a person could do about it. Holding one makes every act's clear the same clear, and
+   * opening the menu clears it too, so a stale refusal goes away the moment somebody looks at the
+   * menu again rather than only when they retry the one act that failed.
+   *
+   * Cleared on open and not on close: the menu closes on the click that starts the mutation, and the
+   * refusal arrives after that, so clearing on close would race the sentence it exists to show.
    */
-  const [pinProblem, setPinProblem] = useState<string | null>(null);
-  /** Same treatment, same reason, for a failed archive or restore. */
-  const [archiveProblem, setArchiveProblem] = useState<string | null>(null);
+  const [problem, setProblem] = useState<string | null>(null);
 
   const confirmDelete = async () => {
     /*
@@ -215,42 +284,45 @@ export const RosterRow = memo(function RosterRow({
   const acts = menuFor({ archived, pinned });
 
   const handlePinClick = () => {
-    setPinProblem(null);
+    setProblem(null);
     if (kind === "channel") {
       channelPinned.mutate(
         { channelId: id, pinned: !pinned },
-        { onError: (thrown) => setPinProblem(thrown.message) },
+        { onError: (thrown) => setProblem(thrown.message) },
       );
     } else {
       botChatPinned.mutate(
         { botChatId: id, pinned: !pinned },
-        { onError: (thrown) => setPinProblem(thrown.message) },
+        { onError: (thrown) => setProblem(thrown.message) },
       );
     }
   };
 
   const handleArchiveClick = () => {
-    setArchiveProblem(null);
+    setProblem(null);
     if (kind === "channel") {
       channelArchived.mutate(
         { channelId: id, archived: !archived },
-        { onError: (thrown) => setArchiveProblem(thrown.message) },
+        { onError: (thrown) => setProblem(thrown.message) },
       );
     } else {
       botChatArchived.mutate(
         { botChatId: id, archived: !archived },
-        { onError: (thrown) => setArchiveProblem(thrown.message) },
+        { onError: (thrown) => setProblem(thrown.message) },
       );
     }
   };
 
   return (
     <>
-      <ContextMenu>
+      <ContextMenu
+        onOpenChange={(open) => {
+          if (open) setProblem(null);
+        }}
+      >
         <ContextMenuTrigger>
           <Link
             {...linkFor({ kind, id })}
-            type="button"
             className="flex flex-row py-2 px-2 gap-2 items-center w-full hover:bg-foreground/5 rounded-lg [contain-intrinsic-size:auto_3.25rem] [content-visibility:auto]"
             activeProps={{
               className: "bg-foreground/5",
@@ -276,13 +348,9 @@ export const RosterRow = memo(function RosterRow({
                 <span className="min-w-0 flex-1 truncate text-[12px] leading-4 text-muted-foreground">
                   {lastMessage}
                 </span>
-                {unread ? (
-                  /* State about the message beats state about the row, so it sits first. */
-                  <span className="size-2 shrink-0 rounded-full bg-primary" />
-                ) : null}
-                {pinned ? (
-                  <IconPinFilled className="size-3 shrink-0 text-muted-foreground/70" />
-                ) : null}
+                {rowMarkers({ unread, archived, pinned }).map(
+                  (marker) => MARKER_META[marker],
+                )}
               </div>
             </div>
           </Link>
@@ -318,14 +386,9 @@ export const RosterRow = memo(function RosterRow({
           )}
         </ContextMenuContent>
       </ContextMenu>
-      {pinProblem ? (
+      {problem ? (
         <p className="px-2 pb-1 text-destructive text-xs" role="alert">
-          {pinProblem}
-        </p>
-      ) : null}
-      {archiveProblem ? (
-        <p className="px-2 pb-1 text-destructive text-xs" role="alert">
-          {archiveProblem}
+          {problem}
         </p>
       ) : null}
       <Dialog

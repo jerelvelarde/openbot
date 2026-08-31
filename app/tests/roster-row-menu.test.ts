@@ -3,6 +3,7 @@ import {
   linkFor,
   menuFor,
   openConversationId,
+  rowMarkers,
 } from "../src/components/app-sidebar/roster-row";
 
 describe("openConversationId", () => {
@@ -66,6 +67,30 @@ describe("menuFor", () => {
       "unpin",
       "archive",
       "delete",
+    ]);
+  });
+});
+
+describe("rowMarkers", () => {
+  test("marks an archived row, so the All list can tell one from a live row", () => {
+    // The All tab holds both kinds of row. Without this marker the only way to tell an archived
+    // conversation from a live one was to right-click it and read whether the menu said Archive or
+    // Restore — which is the tri-state filter's whole point, undone.
+    const live = rowMarkers({ unread: false, archived: false, pinned: false });
+    const archived = rowMarkers({
+      unread: false,
+      archived: true,
+      pinned: false,
+    });
+    expect(archived).toEqual(["archived"]);
+    expect(live).toEqual([]);
+  });
+
+  test("puts state about the message before state about the row", () => {
+    expect(rowMarkers({ unread: true, archived: true, pinned: true })).toEqual([
+      "unread",
+      "archived",
+      "pinned",
     ]);
   });
 });
