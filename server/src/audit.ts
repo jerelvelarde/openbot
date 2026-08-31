@@ -339,6 +339,133 @@ export const auditEventTypes = [
   "bot.deleted",
   "bot.callback_token_issued",
   "bot.callback_token_revoked",
+
+  /*
+   * One Bot handing work to another.
+   *
+   * BOTH OUTCOMES, and the refused one is the more important of the pair. A hop that happened is
+   * visible in the transcript anyway; a hop that was refused is invisible everywhere else, and
+   * "why did this Bot not ask the specialist" is a question somebody asks about an answer that came
+   * back thin. The refusal row names which cap or which missing grant stopped it.
+   *
+   * `agent.handoff_offered` is written when the hop is accepted and made durable, not when the other
+   * Bot answers. The two are minutes apart on a busy cluster, and a trail that only recorded
+   * completion would be silent about work that was accepted and then lost.
+   */
+  "agent.handoff_offered",
+  "agent.handoff_refused",
+  /*
+   * And what became of one, which is a different question from whether it was accepted.
+   *
+   * `delivered` is the other Bot's turn being on record. `failed` is a hop that will be tried again.
+   * `retried` is the one worth its own name: a hop on its second attempt may already have run that
+   * Bot, spent a model call and posted an answer before its owner died, so a person looking at two
+   * similar answers can tell a duplicate from a mystery.
+   */
+  "agent.handoff_delivered",
+  "agent.handoff_failed",
+  "agent.handoff_retried",
+  /*
+   * A Bot asking a person instead.
+   *
+   * The counterpart to the rows above, and the one that says a chain stopped on purpose. Without it
+   * a Bot that correctly refused to guess looks identical to one that ran out of things to try: both
+   * end in a sentence to the person and neither leaves a trace of the decision.
+   *
+   * `agent.escalation_failed` is a question that reached nobody. It is the row worth finding later:
+   * the Bot stopped, the person was never asked, and nothing else anywhere says so.
+   */
+  "agent.escalated",
+  "agent.escalation_failed",
+  /*
+   * A worker's bearer secret did not check out at `/internal/routines/run`, and every routine this
+   * deployment has stopped firing until somebody notices.
+   *
+   * Recorded because that route answers a refusal with the exact same 401 for a missing header, a
+   * wrong secret, and a deployment that never configured one — deliberately, so a caller cannot tell
+   * those apart from the wire. Which means the wire is also the only place this trail could otherwise
+   * be read from, and it was told nothing. `payload.reason` carries the distinction the response
+   * withholds; the offered credential never does.
+   */
+  "routines.dispatch_refused",
+
+  /*
+   * A coworker's configuration leaving this deployment as a file.
+   *
+   * The only record that it happened at all. A template is a document somebody downloads and sends
+   * by whatever means a file travels, so nothing downstream of the click reports back and nothing
+   * in the exported Bot is changed by having been copied; without this row an export is invisible.
+   * `stripped` names the fields the export refused to carry, which is the evidence that the
+   * endpoint, the key and the grants stayed behind rather than being written into the file.
+   *
+   * NEVER THE PROSE AND NEVER A KEY, here or on any row below. A template's whole substance is the
+   * words its author wrote, and this trail is not where they are kept: the payload carries the
+   * slug, the digest and the counts, and a reader who wants the document reads the document. The
+   * key-name redaction below is not what enforces that — it drops `prompt` and `content` and knows
+   * nothing about a field called `description` — so it is enforced where the payload is built.
+   */
+  "template.exported",
+  /**
+   * A document this deployment would not import, and why.
+   *
+   * The row an investigator reaches for, and the reason both outcomes are recorded rather than only
+   * the happy one. An import that succeeded leaves a Bot, its skills and a ledger of what it asked
+   * for, all of which anybody can go and look at. A refusal leaves nothing whatsoever — no Bot, no
+   * skill, no ledger row — so the attempt is unaccounted for everywhere else in the product.
+   *
+   * Which matters because the interesting case is the repeated one. A single paste that failed to
+   * parse is somebody's typo and nobody needs to know. Forty of them in an afternoon, each turned
+   * away for a different reason, is somebody mapping the edges of the parser, and that is only ever
+   * visible to a reader who can count them.
+   *
+   * `reason` is the machine-readable half rather than the sentence shown to the person, so rows can
+   * be grouped by it. `digest` is present only when there was enough of a document to hash — a file
+   * refused on its size never got parsed — and its absence is itself the fact.
+   */
+  "template.import_refused",
+  /*
+   * A Bot that came out of somebody else's file.
+   *
+   * Written after `bot.created` rather than instead of it, so a reader filtering `bot.*` still sees
+   * every Bot that has ever existed here; this row is the extra thing known about one of them.
+   * `digest` names exactly which bytes were read, which is what makes the consent screen mean
+   * anything later: the file on disk may have been edited since.
+   *
+   * `authorClaim` is a claim and is named as one. Nothing verifies it, this deployment has no
+   * identity infrastructure to verify it with, and a field called `author` would be recording an
+   * assertion as a fact.
+   */
+  "template.imported",
+  /**
+   * Something a template asked for that this deployment has not given it.
+   *
+   * One row per unmet request, written even though the install SUCCEEDED, and it exists so that a
+   * Bot which silently cannot work is distinguishable from one nobody asked to work. Configuration
+   * travels and capability does not, so an imported Bot routinely arrives naming a connector nobody
+   * here has connected: it installs, it looks finished on the Bots page, and it answers from memory
+   * because the tool it was written around was never granted. Without this row that is
+   * indistinguishable from a badly written prompt, and the person debugging it reads the prose over
+   * and over looking for the fault.
+   *
+   * Deliberately not filed as a refusal. Nothing was forbidden and nothing was blocked — the ask
+   * simply landed unmet, which is the designed behaviour — and putting it among the refusals would
+   * teach a reader to discount the refusals that are real.
+   */
+  "template.capability_requested",
+  // The answer to one of those requests, given by an administrator through the grant screens that
+  // already refuse. Both outcomes, and kept separate from the import row on purpose: whether
+  // somebody approved a connector must never be inferable from the fact that a template named it.
+  "template.capability_granted",
+  "template.capability_declined",
+  // The ceiling a template shipped with, put on a Bot and taken off it again. The compiled clauses
+  // go in the payload verbatim, because a boundary nobody can read back is one nobody can check —
+  // and because the removal is the half somebody asks about after the fact.
+  "template.boundary_applied",
+  "template.boundary_removed",
+  // An import undone, naming what the retraction deleted. The only record of it: retraction removes
+  // the rows carrying that import's mark, so by the time anybody asks, the evidence is what is here.
+  // The Bot and its skills are not deleted, which is why the row has to say what was.
+  "template.retracted",
 ] as const;
 
 export type AuditEventType = (typeof auditEventTypes)[number];

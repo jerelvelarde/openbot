@@ -1,8 +1,12 @@
 import type { Context, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
+import { TemplateRefusedError } from "../../../shared/bot-template";
 import type { AuditEventType, AuditStore } from "../audit";
 import { recordAuditEvent } from "../audit";
 import type { AppVariables } from "../auth/guards";
+import { SecretInTemplateError } from "../templates/pack";
+import type { TemplateExport } from "../templates/routes";
+import { TemplateSlugTakenError } from "../templates/store";
 import { testAgentConnection } from "./connection-test";
 import { checkAgentEndpoint } from "./endpoint";
 import { canManageAgent } from "./profile-policy";
@@ -142,6 +146,36 @@ export function createAgentRoutes(
    * address. A hosted deployment sets this and leaves the other off.
    */
   allowedHosts: ReadonlySet<string> = new Set(),
+  /**
+   * Which Bots a Bot may hand work to, for the screen that grants it.
+   *
+   * A named object rather than another positional argument: every parameter above this one is
+   * optional, so a misplaced one typechecks and silently does nothing, and this list is already at
+   * the length where that stops being hypothetical.
+   *
+   * Absent in a deployment with no plugin store, which is a deployment where no Bot may address any
+   * other. The screen is then told the capability is off rather than shown a control that grants
+   * nothing.
+   */
+  handoff?: {
+    /** Whether the deployment's own caps leave the capability switched on at all. */
+    enabled: boolean;
+    /** The Bots this one may address today, read per call so a revoked grant stops showing. */
+    reachableFrom: (agentId: string) => Promise<readonly string[]>;
+  },
+  /**
+   * Packing this coworker into a template draft.
+   *
+   * Mounted here rather than under `/api/templates` because it is a thing done TO a Bot, beside
+   * Duplicate, and the question it has to answer first — may this person manage this coworker — is
+   * this file's question. Everything below that question lives in `templates/routes.ts`, so the two
+   * halves are not two copies of the same authorization rule.
+   *
+   * Absent leaves the route unmounted rather than mounted and refusing, the same shape every other
+   * optional capability here takes: a deployment that never built the template store has no door for
+   * this, not a locked one.
+   */
+  templateExport?: TemplateExport,
 ) {
   const routes = new Hono<{ Variables: AppVariables }>();
 
@@ -357,6 +391,72 @@ export function createAgentRoutes(
     }
   });
 
+  /**
+   * Export this coworker as a template draft.
+   *
+   * EXPORTING A PACKAGE BOT IS DELIBERATELY ALLOWED, which is why the check below is not simply
+   * `canManageAgent`. A system-owned Bot is ownerless and public, it is the most template-worthy
+   * thing in the product, and `POST /:agentId/duplicate` already lets any signed-in person fork one
+   * — so refusing here would protect nothing while withholding the only Bots worth writing a
+   * catalogue from. Nothing about the export changes the Bot it read.
+   *
+   * The refusals are the packer's, and they are refusals rather than warnings on purpose: a coworker
+   * with a skill slug the format does not admit, or prose past a ceiling, cannot be expressed as a
+   * template, and a silently truncated instruction is an instruction nobody wrote. A secret shape in
+   * its text is refused for the harder reason — the file is about to be handed to somebody.
+   */
+  routes.post("/:agentId/template", requireUser, async (context) => {
+    if (!templateExport) {
+      return context.json(
+        { error: "This deployment cannot author templates." },
+        503,
+      );
+    }
+    const agentId = context.req.param("agentId");
+    try {
+      const agent = await store.get(context.var.actor, agentId);
+      if (!agent) return context.json({ error: "Agent not found." }, 404);
+      if (!canManageAgent(context.var.actor, agent) && !agent.systemOwned) {
+        return context.json(
+          { error: "You do not have permission to manage this agent." },
+          403,
+        );
+      }
+      return context.json(
+        await templateExport.exportAgent(context.var.actor, agent),
+        201,
+      );
+    } catch (error) {
+      /*
+       * Both refusals carry their machine-readable half beside the sentence, because the export
+       * screen has to tell an author which of the two happened: one is a Bot to rename or shorten,
+       * the other is a key to take out of somebody's prose. Neither body echoes the offending text.
+       */
+      if (error instanceof TemplateRefusedError) {
+        return context.json(
+          { error: error.message, reason: error.reason },
+          400,
+        );
+      }
+      if (error instanceof SecretInTemplateError) {
+        return context.json(
+          { error: error.message, reason: "secret_shape", field: error.field },
+          400,
+        );
+      }
+      if (error instanceof TemplateSlugTakenError) {
+        /*
+         * Two coworkers, one name. The same coworker packed twice no longer reaches this branch —
+         * the export seam hands back the draft that already exists, edits intact — so what is left
+         * here is a genuine clash between two different Bots, and only a person can decide which of
+         * them keeps the name.
+         */
+        return context.json({ error: error.message }, 409);
+      }
+      return mapStoreError(context, error);
+    }
+  });
+
   routes.post("/:agentId/hide", requireUser, async (context) => {
     try {
       await store.setHidden(
@@ -435,6 +535,37 @@ export function createAgentRoutes(
       await store.softDelete(context.var.actor, context.req.param("agentId"));
       await record(context, "bot.deleted", context.req.param("agentId"));
       return context.body(null, 204);
+    } catch (error) {
+      return mapStoreError(context, error);
+    }
+  });
+
+  /**
+   * Which Bots this Bot may hand work to.
+   *
+   * On the Bot's own screen rather than under the connector catalogue, because it is a fact about
+   * this Bot and not about a vendor: the catalogue's entries have a fixed list of tools, and the
+   * Bots a deployment has are whatever somebody made.
+   *
+   * `enabled` is reported separately from the grants, because the two fail differently. A grant with
+   * the capability switched off is a row in the database that will never be read, and a screen that
+   * offered it without saying so would be a switch wired to nothing.
+   */
+  routes.get("/:agentId/handoff", requireUser, async (context) => {
+    const agentId = context.req.param("agentId");
+    try {
+      // Asked of the store, so a Bot somebody may not see is "not found" here as everywhere else,
+      // rather than a list of who it can reach.
+      const agent = await store.get(context.var.actor, agentId);
+      if (!agent) return context.json({ error: "Agent not found." }, 404);
+      return context.json({
+        handoff: {
+          enabled: handoff?.enabled ?? false,
+          // Granting is an administrator's, the same as it is on every other grant.
+          canGrant: context.var.actor.role === "admin",
+          reachable: handoff ? await handoff.reachableFrom(agentId) : [],
+        },
+      });
     } catch (error) {
       return mapStoreError(context, error);
     }

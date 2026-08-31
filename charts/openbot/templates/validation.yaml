@@ -112,6 +112,27 @@ This template renders nothing.
 {{- end }}
 {{- end }}
 
+{{- /*
+  A pool of warm computers that nothing takes one from.
+
+  `warmPool.enabled` renders a `SandboxWarmPool`, grants the service account `create` and `delete` on
+  `sandboxclaims`, and holds `replicas` browsers ready. A Bot reaches a warm one by claiming it, and
+  the server has no code that creates a `SandboxClaim`: `locate` posts a new `Sandbox` and waits for
+  it, the same as with no pool at all. `warm?()` is declared on the provider interface and called at
+  startup, but no provider implements it, so the call is skipped.
+
+  So the pool runs, reports healthy, and bills for browsers nobody is ever handed, while every first
+  action waits exactly as long as before. That is the same shape as the missing-CRD refusal above —
+  an install that looks finished and is not — and it is worse here because nothing ever fails, so
+  there is no moment at which anybody finds out. A refusal at install is the cheapest place to say so.
+
+  Remove this block when the provider claims from the pool. It is a note that the wiring is
+  unfinished, not a judgement that the feature is unwanted.
+*/}}
+{{- if and (eq .Values.computers.mode "sandbox") .Values.computers.sandbox.warmPool.enabled }}
+{{- fail "computers.sandbox.warmPool.enabled is on, but nothing claims from the pool yet: the server creates a Sandbox per Bot and never a SandboxClaim, so the pool would run and bill without ever shortening a first action. Set computers.sandbox.warmPool.enabled=false until claiming ships." }}
+{{- end }}
+
 {{- if not (has .Values.computers.mode (list "shared" "sandbox" "external")) }}
 {{- fail "computers.mode must be one of: shared, sandbox, external." }}
 {{- end }}
@@ -273,5 +294,24 @@ This template renders nothing.
 {{- fail (printf "%s names a proxy the computer's network policy blocks, so every page a Bot opens would fail. Name it in networkPolicy.computerExtraEgress, or turn networkPolicy.enabled off." .name) }}
 {{- end }}
 {{- end }}
+{{- end }}
+{{- end }}
+
+{{- /*
+  The same requirement, for the worker's shared secret.
+
+  `secret.yaml`, where `WORKER_SHARED_SECRET` would otherwise be required into existence, is skipped
+  entirely when `externalSecrets.enabled` — that Secret is the store's to create, not this chart's.
+  So a cloud operator who turns on `routines.enabled` without adding this key to
+  `externalSecrets.data` gets a clean install: the API server and the CronJob both reference a key
+  that is never coming, and every pod that mounts it fails to start. Checked the same way as
+  `managed-agent-token` and `better-auth-secret` above: the value is not readable at template time,
+  but the list of keys is, and a store that never mentions this key cannot be holding one.
+*/}}
+{{- if and (.Values.routines).enabled .Values.externalSecrets.enabled }}
+{{- $named := list }}
+{{- range .Values.externalSecrets.data }}{{- $named = append $named .secretKey }}{{- end }}
+{{- if not (has "worker-shared-secret" $named) }}
+{{- fail "routines.enabled but externalSecrets.data does not name worker-shared-secret. The API server reads it to recognise the worker and the CronJob reads it to be one, so every pod that mounts it fails to start." }}
 {{- end }}
 {{- end }}

@@ -1,5 +1,10 @@
 import { and, asc, eq, inArray, isNull, or, sql } from "drizzle-orm";
-import { type AuditStore, recordAuditEvent } from "../audit";
+import {
+  type AuditEventInput,
+  type AuditStore,
+  recordAuditEvent,
+  redactAuditPayload,
+} from "../audit";
 import {
   type ActionPolicy,
   evaluateActionPolicy,
@@ -16,6 +21,8 @@ import {
 import type { Database } from "../db/client";
 import {
   agentProfiles,
+  agents,
+  auditEvents,
   // Aliased: `credentials` is already the injected vault interface in this module, and the table and
   // the interface are two different things to reach for.
   credentials as credentialRows,
@@ -48,7 +55,30 @@ import { transportFor } from "./transport";
  * mean an operator who granted a Bot a server had also, invisibly, waived every rule about it.
  */
 
-export type PluginKind = "mcp" | "skill";
+/**
+ * What a grant is a grant OF.
+ *
+ * `bot` is one Bot's permission to hand work to another, and it lives here rather than in a table of
+ * its own on purpose: an administrator already understands "this Bot may use that", a fork's policy
+ * layer already applies to grants, and reachability between Bots is the same kind of decision as
+ * reachability to a vendor's tools. A second table would be a second thing to reason about and a
+ * second thing for a fork to reimplement.
+ */
+export type PluginKind = "mcp" | "skill" | "bot";
+
+/**
+ * What an audit row about a grant is a row ABOUT.
+ *
+ * A mapping rather than a ternary, because a ternary quietly labelled everything that was not an MCP
+ * tool a skill. Adding a third kind made that wrong rather than merely terse: a grant letting one Bot
+ * address another would have been filed in the trail as a skill, which is the sort of small lie an
+ * investigation trips over months later.
+ */
+function grantTargetType(kind: PluginKind): string {
+  if (kind === "mcp") return "mcp_tool";
+  if (kind === "bot") return "agent";
+  return "skill";
+}
 
 export type ToolRecord = {
   serverId: string;
@@ -230,6 +260,24 @@ export const INVALID_CLIENT = "invalid_client";
 type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
 
 /**
+ * Where a plugin write runs: the pool, or a caller's open transaction.
+ *
+ * Added for the template import, which creates a Bot, installs the skills the template names and
+ * grants them in one act. Those are three writes through two stores and they have to commit or roll
+ * back together — a failure partway leaves an orphan Bot with half a skill set, and the person
+ * retries into a second orphan Bot rather than into a clean slate.
+ *
+ * Defaulted to `database` everywhere it is accepted, so a caller that does not have a transaction
+ * carries on writing on its own connection exactly as before. What a caller must NOT do is pass a
+ * transaction and then read on the pool: once every pooled connection is inside one of these, the
+ * second read is a session queueing behind sessions that cannot finish until it returns. See the
+ * note on `max` in `db/client.ts`.
+ */
+export type PluginExecutor =
+  | Pick<Database, "select" | "insert" | "delete">
+  | Pick<Transaction, "select" | "insert" | "delete">;
+
+/**
  * A tool name the model can actually call.
  *
  * `<server>/<tool>` is how a grant is stored, because a slash reads correctly to a person and cannot
@@ -291,9 +339,13 @@ const iso = (value: Date | string | null): string | null =>
  * the row a per-person connector exists to be able to trust.
  *
  * `deployment` for a shared token; the asker's own id for a server reached as the person asking.
+ * `builtin` is the third case and the only one with no credential at all — the actor is not whose
+ * token was used, it is whose rows were touched.
  */
 const reachedAsFor = (entry: CatalogueEntry | null, actorId: string): string =>
-  entry?.auth.kind === "user-oauth" ? actorId : "deployment";
+  entry?.auth.kind === "user-oauth" || entry?.auth.kind === "builtin"
+    ? actorId
+    : "deployment";
 
 /**
  * Where this server actually is, when the stored row and the catalogue disagree.
@@ -501,7 +553,12 @@ export type PluginStoreOptions = {
    * reachable, which means the property most worth testing would be the one thing never tested.
    */
   callVendor?: (
-    connection: { url: string; token?: string },
+    connection: {
+      url: string;
+      token?: string;
+      actorId?: string;
+      botId?: string;
+    },
     toolName: string,
     args: Record<string, unknown>,
   ) => Promise<{ text: string; isError: boolean }>;
@@ -522,6 +579,45 @@ export type PluginStoreOptions = {
 
 export function createPluginStore(options: PluginStoreOptions) {
   const { database, auditStore, credentials, encryptionKey } = options;
+
+  /**
+   * A trail row for a change, written on the caller's transaction when there is one.
+   *
+   * WHY THE TRANSACTION AND NOT ALWAYS THE INJECTED STORE. The injected store writes on the pool's
+   * own handle. A caller inside `database.transaction(...)` is already holding one pooled
+   * connection, so a row written that way needs a SECOND connection while the first is not free.
+   * Bun's `SQL` has no acquisition timeout — `connectionTimeout` covers opening a socket, not
+   * waiting for a free connection — so once every pooled connection is inside such a transaction
+   * the waiter never resolves: the transaction never commits, never rolls back, and never gives its
+   * connection back. Ten concurrent template imports were enough to wedge the whole deployment,
+   * every later request on every route with it, and only a restart unwedged it. That is exactly the
+   * deadlock `db/client.ts` names and the one {@link PluginExecutor} tells callers not to walk into;
+   * writing the trail on the pool walked into it on the caller's behalf.
+   *
+   * Without an executor — the Skills page, the package sync, every test — nothing changes. The
+   * injected store writes where it always wrote, so a fork or a test that redirects the trail
+   * somewhere other than this database still gets those rows, and a failed trail write still cannot
+   * take back a change that has already committed on its own statement.
+   *
+   * With one, the row commits or rolls back with the change it describes. That is a stronger
+   * reading than the pool gave — a `skill_installed` row now means the install stuck rather than
+   * that it was attempted — and it is only available because the caller handed us the transaction.
+   */
+  async function recordChange(
+    executor: PluginExecutor,
+    event: AuditEventInput,
+  ): Promise<void> {
+    if (executor === database) {
+      await recordAuditEvent(auditStore, event);
+      return;
+    }
+
+    await executor.insert(auditEvents).values({
+      ...event,
+      payload: redactAuditPayload(event.payload) as Record<string, unknown>,
+    });
+  }
+
   /*
    * Held rather than resolved, because the transport is a property of the entry and is not known
    * until a call names one. An injected vendor still wins over both, which is what keeps a test able
@@ -622,13 +718,16 @@ export function createPluginStore(options: PluginStoreOptions) {
    * server's tool rows, so a ref can be legitimately absent for a moment, and a run must read that as
    * "load nothing" rather than as a failure.
    */
-  async function knownToolRefs(refs: string[]) {
+  async function knownToolRefs(
+    refs: string[],
+    executor: PluginExecutor = database,
+  ) {
     if (refs.length === 0) return new Set<string>();
     // Narrowed in the query to the servers actually named, rather than reading the whole catalogue
     // and filtering here. A deployment aiming at a thousand tools should not scan all of them to
     // check three.
     const servers = [...new Set(refs.map((ref) => ref.split("/")[0] ?? ""))];
-    const rows = await database
+    const rows = await executor
       .select({ serverId: mcpTools.serverId, name: mcpTools.name })
       .from(mcpTools)
       .where(inArray(mcpTools.serverId, servers));
@@ -2132,6 +2231,44 @@ export function createPluginStore(options: PluginStoreOptions) {
      * Read here rather than through the coworker store because the only question this file asks is
      * "may this person put their skill on that Bot", and a whole profile is more than that needs.
      */
+    /**
+     * Whether this Bot's run happens in this process, rather than at an endpoint somewhere.
+     *
+     * Undefined for a Bot nobody has heard of. Asked because a tool this deployment executes can
+     * only be offered to a run it builds: a Bot at an endpoint runs its own loop and is handed
+     * descriptions of what it may call back for, and handing work to another Bot is not one of them.
+     */
+    async agentRunsHere(agentId: string): Promise<boolean | undefined> {
+      const [row] = await database
+        .select({ type: agents.type })
+        .from(agents)
+        .innerJoin(agentProfiles, eq(agentProfiles.agentId, agents.id))
+        // A deleted Bot is not one anybody may be given, and answering about it at all would say it
+        // had existed.
+        .where(and(eq(agents.id, agentId), isNull(agentProfiles.deletedAt)))
+        .limit(1);
+      return row ? row.type === "built_in" : undefined;
+    },
+
+    /**
+     * Whether this Bot is one somebody could be handed work by, at all.
+     *
+     * The TARGET of a bot grant, unlike the grantee, may perfectly well run at its own endpoint —
+     * being handed work is not the same as being able to hand it on. What it may not be is absent:
+     * `ref` is bare text with no foreign key, so a typo stored happily, `message_bot` was offered,
+     * and every hop refused as not-granted. That is the same row-that-cannot-work this check exists
+     * to stop, arriving from the other side.
+     */
+    async agentIsRegistered(agentId: string): Promise<boolean> {
+      const [row] = await database
+        .select({ id: agents.id })
+        .from(agents)
+        .innerJoin(agentProfiles, eq(agentProfiles.agentId, agents.id))
+        .where(and(eq(agents.id, agentId), isNull(agentProfiles.deletedAt)))
+        .limit(1);
+      return row !== undefined;
+    },
+
     async agentOwner(agentId: string): Promise<string | null | undefined> {
       const [row] = await database
         .select({ ownerUserId: agentProfiles.ownerUserId })
@@ -2141,21 +2278,54 @@ export function createPluginStore(options: PluginStoreOptions) {
       return row ? row.ownerUserId : undefined;
     },
 
-    async installSkill(input: {
-      slug: string;
-      title: string;
-      summary: string;
-      instructions: string;
-      origin?: string;
-      /** Whose it is. Null writes a skill for the whole deployment, which is an admin's to make. */
-      ownerUserId: string | null;
-      /**
-       * The tools this skill needs, as `<serverId>/<toolName>` refs. Absent leaves whatever was
-       * declared before; an empty array clears it, which is how a skill stops asking for anything.
-       */
-      tools?: string[];
-      by: string;
-    }): Promise<void> {
+    /**
+     * Write a skill and what it declares it needs, optionally on a transaction the caller has open.
+     *
+     * `executor` defaults to the pool, so the Skills page, the package sync and every test write
+     * where they wrote before. The template import passes its transaction, because a Bot, its
+     * skills and their grants are one act: without that a mid-install failure leaves an orphan Bot
+     * holding half a skill set, and the person retries into a second orphan Bot.
+     */
+    async installSkill(
+      input: {
+        slug: string;
+        title: string;
+        summary: string;
+        instructions: string;
+        origin?: string;
+        /** Whose it is. Null writes a skill for the whole deployment, which is an admin's to make. */
+        ownerUserId: string | null;
+        /**
+         * The tools this skill needs, as `<serverId>/<toolName>` refs. Absent leaves whatever was
+         * declared before; an empty array clears it, which is how a skill stops asking for anything.
+         */
+        tools?: string[];
+        /**
+         * Save the declarations without first checking that this deployment has seen the tools.
+         *
+         * NOT A SECURITY RELAXATION, and it is worth being exact about why, because the name reads
+         * like one. A declared ref grants nothing. What a Bot may call is decided at run time by
+         * intersecting what it was GRANTED with what the skill DECLARED, so a ref naming a tool
+         * nobody has connected is inert, and a ref naming one that exists but was never granted is
+         * equally inert. The refusal this skips is a typo guard, not a gate: it exists so somebody
+         * hand-writing a skill on the Skills page learns immediately that `google-drive/serach_files`
+         * matches nothing, rather than shipping a skill that quietly selects no tools.
+         *
+         * A template import is the other case entirely. A template is written somewhere else, before
+         * this deployment existed, and it necessarily names the connectors its author had — so every
+         * template naming `google-drive/search_files` would fail to install on every deployment that
+         * has not connected Drive, which is every fresh one. Refusing the import over it would mean a
+         * template could only ship skills for connectors it could guarantee, which is none of them.
+         *
+         * `synchronizeTenantPackage` already skips this check for exactly this reason, and says so at
+         * `tenant-package.ts:731-736`. The flag is how the import path reaches the same behaviour
+         * through the store rather than by writing the rows itself.
+         */
+        allowUnknownTools?: boolean;
+        by: string;
+      },
+      executor: PluginExecutor = database,
+    ): Promise<void> {
       /*
        * Checked before anything is written, so a save is all-or-nothing from the caller's side: a
        * skill is never left saved with half its declarations because the fourth ref was a typo.
@@ -2164,8 +2334,12 @@ export function createPluginStore(options: PluginStoreOptions) {
         input.tools === undefined
           ? undefined
           : [...new Set(input.tools.map((ref) => ref.trim()).filter(Boolean))];
-      if (declared !== undefined && declared.length > 0) {
-        const known = await knownToolRefs(declared);
+      if (
+        declared !== undefined &&
+        declared.length > 0 &&
+        !input.allowUnknownTools
+      ) {
+        const known = await knownToolRefs(declared, executor);
         const unknown = declared.filter((ref) => !known.has(ref));
         if (unknown.length > 0) {
           throw new PluginRefusedError(
@@ -2178,7 +2352,7 @@ export function createPluginStore(options: PluginStoreOptions) {
         }
       }
 
-      await database
+      await executor
         .insert(skills)
         .values({
           id: input.slug,
@@ -2207,11 +2381,11 @@ export function createPluginStore(options: PluginStoreOptions) {
        * a save says what it is now; merging would make removing one a thing with no gesture for it.
        */
       if (declared !== undefined) {
-        await database
+        await executor
           .delete(skillTools)
           .where(eq(skillTools.skillId, input.slug));
         if (declared.length > 0) {
-          await database.insert(skillTools).values(
+          await executor.insert(skillTools).values(
             declared.map((ref) => ({
               skillId: input.slug,
               ref,
@@ -2221,7 +2395,22 @@ export function createPluginStore(options: PluginStoreOptions) {
         }
       }
 
-      await recordAuditEvent(auditStore, {
+      /*
+       * On `executor`, so an install inside a transaction never needs a second connection.
+       *
+       * This row used to go to the audit store's own pooled handle even when the caller was inside
+       * a transaction, on the argument that the store is injected and bypassing it would make the
+       * trail depend on how the caller was wired. That argument cost more than it bought: an import
+       * holding a pooled connection and then waiting for another one is the hang described on
+       * {@link recordChange}, and a trail nobody can reach because the server is wedged is worth
+       * less than one a fork can redirect. Callers with no transaction still go through the
+       * injected store.
+       *
+       * The reading of the row changes with it, and that is the better half of the trade: written
+       * on the caller's transaction, a `skill_installed` row commits only if the install did, so it
+       * is evidence the install STUCK rather than that it was attempted.
+       */
+      await recordChange(executor, {
         eventType: "configuration.changed",
         targetType: "skill",
         targetId: input.slug,
@@ -2246,13 +2435,60 @@ export function createPluginStore(options: PluginStoreOptions) {
       });
     },
 
+    /**
+     * The Bots one Bot has been granted, read fresh.
+     *
+     * NEVER CACHED. Whether one Bot may address another is a decision an administrator can change,
+     * and a grant revoked a minute ago has to apply to the next hop rather than after a restart. It
+     * is a single indexed read, which is the right price for that.
+     */
+    /**
+     * The Bots this one may hand work to, and can actually reach.
+     *
+     * FILTERED AT READ TIME, not only when the grant is made. Refusing a new grant to a Bot that
+     * runs at its own endpoint stops one being created; it does nothing about the ones already
+     * there, or about a Bot that was built in when it was granted and was pointed at an endpoint
+     * afterwards. Those rows read as configured and are inert, which is the shape of thing an
+     * administrator debugs for an afternoon: the grant is right there in the table and no hop ever
+     * happens.
+     *
+     * The asking side is the one that matters here — a Bot at an endpoint runs its own loop and is
+     * never offered this tool — so it is the grantee, `agent_id`, that is checked.
+     */
+    async botsReachableFrom(agentId: string): Promise<string[]> {
+      const rows = await database
+        .select({ ref: pluginGrants.ref })
+        .from(pluginGrants)
+        .innerJoin(agents, eq(agents.id, pluginGrants.agentId))
+        .where(
+          and(
+            eq(pluginGrants.kind, "bot"),
+            eq(pluginGrants.agentId, agentId),
+            eq(agents.type, "built_in"),
+          ),
+        );
+      return rows.map((row) => row.ref);
+    },
+
+    /**
+     * Give one Bot one thing, optionally on a transaction the caller already has open.
+     *
+     * The executor is what lets a template import be one act rather than three: the Bot, the skills
+     * it names and the grants that put them on it commit together, or none of them do. Its default
+     * is the pool, so every existing caller — the grant route, the package sync, the tests — writes
+     * exactly where it wrote before.
+     *
+     * The trail row goes on the same executor; see {@link recordChange} for why a row written on
+     * the pool instead would hang an import that is already holding a connection.
+     */
     async grant(
       kind: PluginKind,
       ref: string,
       agentId: string,
       by: string,
+      executor: PluginExecutor = database,
     ): Promise<void> {
-      await database
+      await executor
         .insert(pluginGrants)
         .values({ kind, ref, agentId, grantedBy: by })
         .onConflictDoUpdate({
@@ -2260,9 +2496,9 @@ export function createPluginStore(options: PluginStoreOptions) {
           set: { grantedBy: by, updatedAt: new Date() },
         });
 
-      await recordAuditEvent(auditStore, {
+      await recordChange(executor, {
         eventType: "configuration.changed",
-        targetType: kind === "mcp" ? "mcp_tool" : "skill",
+        targetType: grantTargetType(kind),
         targetId: ref,
         payload: {
           actor: by,
@@ -2292,7 +2528,7 @@ export function createPluginStore(options: PluginStoreOptions) {
 
       await recordAuditEvent(auditStore, {
         eventType: "configuration.changed",
-        targetType: kind === "mcp" ? "mcp_tool" : "skill",
+        targetType: grantTargetType(kind),
         targetId: ref,
         payload: {
           actor: by,
@@ -2802,7 +3038,12 @@ export function createPluginStore(options: PluginStoreOptions) {
         const { token } = await connectionTokenFor(row, entry, input.actorId);
         const vendor = injectedVendor ?? transportFor(entry).callTool;
         const result = await vendor(
-          { url: effectiveUrl(row, entry), token },
+          {
+            url: effectiveUrl(row, entry),
+            token,
+            actorId: input.actorId,
+            botId: input.botId,
+          },
           toolName,
           args,
         );

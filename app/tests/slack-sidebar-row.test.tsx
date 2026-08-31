@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
+import { afterEach, beforeAll, expect, test } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import { cleanup, fireEvent, render, within } from "@testing-library/react";
 import {
@@ -7,9 +7,15 @@ import {
 } from "@/components/app-sidebar/slack-channel";
 import type { ExternalThreadSummary } from "@/lib/external/queries";
 
-beforeAll(() => GlobalRegistrator.register());
+beforeAll(() => {
+  if (!GlobalRegistrator.isRegistered) {
+    // bun runs every test file in ONE process, so whichever file loads first registers the
+    // DOM for all of them. A second unconditional register throws, and the throw leaves an
+    // empty body behind for every render that follows it.
+    GlobalRegistrator.register({ url: "http://localhost:3010" });
+  }
+});
 afterEach(() => cleanup());
-afterAll(() => GlobalRegistrator.unregister());
 
 function slackThread(
   overrides: Partial<ExternalThreadSummary> = {},

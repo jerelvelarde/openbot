@@ -11,7 +11,7 @@ docker run -p 3001:3001 --env-file .env openbot
 
 # Or one inside the container. Nothing else to provision.
 docker run -p 3001:3001 --env-file .env \
-  -e EMBEDDED_POSTGRES=on -v openbot-data:/var/lib/postgresql/data openbot
+  -e EMBEDDED_POSTGRES=on -v openbot-data:/var/lib/postgresql openbot
 ```
 
 ## What is in the image, and what is not
@@ -24,8 +24,16 @@ process beside it.
 the database and the `vector` extension the first time, and runs the migrations on every start. It
 listens on loopback only and is never published, so there is no password to manage.
 
-Give it a volume at `/var/lib/postgresql/data`. Without one, a redeploy takes the audit trail with
-it, and the audit trail is the product. Platforms that offer no persistent volume are the ones to
+Give it a volume at `/var/lib/postgresql` — the parent, not the data directory itself. Without one,
+a redeploy takes the audit trail with it, and the audit trail is the product.
+
+**Mount the parent, not `/var/lib/postgresql/data`.** On any platform whose volume is an ext4 mount,
+and that is most of them, the mount arrives holding a `lost+found` directory. `initdb` will not
+initialise into a directory that has anything in it, so mounting it directly on the data directory
+leaves the cluster uncreated — and because `api` waits on `postgres` and `migrate`, the container
+starts, the platform reports the deploy a success, and the URL serves a 502. Mounting the parent
+leaves `data` as an ordinary subdirectory, which is what PostgreSQL asks for. A Docker named volume
+works either way; a platform volume does not. Platforms that offer no persistent volume are the ones to
 point at a managed database instead: set `DATABASE_URL` and leave `EMBEDDED_POSTGRES` off. The
 `vector` extension must be enabled there; RDS, Cloud SQL and Azure Database all support it, none
 enable it for you.
@@ -38,6 +46,15 @@ do on a laptop with no supervisor configured. A shared browser means shared logi
 shared session between Bots, which is fine for a deployment where one team trusts its own Bots and
 is not fine as a boundary between tenants.
 
+**The routines schedule.** Nothing in this image is scheduled to fire a routine — there is no
+worker service beside the API, and `worker/` (the looping local variant) is not in the image. The
+sweep itself is: `bun scripts/fire-routines.ts` from `/app/server`, one pass then exit, which is what
+the Helm chart's CronJob runs from this same image. So a one-container deployment needs something
+outside the container to run it on a schedule — an external cron, a platform scheduled job, or a
+second container of this image with that command — with `DATABASE_URL`, `SERVER_INTERNAL_URL` and
+`WORKER_SHARED_SECRET` set. Until something does, a routine is stored, its next run time is computed,
+the Routines page shows it, and it never fires. See [routines.md](routines.md).
+
 ## Minimum size
 
 Measured on the real image, one Bot, arm64.
@@ -46,7 +63,7 @@ Measured on the real image, one Bot, arm64.
 | --- | --- | --- | --- |
 | Memory | 409 MB idle, 498 MB after three page loads, 548 MB after a snapshot | **2 GB** | **4 GB** |
 | vCPU | 3 to 6 percent at rest, bursty while a page renders | **1** | **2** |
-| Disk | 5.3 GB image | **8 GB** | 10 GB with room for `/workspace` |
+| Disk | 1.4 GB image | **4 GB** | 8 GB with room for `/workspace` |
 
 **Why 2 GB when it measures at 550 MB.** That figure is one Bot with one page open. Every additional
 concurrent page is roughly another 100 to 200 MB, and Playwright's own guidance is to allow about
@@ -123,6 +140,12 @@ in ECR, and is what AWS points App Runner users at now that App Runner takes no 
 Plain ECS on Fargate behind an ALB is the answer if you want task definitions and fine-grained IAM.
 No shared-memory configuration is needed or possible.
 
+**Kubernetes.** Everything above describes one container run by hand. A cluster is the other shape,
+and it is the only one that gives a Bot a computer of its own, runs the routines schedule without
+something outside the container, and scales the API past a single replica. That is the Helm chart:
+[charts/openbot/README.md](../charts/openbot/README.md), which covers EKS, GKE, AKS and a plain
+self-hosted cluster from the same templates.
+
 **Azure Container Apps.** Managed ingress with TLS and custom domains. Note the **240-second request
 timeout**: the live screen holds a long connection, so expect it to reconnect. Concurrent WebSockets
 are capped at 350 per instance on the basic tier.
@@ -132,8 +155,8 @@ which makes them the shortest path from nothing to a running deployment.
 
 ## Known costs
 
-**The image is 5.3 GB**, most of it the Playwright base, which ships Firefox and WebKit alongside the
-Chromium we use. Deleting them afterwards does not help, because the bytes still ship in the layer
+**The image is 1.4 GB**, and 595 MB of that is Firefox and WebKit, which the Playwright base ships
+alongside the Chromium we use and nothing here ever launches. Deleting them afterwards does not help, because the bytes still ship in the layer
 below. Building Chromium-only onto a slim base would cut this substantially and is not done yet.
 
 **A strict content-security-policy needs a hash or a nonce.** `app/index.html` runs a small inline

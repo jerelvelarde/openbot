@@ -6,6 +6,12 @@
 import { singleUserEnabled } from "./auth/dev-actor";
 import type { ActionPolicy } from "./computer/policy";
 import { parseActionPolicy } from "./computer/policy-store";
+import {
+  isTemplateInstallers,
+  parseSourceHandle,
+  sourceHandleKey,
+  type TemplateInstallers,
+} from "./templates/catalogue";
 
 export type RuntimeCapabilities = {
   mode: "intelligence";
@@ -113,6 +119,24 @@ export type ManagedAgentConfig = {
   token: string;
 };
 
+/**
+ * How far one Bot handing work to another may go.
+ *
+ * NUMBERS A DEPLOYMENT CHOOSES, not constants. A small team and a company running this across
+ * departments want different answers, and neither should have to edit code to get one.
+ *
+ * Both defaults are deliberately mean. A hop costs a whole agent turn at the other end, fan-out
+ * shapes cost several times a single run because each Bot spends its own full budget, and on a
+ * cluster a hop to a Bot whose computer is asleep also pays a pod resume. One level of delegation is
+ * what most systems allow by default, and a deployment that wants more can say so.
+ */
+export type HandoffCaps = {
+  /** How many Bots deep a chain may go. `0` switches the whole capability off. */
+  maxDepth: number;
+  /** How many other Bots one run may address. */
+  maxPerRun: number;
+};
+
 export type DeploymentConfig = {
   databaseUrl: string;
   keyEncryptionKey: string;
@@ -177,6 +201,32 @@ export type DeploymentConfig = {
    */
   appUrl: string | undefined;
   tenantPackageDirectory: string;
+  /**
+   * Where the templates shipped in the box are, resolved from `server/` as the package directory is.
+   *
+   * Defaulted rather than optional, because `COPY examples/` in the `Dockerfile` puts the seed in
+   * every image and a deployment with no network at all should still open a populated gallery. A
+   * directory that is not there is a gallery with nothing in it, never a refusal to start: these are
+   * many authors' files rather than one operator's configuration.
+   */
+  templateDirectory: string;
+  /**
+   * The `owner/repo` values an administrator may register as a template source, and no others.
+   *
+   * SHIPS EMPTY, which is the whole point of it. Nothing is fetched from the network unless somebody
+   * running this deployment has both named a repository here and registered a pin — a self-hosted
+   * product that reaches a third party on first boot because the vendor shipped a default has made
+   * that decision on its operator's behalf. The admin screen renders this list and cannot widen it,
+   * the way it renders `INITIAL_ADMIN_EMAILS`.
+   */
+  templateSources: ReadonlySet<string>;
+  /**
+   * Who may install a template, as a floor a screen may raise and never lower.
+   *
+   * `anyone` unless the environment says otherwise. See `templates/catalogue.ts` for why that is the
+   * right default and what the floor protects.
+   */
+  templateInstallers: TemplateInstallers;
   runtime: RuntimeCapabilities;
   /**
    * How long a Bot's stream may say nothing before this deployment ends the turn, in milliseconds.
@@ -220,6 +270,8 @@ export type DeploymentConfig = {
    * mounted and failing: a capability that is not configured should be missing, not broken.
    */
   computer?: ComputerConfig;
+  /** How far one Bot handing work to another may go. */
+  handoff: HandoffCaps;
   /**
    * The secret a Bot presents when it calls a tool back through this server.
    *
@@ -232,9 +284,41 @@ export type DeploymentConfig = {
    * than an open door.
    */
   agentToolToken?: string;
+  /**
+   * The secret the worker presents when it hands a routine run back to this server.
+   *
+   * Absent means the internal routines endpoint refuses everything, which is the correct state of a
+   * deployment with no worker — a deployment that has not asked for scheduled turns should not have a
+   * door for them standing open.
+   */
+  workerSharedSecret?: string;
 };
 
 type Environment = Record<string, string | undefined>;
+
+/**
+ * The caps, read from the environment, refusing anything that is not a whole number at least zero.
+ *
+ * Refused rather than coerced. A cap is a safety number, and a deployment that typed `two` and got
+ * the default would believe it had set one: the failure has to be at start-up where somebody is
+ * looking, not at the first loop.
+ */
+function handoffCaps(environment: Environment): HandoffCaps {
+  const read = (name: string, fallback: number): number => {
+    const raw = optional(environment, name);
+    if (raw === undefined) return fallback;
+    const value = Number(raw);
+    if (!Number.isInteger(value) || value < 0) {
+      throw new Error(`${name} must be a whole number of zero or more`);
+    }
+    return value;
+  };
+  return {
+    // One level of delegation, which is what most systems allow before anybody asks for more.
+    maxDepth: read("BOT_HANDOFF_MAX_DEPTH", 1),
+    maxPerRun: read("BOT_HANDOFF_MAX_PER_RUN", 3),
+  };
+}
 
 function required(environment: Environment, name: string): string {
   const value = environment[name]?.trim();
@@ -567,6 +651,52 @@ function agentEndpointAllowedHosts(
   return hosts;
 }
 
+/**
+ * The repositories this deployment will fetch templates from, and there are none unless it says so.
+ *
+ * A comma-separated list of `owner/repo`, lowercased because a GitHub handle is case-insensitive and
+ * an allowlist that could be evaded by capitalising a letter is not one. The shape is checked by
+ * `parseSourceHandle`, the same function registration calls, so the environment cannot admit a
+ * spelling the registry would refuse or the other way round.
+ *
+ * Refused rather than skipped, like every other malformed value at this boundary. An administrator
+ * who wrote `github.com/acme/templates` and got a deployment that started with an empty allowlist
+ * would discover it at the first registration, and would have no reason to suspect the variable
+ * rather than the screen.
+ */
+function templateSources(environment: Environment): ReadonlySet<string> {
+  const sources = new Set<string>();
+  for (const entry of commaSeparated(environment, "OPENBOT_TEMPLATE_SOURCES")) {
+    const handle = parseSourceHandle(entry);
+    if (!handle) {
+      throw new Error(
+        `OPENBOT_TEMPLATE_SOURCES entry "${entry}" must be a GitHub owner/repo, such as jerelvelarde/awesome-openbot-templates. A URL, a branch or a pin does not belong here: the pin is registered in the product.`,
+      );
+    }
+    sources.add(sourceHandleKey(handle));
+  }
+  return sources;
+}
+
+/**
+ * Who may install a template, refusing anything that is not one of the two answers.
+ *
+ * Refused rather than defaulted, and for the reason the action policy above is: a deployment that
+ * wrote `administrator` here meant to restrict installs, and falling back to `anyone` would leave it
+ * running with the opposite of what it configured and nothing anywhere saying so. This is a floor
+ * the product may raise and may never lower, so getting it wrong is not recoverable from a screen.
+ */
+function templateInstallers(environment: Environment): TemplateInstallers {
+  const raw = optional(environment, "OPENBOT_TEMPLATE_INSTALLERS");
+  if (!raw) return "anyone";
+  if (!isTemplateInstallers(raw)) {
+    throw new Error(
+      `OPENBOT_TEMPLATE_INSTALLERS must be "anyone" or "admin", not "${raw}"`,
+    );
+  }
+  return raw;
+}
+
 function privateHostsAllowed(environment: Environment): boolean {
   if (optional(environment, "AGENT_COMPUTER_ALLOW_PRIVATE_HOSTS") !== "true") {
     return false;
@@ -775,6 +905,7 @@ export function loadConfig(
   const google = oauthClient(environment, "GOOGLE");
   const auth = authConfig(environment, google);
   const managedAgent = managedAgentConfig(environment);
+  const workerSharedSecret = optional(environment, "WORKER_SHARED_SECRET");
 
   return {
     databaseUrl: required(environment, "DATABASE_URL"),
@@ -794,6 +925,10 @@ export function loadConfig(
     )?.replace(/\/+$/, ""),
     tenantPackageDirectory:
       optional(environment, "TENANT_PACKAGE_DIR") ?? "../examples/fintech",
+    templateDirectory:
+      optional(environment, "OPENBOT_TEMPLATE_DIR") ?? "../examples/templates",
+    templateSources: templateSources(environment),
+    templateInstallers: templateInstallers(environment),
     runtime: runtimeCapabilities(environment),
     agentStallTimeoutMs: agentStallTimeoutMs(environment),
     auditRetentionDays: auditRetentionDays(environment),
@@ -808,8 +943,10 @@ export function loadConfig(
       ? { appDistDir: optional(environment, "APP_DIST_DIR") as string }
       : {}),
     computer: computerConfig(environment),
+    handoff: handoffCaps(environment),
     ...(optional(environment, "AGENT_TOOL_TOKEN")
       ? { agentToolToken: optional(environment, "AGENT_TOOL_TOKEN") as string }
       : {}),
+    ...(workerSharedSecret ? { workerSharedSecret } : {}),
   };
 }

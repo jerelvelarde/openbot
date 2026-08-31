@@ -8,6 +8,210 @@ Newest first. `Unreleased` is what is on `main` and not yet tagged.
 
 ## Unreleased
 
+### A Bot's shell can no longer reach the embedded database without a password
+
+In the all-in-one image the cluster was `trust`-auth on loopback, and the Bot's shell runs in the
+same container: it could `psql -h 127.0.0.1 -U openbot` with no password and read the audit trail,
+the policy store, and the credential vault as the instance owner. The cluster now uses
+`scram-sha-256` with a password generated on first init and kept beside the data, handed to the API
+over the container environment. The shell has no way to learn it, so the connection is refused. An
+external `DATABASE_URL` deployment is unaffected.
+
+### A live screen that ends says so, instead of freezing the last frame
+
+When a Bot's live screen ended — the computer stopped, or the socket failed — the message explaining
+why was drawn only by a component the take-the-wheel view does not mount, so the screen sat frozen on
+its last frame with nothing said. The reason is now shown where the live screen is.
+
+### A Bot's browser drops the automation flags a person needs gone to sign in
+
+The browser announced itself as automated (`navigator.webdriver`, the enable-automation switch),
+which sites like Google refuse even when a real person has taken the wheel. Those flags are now off
+at the source — the browser flag, not a script that patches `navigator.webdriver` and leaves the
+other tells. A headless build still reports `HeadlessChrome` in its user agent, which only running
+headed under a virtual display removes; that heavier change is tracked separately.
+
+### An empty model reply, or a run with no question, no longer ends in silence
+
+Two failures on strict OpenAI-compatible providers (z.ai GLM, Anthropic): a follow-up run that
+carried only tool deltas and no human turn was refused outright, and a reply with no text and no tool
+call ended the run with nothing on screen. A run with no human turn now carries a neutral
+continuation, and an empty reply ends on a visible line rather than in silence. OpenAI, which
+tolerated both, is unchanged.
+
+### Embedded PostgreSQL initialises on a platform volume, and says so when it cannot
+
+`EMBEDDED_POSTGRES=on` could not create its cluster on a platform whose persistent volume is an ext4
+mount — Railway, and by the same mechanism most others — and it failed differently depending on where
+the volume was mounted. Neither of the two paths this repo suggested worked, and the two suggestions
+disagreed with each other: `docs/deployment.md` said `/var/lib/postgresql/data`, the `Dockerfile`
+comment said `/var/lib/postgresql`.
+
+Mounted at the parent, the mount arrives owned by root, `data` is not in it, and the image's
+build-time `chown` is hidden underneath — so `initdb`, which has already dropped to the `postgres`
+user, cannot create the directory. `postgres-init` now creates and chowns it first, as root, which is
+the only step in a position to. This also fixes the plain
+`docker run -v openbot-data:/var/lib/postgresql` case, which relied entirely on that hidden chown.
+
+Mounted directly on the data directory, the mount arrives holding a `lost+found`, and `initdb` will
+not initialise into a directory with anything in it. **The documented mount is now the parent,
+`/var/lib/postgresql`**, which leaves `data` an ordinary subdirectory — what PostgreSQL's own hint
+asks for, and what the `Dockerfile` already said. A volume already mounted at
+`/var/lib/postgresql/data` and working — a Docker named volume, which arrives empty rather than with a
+`lost+found` — keeps working and needs no change.
+
+**The failure said nothing useful.** `api` waits on `postgres` and `migrate`, so neither started, the
+container came up anyway, the platform reported the deploy a success, and the public URL served a
+persistent 502 with the real reason visible only in the container log. A data directory that holds no
+cluster and is not empty is now refused with a sentence naming the mount to use instead.
+
+Reported by [@jerelvelarde](https://github.com/CopilotKit/OpenBot/issues/269) with the container logs
+for both mount paths, which is what made the two failure modes separable.
+### A sign-in a site opens in a new window is shown, and can be clicked
+
+A Bot's browser was bound to the page it launched with, and to nothing the site opened afterwards.
+Anything arriving in a new window or tab was invisible on the live screen and unreachable by input,
+so the popup sign-ins that a person takes the wheel to complete were exactly the ones they could not
+complete. Worse than invisible: a click at the place the popup's button was drawn went to the page
+underneath it, so a person trying to finish a sign-in could navigate the page the Bot was working on
+without seeing either result.
+
+The browser now follows the window the site opens, and returns to the opener when it closes, which is
+what a sign-in popup does when it succeeds. A snapshot taken before the change of page is refused
+afterwards with the same "take a new snapshot" it already gives after a navigation, so a stale ref
+cannot act on the wrong document.
+
+Nothing to configure.
+### Stopping a Bot's computer stops it, and the person watching is told
+
+A computer somebody stopped came back up on its own about a second later, and reset did the same. The
+live screen kept a loop asking for the Bot's current page once a second, asking for a page is what
+starts a browser, and nothing tore that loop down when the browser it was showing went away. The same
+loop kept the browser marked recently used, so a Bot with somebody watching was also immune to the
+idle timeout and came straight back after being closed to stay under the cap on running browsers.
+Those last two never involved a request at all, so nothing on the stop path could have covered them.
+
+Two smaller failures went with it. A person who reconnected, leaving their old window open, could
+have that old window's typing land in the page the new one was watching, with nothing said to either.
+And a window closed while the browser was still starting left a screencast and its loop behind for a
+connection that had already gone.
+
+The screen is now held per connection rather than per Bot, so closing one only ever ends its own, and
+teardown hangs off the browser closing rather than off the two requests that ask for it. A viewer
+whose screen ends is sent a message saying why, whether the computer stopped, was reset, or the
+screen was taken over by another window.
+
+Nothing to configure, and no change for a deployment where nobody watches a Bot work. **The app does
+not yet show that message**: it arrives at the browser and is held in state the live screen does not
+read, so a person still sees the last frame until they reopen the screen. That half is tracked
+separately in #287.
+
+## 0.0.5
+
+### One Bot can hand work to another, and reach a person when no Bot will do
+
+A Bot asked something it is not the right Bot for can now put the question to one that is. The
+addressed Bot answers **as itself, in its own conversation**, with its own tools and its own
+knowledge. The asking Bot does not relay text on its behalf, so what you read is the answer that
+Bot actually gave rather than another Bot's summary of it. The asking conversation records that the
+question was put and to whom. A Bot that judges no other Bot will do can instead reach the person
+who asked it.
+
+**No Bot may address any other until an administrator says so.** Which Bot may reach which is an
+ordinary grant, made per Bot on that Bot's own screen under **Bots it may ask**, and a Bot with no
+grant is told it cannot rather than quietly trying. The pair is directional: that list is who this
+Bot may ask, not who may ask it, so letting two Bots ask each other is two switches. A Bot addressed
+by a name two Bots answer to is refused and both are named, because picking one would be a guess
+about which colleague a person meant.
+
+Two ceilings, because a Bot deciding to ask another Bot is a Bot deciding to spend a run:
+`BOT_HANDOFF_MAX_DEPTH` is how many Bots deep a chain may go and defaults to `1`, and **`0` switches
+the capability off entirely**: the tool is not offered rather than offered and refused.
+`BOT_HANDOFF_MAX_PER_RUN` is how many Bots one run may address and defaults to `3`. The Helm chart
+takes the same two as `config.handoff.maxDepth` and `config.handoff.maxPerRun`.
+
+A hop that fails is reported back by the Bot that asked, after its attempts are spent, rather than
+leaving the person watching a conversation that never finishes. One rough edge to know about: a hop
+that is retried leaves one "asked" line per attempt in the addressed Bot's own transcript, so a hop
+that took three attempts reads there as having been asked three times.
+
+No new tables: this uses the work queue that already fires the culler.
+
+### A conversation that used a tool no longer stops answering for good
+
+A channel could reach a state where every turn in it failed and the only thing it said was
+`Tool result is missing for tool call call_…`. Not the turn: the conversation. Everything sent
+afterwards failed the same way, including a question as ordinary as what two plus two is, and there
+was nothing a person could do to it from the screen.
+
+A tool result is matched to the call above it, and a thread read back from the platform does not
+always carry the two in that order. Where the result was stored ahead of its own call, this
+deployment counted the call answered, sent the history on unchanged, and the model provider rejected
+the whole conversation while assembling it. Handing work to another Bot, asking a person, and
+calling a connector's tool could each leave a thread in that shape.
+
+A result now only answers a call it follows. One that arrives early is moved to sit after its call,
+keeping what it actually said, and a result whose call is nowhere in the thread is dropped. Affected
+conversations start answering again on their own; there is nothing to run and nothing to reset.
+
+### The framework Bot answers on 5.6-tier models, and can be told how hard to think
+
+Pointing `BOT_MODEL` at a `gpt-5.6-*` model gave a Bot that started, reported healthy, and then said
+nothing: every run was a RUN_STARTED and a RUN_FINISHED with no text between them. Those models are
+run on the Responses API, which streams content blocks where chat completions streams a string, and
+the run read only the string — so every delta was dropped on the floor. Both shapes are read now.
+Nothing changes for a deployment on 5.5 or on Anthropic or Google.
+
+`BOT_REASONING_EFFORT` sets how hard a reasoning model thinks: `none`, `minimal`, `low`, `medium`,
+`high`, `xhigh` or `max`. Unset, the model keeps its provider's default. A value the API does not
+have, or one set where it cannot be sent — a provider that is not OpenAI, or a model not on the
+Responses API — stops the Bot at startup with a message naming what to change, rather than starting
+with a setting that goes nowhere.
+
+### A Bot can be asked to do something on a schedule
+
+"Every weekday at nine, post the standup notes here" is now something a Bot can be asked rather than
+something somebody has to remember. A routine created this way runs under its own creator's grants —
+it can do exactly what they could do in chat, and nothing more — and its reply lands in the channel as
+an ordinary Bot message: it lights the unread dot the same way any other message does, and it appears
+in the transcript rather than anywhere separate. A routine that fails posts one message about its
+first failure and, after ten in a row, switches itself off with a final one rather than failing
+forever unnoticed.
+
+The deployment gains two tables, via migration `0021`.
+
+**This needs a new process.** A worker fires due routines by calling this deployment's own API server,
+and a deployment that never starts one schedules nothing — the routine sits on the Routines page with
+a next run time like any other, and nothing on the screen says a worker is missing. `WORKER_SHARED_SECRET`
+is the credential the worker presents; a deployment without it configured refuses every handoff rather
+than accepting one it cannot attribute. `scripts/start.sh` runs the worker locally; the Helm chart
+turns it on with `routines.enabled` and takes the secret as `secrets.workerSharedSecret`. No new port
+is opened for any of this — the worker only ever calls out to the server it already trusts.
+
+### Turn screenshots are swept in every deployment, not one
+
+A page a Bot opens is photographed and kept in `computer_page_frame`, so a conversation read back
+later shows what it was looking at. The reaper for those rows had one caller: the idle-computer
+culler, which refuses to run unless each Bot has its own computer and is scheduled only by the Helm
+chart's CronJob, which exists only when `computers.mode` is `sandbox`. On Compose, on the all-in-one
+image, and on the chart's own default of `shared`, nothing ever called it. One browsing Bot over
+ninety days is several hundred megabytes of rows that nothing was ever going to remove.
+
+The sweep now runs on the server, on the same hourly timer that removes old audit rows, and does not
+wait for a retention policy to be configured: a month of screenshots is what the store already meant
+to keep. It also removes them in batches, because one statement over that much data held its locks
+for seventeen seconds.
+
+Deployments using `computers.mode: sandbox` are unaffected in what they keep. The culler no longer
+purges frames, because the server does it there too and one owner is better than two.
+
+**On upgrade, the first sweep removes the backlog.** A deployment that has been keeping every
+screenshot since it was installed will lose the ones older than a month, about a minute after the
+server starts. That is the window the store has always documented and the one sandbox deployments
+have been enforcing, but it has never been applied anywhere else, so it is worth knowing before the
+upgrade rather than after. It is drained in batches, forty thousand rows an hour, rather than in one
+statement.
+
 ### A channel a Bot has spoken in unseen shows a dot
 
 The sidebar marks a channel when a Bot has said something since you last had it open: a dot beside
@@ -136,8 +340,8 @@ A Helm chart under `charts/openbot`, Bots and all, and the fixes that installing
 up. Proven on a real EKS cluster: five workloads, replicas across two nodes, EBS volumes bound, and a
 Bot opening a real page from inside AWS with the decision in the audit trail.
 
-One chart, four targets: EKS, GKE, AKS and somebody's own cluster, with nothing but values between
-them. There is no cloud branching in any template. Every place the clouds genuinely differ is a
+One chart, five targets: EKS with a shared browser, EKS with a computer for each Bot, GKE, AKS and
+somebody's own cluster, with nothing but values between them. There is no cloud branching in any template. Every place the clouds genuinely differ is a
 value whose default is what a plain self-hosted cluster does: the cluster's own default StorageClass,
 no RuntimeClass, a plain Kubernetes Secret, an Ingress. Identity is one `serviceAccount.annotations`
 map, which is all IRSA, Workload Identity and AKS workload identity are. Secrets are a plain Secret
@@ -334,6 +538,33 @@ that matters is invisible.
 
 The grant queries now wait for a surface to declare a real Bot, and simply do not run while the
 placeholder holds. Conversation surfaces — the Bot page, channels — declare one and are unchanged.
+### A rule can be tested against history before it is saved
+
+A boundary was written blind: an administrator typed a CEL rule, saved it, and learned what it
+actually matches from the refusals it produced in production. The trail already records every judged
+computer action with the same facts the gateway judged it on, so the question "what would this rule
+have done" had an answer nobody could ask.
+
+The Boundaries page now has **Test first** beside **Add rule**. The candidate — the current policy
+plus the drafted rule — is replayed over recent recorded actions, and the reply names each one it
+would have decided differently and the rule that would have decided it. Nothing is saved and nothing
+is decided; no audit row is written, because no action was permitted or refused.
+
+Replay, not simulation: the context is rebuilt from the audit row exactly as the gateway built it at
+decision time, through the same helpers, so a rule behaves here as it will behave live. The scan is
+bounded and biased to recency, and the reply says how many rows it covered.
+
+### A browser refusal names the element again
+
+Every browser context carries a neutral all-empty `mcp` object, so a rule naming `mcp.effect`
+evaluates to false instead of throwing. The refusal copy keyed on that object being present rather
+than on its contents, so every live browser refusal took the tool-call branch and read
+":  on  is blocked" — two empty strings where the element and the page belonged. The tests passed,
+because their contexts omitted the field the gateway always attaches.
+
+The branch now keys on the server and tool being named, which a real tool call always has. A refused
+click reads "“Submit order” on shop.example is blocked by the rule ..." again, which is what the Bot
+relays to the person asking.
 
 ### Knowledge searches instead of guessing
 

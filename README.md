@@ -123,6 +123,7 @@ Leave `EMBEDDED_POSTGRES` off and set `DATABASE_URL` to point at a database you 
 | -------------------- | ------------------------------------------------------------------ |
 | `/`                  | Start and browse channels.                                         |
 | `/agents`            | Create, edit, duplicate, hide, delete, and launch coworkers.       |
+| `/agents/gallery`    | Browse the templates this deployment carries and import one.       |
 | `/channel/:id`       | Converse with one coworker, watch its screen, and see what it ran. |
 | `/bot`               | Direct chat with a Bot; `?agent=<id>` selects one.                 |
 | `/skills`            | Create and enable personal skills.                                 |
@@ -133,6 +134,7 @@ Leave `EMBEDDED_POSTGRES` off and set `DATABASE_URL` to point at a database you 
 | `/admin/components`  | Publish components and govern which Bots may use them.             |
 | `/admin/playground`  | Draft and publish sandboxed components in the browser.             |
 | `/admin/plugins`     | Configure MCP servers, MCP grants, and deployment skills.          |
+| `/admin/templates`   | Register a pinned template source and decide who may install.      |
 | `/admin/audit`       | Review permitted, refused, and failed actions.                     |
 
 ## Features
@@ -148,12 +150,15 @@ Leave `EMBEDDED_POSTGRES` off and set `DATABASE_URL` to point at a database you 
 - **Components instead of prose**: compiled React components live in `app/src/components/gallery/`, sandboxed ones are authored in `/admin/playground` and published with no deployment. Every call asks the server whether the component exists, is published, and is not withheld from that Bot. Data functions are granted per component.
 - **Governed MCP**: Google Drive and Notion ship in the catalogue, reached as the person asking. The catalogue carries only vendors this deployment stands behind, so adding one is a review of that vendor. Custom servers must pass URL checks; unknown tools and custom-server tools are treated as writes, and a catalogue tool the server advertises but does not name as a write classifies as a read. A Bot is told which connectors exist here and which it holds, so it says it has not been granted one rather than browsing to the vendor's website.
 - **Skills are instructions, not capabilities**: personal skills attach only to Bots their author owns, deployment skills are admin-owned, and both are invoked with `/` in the composer.
+- **A coworker as a portable file**: export a Bot to one YAML file — its role, its skills, and the connectors it asks for — and import it on another deployment. Configuration travels; capability does not: a template carries no id, no endpoint, no credential and no grant, and a document containing one fails to parse rather than being quietly stripped. What it wanted lands as a request an administrator decides on the screens that already decide it, so an imported Bot arrives cold and says so. The importer is shown every word a stranger wrote, verbatim, before any of it reaches a model. See [docs/bot-templates.md](docs/bot-templates.md).
+- **A gallery in the box, and a catalogue that grows by a push**: `examples/templates/` is copied into the image, so a deployment with no network at all opens `/agents/gallery` and finds something in it. Each file is parsed on its own, and one that does not parse is named and passed over rather than stopping a boot. Beyond that seed an administrator registers a public repository as a source, and only one the deployment's own `OPENBOT_TEMPLATE_SOURCES` names, pinned to a commit sha and fetched server-side: nothing reaches the network until somebody asks for it, and moving the pin is the only update there is.
 - **Sign in with what your company already has**: Google, Microsoft or Okta from the environment, or a company's own SAML or OpenID Connect provider registered while the deployment runs and routed by email domain. Any one turns sign-in on; several may be configured at once.
 - **Decide who gets in**: `/admin/people` lists everybody who has signed in, promotes and demotes them, and removes access, which ends the session they are using and stops the next sign-in. Every change is on the audit trail.
 - **An audit trail you can read**: `/admin/audit` lists what was permitted, what was refused and what failed, and every refusal carries the rule that caused it.
 - **Credentials encrypted at rest**: stored through `/admin/credentials`, never returned by an API, and redacted from audit events.
 - **Loopback by default**: computers bind to `127.0.0.1` and require a per-container token, so nothing reaches a logged-in browser by knowing its port. The supervisor binds there too, because it holds the Docker socket and its token is a shared secret rather than a network boundary.
 - **Durable threads and memory**: conversations survive restarts through CopilotKit Intelligence, and each deployment stamps the threads it owns.
+- **Routines**: ask a Bot to do something on a schedule and it does, running as you, in the channel you asked in. A 15-minute floor and a cap of 20 enabled routines keep a sentence from scheduling more than a person meant, and ten failures in a row switch a routine off rather than burn model spend forever. Needs a worker process; see [docs/routines.md](docs/routines.md).
 
 ## Bring your own agent
 

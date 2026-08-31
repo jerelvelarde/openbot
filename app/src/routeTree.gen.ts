@@ -17,6 +17,7 @@ import { Route as AuthedAssistRouteImport } from './routes/_authed/assist'
 import { Route as AuthedSettingsRouteRouteImport } from './routes/_authed/settings/route'
 import { Route as AuthedAppIndexRouteImport } from './routes/_authed/_app/index'
 import { Route as AuthedAppBotRouteImport } from './routes/_authed/_app/bot'
+import { Route as AuthedAppRoutinesRouteImport } from './routes/_authed/_app/routines'
 import { Route as AuthedAppSkillsRouteImport } from './routes/_authed/_app/skills'
 import { Route as AuthedAdminIndexRouteImport } from './routes/_authed/admin/index'
 import { Route as AuthedAdminAuditRouteImport } from './routes/_authed/admin/audit'
@@ -27,6 +28,7 @@ import { Route as AuthedAdminIdentityProvidersRouteImport } from './routes/_auth
 import { Route as AuthedAdminPeopleRouteImport } from './routes/_authed/admin/people'
 import { Route as AuthedAdminPlaygroundRouteImport } from './routes/_authed/admin/playground'
 import { Route as AuthedAdminSkillsRouteImport } from './routes/_authed/admin/skills'
+import { Route as AuthedAdminTemplatesRouteImport } from './routes/_authed/admin/templates'
 import { Route as AuthedLinkSlackRouteImport } from './routes/_authed/link/slack'
 import { Route as AuthedSettingsIndexRouteImport } from './routes/_authed/settings/index'
 import { Route as AuthedAppAgentsIndexRouteImport } from './routes/_authed/_app/agents/index'
@@ -40,6 +42,8 @@ import { Route as AuthedSettingsComponentsGalleryIndexRouteImport } from './rout
 import { Route as AuthedSettingsComponentsGalleryNameRouteImport } from './routes/_authed/settings/components-gallery/$name'
 import { Route as AuthedSettingsConnectedAccountsIndexRouteImport } from './routes/_authed/settings/connected-accounts/index'
 import { Route as AuthedSettingsConnectedAccountsKeyRouteImport } from './routes/_authed/settings/connected-accounts/$key'
+import { Route as AuthedAppAgentsGalleryIndexRouteImport } from './routes/_authed/_app/agents/gallery/index'
+import { Route as AuthedAppAgentsGallerySlugRouteImport } from './routes/_authed/_app/agents/gallery/$slug'
 import { Route as AuthedAppSlackThreadThreadIdRouteImport } from './routes/_authed/_app/slack/thread/$threadId'
 import { Route as AuthedAdminPluginsKeyToolsToolRouteImport } from './routes/_authed/admin/plugins/$key_.tools.$tool'
 
@@ -79,6 +83,11 @@ const AuthedAppIndexRoute = AuthedAppIndexRouteImport.update({
 const AuthedAppBotRoute = AuthedAppBotRouteImport.update({
   id: '/bot',
   path: '/bot',
+  getParentRoute: () => AuthedAppRoute,
+} as any)
+const AuthedAppRoutinesRoute = AuthedAppRoutinesRouteImport.update({
+  id: '/routines',
+  path: '/routines',
   getParentRoute: () => AuthedAppRoute,
 } as any)
 const AuthedAppSkillsRoute = AuthedAppSkillsRouteImport.update({
@@ -130,6 +139,11 @@ const AuthedAdminPlaygroundRoute = AuthedAdminPlaygroundRouteImport.update({
 const AuthedAdminSkillsRoute = AuthedAdminSkillsRouteImport.update({
   id: '/skills',
   path: '/skills',
+  getParentRoute: () => AuthedAdminRouteRoute,
+} as any)
+const AuthedAdminTemplatesRoute = AuthedAdminTemplatesRouteImport.update({
+  id: '/templates',
+  path: '/templates',
   getParentRoute: () => AuthedAdminRouteRoute,
 } as any)
 const AuthedLinkSlackRoute = AuthedLinkSlackRouteImport.update({
@@ -204,6 +218,18 @@ const AuthedSettingsConnectedAccountsKeyRoute =
     path: '/connected-accounts/$key',
     getParentRoute: () => AuthedSettingsRouteRoute,
   } as any)
+const AuthedAppAgentsGalleryIndexRoute =
+  AuthedAppAgentsGalleryIndexRouteImport.update({
+    id: '/agents/gallery/',
+    path: '/agents/gallery/',
+    getParentRoute: () => AuthedAppRoute,
+  } as any)
+const AuthedAppAgentsGallerySlugRoute =
+  AuthedAppAgentsGallerySlugRouteImport.update({
+    id: '/agents/gallery/$slug',
+    path: '/agents/gallery/$slug',
+    getParentRoute: () => AuthedAppRoute,
+  } as any)
 const AuthedAppSlackThreadThreadIdRoute =
   AuthedAppSlackThreadThreadIdRouteImport.update({
     id: '/slack/thread/$threadId',
@@ -224,6 +250,7 @@ export interface FileRoutesByFullPath {
   '/settings': typeof AuthedSettingsRouteRouteWithChildren
   '/assist': typeof AuthedAssistRoute
   '/bot': typeof AuthedAppBotRoute
+  '/routines': typeof AuthedAppRoutinesRoute
   '/skills': typeof AuthedAppSkillsRoute
   '/admin/audit': typeof AuthedAdminAuditRoute
   '/admin/boundaries': typeof AuthedAdminBoundariesRoute
@@ -233,6 +260,7 @@ export interface FileRoutesByFullPath {
   '/admin/people': typeof AuthedAdminPeopleRoute
   '/admin/playground': typeof AuthedAdminPlaygroundRoute
   '/admin/skills': typeof AuthedAdminSkillsRoute
+  '/admin/templates': typeof AuthedAdminTemplatesRoute
   '/link/slack': typeof AuthedLinkSlackRoute
   '/admin/': typeof AuthedAdminIndexRoute
   '/settings/': typeof AuthedSettingsIndexRoute
@@ -247,7 +275,9 @@ export interface FileRoutesByFullPath {
   '/admin/plugins/': typeof AuthedAdminPluginsIndexRoute
   '/settings/components-gallery/': typeof AuthedSettingsComponentsGalleryIndexRoute
   '/settings/connected-accounts/': typeof AuthedSettingsConnectedAccountsIndexRoute
+  '/agents/gallery/$slug': typeof AuthedAppAgentsGallerySlugRoute
   '/slack/thread/$threadId': typeof AuthedAppSlackThreadThreadIdRoute
+  '/agents/gallery/': typeof AuthedAppAgentsGalleryIndexRoute
   '/admin/plugins/$key/tools/$tool': typeof AuthedAdminPluginsKeyToolsToolRoute
 }
 export interface FileRoutesByTo {
@@ -255,6 +285,7 @@ export interface FileRoutesByTo {
   '/sign': typeof SignRoute
   '/assist': typeof AuthedAssistRoute
   '/bot': typeof AuthedAppBotRoute
+  '/routines': typeof AuthedAppRoutinesRoute
   '/skills': typeof AuthedAppSkillsRoute
   '/admin/audit': typeof AuthedAdminAuditRoute
   '/admin/boundaries': typeof AuthedAdminBoundariesRoute
@@ -264,6 +295,7 @@ export interface FileRoutesByTo {
   '/admin/people': typeof AuthedAdminPeopleRoute
   '/admin/playground': typeof AuthedAdminPlaygroundRoute
   '/admin/skills': typeof AuthedAdminSkillsRoute
+  '/admin/templates': typeof AuthedAdminTemplatesRoute
   '/link/slack': typeof AuthedLinkSlackRoute
   '/admin': typeof AuthedAdminIndexRoute
   '/settings': typeof AuthedSettingsIndexRoute
@@ -278,7 +310,9 @@ export interface FileRoutesByTo {
   '/admin/plugins': typeof AuthedAdminPluginsIndexRoute
   '/settings/components-gallery': typeof AuthedSettingsComponentsGalleryIndexRoute
   '/settings/connected-accounts': typeof AuthedSettingsConnectedAccountsIndexRoute
+  '/agents/gallery/$slug': typeof AuthedAppAgentsGallerySlugRoute
   '/slack/thread/$threadId': typeof AuthedAppSlackThreadThreadIdRoute
+  '/agents/gallery': typeof AuthedAppAgentsGalleryIndexRoute
   '/admin/plugins/$key/tools/$tool': typeof AuthedAdminPluginsKeyToolsToolRoute
 }
 export interface FileRoutesById {
@@ -290,6 +324,7 @@ export interface FileRoutesById {
   '/_authed/_app': typeof AuthedAppRouteWithChildren
   '/_authed/assist': typeof AuthedAssistRoute
   '/_authed/_app/bot': typeof AuthedAppBotRoute
+  '/_authed/_app/routines': typeof AuthedAppRoutinesRoute
   '/_authed/_app/skills': typeof AuthedAppSkillsRoute
   '/_authed/admin/audit': typeof AuthedAdminAuditRoute
   '/_authed/admin/boundaries': typeof AuthedAdminBoundariesRoute
@@ -299,6 +334,7 @@ export interface FileRoutesById {
   '/_authed/admin/people': typeof AuthedAdminPeopleRoute
   '/_authed/admin/playground': typeof AuthedAdminPlaygroundRoute
   '/_authed/admin/skills': typeof AuthedAdminSkillsRoute
+  '/_authed/admin/templates': typeof AuthedAdminTemplatesRoute
   '/_authed/link/slack': typeof AuthedLinkSlackRoute
   '/_authed/_app/': typeof AuthedAppIndexRoute
   '/_authed/admin/': typeof AuthedAdminIndexRoute
@@ -314,7 +350,9 @@ export interface FileRoutesById {
   '/_authed/admin/plugins/': typeof AuthedAdminPluginsIndexRoute
   '/_authed/settings/components-gallery/': typeof AuthedSettingsComponentsGalleryIndexRoute
   '/_authed/settings/connected-accounts/': typeof AuthedSettingsConnectedAccountsIndexRoute
+  '/_authed/_app/agents/gallery/$slug': typeof AuthedAppAgentsGallerySlugRoute
   '/_authed/_app/slack/thread/$threadId': typeof AuthedAppSlackThreadThreadIdRoute
+  '/_authed/_app/agents/gallery/': typeof AuthedAppAgentsGalleryIndexRoute
   '/_authed/admin/plugins/$key_/tools/$tool': typeof AuthedAdminPluginsKeyToolsToolRoute
 }
 export interface FileRouteTypes {
@@ -326,6 +364,7 @@ export interface FileRouteTypes {
     | '/settings'
     | '/assist'
     | '/bot'
+    | '/routines'
     | '/skills'
     | '/admin/audit'
     | '/admin/boundaries'
@@ -335,6 +374,7 @@ export interface FileRouteTypes {
     | '/admin/people'
     | '/admin/playground'
     | '/admin/skills'
+    | '/admin/templates'
     | '/link/slack'
     | '/admin/'
     | '/settings/'
@@ -349,7 +389,9 @@ export interface FileRouteTypes {
     | '/admin/plugins/'
     | '/settings/components-gallery/'
     | '/settings/connected-accounts/'
+    | '/agents/gallery/$slug'
     | '/slack/thread/$threadId'
+    | '/agents/gallery/'
     | '/admin/plugins/$key/tools/$tool'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -357,6 +399,7 @@ export interface FileRouteTypes {
     | '/sign'
     | '/assist'
     | '/bot'
+    | '/routines'
     | '/skills'
     | '/admin/audit'
     | '/admin/boundaries'
@@ -366,6 +409,7 @@ export interface FileRouteTypes {
     | '/admin/people'
     | '/admin/playground'
     | '/admin/skills'
+    | '/admin/templates'
     | '/link/slack'
     | '/admin'
     | '/settings'
@@ -380,7 +424,9 @@ export interface FileRouteTypes {
     | '/admin/plugins'
     | '/settings/components-gallery'
     | '/settings/connected-accounts'
+    | '/agents/gallery/$slug'
     | '/slack/thread/$threadId'
+    | '/agents/gallery'
     | '/admin/plugins/$key/tools/$tool'
   id:
     | '__root__'
@@ -391,6 +437,7 @@ export interface FileRouteTypes {
     | '/_authed/_app'
     | '/_authed/assist'
     | '/_authed/_app/bot'
+    | '/_authed/_app/routines'
     | '/_authed/_app/skills'
     | '/_authed/admin/audit'
     | '/_authed/admin/boundaries'
@@ -400,6 +447,7 @@ export interface FileRouteTypes {
     | '/_authed/admin/people'
     | '/_authed/admin/playground'
     | '/_authed/admin/skills'
+    | '/_authed/admin/templates'
     | '/_authed/link/slack'
     | '/_authed/_app/'
     | '/_authed/admin/'
@@ -415,7 +463,9 @@ export interface FileRouteTypes {
     | '/_authed/admin/plugins/'
     | '/_authed/settings/components-gallery/'
     | '/_authed/settings/connected-accounts/'
+    | '/_authed/_app/agents/gallery/$slug'
     | '/_authed/_app/slack/thread/$threadId'
+    | '/_authed/_app/agents/gallery/'
     | '/_authed/admin/plugins/$key_/tools/$tool'
   fileRoutesById: FileRoutesById
 }
@@ -480,6 +530,13 @@ declare module '@tanstack/react-router' {
       path: '/bot'
       fullPath: '/bot'
       preLoaderRoute: typeof AuthedAppBotRouteImport
+      parentRoute: typeof AuthedAppRoute
+    }
+    '/_authed/_app/routines': {
+      id: '/_authed/_app/routines'
+      path: '/routines'
+      fullPath: '/routines'
+      preLoaderRoute: typeof AuthedAppRoutinesRouteImport
       parentRoute: typeof AuthedAppRoute
     }
     '/_authed/_app/skills': {
@@ -550,6 +607,13 @@ declare module '@tanstack/react-router' {
       path: '/skills'
       fullPath: '/admin/skills'
       preLoaderRoute: typeof AuthedAdminSkillsRouteImport
+      parentRoute: typeof AuthedAdminRouteRoute
+    }
+    '/_authed/admin/templates': {
+      id: '/_authed/admin/templates'
+      path: '/templates'
+      fullPath: '/admin/templates'
+      preLoaderRoute: typeof AuthedAdminTemplatesRouteImport
       parentRoute: typeof AuthedAdminRouteRoute
     }
     '/_authed/link/slack': {
@@ -643,6 +707,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthedSettingsConnectedAccountsKeyRouteImport
       parentRoute: typeof AuthedSettingsRouteRoute
     }
+    '/_authed/_app/agents/gallery/': {
+      id: '/_authed/_app/agents/gallery/'
+      path: '/agents/gallery'
+      fullPath: '/agents/gallery/'
+      preLoaderRoute: typeof AuthedAppAgentsGalleryIndexRouteImport
+      parentRoute: typeof AuthedAppRoute
+    }
+    '/_authed/_app/agents/gallery/$slug': {
+      id: '/_authed/_app/agents/gallery/$slug'
+      path: '/agents/gallery/$slug'
+      fullPath: '/agents/gallery/$slug'
+      preLoaderRoute: typeof AuthedAppAgentsGallerySlugRouteImport
+      parentRoute: typeof AuthedAppRoute
+    }
     '/_authed/_app/slack/thread/$threadId': {
       id: '/_authed/_app/slack/thread/$threadId'
       path: '/slack/thread/$threadId'
@@ -669,6 +747,7 @@ interface AuthedAdminRouteRouteChildren {
   AuthedAdminPeopleRoute: typeof AuthedAdminPeopleRoute
   AuthedAdminPlaygroundRoute: typeof AuthedAdminPlaygroundRoute
   AuthedAdminSkillsRoute: typeof AuthedAdminSkillsRoute
+  AuthedAdminTemplatesRoute: typeof AuthedAdminTemplatesRoute
   AuthedAdminIndexRoute: typeof AuthedAdminIndexRoute
   AuthedAdminComponentsNameRoute: typeof AuthedAdminComponentsNameRoute
   AuthedAdminPluginsKeyRoute: typeof AuthedAdminPluginsKeyRoute
@@ -686,6 +765,7 @@ const AuthedAdminRouteRouteChildren: AuthedAdminRouteRouteChildren = {
   AuthedAdminPeopleRoute: AuthedAdminPeopleRoute,
   AuthedAdminPlaygroundRoute: AuthedAdminPlaygroundRoute,
   AuthedAdminSkillsRoute: AuthedAdminSkillsRoute,
+  AuthedAdminTemplatesRoute: AuthedAdminTemplatesRoute,
   AuthedAdminIndexRoute: AuthedAdminIndexRoute,
   AuthedAdminComponentsNameRoute: AuthedAdminComponentsNameRoute,
   AuthedAdminPluginsKeyRoute: AuthedAdminPluginsKeyRoute,
@@ -722,22 +802,28 @@ const AuthedSettingsRouteRouteWithChildren =
 
 interface AuthedAppRouteChildren {
   AuthedAppBotRoute: typeof AuthedAppBotRoute
+  AuthedAppRoutinesRoute: typeof AuthedAppRoutinesRoute
   AuthedAppSkillsRoute: typeof AuthedAppSkillsRoute
   AuthedAppIndexRoute: typeof AuthedAppIndexRoute
   AuthedAppChannelChannelIdRoute: typeof AuthedAppChannelChannelIdRoute
   AuthedAppChannelNewRoute: typeof AuthedAppChannelNewRoute
   AuthedAppAgentsIndexRoute: typeof AuthedAppAgentsIndexRoute
+  AuthedAppAgentsGallerySlugRoute: typeof AuthedAppAgentsGallerySlugRoute
   AuthedAppSlackThreadThreadIdRoute: typeof AuthedAppSlackThreadThreadIdRoute
+  AuthedAppAgentsGalleryIndexRoute: typeof AuthedAppAgentsGalleryIndexRoute
 }
 
 const AuthedAppRouteChildren: AuthedAppRouteChildren = {
   AuthedAppBotRoute: AuthedAppBotRoute,
+  AuthedAppRoutinesRoute: AuthedAppRoutinesRoute,
   AuthedAppSkillsRoute: AuthedAppSkillsRoute,
   AuthedAppIndexRoute: AuthedAppIndexRoute,
   AuthedAppChannelChannelIdRoute: AuthedAppChannelChannelIdRoute,
   AuthedAppChannelNewRoute: AuthedAppChannelNewRoute,
   AuthedAppAgentsIndexRoute: AuthedAppAgentsIndexRoute,
+  AuthedAppAgentsGallerySlugRoute: AuthedAppAgentsGallerySlugRoute,
   AuthedAppSlackThreadThreadIdRoute: AuthedAppSlackThreadThreadIdRoute,
+  AuthedAppAgentsGalleryIndexRoute: AuthedAppAgentsGalleryIndexRoute,
 }
 
 const AuthedAppRouteWithChildren = AuthedAppRoute._addFileChildren(

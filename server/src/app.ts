@@ -1,7 +1,7 @@
 import type { Hono as HonoApp, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import { serveStatic } from "hono/bun";
-import { authoriseAgentCall } from "./agents/callback-token";
+import { authoriseAgentCall, sameToken } from "./agents/callback-token";
 import type { BotAccessCheck } from "./agents/profile-policy";
 import type { AgentProfileStore } from "./agents/profile-store";
 import { createAgentRoutes } from "./agents/routes";
@@ -40,10 +40,21 @@ import type { PeopleStore } from "./people/store";
 import { createPluginRoutes } from "./plugins/routes";
 import type { PluginStore } from "./plugins/store";
 import { REFUSAL_MARKER } from "./plugins/tools";
+import { createRoutineRoutes, type RoutineStore } from "./routines/routes";
+import type { RoutineRunner } from "./routines/runner";
 import type { IntentRouter } from "./routing/classify";
 import { createRoutingRoutes } from "./routing/routes";
 import { createCoworkerRoutingService } from "./routing/service";
 import type { SlackStatus } from "./slack/status";
+import type { TemplateCatalogue } from "./templates/catalogue";
+import type { TemplateInstaller } from "./templates/install";
+import {
+  createTemplateAdminRoutes,
+  createTemplateExport,
+  createTemplateRoutes,
+  type TemplateRoutesDeps,
+} from "./templates/routes";
+import type { TemplateReadExecutor, TemplateStore } from "./templates/store";
 import type { PackageStatusReader } from "./tenant-package";
 
 /**
@@ -184,6 +195,60 @@ export function createApp(
     transport: "stopped",
     provider: "unknown",
   }),
+  /*
+   * Everything below arrived from the Bot-templates line of work, which appended after `pageFrames`
+   * at the same time the three Slack parameters above did. Both said "appended last" and both were
+   * right about their own branch; the merge had to pick one order, and it put the parameters this
+   * deployment's production already passes first. These are positional, so this order is the only
+   * order, and every call site in the repo — `index.ts` and the tests alike — passes them exactly
+   * like this. Anything new still goes at the very bottom.
+   */
+  /**
+   * Fires one routine run with nobody's browser open, when the worker hands one back.
+   *
+   * Absent leaves the internal `/internal/routines/run` route unmounted rather than mounted and
+   * refusing every call: a deployment that never built a worker has no door for it, not a locked one.
+   */
+  routineRunner?: RoutineRunner,
+  /**
+   * A person's own standing instructions: the list, and a switch to stop one.
+   *
+   * Absent leaves the routes unmounted rather than mounted and refusing every call, the same
+   * degraded shape every other optional store here takes: a deployment that never built the store
+   * has no door for this at all, not a locked one.
+   */
+  routineStore?: RoutineStore,
+  /**
+   * Bot templates: the drafts this deployment authored, and the one act that installs somebody's.
+   *
+   * Only the three things this module cannot build for itself. The trail, the grant stores and
+   * whether there is a Bot in the box are all already in scope here, and passing them in again would
+   * be a second place for them to disagree with the rest of the app.
+   *
+   * Absent leaves the routes unmounted rather than mounted and refusing every call, and leaves the
+   * export button off a coworker's panel: a deployment that never built the template store has no
+   * door for this at all, not a locked one.
+   */
+  templates?: {
+    store: TemplateStore;
+    installer: TemplateInstaller;
+    /**
+     * A read handle on this deployment's own tables, for the resolver.
+     *
+     * The install path resolves again on its own transaction; this one serves the preview, which
+     * writes nothing and may read on the pool.
+     */
+    executor: TemplateReadExecutor;
+    /**
+     * The gallery this deployment reads templates out of.
+     *
+     * Optional in the same way everything else here is, and its absence is an empty gallery rather
+     * than a missing screen. Built beside the store rather than here, because it reads the three
+     * `OPENBOT_TEMPLATE_*` settings and a directory off disk, and this module builds nothing that
+     * touches the filesystem.
+     */
+    catalogue?: TemplateCatalogue;
+  },
 ) {
   const app = new Hono<{ Variables: AppVariables }>();
 
@@ -630,6 +695,84 @@ export function createApp(
     }
     return context.json({ package: await packageStatusReader.active() });
   });
+  /*
+   * Where the worker hands a routine run back. Not under /api and not behind requireUser: the
+   * worker is not a person with a session, it is another process on this deployment's own network,
+   * and the shared secret below is its whole credential.
+   *
+   * Mounted only when a runner was built, so a deployment that never stood up a worker has no door
+   * for this at all, rather than one that is mounted and permanently refuses.
+   */
+  if (routineRunner) {
+    app.post("/internal/routines/run", async (context) => {
+      const offered = context.req.header("authorization");
+      const expected = config.workerSharedSecret
+        ? `Bearer ${config.workerSharedSecret}`
+        : null;
+      /*
+       * The no-secret-configured case is refused here, before any comparison, and with the exact
+       * same response as a wrong secret. A deployment with no worker must not answer a guess any
+       * differently than a deployment with a worker and a wrong key would.
+       */
+      if (!expected || !offered || !sameToken(offered, expected)) {
+        /*
+         * Recorded, because this is a boundary being held and every other one here leaves a row. A
+         * worker with a stale or missing secret used to fail here in total silence: every routine
+         * stopped firing and nothing anywhere said why, the same false negative `mcp.callback_refused`
+         * exists to catch on the sibling unauthenticated boundary above.
+         *
+         * The reason is short and lives only in the row, never on the wire: the response below stays
+         * byte-identical across all three causes on purpose (see the comment above), so this is the
+         * one place the distinction is allowed to exist. The offered credential itself is never
+         * recorded, not even a fragment of it.
+         */
+        if (auditStore) {
+          try {
+            await recordAuditEvent(auditStore, {
+              eventType: "routines.dispatch_refused",
+              targetType: "worker",
+              payload: {
+                reason: !expected
+                  ? "unconfigured"
+                  : !offered
+                    ? "missing-header"
+                    : "mismatch",
+                note: "A worker's bearer secret did not check out, so no routine run was dispatched.",
+              },
+            });
+          } catch (error) {
+            // Never fatal: the 401 above is already decided and sent. A trail that is briefly
+            // unavailable is not a reason to turn a refusal into a 500.
+            console.error(
+              JSON.stringify({
+                type: "routine-dispatch-audit-write-failed",
+                error: String(error),
+              }),
+            );
+          }
+        }
+        return context.json({ error: "This endpoint is the worker's." }, 401);
+      }
+      const body = await context.req.json().catch(() => null);
+      if (
+        typeof (body as { routineRunId?: unknown } | null)?.routineRunId !==
+        "string"
+      ) {
+        return context.json({ error: "A routineRunId is required." }, 400);
+      }
+      /*
+       * Fire and answer: the consumer needs "accepted", not the outcome. The run row in
+       * `routine_runs` carries the outcome, and the consumer finishes the work item on this 202.
+       * Queue retries exist for DISPATCH failures only — a failed turn is final for this firing, and
+       * the fatigue rule owns it. `run()` never throws by contract; this swallow only guards against
+       * that contract being wrong without turning a bug there into an unhandled rejection here.
+       */
+      void routineRunner
+        .run((body as { routineRunId: string }).routineRunId)
+        .catch(() => {});
+      return context.json({ accepted: true }, 202);
+    });
+  }
   // The CopilotKit runtime, behind the same session guard as every other API route. Mounted last so
   // its own routing under /api/copilotkit cannot shadow an OpenBot route declared above.
   if (copilotHandler) {
@@ -668,6 +811,7 @@ export function createApp(
         requireUser,
         canUseBot,
         pageFrames,
+        auditReader,
       ),
     );
   }
@@ -687,6 +831,45 @@ export function createApp(
         // Addresses this deployment named, which is how a hosted one reaches an agent on its own
         // network without dropping the floor for everything else.
         config.agentEndpointAllowedHosts,
+        /*
+         * What the Bot's own screen needs to show, and change, which Bots it may hand work to.
+         *
+         * Read per request rather than captured, for the reason the desk reads it per hop: a grant
+         * made a minute ago counts and one revoked a minute ago stops counting. Absent with no
+         * plugin store, which is a deployment where no Bot may address any other.
+         */
+        pluginStore
+          ? {
+              enabled:
+                config.handoff.maxDepth > 0 && config.handoff.maxPerRun > 0,
+              reachableFrom: (agentId) =>
+                pluginStore.botsReachableFrom(agentId),
+            }
+          : undefined,
+        /*
+         * Packing a coworker into a template draft, mounted on the Bot rather than under
+         * /api/templates because that is what it is done to.
+         *
+         * Requires the trail as well as the store. An export is the moment a coworker's whole
+         * configuration becomes a file somebody can send anywhere, and `template.exported` is the
+         * only record that it happened — so a deployment that cannot write the row does not get the
+         * button, rather than getting a button that leaves no trace.
+         */
+        templates && auditStore
+          ? createTemplateExport({
+              executor: templates.executor,
+              templateStore: templates.store,
+              auditStore,
+              ...(pluginStore ? { plugins: pluginStore } : {}),
+              ...(componentStore ? { components: componentStore } : {}),
+              // What tells `managed` from `remote`: a coworker that runs in the box carries this
+              // deployment's own address in its configuration, so having an endpoint is not the
+              // distinction. See templates/pack.ts.
+              ...(config.managedAgent
+                ? { managedAgentAgUiUrl: config.managedAgent.endpoint }
+                : {}),
+            })
+          : undefined,
       ),
     );
     // Choosing a coworker for an untagged message needs the same permission-filtered roster the
@@ -737,10 +920,71 @@ export function createApp(
     app.route("/api/external-links", externalLinkRoutes);
   }
 
+  if (routineStore) {
+    app.route("/api/routines", createRoutineRoutes(routineStore, requireUser));
+  }
+
   if (componentStore) {
     app.route(
       "/api/components",
       createComponentRoutes(componentStore, requireUser, auditStore, canUseBot),
+    );
+  }
+
+  /*
+   * Reading a stranger's file, and turning it into an ordinary Bot.
+   *
+   * The trail is a condition of mounting rather than an optional extra, which is not the shape the
+   * other surfaces here take. Every act on these routes is either somebody consenting to text a
+   * stranger wrote or an administrator answering what that text asked for, and both are only
+   * accountable afterwards through `template.import_refused`, `template.imported` and
+   * `template.capability_granted`. A template surface with no trail is the one shape of this feature
+   * that must not exist, so a deployment that cannot write one gets no import at all.
+   *
+   * The grant stores are passed as the narrow `grant` seam each of them already has. There is no new
+   * grant route anywhere in this feature: satisfying a capability goes through the code that already
+   * refuses, and handing these routes anything wider would be an invitation to grow a second path.
+   */
+  if (templates && auditStore) {
+    const templateDeps: TemplateRoutesDeps = {
+      templateStore: templates.store,
+      installer: templates.installer,
+      auditStore,
+      executor: templates.executor,
+      // Whether a coworker with `runtime: managed` has anywhere to run. False on the recommended
+      // one-container image, which is why an import of a managed template asks for an address.
+      managedAgent: Boolean(config.managedAgent),
+      ...(pluginStore ? { grants: pluginStore } : {}),
+      ...(componentStore ? { components: componentStore } : {}),
+      /*
+       * The floor comes off the same `config` field the catalogue's own floor was built from, one
+       * call site apart, so the value the admin screen renders as immovable and the value
+       * `setInstallers` refuses to go below are the same fact rather than two copies of it.
+       */
+      ...(templates.catalogue
+        ? {
+            gallery: {
+              catalogue: templates.catalogue,
+              installerFloor: config.templateInstallers,
+            },
+          }
+        : {}),
+    };
+    app.route(
+      "/api/templates",
+      createTemplateRoutes(templateDeps, requireUser, canUseBot),
+    );
+    /*
+     * The administrator's half, on its own prefix.
+     *
+     * Same dependencies, different guard on every handler: who may install, which repositories the
+     * gallery may read from, and what this deployment has imported. Mounted here rather than folded
+     * into the surface above so that the authorization of a route is visible from where it is
+     * mounted.
+     */
+    app.route(
+      "/api/admin/templates",
+      createTemplateAdminRoutes(templateDeps, requireUser),
     );
   }
 

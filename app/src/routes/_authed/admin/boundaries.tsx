@@ -2,15 +2,21 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useState } from "react";
 import { PageSection, PageShell } from "@/components/layout/page-shell";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { saveActionPolicyMutationOptions } from "@/lib/computers/mutations";
 import {
   type ActionPolicy,
   actionPolicyQueryOptions,
+  type DryRunReport,
+  dryRunActionPolicy,
   type PolicyMode,
 } from "@/lib/computers/queries";
+import {
+  type AppliedBoundaryClause,
+  appliedBoundaryListQueryOptions,
+} from "@/lib/templates/queries";
 import { queryClient } from "@/query-client";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 
 /**
  * CEL computer-action boundary editor. Rules are shown as the gateway evaluates them, and denied
@@ -51,6 +57,12 @@ function BoundariesPage() {
   const [saved, setSaved] = useState(false);
   const [draft, setDraft] = useState("");
 
+  const [tested, setTested] = useState<{
+    rule: string;
+    report: DryRunReport;
+  } | null>(null);
+  const [testing, setTesting] = useState(false);
+
   const stored = useQuery(actionPolicyQueryOptions());
   const savePolicy = useMutation(saveActionPolicyMutationOptions(queryClient));
 
@@ -90,6 +102,31 @@ function BoundariesPage() {
     if (!trimmed || policy.deny.includes(trimmed)) return;
     void save({ ...policy, deny: [...policy.deny, trimmed] });
     setDraft("");
+    setTested(null);
+  };
+
+  /*
+   * The rule as it would be in force — the current policy plus this draft — replayed over recent
+   * recorded actions. Nothing is saved and nothing is decided; the reply names the actions the
+   * addition would have decided differently, so the rule's real reach is known before it starts
+   * refusing anybody.
+   */
+  const testRule = async (rule: string) => {
+    const trimmed = rule.trim();
+    if (!trimmed) return;
+    setProblem(null);
+    setTesting(true);
+    try {
+      const report = await dryRunActionPolicy({
+        ...policy,
+        deny: [...policy.deny, trimmed],
+      });
+      setTested({ rule: trimmed, report });
+    } catch (thrown) {
+      setProblem((thrown as Error).message);
+    } finally {
+      setTesting(false);
+    }
   };
 
   return (
@@ -191,6 +228,7 @@ function BoundariesPage() {
             onChange={(event) => {
               setDraft(event.target.value);
               setSaved(false);
+              setTested(null);
             }}
             onKeyDown={(event) => {
               if (event.key === "Enter") addRule(draft);
@@ -199,6 +237,14 @@ function BoundariesPage() {
             value={draft}
           />
           <Button
+            disabled={testing || draft.trim().length === 0}
+            onClick={() => void testRule(draft)}
+            size="sm"
+            variant="outline"
+          >
+            {testing ? "Testing…" : "Test first"}
+          </Button>
+          <Button
             disabled={saving || draft.trim().length === 0}
             onClick={() => addRule(draft)}
             size="sm"
@@ -206,6 +252,8 @@ function BoundariesPage() {
             Add rule
           </Button>
         </div>
+
+        {tested ? <DryRunResult report={tested.report} /> : null}
 
         <ul className="mt-3 space-y-2">
           {PRESETS.map((preset) => (
@@ -228,6 +276,8 @@ function BoundariesPage() {
           ))}
         </ul>
       </PageSection>
+
+      <AppliedByImport />
 
       <PageSection
         description="The floor, applied to anything the deny list did not catch. It is not a formality: an empty list here permits nothing, so a deployment that clears this refuses every action rather than allowing every action."
@@ -254,5 +304,183 @@ function BoundariesPage() {
         )}
       </p>
     </PageShell>
+  );
+}
+
+/**
+ * What the tested rule would have done to actions already on the trail.
+ *
+ * Says the number over everything scanned first, because the list below it is capped and a reader
+ * who stops at the rows should not believe the rows are the whole answer.
+ */
+function DryRunResult({ report }: { report: DryRunReport }) {
+  if (report.scanned === 0) {
+    return (
+      <p className="mt-2 text-xs text-muted-foreground" role="status">
+        No recorded computer actions to test against yet. The rule is valid;
+        what it matches will only be known once Bots have acted.
+      </p>
+    );
+  }
+
+  return (
+    <div className="mt-2" role="status">
+      <p className="text-xs text-muted-foreground">
+        {report.wouldRefuse === 0
+          ? `Tested against the last ${report.scanned} recorded actions: this rule would have refused none of them. It may still match future actions.`
+          : `Tested against the last ${report.scanned} recorded actions: this rule would have refused ${report.wouldRefuse}.`}
+      </p>
+      {report.changes.length > 0 ? (
+        <ul className="mt-2 divide-y divide-border rounded-md border border-border">
+          {report.changes.map((change) => (
+            <li className="px-3 py-2" key={change.id}>
+              <p className="text-xs">
+                <span className="font-medium">
+                  {change.would === "refused"
+                    ? "Would refuse"
+                    : "Would now allow"}
+                </span>{" "}
+                <code className="font-mono">{change.action}</code>
+                {change.element?.name ? <> on “{change.element.name}”</> : null}
+                {change.command ? (
+                  <>
+                    {" "}
+                    running <code className="font-mono">{change.command}</code>
+                  </>
+                ) : null}
+                {change.file ? <> touching {change.file}</> : null}
+              </p>
+              <p className="mt-0.5 text-muted-foreground text-xs">
+                {change.bot}
+                {change.page ? <> · {change.page}</> : null} ·{" "}
+                {new Date(change.createdAt).toLocaleString()}
+              </p>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+      {report.wouldRefuse > report.changes.length ? (
+        <p className="mt-1 text-muted-foreground text-xs">
+          Showing the first {report.changes.length}; the count above covers
+          everything scanned.
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * The clauses this deployment compiled for one Bot when somebody imported a template.
+ *
+ * A separate section rather than extra entries in the deny list above, because they are a
+ * different kind of thing and the difference is the security property. The list above is an array
+ * this screen POSTs: `policyStore.set` replaces `deny` wholesale and there is no version column, so
+ * anything rendered inside it that the save did not send back would be erased by the next ordinary
+ * edit. Generated clauses therefore live in `template_boundaries` and are composed into the
+ * evaluation only. Reading them here and editing them here are two different questions, and this
+ * section answers the first one alone.
+ *
+ * Read-only is stated twice on purpose — once in the description, in a sentence, and once by there
+ * being no control of any kind on a row. An administrator who cannot find the Remove button should
+ * find the reason rather than conclude the screen is broken.
+ *
+ * The plain bordered list matches the deny and allow lists on this screen rather than reaching for
+ * `PageRows` and `Item`. This screen has never drawn a rule as a row with media and actions, and
+ * one group that did would read as a different kind of list — inviting exactly the distinction the
+ * description is trying to draw in words instead.
+ */
+function AppliedByImport() {
+  const applied = useQuery(appliedBoundaryListQueryOptions());
+
+  return (
+    <PageSection
+      description="Compiled by this deployment from the ceiling a template declared, and applied to that one coworker when it was imported. They are enforced by the engine that decides the rules above, and they only ever subtract. They are not in the list you edit: saving on this screen sends the rules you wrote, and nothing you do here adds, changes or removes any of these. A clause goes away when its import is retracted, from the coworker's own page."
+      title="Applied by an import"
+    >
+      {applied.isPending ? null : applied.error ? (
+        <p className="mt-2 text-destructive text-sm" role="alert">
+          The clauses applied by imports could not be read.
+        </p>
+      ) : applied.data && applied.data.length > 0 ? (
+        <div className="mt-2 grid gap-3">
+          {groupByBot(applied.data).map((group) => (
+            <div
+              className="rounded-md border border-border"
+              key={group.agentId}
+            >
+              <div className="flex items-baseline justify-between gap-4 border-border border-b px-3 py-2">
+                <Link
+                  className="font-medium text-sm underline underline-offset-2"
+                  search={{ agent: group.agentId }}
+                  to="/agents"
+                >
+                  {group.agentName}
+                </Link>
+                <span className="text-muted-foreground text-xs">
+                  Imported {new Date(group.appliedAt).toLocaleDateString()}
+                </span>
+              </div>
+              <ul className="divide-y divide-border">
+                {group.clauses.map((clause) => (
+                  <li className="px-3 py-2" key={clause.expression}>
+                    <code className="block break-all font-mono text-xs">
+                      {clause.expression}
+                    </code>
+                    <p className="mt-0.5 text-muted-foreground text-xs">
+                      From the template&rsquo;s{" "}
+                      <code className="font-mono">{clause.sourceKey}</code>{" "}
+                      line.
+                    </p>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="mt-2 text-muted-foreground text-sm">
+          No import has applied a ceiling here.
+        </p>
+      )}
+    </PageSection>
+  );
+}
+
+/** One Bot and every clause its import applied, which is the unit an administrator reads. */
+type BotClauses = {
+  agentId: string;
+  agentName: string;
+  /** The earliest clause of the group, which is when the import happened. */
+  appliedAt: string;
+  clauses: AppliedBoundaryClause[];
+};
+
+/**
+ * The flat rows, gathered under the coworker each one is about.
+ *
+ * Grouped in the browser rather than asked for grouped, because the grouping is a rendering
+ * decision and the row is the thing the table stores. Sorted by name so the order does not move
+ * under somebody between two visits — an import ordering would reshuffle the whole list every time
+ * anybody imported anything, which on a screen about what is enforced reads as something changing.
+ */
+function groupByBot(clauses: AppliedBoundaryClause[]): BotClauses[] {
+  const groups = new Map<string, BotClauses>();
+  for (const clause of clauses) {
+    const group = groups.get(clause.agentId);
+    if (group) {
+      group.clauses.push(clause);
+      if (clause.appliedAt < group.appliedAt)
+        group.appliedAt = clause.appliedAt;
+      continue;
+    }
+    groups.set(clause.agentId, {
+      agentId: clause.agentId,
+      agentName: clause.agentName,
+      appliedAt: clause.appliedAt,
+      clauses: [clause],
+    });
+  }
+  return [...groups.values()].sort((left, right) =>
+    left.agentName.localeCompare(right.agentName),
   );
 }

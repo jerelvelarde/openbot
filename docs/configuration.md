@@ -99,6 +99,9 @@ at `agent-langgraph` on a laptop.
 | `PORT`               | `3001`                             | API server port.                                                    |
 | `NODE_ENV`           | unset                              | `production` refuses the example `KEY_ENCRYPTION_KEY`. It does not decide whether sign-in is required; see `OPENBOT_SINGLE_USER`. |
 | `TENANT_PACKAGE_DIR` | `../examples/fintech`              | Tenant package directory, resolved from `server/`.                  |
+| `OPENBOT_TEMPLATE_DIR` | `../examples/templates`          | Bot templates shipped in the image, resolved from `server/`. A directory that is not there is an empty gallery, and a file that does not parse is named in the log and passed over, rather than either stopping the deployment. |
+| `OPENBOT_TEMPLATE_SOURCES` | empty                        | Comma-separated `owner/repo` an administrator may register as a template source. Nothing is fetched from the network until a repository is both named here and pinned to a commit in the product. The screen renders this list and cannot widen it. |
+| `OPENBOT_TEMPLATE_INSTALLERS` | `anyone`                  | Who may install a template: `anyone` or `admin`. A floor the product may raise and may never lower. |
 | `DEPLOYMENT_ID`      | the tenant package's id            | Names this deployment inside a shared Intelligence project.          |
 | `OPENBOT_SLACK_TENANT_ID` | unset                         | Single-workspace fallback used only when managed Slack omits canonical tenant metadata. |
 | `OPENAI_API_KEY`     | unset                              | Default model key for built-in agents and both shipped Bots.        |
@@ -114,6 +117,7 @@ at `agent-langgraph` on a laptop.
 | `AGENT_TOOL_TOKEN`   | unset; `start.sh` generates one    | The secret a framework Bot presents when it calls a granted tool back through this server. |
 | `APP_DIST_DIR`       | unset                              | Where the built app is, when this process serves it. Set inside the container image; unset in development, where Vite serves the app. |
 | `AUDIT_RETENTION_DAYS` | unset                            | Whole number of days to keep audit rows; older ones are removed. Unset keeps the trail forever. |
+| `WORKER_SHARED_SECRET` | unset; `start.sh` uses a fixed local default | The secret the routines worker presents to fire a due routine. Without it the server refuses every handoff, whether or not a worker exists to send one. |
 
 **`AGENT_STALL_TIMEOUT_MS`** watches for the failure a Bot has that nothing else in the trail can
 show: a stream that stops producing anything. Every other audit row is something that happened, and
@@ -136,6 +140,30 @@ It is one of a pair, and they are not interchangeable: `MANAGED_AGENT_TOKEN` is 
 itself to a Bot, this is a Bot proving itself to the server. Rotating either means the process
 holding the old one refuses every call, which is why `start.sh` restarts the server and recreates the
 Bot containers on a run that mints one.
+
+**`WORKER_SHARED_SECRET`** is the same shape of secret for a different pair: it is what the routines
+worker presents to `/internal/routines/run` to prove a routine's dispatch actually came from it. The
+API server refuses a handoff without one configured, and the worker refuses to start without one at
+all. See [routines.md](routines.md) for what a deployment with no worker at all looks like — it is
+not obvious from the screen.
+
+Unlike `AGENT_TOOL_TOKEN`, `start.sh` does not generate and persist this one. It supplies a fixed
+local default, `openbot-dev-worker-secret`, the same value every clone of this repository gets. That
+is fine here not because of where the server listens — it binds no hostname, so the port itself is
+reachable like any other — but because this is a dev-only default on a machine's own dev stack, and
+the endpoint it guards accepts nothing but an unguessable `routine_run_<uuid>` id: the server
+re-reads the routine, the owner and the channel from its own tables rather than trusting anything
+else the caller says, so a well-known value from a public repository gates nothing sensitive here.
+`AGENT_TOOL_TOKEN` is generated fresh and written to `.env` precisely because it is not that: it is
+copied into every Bot container, and a framework Bot holding it may be running on a machine of its
+own, so a fixed default there would be no boundary at all. Production deployments must set a real
+`WORKER_SHARED_SECRET`.
+
+**`SERVER_INTERNAL_URL`** is read by the worker, not by the API server, so it is not in the table
+above: it says where the worker's own process can reach this deployment's API, which is a fact about
+where the worker runs rather than a fact about the deployment `loadConfig` describes. `start.sh` points
+it at the server's own port on a laptop; the Helm chart's routines CronJob points it at the server's
+in-cluster Service address.
 
 ## OpenAI-compatible endpoints
 
@@ -230,6 +258,26 @@ sends people to link an account or complete secure assistance. It is a separate 
 app and the API are separate addresses: locally the app is Vite on `3010` and the API is `3001`, so
 a relative redirect would land on the API, which serves no pages. A deployment serving both from
 one origin can leave it unset when the fallback resolves to that same app origin.
+
+## One Bot handing work to another
+
+| Variable                   | Meaning                                                                                     |
+| -------------------------- | ------------------------------------------------------------------------------------------- |
+| `BOT_HANDOFF_MAX_DEPTH`    | How many Bots deep a chain may go. `0` switches the capability off entirely. Default `1`.    |
+| `BOT_HANDOFF_MAX_PER_RUN`  | How many other Bots one run may address. Default `3`.                                        |
+
+Both refuse rather than truncate, and both are refused at start-up if they are not whole numbers of
+zero or more: a deployment that typed `two` and silently got the default would believe it had set a
+cap.
+
+Which Bots may address which is a grant, not a variable, and no Bot may address any other until one
+is made. It is made on the Bot's own screen: open it from **Agents**, and switch on each Bot under
+**Bots it may ask**. The pair is directional: that list is who this Bot may ask, not who may ask it,
+so letting them ask each other is two switches. Only an administrator may change it; anyone who can
+see the Bot can read it.
+
+With both caps above at zero the screen says the capability is switched off, because a grant made
+then is a row nothing will read.
 
 ## Computer and supervisor
 

@@ -141,6 +141,27 @@ config:
       issuer: ""
   tenantPackageDir: /app/examples/fintech
 
+  # The templates shipped in the image. `COPY examples/` puts them there, so a cluster with no egress
+  # at all still opens a populated gallery.
+  #
+  # Emitted only when set, like every other key added after v0.0.5: a release upgrading from a values
+  # file written before this existed must still render, and an absent variable is not the same as an
+  # empty one — the server's own default resolves to this same directory, and an empty string would
+  # be a deployment told to read templates from nowhere.
+  templateDir: /app/examples/templates
+
+  # The GitHub repositories an administrator may register as a template source, comma-separated as
+  # `owner/repo`. EMPTY, and empty means this deployment fetches nothing from anybody: a registration
+  # naming a repository that is not here is refused. The pin — the commit sha — is registered in the
+  # product rather than here, because moving it is an administrator's deliberate act and not a
+  # redeploy. The reference catalogue is jerelvelarde/awesome-openbot-templates.
+  templateSources: ""
+
+  # Who may install a template: "anyone" (the default) or "admin". A floor rather than a setting —
+  # the admin screen may raise it and may never lower it, so a cluster that writes "admin" here can
+  # rely on it holding.
+  templateInstallers: ""
+
   # CopilotKit Intelligence, which OpenBot requires. All four values are needed together: the server
   # refuses to start on a partial set, deliberately, because a half-configured Intelligence is a
   # mistake somebody made rather than a deployment that meant to run without one.
@@ -148,6 +169,19 @@ config:
     apiUrl: ""
     gatewayWsUrl: ""
     # The two secret halves live under `secrets` below, never here.
+  # How far one Bot may hand work to another.
+  #
+  # A Bot addressing another is a grant an administrator makes, and these are the ceilings on what
+  # that grant can cost. Both are deliberately mean: a hop is a whole agent turn at the other end,
+  # several Bots asked in one turn cost several full runs rather than a fraction each, and with
+  # `computers.mode: sandbox` a hop to a Bot whose browser is asleep also pays a pod resume. A chatty
+  # Bot fanning out to four others wakes four machines.
+  #
+  # `maxDepth: 0` switches the capability off entirely: no Bot is offered the tool and the delivery
+  # loop does not run.
+  handoff:
+    maxDepth: 1
+    maxPerRun: 3
   # Your own Bot, over AG-UI.
   #
   # OpenBot is a shell for somebody else's agent, so this is the seam that matters: point it at a
@@ -227,6 +261,11 @@ computers:
     requireController: true
     namespace: ""
     # Pre-warmed sandboxes, so a Bot's first action after lunch does not wait for Chromium to boot.
+    #
+    # Not usable yet, and the chart refuses to render with it on. A Bot reaches a warm sandbox by
+    # claiming it, and nothing in the server creates a SandboxClaim: `locate` posts a new Sandbox and
+    # waits for it, pool or no pool. Left here, with the template and the RBAC beside it, because the
+    # missing half is the claim rather than any of this.
     warmPool:
       enabled: false
       replicas: 2
@@ -234,8 +273,20 @@ computers:
     # is not the same question, so the culler below asks this one.
     idleAfter: 30m
     culler:
+      # A ceiling on one sweep. `concurrencyPolicy: Forbid` means a sweep that hangs holds the lock
+      # for ever and culling stops silently, which is the failure this feature exists to prevent.
+      activeDeadlineSeconds: 600
       enabled: true
       schedule: "*/5 * * * *"
+
+# Standing instructions a Bot runs on a schedule. The sweep offers due routines to the shared work
+# queue and hands each firing to the API server, which runs the turn as the person who scheduled it.
+routines:
+  # Off by default, because it needs a secret. Without `secrets.workerSharedSecret` the API server
+  # refuses every handoff, and a CronJob whose every run is a 401 is worse than no CronJob at all.
+  enabled: false
+  # Inside the 15-minute floor the tools enforce, so a firing waits at most one tick.
+  schedule: "*/5 * * * *"
 
 database:
   # Used when `postgresql.enabled` is false. A URL, or a secret holding one.
@@ -329,10 +380,16 @@ secrets:
   modelApiKey: ""
   computerToken: ""
   supervisorToken: ""
+  # Both from the CopilotKit CLI: `npx --yes copilotkit@latest project select` prints the runtime
+  # key, and `npx --yes copilotkit@latest license --print` prints the licence. The chart refuses to
+  # install without them, because there is no mode where this runs with Intelligence missing.
   intelligenceApiKey: ""
   licenseToken: ""
   # Sent to `config.managedAgent.url` on every call. Required when that url is set.
   managedAgentToken: ""
+  # Required when `routines.enabled`: what the CronJob presents to the API server to be recognised
+  # as the worker rather than as an unauthenticated caller.
+  workerSharedSecret: ""
   # The client secret for whichever provider is configured above.
   googleClientSecret: ""
   microsoftClientSecret: ""
@@ -385,6 +442,11 @@ networkPolicy:
   # Where a Bot's computer may reach beyond the public internet. A deployment whose Bots must reach
   # an internal site adds it here, one address at a time, rather than reopening the private ranges.
   computerExtraEgress: []
+  # Extra egress for the culler. Empty falls back to `extraEgress`, where an external database is
+  # already named; set it to give the culler a narrower list.
+  cullerExtraEgress: []
+  # The same, for the routines sweep.
+  routinesExtraEgress: []
 
 podSecurityContext:
   runAsNonRoot: false
