@@ -1,13 +1,25 @@
 import { CopilotChat } from "@copilotkit/react-core/v2";
 import { IconPlus } from "@tabler/icons-react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
+import { useEffect } from "react";
+import { hasUnseenActivity } from "@/components/app-sidebar/app-sidebar";
 import { Button } from "@/components/ui/button";
-import { createBotChatMutationOptions } from "@/lib/bot-chats/mutations";
+import { useBotChatActivity } from "@/lib/bot-chats/activity";
+import {
+  createBotChatMutationOptions,
+  markBotChatReadMutationOptions,
+} from "@/lib/bot-chats/mutations";
 import { type BotChat, botChatQueryOptions } from "@/lib/bot-chats/queries";
 import { useActiveBot } from "@/lib/copilot/active-bot";
 import { useLegacyThreadAdoption } from "@/lib/copilot/bot-thread";
 import { useStoppedTurn } from "@/lib/copilot/stopped-turn";
+import { rosterListQueryOptions } from "@/lib/roster/queries";
 
 /**
  * One direct conversation with one Bot.
@@ -64,6 +76,7 @@ function BotChatScreen({ botChat }: { botChat: BotChat }) {
   const navigate = Route.useNavigate();
   const queryClient = useQueryClient();
   const createBotChat = useMutation(createBotChatMutationOptions(queryClient));
+  const markRead = useMutation(markBotChatReadMutationOptions(queryClient));
 
   // Tool calls here act on this Bot's own computer.
   useActiveBot(botChat.agentId);
@@ -77,6 +90,47 @@ function BotChatScreen({ botChat }: { botChat: BotChat }) {
   const stopped = useStoppedTurn(botChat.agentId);
   // No-op for every browser with no remembered key — which is every browser after the first visit.
   useLegacyThreadAdoption(botChat.agentId);
+  /*
+   * The roster hears what is said here from this screen, because nothing else can hear it.
+   *
+   * The packaged chat owns the composer and the transcript, so this watches the agent instance it
+   * binds to and reports each new message in both directions — which is what derives `title` from the
+   * person's first message, writes the preview line and its timestamp, restores an archived
+   * conversation when somebody speaks in it again, and raises the unseen dot the effect below clears.
+   * See `lib/bot-chats/activity.ts` for why the browser is the only thing that can report this and
+   * how a replayed history is told apart from something just said.
+   */
+  useBotChatActivity(botChat);
+
+  /*
+   * This conversation's roster summary, read out of the same infinite query the sidebar renders. The
+   * detail query deliberately knows nothing about activity; the roster is where the socket keeps
+   * `lastMessageAt` live, so it is the one honest source for "has something new been said".
+   *
+   * Read from "all", not "active", for the reason `channel/$channelId.tsx` gives about its own copy of
+   * this: the conversation this screen has open may be the one somebody just archived, and "all" is
+   * the only status guaranteed to still hold the row this screen is looking at.
+   */
+  const roster = useInfiniteQuery(rosterListQueryOptions("all"));
+  const summary = roster.data?.find((row) => row.id === botChat.id);
+
+  /*
+   * Opening the conversation marks it read; the Bot replying while it is open marks it read again.
+   * One effect covers both: the dep changes on navigation and on every activity patch, and the unseen
+   * check keeps it from writing a row per render.
+   *
+   * Keyed on primitives, deliberately — the same trap the channel route documents. The optimistic
+   * mark-read patch changes the summary OBJECT's identity without changing these values, so an object
+   * dep would re-fire the effect on its own write, and when `lastMessageAt` sits ahead of this
+   * browser's clock (another device wrote it) that re-fire loops into a PUT per render.
+   */
+  const unseen = summary !== undefined && hasUnseenActivity(summary);
+  const markReadMutate = markRead.mutate;
+  useEffect(() => {
+    if (unseen) {
+      markReadMutate(botChat.id);
+    }
+  }, [botChat.id, unseen, markReadMutate]);
 
   const startNew = async () => {
     const created = await createBotChat.mutateAsync(botChat.agentId);
