@@ -1,12 +1,8 @@
-import {
-  mutationOptions,
-  type InfiniteData,
-  type QueryClient,
-} from "@tanstack/react-query";
+import { mutationOptions, type QueryClient } from "@tanstack/react-query";
 import { client, tryClient } from "@/lib/client";
 import { patchRosterRead } from "@/lib/roster/read-marker";
 import { rosterKeys } from "@/lib/roster/queries";
-import { type AgentChannel, type ChannelPage, channelKeys } from "./queries";
+import { type AgentChannel, channelKeys } from "./queries";
 
 /**
  * Start a new channel with one or more coworkers.
@@ -23,8 +19,9 @@ export function createChannelMutationOptions(queryClient: QueryClient) {
       });
       return ((await response.json()) as { channel: AgentChannel }).channel;
     },
-    // Both keys: channelKeys backs the channels list this factory used to be the only reader of,
-    // and rosterKeys.all backs the sidebar now, which channelQueryOptions no longer reaches.
+    // channelKeys.all no longer backs anything the sidebar reads — that reader is gone — but it
+    // still reaches channelKeys.detail, which channelQueryOptions does read; rosterKeys.all is
+    // what actually gets the new row into the sidebar.
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: channelKeys.all });
       void queryClient.invalidateQueries({ queryKey: rosterKeys.all });
@@ -71,12 +68,11 @@ export function setChannelPinnedMutationOptions(queryClient: QueryClient) {
         fallback: "Could not pin this channel",
       });
     },
-    // Both keys: channelKeys still backs the open channel screen via channelQueryOptions, and
-    // rosterKeys.all backs the sidebar, which no longer reads channelKeys at all.
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: channelKeys.all });
-      void queryClient.invalidateQueries({ queryKey: rosterKeys.all });
-    },
+    // rosterKeys.all only: a pin changes the roster row's `pinned` flag and where it sorts, nothing
+    // in the AgentChannel detail payload that channelQueryOptions reads, so there is nothing in
+    // channelKeys worth refetching over this.
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: rosterKeys.all }),
   });
 }
 
@@ -88,9 +84,8 @@ export function setChannelPinnedMutationOptions(queryClient: QueryClient) {
  * not land is a dot that returns on the next refetch, which is the truth reasserting itself, and a
  * refetch here would race the socket's own patches for nothing.
  *
- * Patches channelKeys.list() (the open channel screen still reads it) and all three roster status
- * lists (the sidebar reads those instead now): unlike a bot chat, which only ever had the roster,
- * a channel's row lives in both caches until the sidebar's old channel-list reader is gone for good.
+ * Patches only the three roster status lists, via `patchRosterRead`: the sidebar is the one reader
+ * of a channel's unread state now, and it reads the roster, not channelKeys.list().
  */
 export function markChannelReadMutationOptions(queryClient: QueryClient) {
   return mutationOptions({
@@ -101,33 +96,6 @@ export function markChannelReadMutationOptions(queryClient: QueryClient) {
       });
     },
     onMutate: (channelId) => {
-      const now = new Date().toISOString();
-      queryClient.setQueryData(
-        channelKeys.list(),
-        (data: InfiniteData<ChannelPage> | undefined) =>
-          data && {
-            ...data,
-            pages: data.pages.map((page) => ({
-              ...page,
-              channels: page.channels.map((row) =>
-                row.id === channelId
-                  ? {
-                      ...row,
-                      /*
-                       * The later of now and the row's own lastMessageAt: lastMessageAt comes from
-                       * another clock, and a marker stamped "now" by a clock running behind it
-                       * would leave the row still reading as unseen — and the dot still lit.
-                       */
-                      lastReadAt:
-                        row.lastMessageAt && row.lastMessageAt > now
-                          ? row.lastMessageAt
-                          : now,
-                    }
-                  : row,
-              ),
-            })),
-          },
-      );
       patchRosterRead(queryClient, channelId);
     },
   });
@@ -142,15 +110,12 @@ export function deleteChannelMutationOptions(queryClient: QueryClient) {
         fallback: "Could not delete this channel",
       });
     },
-    // The lists only, not the detail query: the open channel's detail query would refetch into
-    // the fresh 404 and flash an error before the navigate-home lands; left alone, it keeps its
-    // cache and the navigation happens with nothing to complain about. Both list keys, though —
-    // channelKeys.list() still backs the open channel screen, and rosterKeys.all backs the
-    // sidebar, which no longer reads channelKeys at all.
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: channelKeys.list() });
-      void queryClient.invalidateQueries({ queryKey: rosterKeys.all });
-    },
+    // Not the detail query: the open channel's detail query would refetch into the fresh 404 and
+    // flash an error before the navigate-home lands; left alone, it keeps its cache and the
+    // navigation happens with nothing to complain about. Just rosterKeys.all — the sidebar is the
+    // only reader of the channel list now, and it reads the roster, not channelKeys.list().
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: rosterKeys.all }),
   });
 }
 

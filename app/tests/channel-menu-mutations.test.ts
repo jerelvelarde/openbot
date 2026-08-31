@@ -6,7 +6,6 @@ import {
   markChannelReadMutationOptions,
   setChannelPinnedMutationOptions,
 } from "../src/lib/channels/mutations";
-import { channelKeys, type ChannelPage } from "../src/lib/channels/queries";
 import {
   rosterKeys,
   type RosterItem,
@@ -89,10 +88,9 @@ test("pinning PUTs the flag to the channel's pin route and invalidates the roste
   expect(seen[0]?.url).toBe("/api/channels/channel-1/pin");
   expect(seen[0]?.init?.method).toBe("PUT");
   expect(JSON.parse(String(seen[0]?.init?.body))).toEqual({ pinned: true });
-  expect(invalidated).toEqual([
-    { queryKey: ["channels"] },
-    { queryKey: ["roster"] },
-  ]);
+  // Roster only: a pin doesn't touch the AgentChannel detail payload, so there is nothing under
+  // channelKeys worth invalidating over it.
+  expect(invalidated).toEqual([{ queryKey: ["roster"] }]);
 });
 
 test("deleting sends DELETE to the channel route and invalidates the roster", async () => {
@@ -111,10 +109,8 @@ test("deleting sends DELETE to the channel route and invalidates the roster", as
   expect(seen).toHaveLength(1);
   expect(seen[0]?.url).toBe("/api/channels/channel-1");
   expect(seen[0]?.init?.method).toBe("DELETE");
-  expect(invalidated).toEqual([
-    { queryKey: ["channels", "list"] },
-    { queryKey: ["roster"] },
-  ]);
+  // Roster only: the sidebar is the only reader of the channel list, and it reads the roster.
+  expect(invalidated).toEqual([{ queryKey: ["roster"] }]);
 });
 
 test("a refused delete surfaces the server's sentence", async () => {
@@ -165,33 +161,8 @@ test("creating a channel invalidates the roster, not just the channels list", as
 test("marking read PUTs the read route and patches lastReadAt in place", async () => {
   const seen = capturingFetch(204, undefined);
   const queryClient = new QueryClient();
-  queryClient.setQueryData(channelKeys.list(), {
-    pages: [
-      {
-        channels: [
-          {
-            id: "channel-1",
-            name: "Assistant channel",
-            agentIds: ["agent-1"],
-            threadId: "thread-1",
-            active: true,
-            lastMessage: "hello",
-            lastMessageAt: "2026-08-25T12:00:00.000Z",
-            lastMessageAgentId: "agent-1",
-            createdAt: "2026-08-25T11:00:00.000Z",
-            pinned: false,
-            lastReadAt: null,
-          },
-        ],
-        nextCursor: null,
-      },
-    ],
-    pageParams: [""],
-  } satisfies InfiniteData<ChannelPage>);
-  // The sidebar no longer renders channelKeys.list() — it renders the roster — so the roster's
-  // cached lists have to get the same patch or the unread dot never clears there. Seeded in two of
-  // the three statuses (not just Active) so the ["active","archived","all"] loop is proven to reach
-  // more than the first entry it happens to try.
+  // Seeded in two of the three statuses (not just Active) so the ["active","archived","all"] loop
+  // inside patchRosterRead is proven to reach more than the first entry it happens to try.
   queryClient.setQueryData(
     rosterKeys.list("active"),
     rosterPage([rosterItem("channel-1")]),
@@ -208,12 +179,8 @@ test("marking read PUTs the read route and patches lastReadAt in place", async (
   expect(seen).toHaveLength(1);
   expect(seen[0]?.url).toBe("/api/channels/channel-1/read");
   expect(seen[0]?.init?.method).toBe("PUT");
-  const patched = queryClient.getQueryData<InfiniteData<ChannelPage>>(
-    channelKeys.list(),
-  );
   // The dot clears from the cache before the wire answered, and nothing was invalidated:
   // there is no onSuccess to queue a refetch that would race the socket's own patches.
-  expect(patched?.pages[0]?.channels[0]?.lastReadAt).not.toBeNull();
   expect(options.onSuccess).toBeUndefined();
 
   // RosterPage's array field is `items`, not `channels` — get that name wrong in the shared patch
@@ -233,31 +200,9 @@ test("a message stamped by a clock ahead of ours still reads as seen after marki
   capturingFetch(204, undefined);
   const queryClient = new QueryClient();
   const futureLastMessageAt = new Date(Date.now() + 60_000).toISOString();
-  queryClient.setQueryData(channelKeys.list(), {
-    pages: [
-      {
-        channels: [
-          {
-            id: "channel-1",
-            name: "Assistant channel",
-            agentIds: ["agent-1"],
-            threadId: "thread-1",
-            active: true,
-            lastMessage: "hello",
-            lastMessageAt: futureLastMessageAt,
-            lastMessageAgentId: "agent-1",
-            createdAt: "2026-08-25T11:00:00.000Z",
-            pinned: false,
-            lastReadAt: null,
-          },
-        ],
-        nextCursor: null,
-      },
-    ],
-    pageParams: [""],
-  } satisfies InfiniteData<ChannelPage>);
-  // Same guard, same hazard, in the roster cache this time: the future-clock fix lives in the
-  // extracted `patchRosterRead` now, not just in the channel-list patch beside it.
+  // The future-clock guard lives inside `patchRosterRead`, the only place this mutation patches a
+  // cache: a reader's clock running behind the writer's must not leave the row still reading as
+  // unseen, so the patched lastReadAt has to catch up to (or pass) lastMessageAt, not just "now".
   queryClient.setQueryData(
     rosterKeys.list("active"),
     rosterPage([
@@ -267,15 +212,6 @@ test("a message stamped by a clock ahead of ours still reads as seen after marki
   const options = markChannelReadMutationOptions(queryClient);
 
   options.onMutate?.("channel-1");
-
-  const patched = queryClient.getQueryData<InfiniteData<ChannelPage>>(
-    channelKeys.list(),
-  );
-  const row = patched?.pages[0]?.channels[0];
-  // A reader's clock running behind the writer's must not leave the row still reading as unseen:
-  // the patched lastReadAt has to catch up to (or pass) lastMessageAt, not just "now".
-  expect(row?.lastReadAt).not.toBeNull();
-  expect((row?.lastReadAt as string) >= futureLastMessageAt).toBe(true);
 
   const rosterPatched = queryClient.getQueryData<InfiniteData<RosterPage>>(
     rosterKeys.list("active"),
