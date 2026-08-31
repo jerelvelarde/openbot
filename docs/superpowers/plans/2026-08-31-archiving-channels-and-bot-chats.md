@@ -1184,11 +1184,18 @@ Add to the `ChannelStore` type, next to `softDelete`:
    * Throws ChannelNotFoundError for a non-member, an unknown channel, or a deleted one, and
    * ChannelPackageOwnedError for a channel the tenant package defines.
    */
+  /**
+   * Returns whether anything actually changed.
+   *
+   * The route needs to know, because it audits the act: a repeat call that neither restamps nor
+   * announces must not write a trail row either. `record`'s own docblock says the trail records acts,
+   * not attempts, and `softDelete` enforces that by throwing on a repeat — this one returns instead.
+   */
   setArchived(
     actor: AgentActor,
     channelId: string,
     archived: boolean,
-  ): Promise<void>;
+  ): Promise<boolean>;
 ```
 
 And the implementation, next to `softDelete`:
@@ -4664,6 +4671,19 @@ function RouteComponent() {
 `BotChatScreen` keeps everything the current `BotChat` component does and why:
 
 - `useActiveBot(botChat.agentId)` — tool calls act on this Bot's own computer.
+- **Report activity, and mark read. THIS WAS MISSING FROM THE ORIGINAL PLAN** and is its worst hole:
+  Task 9 builds `recordBotChatActivityMutationOptions` and `markBotChatReadMutationOptions`, and no
+  task ever calls them — so `POST /api/bot-chats/:id/activity` and `PUT /:id/read` ship with no caller
+  at all. Every consequence is a spec'd behaviour silently dropped for bot chats: `title` is never
+  derived (so every row renders as the Bot's name and several conversations with one Bot are
+  indistinguishable, which is the entire justification for the table), `last_message` and
+  `last_message_at` are never written (no preview line, and recency stays `created_at` forever),
+  "saying something in an archived conversation restores it" becomes unreachable through the UI for
+  one of the two kinds, and `last_read_at` is never stamped. Subscribe to the same agent instance
+  `CopilotChat` binds to — `useAgent({ agentId })`, exactly as `stopped-turn.ts` already does — report
+  each new message in both directions the way `channel-chat.tsx` does, and add the
+  `hasUnseenActivity` → `markBotChatRead` effect `channel/$channelId.tsx` has. Observing the packaged
+  transcript is not the same as replacing it; only replacing it is a non-goal.
 - `useStoppedTurn(botChat.agentId)` and its banner. Keep the whole comment: the packaged chat reports
   a failed run to `onError` and otherwise carries on as though the turn finished, so the sentence has
   to be said here.
@@ -4709,6 +4729,23 @@ endpoint for a question the roster can answer.
 
 Then, in an effect: `resolveBotChat` and either `navigate` to the chat or create one and navigate to
 that.
+
+**Adoption must run BEFORE the create decision, not after it.** As first written, this resolver asks
+the roster for a most-recent chat, finds none on a browser upgrading into the feature (it has no rows
+yet), mints a fresh chat and navigates — and only then does the chat screen's adoption hook insert a
+*second* row for the remembered thread. That is deterministic on upgrade, not a race: nobody can
+deep-link `/bot/$botChatId` before a row exists, so the resolver always wins. The person ends up with
+two conversations and is looking at the empty one. It breaks the one Goal that fires exactly once, at
+the release boundary, where getting it wrong is unrecoverable for their data. So: when `localStorage`
+holds a key for this Bot, run `checkKnown` / `adopt` here first and prefer the adopted row over
+creating. The hook on the chat screen stays as the belt, but this resolver must never create while an
+adoptable thread is still sitting in storage.
+
+**Do not take the first matching roster row as "most recent".** The roster arrives pinned-first, then
+by recency, so a pinned older bot chat beats a more recently used unpinned one — while
+`BotChatStore.mostRecent` orders on recency alone. Pick the maximum by `lastMessageAt ?? createdAt`
+among the matching rows, or state the pin-first precedence honestly as the rule. The two must not
+silently disagree.
 
 **Gate the effect on `roster.data === undefined`, NOT on `roster.isPending`.** `isPending` is false in
 the *error* state too, where `data` is still undefined — so on a failed roster load `mostRecent` reads
