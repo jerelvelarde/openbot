@@ -201,11 +201,21 @@ describe("the bot_chats table", () => {
       .insert(botChats)
       .values({ id: `botchat_${randomUUID()}`, userId, agentId, threadId });
 
-    // The constraint is what decides an adoption race, so it is asserted rather than assumed.
+    /*
+     * The constraint is what decides an adoption race, so it is asserted rather than assumed.
+     *
+     * `Promise.resolve` is load-bearing, not decoration. Drizzle's insert builder is a *thenable*
+     * (`PgInsertBase`), not a `Promise`, and Bun 1.3.14's `rejects` matcher checks for a real
+     * Promise — handed the builder it fails with `Expected promise, Received: PgInsertBase` before
+     * ever running the insert, so the test would pass or fail for the wrong reason. Wrapping it
+     * converts the thenable without changing what is asserted.
+     */
     await expect(
-      database
-        .insert(botChats)
-        .values({ id: `botchat_${randomUUID()}`, userId, agentId, threadId }),
+      Promise.resolve(
+        database
+          .insert(botChats)
+          .values({ id: `botchat_${randomUUID()}`, userId, agentId, threadId }),
+      ),
     ).rejects.toThrow();
   });
 
