@@ -50,7 +50,9 @@ describe("rosterListQueryOptions", () => {
 
     // The sidebar and the socket both see one array in roster order; neither has to know it is paged.
     expect(
-      options.select?.({ pages, pageParams: ["", "one"] })?.map((row) => row.id),
+      options
+        .select?.({ pages, pageParams: ["", "one"] })
+        ?.map((row) => row.id),
     ).toEqual(["channel_1", "botchat_2"]);
   });
 
