@@ -7,7 +7,11 @@ import {
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useRef } from "react";
 import { agentListQueryOptions } from "@/lib/agents/queries";
-import { createBotChatMutationOptions } from "@/lib/bot-chats/mutations";
+import {
+  adoptBotChatMutationOptions,
+  createBotChatMutationOptions,
+} from "@/lib/bot-chats/mutations";
+import { attemptAdoption, remembered } from "@/lib/copilot/bot-thread";
 import { type RosterItem, rosterListQueryOptions } from "@/lib/roster/queries";
 
 export const Route = createFileRoute("/_authed/_app/bot")({
@@ -69,6 +73,64 @@ export function resolveBotChat(input: { mostRecent: string | null }) {
 }
 
 /**
+ * The caller's most recently active Bot chat among the matching roster rows — by the same rule
+ * `BotChatStore.mostRecent` (server/src/bot-chats/store.ts) uses server-side, not by roster order.
+ *
+ * Those are different things. The roster arrives pinned-first, then by recency
+ * (`server/src/roster/order.ts`'s `RECENCY` expression) — a pinned bot chat from a month ago sorts
+ * ahead of an unpinned one this person used five minutes ago. Taking the first matching row used to
+ * be asserted, in a comment on the caller below, as "exactly `mostRecent`" — it was not:
+ * `BotChatStore.mostRecent` orders on `coalesce(last_message_at, created_at)` alone, with no
+ * pinned-first term at all, so the two silently disagreed on a pinned-but-stale bot chat. This picks
+ * the maximum by `lastMessageAt ?? createdAt` among the matches instead of the first one, so the two
+ * mean the same thing.
+ *
+ * Until a separate fix lands, nothing calls `recordActivity` for a bot chat (see Task 13's own
+ * plan note on this), so `lastMessageAt` is always null here today and every comparison falls back to
+ * `createdAt` — newest-created wins, not "most recently talked to." Said here rather than left
+ * implied, so this doesn't read as a richer signal than the data currently carries.
+ */
+export function mostRecentBotChat(
+  rows: RosterItem[],
+  agentId: string,
+): RosterItem | null {
+  let best: RosterItem | null = null;
+  for (const row of rows) {
+    if (row.kind !== "bot_chat" || !row.agentIds.includes(agentId)) continue;
+    if (
+      best === null ||
+      (row.lastMessageAt ?? row.createdAt) >
+        (best.lastMessageAt ?? best.createdAt)
+    ) {
+      best = row;
+    }
+  }
+  return best;
+}
+
+/**
+ * Whether the resolver must try to adopt a remembered thread before it is allowed to create.
+ *
+ * This is the fix for the duplicate-conversation defect at the release boundary: a browser upgrading
+ * into this feature has no `bot_chats` rows yet (`mostRecent` reads `null`), and — unfixed — the
+ * resolver read that as "nothing to open," minted a fresh chat, and navigated, before the chat
+ * screen's own adoption hook ever got a turn to claim the remembered thread. That is deterministic on
+ * upgrade, not a race: nobody can deep-link `/bot/$botChatId` before a row exists, so the resolver
+ * always won, and the person landed on the empty one while their real conversation sat unclaimed.
+ *
+ * `mostRecent !== null` means there is already something to open — the browser has been through this
+ * before, or already adopted — so there is nothing for the resolver to gain by re-running the check
+ * here; `useLegacyThreadAdoption` on the chat screen is the belt for a stray key left over from that.
+ * Only "about to create, and something is remembered" is the case this function exists to catch.
+ */
+export function shouldAttemptAdoption(input: {
+  mostRecent: string | null;
+  remembered: string | null;
+}): boolean {
+  return input.mostRecent === null && input.remembered !== null;
+}
+
+/**
  * Whether the resolver effect below is clear to act, given what the roster query currently holds
  * and whether an earlier run already claimed this resolution.
  *
@@ -92,10 +154,15 @@ function BotResolver({ agentId }: { agentId: string }) {
   const navigate = Route.useNavigate();
   const queryClient = useQueryClient();
   const createBotChat = useMutation(createBotChatMutationOptions(queryClient));
+  const adoptBotChat = useMutation(adoptBotChatMutationOptions(queryClient));
   /*
-   * The same infinite query the sidebar already loaded, so this needs no endpoint of its own: the
-   * roster is already in recency order, and "first bot_chat row for this Bot" is exactly
-   * `mostRecent`.
+   * The same infinite query the sidebar already loaded, so this needs no endpoint of its own — but
+   * unlike the sidebar, "which row is most recent" cannot be read off list order. The roster arrives
+   * pinned-first, then by recency (`server/src/roster/order.ts`'s `RECENCY` expression): a pinned
+   * older bot chat sorts ahead of an unpinned one used five minutes ago. Taking the first matching
+   * row used to be asserted here as "exactly `mostRecent`" — it is not; `BotChatStore.mostRecent`
+   * (server/src/bot-chats/store.ts) orders on recency alone, with no pinned-first term at all. See
+   * `mostRecentBotChat` above for the fix and why the two now agree.
    *
    * Read from "active", deliberately not "all": `?agent=` must never reopen a conversation somebody
    * archived. `BotChatStore.mostRecent` applies the identical active-only filter, but it is not a
@@ -113,10 +180,13 @@ function BotResolver({ agentId }: { agentId: string }) {
    * failed roster load causes by a different route (see `shouldResolveBotChat` above). Not fixed
    * here — paging the roster from this resolver is a bigger change than this one.
    */
-  const mostRecent =
-    roster.data?.find(
-      (row) => row.kind === "bot_chat" && row.agentIds.includes(agentId),
-    )?.id ?? null;
+  const mostRecent = mostRecentBotChat(roster.data ?? [], agentId)?.id ?? null;
+  /*
+   * Read synchronously, alongside `mostRecent`, so `shouldAttemptAdoption` below can be a plain
+   * function of two values rather than something that reaches into storage on its own. See
+   * `remembered`'s own comment in `bot-thread.ts` for why it is exported for exactly this.
+   */
+  const legacyThreadId = remembered(agentId);
 
   /*
    * Runs once per resolution, guarded by a ref rather than left to the dependency array: this
@@ -129,6 +199,7 @@ function BotResolver({ agentId }: { agentId: string }) {
    */
   const started = useRef(false);
   const createBotChatMutate = createBotChat.mutateAsync;
+  const adoptBotChatMutate = adoptBotChat.mutateAsync;
   useEffect(() => {
     if (!shouldResolveBotChat({ data: roster.data, started: started.current }))
       return;
@@ -136,28 +207,50 @@ function BotResolver({ agentId }: { agentId: string }) {
     /*
      * Set once this run commits to acting, and read only in the `.then` below: if the person
      * navigates away — or this Bot changes, which remounts the whole resolver under a new `key` —
-     * before the create or lookup settles, `navigate` must not fire into a screen nobody is looking
-     * at any more. Same `let current = true` / cleanup pair `useBotThread` in `bot-thread.ts` uses,
-     * for the same reason.
+     * before adoption, the open, or the create settles, `navigate` must not fire into a screen
+     * nobody is looking at any more. Same `let current = true` / cleanup pair
+     * `useLegacyThreadAdoption` in `bot-thread.ts` uses, for the same reason — and this exact flag
+     * is handed to `attemptAdoption` below as `isCurrent`, so a Bot change mid-check cancels the
+     * adoption attempt and the create/open decision together rather than the two being able to
+     * drift out of sync.
      */
     let current = true;
-    /*
-     * Annotated, rather than left to inference: TypeScript fills each branch of the ternary inside
-     * `resolveBotChat` with the other branch's key typed `undefined`, so an inferred type here still
-     * carries `open?: undefined` on the `create` branch. `"open" in resolution` then stops
-     * discriminating anything — both branches "have" `open` — and `resolution.open` comes back
-     * `string | undefined` even inside this guard. The explicit annotation is the clean type
-     * `resolveBotChat` actually promises; it is not on the export itself because the plan's
-     * signature for it is exact.
-     */
-    const resolution: { open: string } | { create: true } = resolveBotChat({
-      mostRecent,
-    });
-    const botChatId =
-      "open" in resolution
-        ? Promise.resolve(resolution.open)
-        : createBotChatMutate(agentId).then((created) => created.id);
-    botChatId
+    async function resolve(): Promise<string> {
+      /*
+       * Adoption first, and fully awaited before any create decision is made — this is the fix for
+       * the duplicate-conversation defect `shouldAttemptAdoption` documents: a browser upgrading
+       * into this feature has no `bot_chats` rows yet, so without this, `mostRecent` reading `null`
+       * would go straight to create below, and the remembered thread would only ever be rescued
+       * *after* landing on the wrong, empty conversation — by which point there are two rows and no
+       * way to tell the person had one already. Skipped whenever `mostRecent` is not `null`: a row
+       * already exists, so there is nothing to gain from checking, and `useLegacyThreadAdoption` on
+       * the chat screen is the belt for a stray key an earlier, incomplete adoption left behind.
+       */
+      if (shouldAttemptAdoption({ mostRecent, remembered: legacyThreadId })) {
+        const attempt = await attemptAdoption(
+          agentId,
+          adoptBotChatMutate,
+          () => current,
+        );
+        if (attempt.adopted !== null) return attempt.adopted;
+      }
+      /*
+       * Annotated, rather than left to inference: TypeScript fills each branch of the ternary inside
+       * `resolveBotChat` with the other branch's key typed `undefined`, so an inferred type here still
+       * carries `open?: undefined` on the `create` branch. `"open" in resolution` then stops
+       * discriminating anything — both branches "have" `open` — and `resolution.open` comes back
+       * `string | undefined` even inside this guard. The explicit annotation is the clean type
+       * `resolveBotChat` actually promises; it is not on the export itself because the plan's
+       * signature for it is exact.
+       */
+      const resolution: { open: string } | { create: true } = resolveBotChat({
+        mostRecent,
+      });
+      if ("open" in resolution) return resolution.open;
+      const created = await createBotChatMutate(agentId);
+      return created.id;
+    }
+    resolve()
       .then((id) => {
         if (!current) return;
         void navigate({ to: "/bot/$botChatId", params: { botChatId: id } });
@@ -169,12 +262,23 @@ function BotResolver({ agentId }: { agentId: string }) {
         // is nothing further to do in the catch itself — `createBotChat.error` is the same state a
         // caught error would otherwise have to be threaded into by hand, and the render below reads
         // it directly, the same way `startNew` in `bot_.$botChatId.tsx` leaves its own throw for
-        // `createBotChat.error` to say out loud.
+        // `createBotChat.error` to say out loud. `attemptAdoption` never rejects — every failure
+        // inside it is caught and folded into `{ adopted: null }`, so a caught rejection here still
+        // only ever comes from the create branch, exactly as before this function had adoption in
+        // front of it.
       });
     return () => {
       current = false;
     };
-  }, [agentId, createBotChatMutate, mostRecent, navigate, roster.data]);
+  }, [
+    agentId,
+    adoptBotChatMutate,
+    createBotChatMutate,
+    legacyThreadId,
+    mostRecent,
+    navigate,
+    roster.data,
+  ]);
 
   /*
    * A sentence instead of nothing when the roster failed to load or a create was refused, for the
@@ -184,6 +288,13 @@ function BotResolver({ agentId }: { agentId: string }) {
    * state below, not folded into `shouldResolveBotChat`: the effect asks "is it safe to act", this
    * asks "is there something to say instead of nothing", and a roster that is still failing
    * answers "no" to the first and "yes" to the second at the same time.
+   *
+   * `adoptBotChat.error` is deliberately not in this list. A failed adoption is not this screen's
+   * failure to report: `resolve` above already falls through to opening or creating when
+   * `attemptAdoption` comes back empty, so the person still lands somewhere usable, and the
+   * remembered key survives for `useLegacyThreadAdoption` to retry from the chat screen. Reporting
+   * it here would turn a quiet, retryable fallback into a blocking error sentence for a problem that
+   * already has a recovery path.
    */
   const failure = roster.error ?? createBotChat.error;
   if (failure) {

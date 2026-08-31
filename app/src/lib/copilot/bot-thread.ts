@@ -4,6 +4,7 @@ import {
   adoptBotChatMutationOptions,
   AdoptConflictError,
 } from "@/lib/bot-chats/mutations";
+import type { BotChat } from "@/lib/bot-chats/queries";
 import { tryClient } from "@/lib/client";
 
 /**
@@ -23,6 +24,15 @@ import { tryClient } from "@/lib/client";
  * The check is what makes adoption safe rather than merely enthusiastic. Adopting an id Intelligence
  * has forgotten would manufacture a roster row with nothing behind it: a conversation that looks
  * recoverable and is empty when opened. So only a provable "yes" adopts.
+ *
+ * WHO CALLS THIS NOW. `useLegacyThreadAdoption` below is the belt: it runs on the chat screen, on
+ * every visit, and covers somebody who deep-links straight into a Bot chat. `attemptAdoption`, the
+ * sequence it is built from, is also called directly by `BotResolver`
+ * (app/src/routes/_authed/_app/bot.tsx) — the resolver has to run this to completion *before* it will
+ * ever create, because a browser upgrading into this feature always reaches the resolver first, with
+ * no `bot_chats` rows yet, and the resolver used to lose that race by definition: "nothing to open"
+ * read as true before this hook — which only exists on the screen the resolver navigates to — ever
+ * got a turn.
  */
 
 const KEY = "openbot.bot-thread";
@@ -32,7 +42,13 @@ export function botThreadKey(agentId: string): string {
   return `${KEY}.${agentId}`;
 }
 
-function remembered(agentId: string): string | null {
+/**
+ * Exported so `BotResolver` can ask, synchronously, whether there is anything worth adopting before
+ * it commits to creating — see `shouldAttemptAdoption` in bot.tsx, which takes this value as a plain
+ * argument rather than reading storage itself, for the same "one function, not two spellings" reason
+ * `shouldAdopt` is built on `threadToUse` instead of re-deriving it.
+ */
+export function remembered(agentId: string): string | null {
   try {
     return window.localStorage.getItem(botThreadKey(agentId));
   } catch {
@@ -145,14 +161,78 @@ export function shouldAdopt(input: {
  */
 
 /**
+ * The full rescue sequence, once: check, decide, adopt, forget. Shared by `useLegacyThreadAdoption`
+ * below (the belt, on the chat screen) and `BotResolver` (app/src/routes/_authed/_app/bot.tsx, the
+ * primary path — see this file's module comment for why the resolver has to run this itself rather
+ * than waiting for the hook). One function rather than the sequence hand-copied into both places: the
+ * two would drift the first time either changed a step, and this is exactly the kind of drift that
+ * turns "adopt safely" into "adopt safely, except from the one call site nobody updated."
+ *
+ * `adopt` is the caller's own `adoptBotChatMutationOptions().mutateAsync`, not created here, so each
+ * caller keeps its own mutation state (`adopt.error`, `adopt.isPending`, …) if it ever needs it.
+ *
+ * `isCurrent` is checked at the same two points the hook's effect used to check its own local
+ * `current` flag before this was extracted: after `checkKnown` resolves, and again after `adopt`
+ * settles, before `forget`. A stale answer — the Bot changed, or the caller unmounted, while a
+ * request was in flight — must not adopt or forget anything. Note what that means on the second
+ * check: an adopt that *succeeded* but arrives stale still does not `forget` — the row now exists,
+ * but the only side effect skipped is clearing the local pointer to it, and a future, unstale run
+ * finishes that cleanly (finding the thread already adopted looks identical to a fresh adopt racing
+ * a duplicate, which is exactly the 409 case below, already handled). Committing to `forget` on
+ * behalf of a screen nobody is looking at any more is the one thing that cannot be undone, so it is
+ * the one thing withheld until the answer is not stale.
+ */
+export async function attemptAdoption(
+  agentId: string,
+  adopt: (variables: { agentId: string; threadId: string }) => Promise<BotChat>,
+  isCurrent: () => boolean,
+): Promise<{ adopted: string } | { adopted: null }> {
+  const threadId = remembered(agentId);
+  // Nothing remembered means nothing the check could protect.
+  if (threadId === null) return { adopted: null };
+
+  const outcome = await checkKnown(threadId);
+  if (!isCurrent()) return { adopted: null };
+  if (!shouldAdopt({ remembered: threadId, known: outcome.known })) {
+    return { adopted: null };
+  }
+
+  try {
+    const botChat = await adopt({ agentId, threadId });
+    if (!isCurrent()) return { adopted: null };
+    forget(agentId);
+    return { adopted: botChat.id };
+  } catch (error) {
+    if (!(error instanceof AdoptConflictError)) {
+      // Any other failure — offline, a 500, the tab closing mid-request — keeps the key: it is
+      // the only remaining pointer to this transcript, so the next visit has to be able to try
+      // again. See `AdoptConflictError` for why a 409 does not take this branch.
+      return { adopted: null };
+    }
+    // A 409: somebody already has this thread — this same adoption racing from another tab, or
+    // this same person having soft-deleted the row adoption would have created (see
+    // `AdoptConflictError`). Either way the outcome adoption wanted has already happened, so
+    // this falls through to `forget` exactly as a successful `await` above would have. There is
+    // no id to hand back here — whoever holds the thread now is not necessarily this call — so a
+    // caller that needed an id (the resolver) falls back to its own `mostRecent`/create decision,
+    // which is the right answer in both 409 cases: a stranger's row is invisible to this actor's
+    // roster either way, and this same actor's soft-deleted row was deliberately put away, so
+    // starting fresh is not a mistake to correct.
+    if (!isCurrent()) return { adopted: null };
+    forget(agentId);
+    return { adopted: null };
+  }
+}
+
+/**
  * Rescue a remembered conversation, once per Bot.
  *
- * Runs on the Bot screen. `forget` only after the adoption has landed, so an adoption that failed —
- * offline, a 500, the tab closing — is retried next time rather than losing the id that is the only
- * remaining pointer to that transcript.
- *
- * A 409 is a success for this purpose: somebody already has the thread, which is the outcome adoption
- * wanted. Only an error that leaves the thread unclaimed is worth keeping the key for.
+ * Runs on the Bot screen. The outcome is not read here — `attemptAdoption` already does everything
+ * this hook exists for (adopt, and forget once it lands) — this is a belt for whoever deep-links
+ * straight into a Bot chat without going through `BotResolver` first: the resolver already ran this
+ * exact sequence before it ever navigated here, so on the ordinary path this hook finds nothing
+ * remembered and does nothing. It only has work left to do when the resolver's own attempt kept the
+ * key — a failed adopt, or a check that could not get an answer — and this mount is the retry.
  */
 export function useLegacyThreadAdoption(agentId: string): void {
   const queryClient = useQueryClient();
@@ -164,36 +244,7 @@ export function useLegacyThreadAdoption(agentId: string): void {
 
   useEffect(() => {
     let current = true;
-
-    const threadId = remembered(agentId);
-    // Nothing remembered means nothing the check could protect.
-    if (threadId === null) return;
-
-    void checkKnown(threadId).then(async (outcome) => {
-      // The agent may have changed, or this screen may have unmounted, while the check was in
-      // flight; an answer about a Bot nobody is looking at any more must not adopt anything.
-      if (!current) return;
-      if (!shouldAdopt({ remembered: threadId, known: outcome.known })) return;
-
-      try {
-        await adoptThread({ agentId, threadId });
-      } catch (error) {
-        if (!(error instanceof AdoptConflictError)) {
-          // Any other failure — offline, a 500, the tab closing mid-request — keeps the key: it is
-          // the only remaining pointer to this transcript, so the next visit has to be able to try
-          // again. See `AdoptConflictError` for why a 409 does not take this branch.
-          return;
-        }
-        // A 409: somebody already has this thread — this same adoption racing from another tab, or
-        // this same person having soft-deleted the row adoption would have created (see
-        // `AdoptConflictError`). Either way the outcome adoption wanted has already happened, so
-        // this falls through to `forget` exactly as a successful `await` above would have.
-      }
-
-      if (!current) return;
-      forget(agentId);
-    });
-
+    void attemptAdoption(agentId, adoptThread, () => current);
     return () => {
       current = false;
     };
