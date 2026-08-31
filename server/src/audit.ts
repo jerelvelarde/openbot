@@ -69,14 +69,44 @@ export const auditEventTypes = [
    */
   "channel.deleted",
   /**
-   * A channel hidden from every roster through the archive route, or restored through it —
-   * the reversible sibling of `channel.deleted`. Archiving is hidden, not frozen: `recordActivity`
-   * also clears the archive on its own when somebody speaks in one, but that path runs in the store,
-   * which holds no audit trail, so only a deliberate archive or restore through the route is recorded
-   * here.
+   * A channel hidden from every roster, or restored — the reversible sibling of `channel.deleted`.
+   *
+   * Archiving is hidden, not frozen, so a channel comes back two ways: somebody restoring it, and
+   * somebody saying something in it, which clears the archive on its own. Both are recorded, and
+   * `payload.mechanism` is what separates them — `explicit` for the decision, `activity` for the side
+   * effect — because the event type cannot. A trail showing `channel.archived` and no matching
+   * restore for a channel that is live on every roster is the shape of audit bug this file argues is
+   * worse than a silent one: it gets used to rule things out.
    */
   "channel.archived",
   "channel.unarchived",
+  /**
+   * A person's own conversation with one Bot, hidden or restored.
+   *
+   * Both halves of the roster archive, and a trail that records only one of them answers "where did
+   * that conversation go" for a channel and shrugs at a bot chat. That is the same gap
+   * `channel.deleted` exists to close, left open for half the rows on the screen.
+   *
+   * `payload.mechanism` carries the same two words its channel twin uses, because they are the same
+   * two facts. `explicit` is somebody pressing Archive or Restore. `activity` is a restore nobody
+   * performed as such: saying something in an archived conversation is how it comes back, so an
+   * ordinary message clears `archived_at` and the conversation reappears. That one earns a row
+   * precisely because nobody did it on purpose — it is the answer to "I archived that, why is it
+   * back".
+   */
+  "bot_chat.archived",
+  "bot_chat.unarchived",
+  /**
+   * A bot chat taken off its owner's roster, and when.
+   *
+   * The removal is soft, so the row and its thread survive and `bot_chats.deleted_at` records that it
+   * happened. `channel.deleted` sets out why a timestamp on the row is not enough on its own, and the
+   * argument carries over with one difference: a bot chat has exactly one interested party, so "who
+   * ended it" is rarely the question and "whether it happened, and when" is. Somebody says a
+   * conversation is gone; this is the row that agrees with them. `payload.mechanism` names how, so a
+   * later hard delete stays distinguishable from this one.
+   */
+  "bot_chat.deleted",
   "agent.invoked",
   /**
    * An address this deployment declined to dial for a Bot, and why.

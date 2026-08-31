@@ -13,6 +13,7 @@ const database = createDatabase(databaseUrl, TEST_POOL);
 const prefix = `bot-chat-schema-${randomUUID()}`;
 const createdUserIds: string[] = [];
 const createdAgentIds: string[] = [];
+const createdChannelIds: string[] = [];
 
 afterEach(async () => {
   for (const id of createdUserIds.splice(0)) {
@@ -20,6 +21,9 @@ afterEach(async () => {
   }
   for (const id of createdAgentIds.splice(0)) {
     await database.delete(agents).where(eq(agents.id, id));
+  }
+  for (const id of createdChannelIds.splice(0)) {
+    await database.delete(channels).where(eq(channels.id, id));
   }
 });
 
@@ -136,6 +140,15 @@ describe("the channels table", () => {
     await database
       .insert(channels)
       .values({ id, name: "Channel", description: "Test channel." });
+    /*
+     * Tracked for `afterEach` rather than deleted at the end of this test.
+     *
+     * A delete written after the assertions does not run when one of them fails, and the row it
+     * leaves behind is not merely litter: `seedUser` and `seedAgent` build ids from the length of
+     * arrays `afterEach` empties, so the next test reuses the same ids and a leak surfaces as a
+     * duplicate-key failure somewhere else entirely.
+     */
+    createdChannelIds.push(id);
 
     const archivedAt = new Date();
     await database
@@ -154,7 +167,5 @@ describe("the channels table", () => {
     expect(row?.archivedAt).toEqual(archivedAt);
     // Archiving is not deleting, and the two columns must be independently readable.
     expect(row?.deletedAt).toBeNull();
-
-    await database.delete(channels).where(eq(channels.id, id));
   });
 });

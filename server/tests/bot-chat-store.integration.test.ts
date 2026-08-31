@@ -91,6 +91,25 @@ async function seedProfile(name = "Expense Manager"): Promise<string> {
   return id;
 }
 
+/**
+ * A Bot with no `agent_profiles` row at all, which is not the same thing as a retired one.
+ *
+ * Retirement soft-deletes the profile and leaves the row behind; this is the absence of the row. The
+ * two used to be indistinguishable to a caller, because both left the joined `deleted_at` null, and
+ * that is the confusion these seeds exist to tell apart.
+ */
+async function seedAgentWithoutProfile(): Promise<string> {
+  const id = `${testPrefix}-agent-${randomUUID()}`;
+  await database.insert(agents).values({
+    id,
+    name: "Bot With No Profile",
+    type: "remote_ag_ui",
+    configuration: { endpoint: "https://agent.example.test/ag-ui" },
+  });
+  createdAgentIds.push(id);
+  return id;
+}
+
 function actorFor(userId: string): AgentActor {
   return { id: userId, role: "user" };
 }
@@ -205,6 +224,34 @@ describe("adopting a remembered thread", () => {
     ).rejects.toThrow(BotChatThreadTakenError);
   });
 
+  test("refuses a thread that is the caller's own conversation with a different Bot", async () => {
+    const userId = await seedUser();
+    const agentId = await seedProfile();
+    const otherAgentId = await seedProfile("Travel Desk");
+    const threadId = randomUUID();
+
+    const chat = await store.adopt(actorFor(userId), agentId, threadId);
+    createdBotChatIds.push(chat.id);
+
+    /*
+     * The caller's own live row, on the thread they named, but with the wrong Bot. Handing it back
+     * would answer a request about one Bot with a conversation belonging to another — and a `BotChat`
+     * this call returns is one the client navigates straight to, so the person would land in a
+     * transcript with a coworker they never opened.
+     */
+    await expect(
+      store.adopt(actorFor(userId), otherAgentId, threadId),
+    ).rejects.toThrow(BotChatThreadTakenError);
+
+    const [row] = await database
+      .select({ agentId: botChats.agentId })
+      .from(botChats)
+      .where(eq(botChats.id, chat.id));
+    // And the refusal left the conversation pointing where it did: the insert conflicts and does
+    // nothing, so nothing re-points a live transcript at a Bot that did not say any of it.
+    expect(row?.agentId).toBe(agentId);
+  });
+
   test("refuses to hand back a thread the same person deleted", async () => {
     const userId = await seedUser();
     const agentId = await seedProfile();
@@ -257,6 +304,34 @@ describe("reading a bot chat", () => {
 
     const read = await store.get(actorFor(userId), chat.id);
     expect(read?.archived).toBe(true);
+  });
+
+  test("reads a chat whose Bot has no profile row, and says the Bot is gone", async () => {
+    const userId = await seedUser();
+    const agentId = await seedAgentWithoutProfile();
+    const id = `botchat_${randomUUID()}`;
+    // Inserted directly, because neither `create` nor `adopt` will make one: both hold a live profile
+    // before they write. This is the shape the reads have to agree about, not a path a caller takes.
+    await database
+      .insert(botChats)
+      .values({ id, userId, agentId, threadId: randomUUID() });
+    createdBotChatIds.push(id);
+
+    const read = await store.get(actorFor(userId), id);
+
+    /*
+     * `active` is "this conversation's Bot is still around", and a Bot with no profile row is not
+     * around. It used to arrive as the same null a live profile produces, so this chat reported
+     * itself usable — while an inner join in this very method dropped it, answering "not found" for
+     * a conversation the roster lists. The roster shows this row, so this read must open it.
+     */
+    expect(read).not.toBeNull();
+    expect(read?.active).toBe(false);
+    // And the `?agent=` belt does not skip it either, so the two reads of a chat agree about which
+    // conversations exist as well as about what `active` means.
+    const opened = await store.mostRecent(actorFor(userId), agentId);
+    expect(opened?.id).toBe(id);
+    expect(opened?.active).toBe(false);
   });
 
   test("reports a retired Bot as inactive rather than hiding the conversation", async () => {
@@ -362,6 +437,126 @@ describe("recording activity", () => {
     expect((await store.get(actorFor(userId), chat.id))?.title).toBe(
       "First question",
     );
+  });
+
+  test("names the chat from the person's message reported after the Bot's reply", async () => {
+    const userId = await seedUser();
+    const agentId = await seedProfile();
+    const chat = await store.create(actorFor(userId), agentId);
+    createdBotChatIds.push(chat.id);
+
+    const replyAt = new Date();
+    await store.recordActivity(actorFor(userId), chat.id, {
+      text: "Hello, how can I help?",
+      agentId,
+      at: replyAt,
+    });
+    await store.recordActivity(actorFor(userId), chat.id, {
+      text: "What is our refund policy?",
+      agentId: null,
+      at: new Date(replyAt.getTime() - 1000),
+    });
+
+    /*
+     * The two halves of one exchange are reported by separate calls and can arrive in either order.
+     * The title used to ride the moves-forwards-only guard, so a person's first message reported
+     * after the Bot's reply was discarded whole and the conversation was never named — while the
+     * spec says a chat is named after the person's first message, which this is.
+     */
+    expect((await store.get(actorFor(userId), chat.id))?.title).toBe(
+      "What is our refund policy?",
+    );
+    const [row] = await database
+      .select({ lastMessage: botChats.lastMessage })
+      .from(botChats)
+      .where(eq(botChats.id, chat.id));
+    // And the late report still did not drag the preview backwards, which is what that guard is for.
+    expect(row?.lastMessage).toBe("Hello, how can I help?");
+  });
+
+  test("leaves the chat unnamed when the first thing said renders as nothing", async () => {
+    const userId = await seedUser();
+    const agentId = await seedProfile();
+    const chat = await store.create(actorFor(userId), agentId);
+    createdBotChatIds.push(chat.id);
+
+    const at = new Date();
+    await store.recordActivity(actorFor(userId), chat.id, {
+      // Written as escapes, because a message whose whole content is invisible is not something a
+      // reader of this file could otherwise see is here.
+      text: "\u200b \u200b",
+      agentId: null,
+      at,
+    });
+
+    // Untitled rather than titled the empty string, because a chat is named once and an empty name
+    // is a conversation called nothing for good. See `titleOf` in roster/preview.ts.
+    expect((await store.get(actorFor(userId), chat.id))?.title).toBeNull();
+
+    await store.recordActivity(actorFor(userId), chat.id, {
+      text: "Now a real question",
+      agentId: null,
+      at: new Date(at.getTime() + 1000),
+    });
+
+    // So the next thing the person says gets to name it.
+    expect((await store.get(actorFor(userId), chat.id))?.title).toBe(
+      "Now a real question",
+    );
+  });
+
+  test("says it restored a conversation archived while it was deciding", async () => {
+    const userId = await seedUser();
+    const agentId = await seedProfile();
+    const chat = await store.create(actorFor(userId), agentId);
+    createdBotChatIds.push(chat.id);
+
+    /*
+     * The archive commits between the read that decides what to announce and the write that clears
+     * the flag — the one interleaving this method used to lose.
+     *
+     * Held open here rather than raced, so the ordering is this test's and not the scheduler's. The
+     * defect: `archived_at` was read on an earlier statement, so the recording saw "not archived",
+     * cleared it anyway, and left `archived: false` off its announcement. Restored in the database
+     * and still hidden in every tab until something unrelated made them refetch — and saying
+     * something in an archived conversation is precisely how it is meant to come back.
+     */
+    let release = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let archiveWritten = () => {};
+    const written = new Promise<void>((resolve) => {
+      archiveWritten = resolve;
+    });
+    const archiving = database.transaction(async (transaction) => {
+      await transaction
+        .update(botChats)
+        .set({ archivedAt: new Date() })
+        .where(eq(botChats.id, chat.id));
+      archiveWritten();
+      await held;
+    });
+    // Awaited, so the archive is uncommitted-but-written before the recording starts. Without this the
+    // recording can take the row first and the archive queues behind it, which is a different (and
+    // already correct) interleaving.
+    await written;
+
+    const recording = store.recordActivity(actorFor(userId), chat.id, {
+      text: "One more thing",
+      agentId: null,
+      at: new Date(),
+    });
+    // Long enough for the recording to have reached its first statement and blocked there on the
+    // archive's row lock. Nothing observable happens on either side while it waits.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    release();
+    await archiving;
+
+    // Reported as a restore, because the pre-image it is reported from is the one this write
+    // actually overwrote.
+    expect(await recording).toEqual({ restored: true });
+    expect((await store.get(actorFor(userId), chat.id))?.archived).toBe(false);
   });
 
   test("only ever moves the last message forwards", async () => {
@@ -512,7 +707,12 @@ describe("the caller's own state", () => {
       .select({ pinnedAt: botChats.pinnedAt })
       .from(botChats)
       .where(eq(botChats.id, chat.id));
-    expect(pinned?.pinnedAt).not.toBeNull();
+    /*
+     * A stamp, asserted as a stamp. `not.toBeNull()` passes for `undefined` too, so it passed just
+     * as happily when the row was not there at all — which is the one outcome this test is supposed
+     * to catch, since a chat this store refused to pin would leave no row to read.
+     */
+    expect(pinned?.pinnedAt).toBeInstanceOf(Date);
 
     await store.setPinned(actorFor(userId), chat.id, false);
 
@@ -521,8 +721,9 @@ describe("the caller's own state", () => {
       .from(botChats)
       .where(eq(botChats.id, chat.id));
     expect(unpinned?.pinnedAt).toBeNull();
-    // And neither call touched the archive. Only the roster query reads `archived_at`.
-    expect(unpinned?.archivedAt).not.toBeNull();
+    // And neither call touched the archive. Only the roster query reads `archived_at`. Asserted as a
+    // stamp for the reason above: `not.toBeNull()` would hold for a row that had gone missing.
+    expect(unpinned?.archivedAt).toBeInstanceOf(Date);
   });
 });
 
@@ -533,13 +734,17 @@ describe("archiving a bot chat", () => {
     const chat = await store.create(actorFor(userId), agentId);
     createdBotChatIds.push(chat.id);
 
-    await store.setArchived(actorFor(userId), chat.id, true);
+    expect(await store.setArchived(actorFor(userId), chat.id, true)).toBe(true);
     const [first] = await database
       .select({ archivedAt: botChats.archivedAt })
       .from(botChats)
       .where(eq(botChats.id, chat.id));
 
-    await store.setArchived(actorFor(userId), chat.id, true);
+    // `false` is the answer the route reads to decide whether to write the trail, so a repeat click
+    // is not merely harmless here — it must say it changed nothing.
+    expect(await store.setArchived(actorFor(userId), chat.id, true)).toBe(
+      false,
+    );
     const [second] = await database
       .select({ archivedAt: botChats.archivedAt })
       .from(botChats)
@@ -547,6 +752,29 @@ describe("archiving a bot chat", () => {
 
     // A repeat call must not restamp, or the row's archive time drifts on every click.
     expect(second?.archivedAt).toEqual(first?.archivedAt);
+  });
+
+  test("gives one archiving to two callers that race", async () => {
+    const userId = await seedUser();
+    const agentId = await seedProfile();
+    const chat = await store.create(actorFor(userId), agentId);
+    createdBotChatIds.push(chat.id);
+
+    /*
+     * Started together, not one after the other, which is the case the guard exists for.
+     *
+     * The decision used to be taken from a read on an earlier statement: under READ COMMITTED both
+     * callers read `archived_at` null, both wrote, and both reported they had changed something. The
+     * route above turns that boolean into an audit row and an announcement, so one archiving became
+     * two rows saying it happened and two whole-roster refetches in every tab. Exactly one of these
+     * may claim it.
+     */
+    const claimed = await Promise.all([
+      store.setArchived(actorFor(userId), chat.id, true),
+      store.setArchived(actorFor(userId), chat.id, true),
+    ]);
+
+    expect(claimed.filter(Boolean)).toHaveLength(1);
   });
 
   test("refuses a deleted chat", async () => {

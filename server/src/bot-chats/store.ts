@@ -13,7 +13,7 @@
  * Every method is scoped to `actor.id`. A row belonging to somebody else is reported exactly as a row
  * that does not exist, so ownership is not something an outsider can probe for.
  */
-import { and, desc, eq, isNull, lt, or, sql } from "drizzle-orm";
+import { and, desc, eq, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
 import {
   AgentNotFoundError,
   type AgentProfileStore,
@@ -27,6 +27,7 @@ import type { ChannelActivity } from "../channels/routes";
 import type { ThreadIdentity } from "../channels/thread-identity";
 import type { Database } from "../db/client";
 import { agentProfiles, botChats } from "../db/schema";
+import { recencyOf } from "../roster/order";
 import { previewOf, titleOf } from "../roster/preview";
 
 export type BotChat = {
@@ -45,23 +46,37 @@ export type BotChatStore = {
   create(actor: AgentActor, agentId: string): Promise<BotChat>;
   /**
    * Take over a thread the browser already had, so a conversation that predates this table is not
-   * orphaned in Intelligence. Idempotent for the person who owns it; throws
-   * `BotChatThreadTakenError` when somebody else does.
+   * orphaned in Intelligence. Idempotent for the person who owns it with the same Bot; throws
+   * `BotChatThreadTakenError` when somebody else owns it, when they deleted it themselves, or when
+   * the thread is already a conversation with a different Bot.
    */
   adopt(actor: AgentActor, agentId: string, threadId: string): Promise<BotChat>;
   /** The caller's own chat, or null for an unknown, deleted, or somebody else's one. */
   get(actor: AgentActor, id: string): Promise<BotChat | null>;
-  /** The caller's newest non-archived chat with this Bot, or null when there is none. */
+  /**
+   * The caller's newest non-archived chat with this Bot, or null when there is none.
+   *
+   * No route reads this today, and the browser reaches the same answer for itself over the roster it
+   * has already loaded (`mostRecentBotChat` in `app/src/routes/_authed/_app/bot.tsx`, whose comment
+   * records that the two once disagreed). Kept, and said out loud rather than left to be discovered,
+   * because two definitions of one ordering is how they drifted the first time.
+   */
   mostRecent(actor: AgentActor, agentId: string): Promise<BotChat | null>;
   /**
-   * Record the last thing said. Moves forwards only, titles the conversation from the person's
-   * first message, and restores it if it was archived.
+   * Record the last thing said, and report whether doing so brought an archived conversation back.
+   *
+   * `last_message` moves forwards only, so a report that arrives late is dropped. The title does not:
+   * it is written from the person's first message whenever that message arrives, because which
+   * message names a conversation has nothing to do with which one arrived last.
+   *
+   * `restored` is for the route above, which writes the trail: saying something in an archived
+   * conversation clears the archive, and that is a restore nobody performed as such.
    */
   recordActivity(
     actor: AgentActor,
     id: string,
     activity: ChannelActivity,
-  ): Promise<void>;
+  ): Promise<{ restored: boolean }>;
   /** Pin or unpin. Throws `BotChatNotFoundError` for anything the caller does not own. */
   setPinned(actor: AgentActor, id: string, pinned: boolean): Promise<void>;
   /** Stamp the caller's chat as read now. Throws `BotChatNotFoundError` as above. */
@@ -72,8 +87,9 @@ export type BotChatStore = {
    *
    * Returns whether anything actually changed, matching `ChannelStore.setArchived` — the two are one
    * idea applied twice, and letting only one of them report change is exactly how they would drift.
-   * Bot chats have no audit route today, so nothing yet consumes this, but the shape stays symmetric
-   * against the day one arrives.
+   * The route above audits the act on this boolean, so it has to be the answer to "did this call move
+   * the flag" and not "is the flag now where the caller asked": a repeat click must leave one row on
+   * the trail, not two.
    */
   setArchived(
     actor: AgentActor,
@@ -91,6 +107,14 @@ type ChatRow = {
   threadId: string;
   title: string | null;
   archivedAt: Date | null;
+  /**
+   * The joined profile's own key, or null when this Bot has no profile row at all.
+   *
+   * Selected alongside `profileDeletedAt` because the profile is joined loosely everywhere, and a
+   * loose join answers "no such row" with nulls in every one of its columns. Without this column
+   * there is nothing to tell that apart from a row that is there and not deleted.
+   */
+  profileAgentId: string | null;
   /** When this chat's Bot was retired, or null. Joined, not stored here. */
   profileDeletedAt: Date | null;
 };
@@ -106,8 +130,14 @@ function chatFrom(row: ChatRow): BotChat {
      * row, so this conversation stays readable and merely reports its coworker as gone. That is the
      * same thing a channel reports about a deleted coworker, and it is what keeps a retirement from
      * silently taking a transcript with it.
+     *
+     * Two conditions rather than one, and both load-bearing. `profileDeletedAt === null` alone means
+     * either "the Bot is alive" or "the Bot has no profile row at all", which are opposite answers to
+     * the question this field asks — and the second is what a loose join produces. The roster's own
+     * bot-chat hydration tests the same pair, so a row's `active` reads the same whichever of the two
+     * built it.
      */
-    active: row.profileDeletedAt === null,
+    active: row.profileAgentId !== null && row.profileDeletedAt === null,
     archived: row.archivedAt !== null,
   };
 }
@@ -119,17 +149,23 @@ const chatProjection = {
   threadId: botChats.threadId,
   title: botChats.title,
   archivedAt: botChats.archivedAt,
+  profileAgentId: agentProfiles.agentId,
   profileDeletedAt: agentProfiles.deletedAt,
 };
 
 /**
  * Most recent first, where starting a conversation counts as activity.
  *
- * The same shape as `RECENCY` in `roster/order.ts`, over this table's own two columns; that module's
- * expression is written against `channels` and says so. `bot_chats_recent_activity_idx` is declared
- * on this expression, so the ordering is an index read rather than a sort.
+ * `roster/order.ts`'s rule, applied to this table's own two columns, rather than a third hand-written
+ * copy of it. There were three: that module's header argues that a second server-side spelling of the
+ * sort is exactly what lets the two kinds of conversation drift apart, and then the module left the
+ * expression un-exported and the spellings accumulated anyway. It is exported now.
+ *
+ * `bot_chats_recent_activity_idx` is declared on this expression, so `mostRecent`'s ordering — which
+ * leads with recency and nothing else — is an index read rather than a sort. That is not true of the
+ * roster's bot-chat branch, whose key leads with the pin; see `roster/query.ts`.
  */
-const RECENCY = sql`coalesce(${botChats.lastMessageAt}, ${botChats.createdAt})`;
+const RECENCY = recencyOf(botChats.lastMessageAt, botChats.createdAt);
 
 export function createBotChatStore(
   database: Database,
@@ -219,14 +255,21 @@ export function createBotChatStore(
 
           const [row] = inserted;
           if (row) {
-            return chatFrom({ ...row, profileDeletedAt: profile.deletedAt });
+            // The profile in hand is this row's, because this row was just written naming `agentId`,
+            // and `getWithin` resolved it — so it is present and not retired.
+            return chatFrom({
+              ...row,
+              profileAgentId: agentId,
+              profileDeletedAt: profile.deletedAt,
+            });
           }
 
-          // Somebody already has it. There are three shapes that row can take, and only one of them
+          // Somebody already has it. There are four shapes that row can take, and only one of them
           // is an outcome this call should hand back:
           //
-          //   - the caller's own live row: return it. Two tabs adopting the same remembered thread is
-          //     exactly the race this function exists to survive, so idempotence here is the point.
+          //   - the caller's own live row with the Bot they named: return it. Two tabs adopting the
+          //     same remembered thread is exactly the race this function exists to survive, so
+          //     idempotence here is the point.
           //   - the caller's own row, but soft-deleted: refuse. Do NOT clear `deleted_at` and
           //     resurrect it — that is the same "undone by navigation" mistake `mostRecent` already
           //     refuses for archived rows, applied to a stronger act: a person who deleted this
@@ -241,10 +284,20 @@ export function createBotChatStore(
           //     for, and it answers the same `BotChatThreadTakenError` as the case above so that
           //     which one happened is not something the response lets a caller tell apart — ownership
           //     and not-found read alike everywhere else in this store, and this is no exception.
+          //   - the caller's own live row, but with a different Bot: refuse. A thread carries one
+          //     transcript and a bot chat has one Bot, so this request cannot be satisfied: the row
+          //     that exists is not a conversation with the Bot that was asked for. Returning it would
+          //     answer a request about one Bot with another Bot's conversation, and the obvious next
+          //     move for a client holding a `BotChat` is to navigate to it — so the person would land
+          //     in a transcript with a coworker they never opened. Repointing the row at `agentId`
+          //     instead would be worse: the transcript stays and its Bot changes underneath it, which
+          //     attributes everything already said to somebody who did not say it.
           //
-          // The profile is joined loosely, because the decision below has to come from the
-          // `bot_chats` row alone: an inner join would turn a row whose Bot has no profile at all
-          // into "taken by somebody else", which is a refusal for the wrong reason.
+          // The profile is joined loosely, matching `get` below and the roster's own bot-chat
+          // hydration: no read of a chat withholds a row because a profile is missing, and the
+          // decision below comes from the `bot_chats` columns alone — ownership, the Bot, and
+          // `deleted_at`. Here that join is belt rather than load-bearing, because the Bot is compared
+          // and `getWithin` has already proved that Bot's profile is present and not retired.
           const [existing] = await transaction
             .select({
               ...chatProjection,
@@ -260,10 +313,14 @@ export function createBotChatStore(
           if (
             !existing ||
             existing.userId !== actor.id ||
+            existing.agentId !== agentId ||
             existing.deletedAt !== null
           ) {
             throw new BotChatThreadTakenError(threadId);
           }
+          // Its Bot is the one `getWithin` just resolved, so what this hands back is a conversation
+          // `get` will open: the row is live, it is the caller's, and its profile is present and not
+          // retired.
           return chatFrom(existing);
         },
         { isolationLevel: "read committed" },
@@ -274,7 +331,17 @@ export function createBotChatStore(
       const [row] = await database
         .select(chatProjection)
         .from(botChats)
-        .innerJoin(agentProfiles, eq(agentProfiles.agentId, botChats.agentId))
+        /*
+         * Loosely, matching `adopt` above and the roster's own bot-chat hydration, because whether a
+         * Bot has a profile row is something to report and not a reason to withhold a conversation.
+         *
+         * An inner join here answered "not found" for a chat the roster lists and `adopt` hands back,
+         * which is the one disagreement between these reads a client actually feels: it navigates to
+         * what it was given and is told the conversation is not there. `chatFrom` is what makes the
+         * loose join safe — it asks whether the profile row is present, rather than reading a null
+         * that could mean either.
+         */
+        .leftJoin(agentProfiles, eq(agentProfiles.agentId, botChats.agentId))
         .where(
           and(
             eq(botChats.id, id),
@@ -294,7 +361,9 @@ export function createBotChatStore(
       const [row] = await database
         .select(chatProjection)
         .from(botChats)
-        .innerJoin(agentProfiles, eq(agentProfiles.agentId, botChats.agentId))
+        // Loosely, for the reason `get` gives: this read decides which conversation opening a Bot
+        // lands on, and it must not skip one the roster is showing.
+        .leftJoin(agentProfiles, eq(agentProfiles.agentId, botChats.agentId))
         .where(
           and(
             eq(botChats.userId, actor.id),
@@ -322,7 +391,6 @@ export function createBotChatStore(
           const [row] = await transaction
             .select({
               agentId: botChats.agentId,
-              title: botChats.title,
               archivedAt: botChats.archivedAt,
             })
             .from(botChats)
@@ -336,7 +404,26 @@ export function createBotChatStore(
                 // a row that cannot appear.
                 isNull(botChats.deletedAt),
               ),
-            );
+            )
+            /*
+             * Locked, because `archived_at` read here is the state of the row BEFORE this write and
+             * it decides what the announcement below says.
+             *
+             * Unlocked, an archive committing between this statement and the update reads here as
+             * "was not archived"; the update clears `archived_at` regardless, and the event goes out
+             * without `archived: false`. The conversation is then restored in the database and still
+             * hidden in every tab until something unrelated makes them refetch — and saying something
+             * in an archived conversation is exactly how it is meant to come back, which
+             * `app/src/lib/channels/use-channel-events.ts` argues at length is the direction that must
+             * not be lossy. The lock is what makes the pre-image this method announces from the same
+             * one it writes over.
+             *
+             * `FOR UPDATE` and not `FOR SHARE`: an archive must block on it rather than commit
+             * underneath it. Note this is a `bot_chats` row and has nothing to do with the share lock
+             * `adopt` takes on `agent_profiles`, which the adoption-race test depends on staying
+             * shared.
+             */
+            .for("update");
           // Not a chat, not this person's, or a deleted one: the same answer every way, matching
           // `get`.
           if (!row) throw new BotChatNotFoundError(id);
@@ -346,6 +433,37 @@ export function createBotChatStore(
           // attribute somebody else's Bot's words to this transcript.
           if (activity.agentId !== null && activity.agentId !== row.agentId) {
             throw new AgentNotFoundError(activity.agentId);
+          }
+
+          /*
+           * Titled once, from the person's first message, on a statement of its own.
+           *
+           * Its own statement because it must not ride the moves-forwards-only guard below. The two
+           * halves of one exchange are reported separately and can arrive in either order, so a
+           * person's first message can turn up after the Bot's reply — and under that guard the whole
+           * report was discarded as stale and the conversation was never named. Which message names a
+           * conversation has nothing to do with which one arrived last; the guard exists to stop a
+           * late report rewinding `last_message_at`.
+           *
+           * Never from the Bot's message: the same greeting opens every chat, so titling from it would
+           * make every row in the roster identical.
+           *
+           * `title IS NULL` in the `WHERE` rather than a decision taken from the read above, so
+           * "titled once, never re-titled" survives two first messages arriving at once: the second
+           * statement blocks, re-checks against what the first committed, and writes nothing instead
+           * of renaming a conversation somebody is already reading.
+           *
+           * Skipped when `titleOf` finds nothing worth showing — a message of invisible characters —
+           * which leaves the chat untitled so the next thing the person says gets to name it. Writing
+           * that null would be a write that changed nothing and stamped `updated_at` for it.
+           */
+          const title =
+            activity.agentId === null ? titleOf(activity.text) : null;
+          if (title !== null) {
+            await transaction
+              .update(botChats)
+              .set({ title, updatedAt: new Date() })
+              .where(and(eq(botChats.id, id), isNull(botChats.title)));
           }
 
           const lastMessage = previewOf(activity.text);
@@ -363,16 +481,6 @@ export function createBotChatStore(
                */
               archivedAt: null,
               updatedAt: new Date(),
-              /*
-               * Titled once, from the person's first message.
-               *
-               * Never from the Bot's: the same greeting opens every chat, so titling from it would
-               * make every row in the roster identical. And never again after the first, so the
-               * name of a conversation does not change under somebody mid-conversation.
-               */
-              ...(row.title === null && activity.agentId === null
-                ? { title: titleOf(activity.text) }
-                : {}),
             })
             .where(
               and(
@@ -387,8 +495,19 @@ export function createBotChatStore(
               ),
             )
             .returning({ id: botChats.id });
-          // Nothing changed, so there is nothing to announce: a stale report is not news.
-          if (applied.length === 0) return;
+          /*
+           * The report was stale, so there is nothing to announce: a stale report is not news, and
+           * nothing was restored either — the guard is also what stops a late arrival un-archiving
+           * what it predates.
+           *
+           * A title may still have been written just above. Deliberately not announced: this event
+           * carries no title, and the browser spreads whatever arrives onto the row it holds, so an
+           * event sent for a title alone would stamp this call's null `lastMessage` over the preview
+           * the roster is rendering (`applyRosterEvent` in use-channel-events.ts, which guards the
+           * pin path against exactly that). The name is picked up by the next refetch, and by the next
+           * report that is not stale.
+           */
+          if (applied.length === 0) return { restored: false };
 
           /*
            * Announced inside the transaction, so it is delivered on commit and a write that rolls
@@ -412,6 +531,10 @@ export function createBotChatStore(
           await transaction.execute(
             sql`select pg_notify(${CHANNEL_ACTIVITY_TOPIC}, ${JSON.stringify(event)})`,
           );
+
+          // The same fact the event above carries, for the route, which writes it to the trail: this
+          // write is how an archived conversation comes back, and nobody performed that as an act.
+          return { restored: row.archivedAt !== null };
         },
         { isolationLevel: "read committed" },
       );
@@ -491,35 +614,62 @@ export function createBotChatStore(
     setArchived(actor, id, archived) {
       return database.transaction(
         async (transaction) => {
-          const [row] = await transaction
-            .select({ archivedAt: botChats.archivedAt })
-            .from(botChats)
+          /*
+           * The state this call is moving away from is a term in the `WHERE`, not a decision taken
+           * from an earlier read.
+           *
+           * Written this way for the reason `adopt` inserts before it reads: a read and then a write
+           * is two statements on two snapshots. Under READ COMMITTED two callers archiving the same
+           * conversation at once both read `archived_at` null, both write, and both report they
+           * changed something — and this boolean is what gates the route's audit row and this method's
+           * announcement, so one archiving became two rows on the trail and two whole-roster refetches
+           * in every tab. With the term here, the second statement blocks on the first, re-checks
+           * against the row the first committed, matches nothing, and says honestly that it changed
+           * nothing. A repeat call is the same shape as a race and gets the same answer.
+           */
+          const applied = await transaction
+            .update(botChats)
+            .set({
+              archivedAt: archived ? new Date() : null,
+              updatedAt: new Date(),
+            })
             .where(
               and(
                 eq(botChats.id, id),
                 eq(botChats.userId, actor.id),
                 // A deleted chat is not there to archive, the same way it is not there to pin.
                 isNull(botChats.deletedAt),
+                archived
+                  ? isNull(botChats.archivedAt)
+                  : isNotNull(botChats.archivedAt),
               ),
-            );
-          // Not a chat, not this person's, or a deleted one: the same answer every way.
-          if (!row) throw new BotChatNotFoundError(id);
+            )
+            .returning({ id: botChats.id });
 
-          // Already where the caller wants it. Returning here rather than writing is what makes a
-          // repeat call a no-op instead of a fresh stamp and a second announcement. `false` reports
-          // that nothing changed, matching `ChannelStore.setArchived`.
-          const alreadyThere = archived
-            ? row.archivedAt !== null
-            : row.archivedAt === null;
-          if (alreadyThere) return false;
-
-          await transaction
-            .update(botChats)
-            .set({
-              archivedAt: archived ? new Date() : null,
-              updatedAt: new Date(),
-            })
-            .where(eq(botChats.id, id));
+          if (applied.length === 0) {
+            /*
+             * Nothing was written, and there are two reasons for that. Told apart here, after the
+             * write rather than before it, so no decision this method makes ever comes from a read
+             * that could go stale underneath it.
+             *
+             * A row that is there and already where the caller wants it is a no-op: `false`, no
+             * stamp, no announcement, no trail row. Anything else — not a chat, not this person's, or
+             * one deleted, including one deleted while this ran — is the same "not found" every other
+             * method in this store gives, so ownership stays unprobeable.
+             */
+            const [row] = await transaction
+              .select({ id: botChats.id })
+              .from(botChats)
+              .where(
+                and(
+                  eq(botChats.id, id),
+                  eq(botChats.userId, actor.id),
+                  isNull(botChats.deletedAt),
+                ),
+              );
+            if (!row) throw new BotChatNotFoundError(id);
+            return false;
+          }
 
           // Announced inside the transaction, so it rides the commit and a refused archive announces
           // nothing at all.

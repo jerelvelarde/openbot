@@ -734,7 +734,10 @@ export function createApp(
   }
 
   if (botChatStore) {
-    app.route("/api/bot-chats", createBotChatRoutes(botChatStore, requireUser));
+    app.route(
+      "/api/bot-chats",
+      createBotChatRoutes(botChatStore, requireUser, auditStore),
+    );
   }
 
   if (rosterStore) {

@@ -13,6 +13,11 @@
 import type { Context, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import { AgentNotFoundError } from "../agents/profile-store";
+import {
+  type AuditEventType,
+  type AuditStore,
+  recordAuditEvent,
+} from "../audit";
 import type { AppVariables } from "../auth/guards";
 import { parseActivityInput } from "../channels/routes";
 import {
@@ -87,8 +92,60 @@ export function parseAdoptInput(input: unknown): AdoptInputParseResult {
 export function createBotChatRoutes(
   store: BotChatStore,
   requireUser: MiddlewareHandler<{ Variables: AppVariables }>,
+  /**
+   * Where an archive, a restore and a delete are written. Absent in tests that do not care about the
+   * trail, and the routes still work without it — `createChannelRoutes` takes it the same way, last
+   * and optional, for the same reason.
+   */
+  auditStore?: AuditStore,
 ) {
   const routes = new Hono<{ Variables: AppVariables }>();
+
+  /**
+   * Write one row to the trail, tolerantly.
+   *
+   * Mirrors `record` in channels/routes.ts, down to the reasoning: never fatal, because by the time
+   * this runs the conversation has already been archived, restored or removed and the caller has
+   * already been told so. A trail that is briefly unavailable is not a reason to report a failure that
+   * did not happen — and the failure is said out loud, because a silent trail is worse than an
+   * unavailable one.
+   *
+   * Reached only after the store call resolves, and only where the store reports it changed
+   * something, so a refused act and a repeat click both write nothing. The trail records acts, not
+   * attempts.
+   */
+  const record = async (
+    context: Context<{ Variables: AppVariables }>,
+    eventType: AuditEventType,
+    botChatId: string,
+    payload: Record<string, unknown>,
+  ): Promise<void> => {
+    if (!auditStore) return;
+    try {
+      await recordAuditEvent(auditStore, {
+        eventType,
+        targetType: "bot_chat",
+        targetId: botChatId,
+        /*
+         * Attributed, including in single-user mode, for the reason channels/routes.ts gives at
+         * length: `audit_events.actor_user_id` has no foreign key to violate, `initializeDevActorUser`
+         * writes that row at start-up anyway, and single-user is the mode `.env.example` ships
+         * switched on — so an unattributed row is what a fork sees by default.
+         */
+        actorUserId: context.var.actor.id,
+        payload,
+      });
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          type: "bot-chat-audit-write-failed",
+          eventType,
+          botChatId,
+          error: String(error),
+        }),
+      );
+    }
+  };
 
   routes.post("/", requireUser, async (context) => {
     const parsed = parseCreateInput(await context.req.json().catch(() => null));
@@ -144,12 +201,26 @@ export function createBotChatRoutes(
     );
     if (!parsed.ok) return context.json({ error: parsed.error }, 400);
 
+    const id = context.req.param("id");
     try {
-      await store.recordActivity(
+      const { restored } = await store.recordActivity(
         context.var.actor,
-        context.req.param("id"),
+        id,
         parsed.value,
       );
+      /*
+       * This route restores conversations without anybody asking it to: saying something in an
+       * archived one is how it comes back, so an ordinary message clears `archived_at`. Recorded when
+       * it actually happened, and named `activity` rather than `explicit`, so the trail can tell a
+       * restore somebody pressed from one that fell out of a message — the second is the one whose
+       * absence reads as the archive having undone itself. The same two words the channel twin's
+       * activity route uses, because they are the same two facts.
+       */
+      if (restored) {
+        await record(context, "bot_chat.unarchived", id, {
+          mechanism: "activity",
+        });
+      }
       return context.body(null, 204);
     } catch (error) {
       return mapStoreError(context, error);
@@ -196,12 +267,30 @@ export function createBotChatRoutes(
       return context.json({ error: "Archived must be true or false." }, 400);
     }
 
+    const id = context.req.param("id");
     try {
-      await store.setArchived(
-        context.var.actor,
-        context.req.param("id"),
-        archived,
-      );
+      const changed = await store.setArchived(context.var.actor, id, archived);
+      /*
+       * Only when the store moved the flag. `setArchived` answers `false` for a repeat call on a chat
+       * already in the requested state, and pressing Archive twice must not lay down two rows for one
+       * archiving.
+       *
+       * The response below is unconditional either way — the caller asked for a state and that state
+       * now holds — so a 200 here can coincide with no trail write at all. Deliberate: the HTTP
+       * contract answers "is it archived now", not "did this call do the archiving".
+       */
+      if (changed) {
+        await record(
+          context,
+          archived ? "bot_chat.archived" : "bot_chat.unarchived",
+          id,
+          // Named the way `bot_chat.deleted` names its mechanism, and for a sharper reason: the
+          // activity route writes `bot_chat.unarchived` too, when somebody speaking in an archived
+          // conversation brings it back. Without this a reader cannot tell a decision from a side
+          // effect.
+          { mechanism: "explicit" },
+        );
+      }
       return context.json({ archived });
     } catch (error) {
       return mapStoreError(context, error);
@@ -209,8 +298,14 @@ export function createBotChatRoutes(
   });
 
   routes.delete("/:id", requireUser, async (context) => {
+    const id = context.req.param("id");
     try {
-      await store.softDelete(context.var.actor, context.req.param("id"));
+      await store.softDelete(context.var.actor, id);
+      // Named rather than implied: the row and its thread are still there, and a later hard delete
+      // would be a different fact about the same conversation. `softDelete` throws for a repeat, so
+      // reaching this line is itself the "it happened this time" gate the archive route needs a
+      // boolean for.
+      await record(context, "bot_chat.deleted", id, { mechanism: "soft" });
       return context.body(null, 204);
     } catch (error) {
       return mapStoreError(context, error);
@@ -240,18 +335,19 @@ function mapStoreError(context: Context, error: unknown): Response {
   }
   if (error instanceof BotChatThreadTakenError) {
     /*
-     * `adopt` throws this for two different situations, not one: a thread that belongs to somebody
-     * else, and a thread that is the caller's own row but one *they* soft-deleted (see the second
-     * and third bullets of the comment inside `adopt` in bot-chats/store.ts). Both answer with this
-     * one message and this one status, deliberately, and not because the two cases have anything in
-     * common besides the code:
+     * `adopt` throws this for three different situations, not one: a thread that belongs to somebody
+     * else, a thread that is the caller's own row but one *they* soft-deleted, and a thread that is
+     * the caller's own live row with a different Bot (see the second, third and fourth bullets of the
+     * comment inside `adopt` in bot-chats/store.ts). All three answer with this one message and this
+     * one status, deliberately, and not because they have anything in common besides the code:
      *
      *   - the client already treats 409 as success here — it is what clears the remembered thread
-     *     id in storage, whichever of the two reasons produced it — so one status code correctly
-     *     serves both;
-     *   - naming which of the two happened would tell an outsider adopting a stranger's remembered
-     *     thread id whether that thread exists and who deleted it, which is exactly the kind of
-     *     probe every other method in this file (and in the store beneath it) is written to refuse.
+     *     id in storage, whichever of the reasons produced it — so one status code correctly serves
+     *     all three;
+     *   - naming which one happened would tell an outsider adopting a stranger's remembered thread
+     *     id whether that thread exists, who deleted it, and which Bot it belongs to, which is
+     *     exactly the kind of probe every other method in this file (and in the store beneath it) is
+     *     written to refuse.
      */
     return context.json(
       { error: "That conversation is no longer available." },
