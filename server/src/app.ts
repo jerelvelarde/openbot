@@ -20,6 +20,8 @@ import {
   requireAdmin,
 } from "./auth/guards";
 import type { IdentityProviderStore } from "./auth/identity-provider-store";
+import { createBotChatRoutes } from "./bot-chats/routes";
+import type { BotChatStore } from "./bot-chats/store";
 import type { ChannelEventHub } from "./channels/events";
 import { type ChannelStore, createChannelRoutes } from "./channels/routes";
 import type { ThreadIdentity } from "./channels/thread-identity";
@@ -167,6 +169,15 @@ export function createApp(
    * the wrong thing.
    */
   pageFrames?: PageFrameStore,
+  /**
+   * A person's own direct conversations with one Bot, outside any channel.
+   *
+   * Appended last on purpose: these are positional, so inserting one anywhere else silently
+   * shifts every existing call site's arguments by one.
+   *
+   * Absent leaves the routes unmounted.
+   */
+  botChatStore?: BotChatStore,
 ) {
   const app = new Hono<{ Variables: AppVariables }>();
 
@@ -704,6 +715,10 @@ export function createApp(
       "/api/channels",
       createChannelRoutes(channelStore, requireUser, channelEvents, auditStore),
     );
+  }
+
+  if (botChatStore) {
+    app.route("/api/bot-chats", createBotChatRoutes(botChatStore, requireUser));
   }
 
   if (componentStore) {

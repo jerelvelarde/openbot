@@ -11,6 +11,7 @@ import { DEV_ACTOR, initializeDevActorUser } from "./auth/dev-actor";
 import { createRoleRepository } from "./auth/guards";
 import { createIdentityProviderStore } from "./auth/identity-provider-store";
 import type { OpenBotRole } from "./auth/roles";
+import { createBotChatStore } from "./bot-chats/store";
 import {
   createChannelEventHub,
   startChannelActivityListener,
@@ -139,6 +140,13 @@ const threadIdentity = createThreadIdentity(
   config.deploymentId ?? tenantPackage.tenantId,
 );
 const channelStore = createChannelStore(
+  database,
+  agentProfileStore,
+  threadIdentity,
+);
+// The same thread identity the channels use, so a bot chat's thread says which deployment minted it
+// in a project that may hold more than one.
+const botChatStore = createBotChatStore(
   database,
   agentProfileStore,
   threadIdentity,
@@ -557,6 +565,8 @@ const app = createApp(
   intentRouter,
   // What a browsing turn's screen looked like when it finished, so the transcript can show it later.
   createPageFrameStore(database),
+  // A person's own direct conversations with one Bot, outside any channel.
+  botChatStore,
 );
 
 /**
