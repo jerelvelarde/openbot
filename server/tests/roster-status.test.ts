@@ -1,0 +1,22 @@
+import { describe, expect, test } from "bun:test";
+import { parseRosterStatus } from "../src/roster/query";
+
+describe("parseRosterStatus", () => {
+  test.each([
+    ["active", "active"],
+    ["archived", "archived"],
+    ["all", "all"],
+  ])("reads %p as %p", (input, expected) => {
+    expect(parseRosterStatus(input)).toBe(expected);
+  });
+
+  test.each([[null], [undefined], [""], ["ACTIVE"], ["deleted"], ["nonsense"]])(
+    "reads %p as active",
+    (input) => {
+      // The same call decodeRosterCursor makes for a malformed cursor: the honest answer to a stale
+      // link is the first page, not a 400 a person cannot act on. Case-sensitive on purpose, so the
+      // accepted set is exactly the three documented values.
+      expect(parseRosterStatus(input)).toBe("active");
+    },
+  );
+});
