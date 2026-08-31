@@ -235,10 +235,22 @@ Their results are then interleaved back into the order phase 1 returned, which i
 authority in the module.
 
 This removes the risk that a straight `unionAll` over two fully-hydrated, differently-shaped selects
-would have carried. The union is over two narrow, identically-shaped selects, which is the case
-drizzle-orm 0.45's `unionAll` composes with `orderBy` and `limit` cleanly. If it still fights, the
-fallback is one raw parameterised `sql` union for phase 1 — **not** merging in TypeScript, which
-would put the sort rule in a second place inside the very module that exists to own it.
+would have carried.
+
+**What it actually took, once built.** Ordering the union directly does not run. Postgres lets a set
+operation's `ORDER BY` name only the union's *output* columns, and drizzle-orm 0.45.2 rewrites a bare
+column handed to a set operator's `orderBy` into an unqualified identifier but not one nested inside
+an expression — and `rosterOrder` nests all three parts of the key. The attempt fails with an
+invalid-FROM-clause reference.
+
+The resolution is a derived table: wrap the union as `.as("roster")` and select from it, which makes
+the four aliased output columns nameable so `rosterOrder` applies unchanged. The sort rule is still
+expressed exactly once, in phase 1, and TypeScript never merges anything. This is better than the raw
+`sql` fallback this section originally reached for, and it is what shipped.
+
+One drizzle hazard found alongside it, worth knowing before touching this file: **`unionAll` mutates
+its left argument**, pushing onto `config.setOperators`. A branch builder must never be reused; both
+branches are built fresh per call.
 
 The `RECENCY` and `PINNED_RANK` fragments move here from `channels/routes.ts`, and the channels list
 route imports them back. That keeps one definition rather than two that must agree.
