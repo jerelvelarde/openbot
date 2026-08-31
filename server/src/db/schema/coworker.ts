@@ -95,6 +95,12 @@ export const agentPreferences = pgTable(
  * `pinned_at` and `last_read_at` sit here, where a channel keeps them on `channel_memberships`. A
  * bot chat has exactly one interested party, so a membership table would be a second row per
  * conversation able to hold only ever one member. The roster query is what flattens that asymmetry.
+ *
+ * MANY PER PAIR, DELIBERATELY. There is no unique constraint on `(user_id, agent_id)`, and there is
+ * not meant to be: several conversations with one Bot is the whole point of the table, and it is what
+ * `New chat` does. The only uniqueness it carries beyond its primary key is on `thread_id`, below,
+ * which is there to decide an adoption race rather than to say anything about how many of these a
+ * person may have.
  */
 export const botChats = pgTable(
   "bot_chats",
@@ -190,8 +196,3 @@ export const botChats = pgTable(
     ),
   ],
 );
-
-/**
- * Deliberately no unique constraint on `(user_id, agent_id)`. Several conversations with one Bot is
- * the whole point of the table.
- */

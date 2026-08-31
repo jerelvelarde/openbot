@@ -66,12 +66,21 @@ describe("the roster cursor", () => {
     ["2026-08-31 09:00:00Z", "a space where the `T` goes"],
     ["2026-08-31T09:00:00.1234567Z", "more precision than `timestamptz` keeps"],
     ["2026-08-31T09:00:00+02:00", "an offset rather than the UTC this mints"],
+    [
+      "0000-01-01T00:00:00Z",
+      "a year 0, which a `Date` has and `timestamptz` does not",
+    ],
   ])("reads %p as the first page: %s", (recency) => {
     /*
      * Checked here rather than left to Postgres. The value reaches it as `'...'::timestamptz`, so a
      * cursor somebody edited by hand used to fail inside the read with `invalid input syntax for type
-     * timestamp with time zone`, and `roster/routes.ts` registers no `onError` to turn that into
-     * anything but a bare 500 — the opposite of the first page this codec promises.
+     * timestamp with time zone` or `date/time field value out of range`, which `roster/routes.ts` can
+     * only answer with a 500 — the opposite of the first page this codec promises.
+     *
+     * Year 0 is the one on this list that the field-by-field round trip cannot catch on its own:
+     * `new Date(0)` with `setUTCFullYear(0, 0, 1)` reads back as year 0 exactly, and Postgres has no
+     * such year — `select '0000-01-01T00:00:00Z'::timestamptz` is out of range. `0001-01-01` in the
+     * accepted table above is the neighbour it must not be confused with.
      */
     const cursor = encodeRosterCursor({
       pinned: false,

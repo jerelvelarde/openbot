@@ -147,6 +147,11 @@ const CURSOR_RECENCY =
  *
  * Built through `setUTCFullYear` rather than `Date.UTC`, which maps years 0 through 99 onto 1900
  * through 1999 and would therefore reject the year 1 as a rollover it is not.
+ *
+ * Year 0 is refused on its own line, because the round trip cannot catch it: a `Date` has a year 0
+ * and rebuilds it perfectly, and Postgres does not — `select '0000-01-01T00:00:00Z'::timestamptz`
+ * answers the same out-of-range error. There is no year between 1 BC and AD 1 in the calendar
+ * `timestamptz` implements, so a cursor naming one is malformed however cleanly it parses here.
  */
 function readsAsTimestamp(value: string): boolean {
   const parts = CURSOR_RECENCY.exec(value);
@@ -154,6 +159,7 @@ function readsAsTimestamp(value: string): boolean {
   const [year, month, day, hour, minute, second] = parts
     .slice(1, 7)
     .map(Number) as [number, number, number, number, number, number];
+  if (year < 1) return false;
   const at = new Date(0);
   at.setUTCFullYear(year, month - 1, day);
   at.setUTCHours(hour, minute, second, 0);
@@ -175,8 +181,10 @@ function readsAsTimestamp(value: string): boolean {
  *
  * `recency` is checked for what it is and not merely for being a string, because it reaches Postgres
  * as `'...'::timestamptz`. A cursor somebody edited by hand used to fail there, deep inside the read,
- * with `invalid input syntax for type timestamp with time zone`; `roster/routes.ts` registers no
- * `onError`, so Hono answered a bare 500 — the opposite of the first page this docblock promises.
+ * with `invalid input syntax for type timestamp with time zone`, and `roster/routes.ts` answered
+ * Hono's bare 500 — the opposite of the first page this docblock promises. That route now answers a
+ * failed read as JSON, but a 500 of any shape is still the wrong answer to a stale link, so the
+ * check belongs here, where the cursor is read rather than where the read fails.
  */
 export function decodeRosterCursor(
   value: string | undefined,

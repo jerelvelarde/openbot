@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import type { MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import type { AgentActor } from "../src/agents/profile-types";
@@ -115,12 +115,62 @@ describe("GET /", () => {
     ]);
   });
 
-  test("omits a limit that is not a number rather than passing NaN", async () => {
+  test("passes a limit above the page cap through for the store to clamp", async () => {
+    // The cap is the store's to apply — `MAX_ROSTER_PAGE` lives beside it — so the route's job is to
+    // pass on what was asked for rather than to quietly ask for something else.
     const store = fakeStore({ items: [], nextCursor: null });
-    await appFor(store).request("/?limit=lots");
+    await appFor(store).request("/?limit=1000");
 
-    // The store clamps a limit it is given; it must not be handed NaN to clamp.
+    expect(store.queries).toEqual([{ status: "active", limit: 1000 }]);
+  });
+
+  test("reads a leading zero as a digit, not as a refusal", async () => {
+    const store = fakeStore({ items: [], nextCursor: null });
+    await appFor(store).request("/?limit=007");
+
+    expect(store.queries).toEqual([{ status: "active", limit: 7 }]);
+  });
+
+  test("reads an empty ?limit= as absent", async () => {
+    // A parameter that says nothing is not a parameter, which is how an empty `?cursor=` reads too.
+    // Omitting the key is what makes the store's own default page size fire.
+    const store = fakeStore({ items: [], nextCursor: null });
+    await appFor(store).request("/?limit=");
+
     expect(store.queries).toEqual([{ status: "active" }]);
+  });
+
+  /*
+   * A limit that is not a whole number is refused, not reinterpreted.
+   *
+   * `Number.parseInt` stopped at the first character it could not read and kept the digits in front
+   * of it, so each of these used to mean something the caller did not ask for, with a 200 on it and
+   * nothing to reveal the difference. The sharpest is `1e3`: a caller asking for a thousand rows was
+   * served one.
+   */
+  test.each([
+    ["1e3", "a thousand in exponent form, which parsed as 1"],
+    ["0x10", "sixteen in hex, which parsed as 0"],
+    ["50abc", "digits with a tail, which parsed as 50"],
+    ["-5", "negative, which the store clamped up to 1"],
+    ["0", "no rows, which the store clamped up to 1"],
+    ["5.5", "not a whole number"],
+    ["+5", "signed"],
+    [" 5", "a space where a digit goes"],
+    ["lots", "not a number at all"],
+  ])("refuses ?limit=%p: %s", async (value: string) => {
+    const store = fakeStore({ items: [], nextCursor: null });
+    const response = await appFor(store).request(
+      `/?limit=${encodeURIComponent(value)}`,
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      error: "Limit must be a whole number of at least 1.",
+    });
+    // And no page was read. A refusal that still served rows would be the same misreading with a
+    // status code on top of it.
+    expect(store.queries).toEqual([]);
   });
 
   test("carries the next cursor", async () => {
@@ -128,6 +178,41 @@ describe("GET /", () => {
     const response = await appFor(store).request("/");
 
     expect((await response.json()).nextCursor).toBe("next");
+  });
+
+  test("answers a failed read as JSON, not as Hono's bare 500", async () => {
+    /*
+     * This is the sidebar's only read, so whatever it answers is the whole screen. `client()` in the
+     * browser takes its message from `body.error` and falls back to its own "Could not load your
+     * conversations" when the body is not JSON, and Hono's default 500 body is `text/plain` — so an
+     * unreachable database reached a person as the client's own sentence, carrying nothing of the
+     * server's reason and indistinguishable from any other way this read can fail.
+     */
+    const store: RosterStore = {
+      async list() {
+        throw new Error("connect ECONNREFUSED 127.0.0.1:5432");
+      },
+    };
+    const consoleError = spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const response = await appFor(store).request("/");
+
+      expect(response.status).toBe(500);
+      expect(response.headers.get("content-type")).toContain(
+        "application/json",
+      );
+      expect(await response.json()).toEqual({
+        error: "The server could not read your conversations.",
+      });
+      // What was thrown may name a host or carry a connection string, so the browser gets none of
+      // it and the log gets all of it. A 500 with no log line would be an outage nobody could tell
+      // from a typo in this file.
+      expect(consoleError).toHaveBeenCalledTimes(1);
+      expect(String(consoleError.mock.calls[0]?.[0])).toContain("ECONNREFUSED");
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 });
 
