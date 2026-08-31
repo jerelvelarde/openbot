@@ -425,4 +425,37 @@ describe("SlackIdentityLinker", () => {
       }
     }
   });
+
+  describe("resolveApplicationAuthor", () => {
+    test("runs a web-authored turn as its signed-in OpenBot user, with no link", async () => {
+      // The actor id on a web turn is an OpenBot user id, so the ordinary Slack
+      // resolution can never match it. Without this the person is answered with
+      // a "link your Slack identity" card in reply to a message they composed
+      // while already signed in.
+      const store = storeFor({
+        link: null,
+        active: new Map([["alice", { id: "alice", name: "Alice", role: "admin" }]]),
+      });
+
+      const result = await linker(store).resolveApplicationAuthor(
+        context(),
+        "alice",
+      );
+
+      expect(result).not.toBeNull();
+      expect(result?.kind).toBe("linked");
+      expect(result?.user).toEqual({ id: "alice", name: "Alice" });
+      expect(result?.actor).toEqual({ id: "alice", role: "admin" });
+    });
+
+    test("returns null for an unknown or deactivated app user", async () => {
+      // Null means "do not run", not "prompt for linking": there is no action
+      // the person could take in Slack that would fix it.
+      const store = storeFor({ link: null, active: new Map() });
+
+      expect(
+        await linker(store).resolveApplicationAuthor(context(), "ghost"),
+      ).toBeNull();
+    });
+  });
 });

@@ -3,6 +3,7 @@ export const SLACK_TURN_PHASES = [
   "ingress.remember",
   "ingress.take",
   "identity.validate",
+  "identity.application_author",
   "link_card.post",
   "thread.subscribe",
   "execution.prepare",

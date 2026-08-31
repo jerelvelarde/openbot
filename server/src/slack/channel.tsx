@@ -41,7 +41,10 @@ import {
 } from "./turn-phase";
 
 export type OpenBotSlackChannelDependencies = {
-  identityLinker: Pick<SlackIdentityLinker, "resolve">;
+  identityLinker: Pick<
+    SlackIdentityLinker,
+    "resolve" | "resolveApplicationAuthor"
+  >;
   appUrl?: string;
   configuredTenantId?: string;
   agentDeps: OpenBotChannelAgentDependencies;
@@ -233,6 +236,14 @@ export function createOpenBotSlackChannel(
     subscribe: boolean;
   }): Promise<void> {
     if (message.actor.kind !== "human" || !isNewMessage(message)) return;
+    // A turn composed on the OpenBot web surface arrives here as an ordinary
+    // inbound delivery carrying its author. That author is an OpenBot user who
+    // was signed in when they wrote it, not a Slack identity to be discovered.
+    const authoredBy = message.authoredBy;
+    const applicationAuthorId =
+      authoredBy?.kind === "application" && authoredBy.appUserId.trim()
+        ? authoredBy.appUserId.trim()
+        : null;
     const remembered = await runSlackPhase(
       "ingress.take",
       () =>
@@ -255,7 +266,24 @@ export function createOpenBotSlackChannel(
       logTurnFailure,
     );
     if (!remembered) return;
-    const identityResult = remembered.identityResult;
+    // Only a Slack-authored turn needs a Slack identity. Resolving the web
+    // author here instead of in `identifyUser` is forced by the seam: the SDK
+    // gives `identifyUser` an identity context, and only the message carries
+    // `authoredBy`.
+    const identityResult = applicationAuthorId
+      ? await runSlackPhase(
+          "identity.application_author",
+          () =>
+            deps.identityLinker.resolveApplicationAuthor(
+              remembered.identityContext,
+              applicationAuthorId,
+            ),
+          logTurnFailure,
+        )
+      : remembered.identityResult;
+    // An unknown or deactivated app user is not a linking problem, so it is
+    // dropped rather than answered with a card the person cannot act on.
+    if (!identityResult) return;
     if (identityResult.kind === "unlinked") {
       await runSlackPhase(
         "link_card.post",
@@ -264,7 +292,10 @@ export function createOpenBotSlackChannel(
       );
       return;
     }
-    if (!message.user) {
+    // `identifyUser` returns null for a web-authored turn — it cannot see
+    // `authoredBy` — so a missing `message.user` is expected there and is only a
+    // mismatch for a turn that really came from Slack.
+    if (!message.user && !applicationAuthorId) {
       await runSlackPhase(
         "identity.validate",
         () => {
