@@ -4,6 +4,7 @@ import {
   type QueryClient,
 } from "@tanstack/react-query";
 import { client, tryClient } from "@/lib/client";
+import { rosterKeys } from "@/lib/roster/queries";
 import { type AgentChannel, type ChannelPage, channelKeys } from "./queries";
 
 /**
@@ -132,5 +133,27 @@ export function deleteChannelMutationOptions(queryClient: QueryClient) {
     // navigation happens with nothing to complain about.
     onSuccess: () =>
       queryClient.invalidateQueries({ queryKey: channelKeys.list() }),
+  });
+}
+
+/**
+ * Archive or restore a channel for everyone in it. Hidden, not frozen: the conversation stays live.
+ *
+ * Invalidates rather than patches, because the row moves between the Active, Archived, and All lists
+ * and a patch would leave it in two of them at once. `rosterKeys.all` is the prefix all three share.
+ */
+export function setChannelArchivedMutationOptions(queryClient: QueryClient) {
+  return mutationOptions({
+    mutationFn: async (variables: { channelId: string; archived: boolean }) => {
+      await client(`/api/channels/${variables.channelId}/archive`, {
+        method: "PUT",
+        body: { archived: variables.archived },
+        fallback: variables.archived
+          ? "Could not archive this channel"
+          : "Could not restore this channel",
+      });
+    },
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: rosterKeys.all }),
   });
 }
