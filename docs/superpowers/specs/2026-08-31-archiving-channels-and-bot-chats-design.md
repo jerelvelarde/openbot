@@ -182,7 +182,7 @@ Ordering is the existing rule, unchanged:
 order by pinned_rank desc, coalesce(last_message_at, created_at) desc, id desc
 ```
 
-### The cursor is unchanged
+### The cursor's shape is unchanged; its encoding was not fit to reuse
 
 `ChannelCursor` — `{pinned, recency, id}` — keeps working across both kinds, with no `kind` term,
 because ids are prefixed (`channel_…`, `botchat_…`) and therefore globally unique. `id` still breaks
@@ -191,6 +191,28 @@ every tie on its own.
 This is worth stating because it is the single piece of luck in this design and everything downstream
 spends it: the cursor's encode, decode, stale-cursor rule, and the "a cursor that names a different
 ordering reads as the first page" behaviour all survive untouched.
+
+**Amended after review, and this section is why the defect was missed.** The *shape* survived
+untouched, and this section said so approvingly enough that nobody looked inside the encoding. The
+encoding was broken before this work and reusing it verbatim routed the whole roster through it: the
+recency term was minted with `new Date(row.recency).toISOString()`, which is milliseconds, while
+`timestamptz` stores microseconds and `COALESCE` falls back to `created_at` — defaulted from `now()`
+— for every conversation nobody has spoken in yet. The cursor therefore always named an instant
+strictly below the row it was built from, and every row inside the discarded window was served on no
+page at all. Two reviewers reproduced it independently; `tenant-package.ts` creates every package
+channel inside one transaction, so a package with more channels than a page lost the remainder from
+the sidebar permanently.
+
+The cursor value never becomes a `Date` now. Phase 1 projects it as text at microsecond precision
+with an explicit UTC `Z`, and the `timestamptz` column is deliberately kept out of the outer select
+so there is nothing to reach for. `to_char`'s `OF` was tried and rejected on evidence: it renders
+LMT-era sub-minute offsets lossily. `decodeRosterCursor` also validated `typeof` only, so a recency
+of `"lol"` reached Postgres and raised a bare 500 against the contract two docblocks state; it now
+round-trips the value's date fields, because `Date.parse` accepts `2026-02-30` and Postgres does not.
+
+The general lesson, recorded because this design made the mistake twice: "unchanged" is a claim about
+a boundary, not a warrant that what is on the far side of it is correct. Reusing a codec is inheriting
+it.
 
 ### Status filter
 

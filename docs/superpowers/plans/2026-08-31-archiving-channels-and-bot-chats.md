@@ -75,7 +75,7 @@ Integration tests (`*.integration.test.ts`) need PostgreSQL at `DATABASE_URL`, d
 | --- | --- |
 | `server/src/db/schema/coworker.ts` | Add `botChats` |
 | `server/src/db/schema/core.ts` | Add `channels.archivedAt` |
-| `server/src/channels/events.ts` | `RosterActivityEvent` with `kind` / `id` / `archived`; `ChannelActivityEvent` becomes a deprecated alias |
+| `server/src/channels/events.ts` | `RosterActivityEvent` with `kind` / `id` / `archived`. **Amended after review: no `ChannelActivityEvent` alias — see Task 6.** Also `DeliveredRosterEvent`, the payload a browser actually receives |
 | `server/src/channels/routes.ts` | `setArchived`; `recordActivity` restores; import order and preview helpers from `roster/`; `ChannelPackageOwnedError` carries the act |
 | `server/src/app.ts` | Mount `/api/bot-chats` and `/api/roster` |
 | `server/src/index.ts` | Build `botChatStore` and `rosterStore` |
@@ -822,7 +822,7 @@ git commit -m "Move the preview and sort rules where two kinds of conversation c
 **Interfaces:**
 - Consumes: `RosterCursor` and friends from Task 2.
 - Produces:
-  - `type RosterActivityEvent` in `channels/events.ts`, with `kind: "channel" | "bot_chat"`, `id: string`, optional `channelId?: string`, and optional `archived?: boolean`. `ChannelActivityEvent` remains exported as a deprecated alias of it.
+  - `type RosterActivityEvent` in `channels/events.ts`, with `kind: "channel" | "bot_chat"`, `id: string`, optional `channelId?: string`, and optional `archived?: boolean`. **Amended after review: `ChannelActivityEvent` is NOT kept as an alias.** The plan justified keeping it as "so existing imports keep compiling", and review established that its only importer was a test — a compatibility obligation that did not exist. A comment asserting an obligation nothing holds is worse than no comment, so the alias is deleted and the test names `RosterActivityEvent` or `DeliveredRosterEvent` as appropriate.
   - `ChannelStore.setArchived(actor: AgentActor, channelId: string, archived: boolean): Promise<void>`
   - `ChannelPackageOwnedError` gains a public readonly `act: string`, defaulting to `"deleted"`.
   - `PUT /api/channels/:channelId/archive` accepting `{archived: boolean}` and answering `{archived: boolean}`.
@@ -1128,7 +1128,9 @@ export type RosterActivityEvent = {
 };
 
 /** @deprecated Use {@link RosterActivityEvent}. Kept so existing imports keep compiling. */
-export type ChannelActivityEvent = RosterActivityEvent;
+// AMENDED AFTER REVIEW: do NOT add this alias. Its only importer was a test, so the
+// "existing imports keep compiling" it claimed to serve was not a real obligation.
+// export type ChannelActivityEvent = RosterActivityEvent;
 ```
 
 Leave `CHANNEL_ACTIVITY_TOPIC`, `createChannelEventHub`, and `startChannelActivityListener`
