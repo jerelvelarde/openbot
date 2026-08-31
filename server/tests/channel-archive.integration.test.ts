@@ -94,6 +94,77 @@ async function createChannel(owner: AgentActor, agentIds: string[]) {
 }
 
 /**
+ * A crowd of members, inserted directly: `create` adds only the caller.
+ *
+ * The ids are the shape every other user in this file gets, because their length is the point. An
+ * announcement carries one id per member, so a test that shortened them would prove a size bound
+ * for ids nothing produces.
+ */
+async function createMembers(channelId: string, count: number) {
+  const memberIds = Array.from(
+    { length: count },
+    () => `${testPrefix}-user-${randomUUID()}`,
+  );
+  await database.insert(users).values(
+    memberIds.map((id) => ({
+      id,
+      email: `${id}@example.test`,
+      name: "Channel Archive Crowd Member",
+    })),
+  );
+  createdUserIds.push(...memberIds);
+  await database
+    .insert(channelMemberships)
+    .values(memberIds.map((userId) => ({ channelId, userId })));
+  return memberIds;
+}
+
+/**
+ * Hold one uncommitted write to a channel open, and hand back the commit.
+ *
+ * The shape `channel-routes.test.ts`'s "deletion committing mid-creation" test uses, for the reason
+ * it gives: a race between two connections is a test only if the interleaving is chosen rather than
+ * hoped for. The returned transaction has already taken the row's write lock and does not commit
+ * until `finish` runs, so a store call started in between reads the pre-image on its own snapshot
+ * and then blocks on the write. That gap — between what a call read and what it writes — is where
+ * every finding below lives.
+ *
+ * `TEST_POOL` is two connections, which is exactly this and the store call. Nothing else may touch
+ * the database until `finish` has resolved.
+ */
+async function heldWrite(
+  channelId: string,
+  values: { archivedAt?: Date | null; deletedAt?: Date | null },
+) {
+  let markApplied: () => void = () => {};
+  let release: () => void = () => {};
+  const applied = new Promise<void>((resolve) => {
+    markApplied = resolve;
+  });
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const committed = database.transaction(async (transaction) => {
+    await transaction
+      .update(channels)
+      .set(values)
+      .where(eq(channels.id, channelId));
+    markApplied();
+    await held;
+  });
+  await applied;
+  return {
+    finish: async () => {
+      release();
+      await committed;
+    },
+  };
+}
+
+/** Long enough for a store call to have reached the write it must block on. */
+const REACHED_THE_WRITE = 250;
+
+/**
  * The other half of "hidden, not frozen": an archived channel is not a dead end, because saying
  * something in it is how it comes back.
  */
@@ -285,6 +356,194 @@ describe("archiving a channel, in the database", () => {
     await expect(
       store.setArchived(stranger, channel.id, true),
     ).rejects.toBeInstanceOf(ChannelNotFoundError);
+  });
+});
+
+/**
+ * The decision and the write, under a writer that commits between them.
+ *
+ * Every test here is the same shape: something else changes the channel while the call is in flight,
+ * and the call has to answer about the row as it is when it writes rather than as it was when it
+ * looked. Read committed gives a plain `select` a snapshot and no lock, so a call that decides from
+ * one and then writes on `id` alone decides about a row that no longer exists.
+ *
+ * `softDelete` is tested here too, rather than beside the rest of its own tests in
+ * `channel-routes.test.ts`: it is the third method that had to start taking its answer from its
+ * write, it shares this hazard exactly, and it shares the helper above.
+ */
+describe("deciding from a read, and writing on it", () => {
+  test("does not stamp again when another archive commits mid-call", async () => {
+    const owner = await createUser();
+    const agentId = await createAgent(owner);
+    const channel = await createChannel(owner, [agentId]);
+
+    const stamp = new Date(Date.now() - 60_000);
+    const other = await heldWrite(channel.id, { archivedAt: stamp });
+    const archiving = store.setArchived(owner, channel.id, true);
+    await Bun.sleep(REACHED_THE_WRITE);
+    await other.finish();
+
+    /*
+     * Nothing changed, because it was already archived by the time this call could write.
+     *
+     * Two concurrent archives used to report `true` twice: each read `archived_at is null` on its own
+     * snapshot, and the update was keyed on the channel id alone, so the second overwrote the first's
+     * stamp and announced again. The route audits on that answer, so one archiving laid down two
+     * `channel.archived` rows — the thing the route's own comment says it prevents.
+     */
+    await expect(archiving).resolves.toBe(false);
+
+    const [row] = await database
+      .select({ archivedAt: channels.archivedAt })
+      .from(channels)
+      .where(eq(channels.id, channel.id));
+    expect(row?.archivedAt).toEqual(stamp);
+  });
+
+  test("refuses a channel whose deletion commits mid-call", async () => {
+    const owner = await createUser();
+    const agentId = await createAgent(owner);
+    const channel = await createChannel(owner, [agentId]);
+
+    const other = await heldWrite(channel.id, { deletedAt: new Date() });
+    const archiving = store.setArchived(owner, channel.id, true);
+    await Bun.sleep(REACHED_THE_WRITE);
+    await other.finish();
+
+    // The same answer a delete that had already committed gets. Without the guard on the write, the
+    // deleted channel was archived anyway and announced to every member, each of whom refetched a
+    // roster that cannot show the row — the exact case the read's own comment claims to prevent.
+    await expect(archiving).rejects.toBeInstanceOf(ChannelNotFoundError);
+
+    const [row] = await database
+      .select({ archivedAt: channels.archivedAt })
+      .from(channels)
+      .where(eq(channels.id, channel.id));
+    expect(row?.archivedAt).toBeNull();
+  });
+
+  test("refuses a delete whose twin commits mid-call", async () => {
+    const owner = await createUser();
+    const agentId = await createAgent(owner);
+    const channel = await createChannel(owner, [agentId]);
+
+    const stamp = new Date(Date.now() - 60_000);
+    const other = await heldWrite(channel.id, { deletedAt: stamp });
+    const deleting = store.softDelete(owner, channel.id);
+    await Bun.sleep(REACHED_THE_WRITE);
+    await other.finish();
+
+    // The read said the channel was there and the write found it already gone. Nobody looked at that
+    // answer before, so the call announced `deleted: true` to every member and let the route write a
+    // second `channel.deleted` row for a deletion it had not done.
+    await expect(deleting).rejects.toBeInstanceOf(ChannelNotFoundError);
+
+    const [row] = await database
+      .select({ deletedAt: channels.deletedAt })
+      .from(channels)
+      .where(eq(channels.id, channel.id));
+    expect(row?.deletedAt).toEqual(stamp);
+  });
+
+  /*
+   * The restore direction, which is the one that must not be lossy.
+   *
+   * `recordActivity` clears `archived_at` on its own write, correctly. What it has to get right as
+   * well is SAYING SO: `app/src/lib/channels/use-channel-events.ts` refetches only when the event
+   * carries `archived`, so an event that omits it leaves the conversation restored in the database
+   * and hidden on every viewer until something unrelated makes them refetch. Deciding that from a
+   * read taken before the write is how the field goes missing.
+   */
+  test("still says the conversation came back when the archive lands after its read", async () => {
+    const owner = await createUser();
+    const agentId = await createAgent(owner);
+    const channel = await createChannel(owner, [agentId]);
+
+    const hub = createChannelEventHub();
+    const received: RosterActivityEvent[] = [];
+    const arrived = new Promise<void>((resolve) => {
+      hub.register(owner.id, (payload) => {
+        received.push(JSON.parse(payload) as RosterActivityEvent);
+        resolve();
+      });
+    });
+    const listener = await startChannelActivityListener(databaseUrl, hub);
+
+    try {
+      const other = await heldWrite(channel.id, { archivedAt: new Date() });
+      const reporting = store.recordActivity(owner, channel.id, {
+        text: "One more thing",
+        agentId: null,
+        at: new Date(),
+      });
+      await Bun.sleep(REACHED_THE_WRITE);
+      await other.finish();
+
+      // The report restored it, so it has to report that it did: the route writes
+      // `channel.unarchived` from this answer, and the event carries `archived: false` from it.
+      await expect(reporting).resolves.toEqual({ restored: true });
+      await within5s(arrived);
+    } finally {
+      await listener.stop();
+    }
+
+    expect(received).toHaveLength(1);
+    expect(received[0]).toMatchObject({ archived: false });
+  });
+});
+
+/**
+ * How big an announcement is allowed to get.
+ *
+ * `pg_notify` refuses a payload over 8000 bytes, and it runs inside the transaction that wrote the
+ * row, so the overflow does not lose the announcement — it loses the write.
+ */
+describe("announcing to a channel with many members", () => {
+  test("tells every member, and the message survives", async () => {
+    const owner = await createUser();
+    const agentId = await createAgent(owner);
+    const channel = await createChannel(owner, [agentId]);
+    // Past the point where one id per member overflows the cap: these ids run to about 95
+    // characters, so a single payload naming all of them is some 15KB of the 8000 allowed.
+    const memberIds = await createMembers(channel.id, 150);
+    const everybody = [owner.id, ...memberIds];
+
+    const hub = createChannelEventHub();
+    const heard = new Map<string, number>();
+    const allHeard = new Promise<void>((resolve) => {
+      for (const memberId of everybody) {
+        hub.register(memberId, () => {
+          heard.set(memberId, (heard.get(memberId) ?? 0) + 1);
+          if (heard.size === everybody.length) resolve();
+        });
+      }
+    });
+    const listener = await startChannelActivityListener(databaseUrl, hub);
+
+    try {
+      await store.recordActivity(owner, channel.id, {
+        text: "Said to a crowd",
+        agentId: null,
+        at: new Date(),
+      });
+      await within5s(allHeard);
+    } finally {
+      await listener.stop();
+    }
+
+    // The write, first. Over the cap, `pg_notify` raises payload-too-long inside the transaction and
+    // rolls it back, so every message, archive and delete in a channel this size failed permanently
+    // and surfaced as an opaque 500.
+    const [row] = await database
+      .select({ lastMessage: channels.lastMessage })
+      .from(channels)
+      .where(eq(channels.id, channel.id));
+    expect(row?.lastMessage).toBe("Said to a crowd");
+
+    // Once each. The notifications partition the member list rather than repeating it: a tab that
+    // hears one refetches the whole roster, so a second copy is a second refetch for nothing.
+    expect(heard.size).toBe(everybody.length);
+    expect([...heard.values()].filter((times) => times !== 1)).toEqual([]);
   });
 });
 

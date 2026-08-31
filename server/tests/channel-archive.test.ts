@@ -4,8 +4,10 @@ import { Hono } from "hono";
 import type { AgentActor } from "../src/agents/profile-types";
 import type { AuditEventInput, AuditStore } from "../src/audit";
 import type { AppVariables } from "../src/auth/guards";
+import type { RosterActivityEvent } from "../src/channels/events";
 import {
   type AgentChannel,
+  announcementPayloads,
   ChannelNotFoundError,
   ChannelPackageOwnedError,
   type ChannelStore,
@@ -33,6 +35,7 @@ function channel(overrides: Partial<AgentChannel> = {}): AgentChannel {
     agentIds: ["agent-1"],
     threadId: "thread-1",
     active: true,
+    archived: false,
     ...overrides,
   };
 }
@@ -69,6 +72,7 @@ function fakeStore(overrides: Partial<ChannelStore> = {}) {
     },
     async recordActivity(receivedActor, id, activity) {
       calls.push(["recordActivity", receivedActor, id, activity]);
+      return { restored: false };
     },
   };
   return Object.assign(base, overrides, { calls });
@@ -101,6 +105,18 @@ async function archive(app: Hono<{ Variables: AppVariables }>, body: unknown) {
     method: "PUT",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
+  });
+}
+
+async function reportActivity(app: Hono<{ Variables: AppVariables }>) {
+  return app.request("/channel_1/activity", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      text: "One more thing",
+      agentId: null,
+      at: "2026-01-01T00:00:00.000Z",
+    }),
   });
 }
 
@@ -173,7 +189,10 @@ describe("PUT /:channelId/archive", () => {
         targetType: "channel",
         targetId: "channel_1",
         actorUserId: actor.id,
-        payload: {},
+        // Named the way `channel.deleted` names its mechanism, and for a sharper reason: somebody
+        // typing in an archived channel restores it and writes `channel.unarchived` too, so without
+        // this a reader cannot tell a decision from a side effect.
+        payload: { mechanism: "explicit" },
       },
     ]);
   });
@@ -247,6 +266,157 @@ describe("PUT /:channelId/archive", () => {
 
     // The channel is already archived and the caller already told by the time this runs.
     expect(response.status).toBe(200);
+  });
+});
+
+/**
+ * The other way a channel comes back, and the row it owes the trail.
+ *
+ * Saying something in an archived channel restores it, which is a real unarchiving with a real
+ * actor. The store cannot write it — it holds no audit store — so the route does, from what the
+ * store reports back. Without the row the trail shows `channel.archived` with no matching
+ * `channel.unarchived` while the channel is live and visible on every roster: a trail that is
+ * confidently wrong, which `audit.ts` argues at length is worse than a silent one because it is used
+ * to rule things out.
+ */
+describe("POST /:channelId/activity", () => {
+  test("records the unarchiving when the report is what restored the channel", async () => {
+    const audit = recordingAuditStore();
+    const store = fakeStore({
+      async recordActivity() {
+        return { restored: true };
+      },
+    });
+
+    const response = await reportActivity(appFor(store, audit.store));
+
+    expect(response.status).toBe(204);
+    expect(audit.written).toEqual([
+      {
+        eventType: "channel.unarchived",
+        targetType: "channel",
+        targetId: "channel_1",
+        actorUserId: actor.id,
+        // Named, because the same event type is written by somebody clicking Restore. A reader who
+        // cannot tell those apart cannot tell whether anybody decided anything.
+        payload: { mechanism: "activity" },
+      },
+    ]);
+  });
+
+  test("writes nothing for a report that restored nothing", async () => {
+    const audit = recordingAuditStore();
+
+    const response = await reportActivity(appFor(fakeStore(), audit.store));
+
+    expect(response.status).toBe(204);
+    // Every message in an unarchived channel would otherwise lay down an unarchiving. The trail
+    // records acts, not messages.
+    expect(audit.written).toEqual([]);
+  });
+
+  test("writes nothing when the store refused the report", async () => {
+    const audit = recordingAuditStore();
+    const store = fakeStore({
+      async recordActivity() {
+        throw new ChannelNotFoundError("channel_1");
+      },
+    });
+
+    const response = await reportActivity(appFor(store, audit.store));
+
+    expect(response.status).toBe(404);
+    expect(audit.written).toEqual([]);
+  });
+
+  test("still answers 204 when the trail is unavailable", async () => {
+    const failing: AuditStore = {
+      insert: async () => {
+        throw new Error("trail unreachable");
+      },
+    };
+    const store = fakeStore({
+      async recordActivity() {
+        return { restored: true };
+      },
+    });
+
+    // The message is already stored and the channel already restored by the time this runs. A trail
+    // that is briefly unavailable is not a reason to report a failure that did not happen.
+    expect((await reportActivity(appFor(store, failing))).status).toBe(204);
+  });
+});
+
+/**
+ * The size of what gets announced, without a database in the way.
+ *
+ * `pg_notify` refuses a payload over 8000 bytes, and it runs inside the transaction that wrote the
+ * row, so an overflow does not lose the announcement — it loses the write.
+ */
+describe("announcementPayloads", () => {
+  function event(memberIds: string[]): RosterActivityEvent {
+    return {
+      kind: "channel",
+      id: "channel_1",
+      channelId: "channel_1",
+      memberIds,
+      // The longest preview `previewOf` can produce, in the widest characters it can produce it in.
+      lastMessage: "😀".repeat(200),
+      lastMessageAt: "2026-01-01T00:00:00.000Z",
+      lastMessageAgentId: "agent_00000000-0000-4000-8000-000000000000",
+    };
+  }
+
+  test("stays one notification for a channel of the size channels are", () => {
+    // What the round-trip tests describe and depend on: one NOTIFY, delivered to both members of a
+    // shared channel through one `deliver`. Splitting is what happens past the cap, not by default.
+    expect(announcementPayloads(event(["user-1", "user-2"]))).toHaveLength(1);
+  });
+
+  test("keeps every payload under the cap however many members hear it", () => {
+    const memberIds = Array.from(
+      { length: 5_000 },
+      (_, at) => `user_${"9".repeat(60)}_${at}`,
+    );
+
+    const payloads = announcementPayloads(event(memberIds));
+
+    expect(payloads.length).toBeGreaterThan(1);
+    for (const payload of payloads) {
+      expect(Buffer.byteLength(payload)).toBeLessThanOrEqual(8000);
+    }
+    // The chunks partition the list: everybody is named once, in order, and nobody is named twice. A
+    // second copy is a second whole-roster refetch in somebody's tab for nothing.
+    expect(
+      payloads.flatMap(
+        (payload) => (JSON.parse(payload) as RosterActivityEvent).memberIds,
+      ),
+    ).toEqual(memberIds);
+  });
+
+  test("carries the whole event on every payload, not only the first", () => {
+    const memberIds = Array.from(
+      { length: 500 },
+      (_, at) => `user_${"9".repeat(60)}_${at}`,
+    );
+
+    const payloads = announcementPayloads({
+      ...event(memberIds),
+      archived: false,
+    });
+
+    expect(payloads.length).toBeGreaterThan(1);
+    for (const payload of payloads) {
+      // A chunk that dropped `archived` would leave the members it names knowing a message arrived
+      // and not knowing the conversation came back, which is the half that moves the row.
+      expect(JSON.parse(payload)).toMatchObject({
+        kind: "channel",
+        id: "channel_1",
+        channelId: "channel_1",
+        lastMessage: "😀".repeat(200),
+        archived: false,
+      });
+    }
   });
 });
 

@@ -4,13 +4,16 @@ import {
   eq,
   exists,
   inArray,
+  isNotNull,
   isNull,
   lt,
   or,
   sql,
 } from "drizzle-orm";
+import type { PgColumn } from "drizzle-orm/pg-core";
 import type { Context, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import {
   AgentNotFoundError,
   type AgentProfileStore,
@@ -35,7 +38,9 @@ import {
   encodeRosterCursor,
   pinnedRank,
   RECENCY,
+  recencyCursorText,
   type RosterCursor,
+  rosterCursorFilter,
   rosterOrder,
 } from "../roster/order";
 import {
@@ -43,6 +48,7 @@ import {
   MAX_ROSTER_PAGE,
   previewOf,
 } from "../roster/preview";
+import { parseRosterStatus, type RosterStatus } from "../roster/query";
 import {
   CHANNEL_ACTIVITY_TOPIC,
   type ChannelEventHub,
@@ -57,6 +63,16 @@ export type AgentChannel = {
   agentIds: string[];
   threadId: string;
   active: boolean;
+  /**
+   * Whether the channel is archived, for every member of it.
+   *
+   * Reported rather than filtered on a read of one channel: archived is hidden from a roster, not
+   * from a direct read, and the URL of an archived conversation still opens it — that is what makes
+   * archiving reversible rather than a deletion wearing a gentler name. So the flag has to travel on
+   * the row instead, or a caller holding one cannot tell an archived channel from an active one.
+   * `BotChatStore.get` reports it the same way, and the roster carries the same field for both kinds.
+   */
+  archived: boolean;
 };
 
 /** A channel plus the last thing said in it, which is what a roster renders. */
@@ -86,7 +102,31 @@ export type ChannelPage = {
   nextCursor: string | null;
 };
 
-export type ChannelQuery = { cursor?: string; limit?: number };
+/**
+ * What one page of channels asks for.
+ *
+ * `status` is the roster's own filter, spelled the same way and parsed by the same function, because
+ * this endpoint answers about the same rows: a channel that `GET /api/roster?status=archived` shows
+ * and `GET /api/channels?status=archived` does not is one archive feature implemented twice with two
+ * different answers.
+ */
+export type ChannelQuery = {
+  cursor?: string;
+  limit?: number;
+  status?: RosterStatus;
+};
+
+/** What `recordActivity` did, for the caller that has to write it down. */
+export type ChannelActivityOutcome = {
+  /**
+   * Whether this report is what brought an archived channel back.
+   *
+   * An object rather than a bare boolean because the route reads it by name: `restored` is the fact
+   * the audit row is written from, and a bare `true` at that call site says nothing about which fact
+   * it is.
+   */
+  restored: boolean;
+};
 
 const PINNED_RANK = pinnedRank(channelMemberships.pinnedAt);
 const ROSTER_ORDER = rosterOrder(PINNED_RANK, RECENCY, channels.id);
@@ -105,8 +145,9 @@ export type ChannelStore = {
   markRead(actor: AgentActor, channelId: string): Promise<void>;
   /**
    * Hide the channel for every member. Soft: the row and the thread survive, every read filters.
-   * Throws ChannelNotFoundError for a non-member and ChannelPackageOwnedError for a channel the
-   * tenant package defines, which configuration owns rather than any member.
+   * Throws ChannelNotFoundError for a non-member, an unknown channel, or one already deleted, and
+   * ChannelPackageOwnedError for a channel the tenant package defines, which configuration owns
+   * rather than any member.
    */
   softDelete(actor: AgentActor, channelId: string): Promise<void>;
   /**
@@ -127,11 +168,21 @@ export type ChannelStore = {
     channelId: string,
     archived: boolean,
   ): Promise<boolean>;
+  /**
+   * Record the last thing said, and bring the channel back if it was archived.
+   *
+   * Throws ChannelNotFoundError for a non-member, an unknown channel, or a deleted one.
+   *
+   * Reports whether it restored an archive, for the same reason `setArchived` reports whether it
+   * changed anything: the route audits the act, and an unarchiving that happens here is as real as
+   * one somebody clicked. A store method cannot write that row itself — this store holds no audit
+   * trail — so it has to be able to say what it did.
+   */
   recordActivity(
     actor: AgentActor,
     channelId: string,
     activity: ChannelActivity,
-  ): Promise<void>;
+  ): Promise<ChannelActivityOutcome>;
 };
 
 const PRIVATE_AGENT_CHANNEL_DESCRIPTION = "Private agent channel.";
@@ -142,6 +193,103 @@ function channelName(names: string[]) {
   const codePoints = Array.from(joined);
   if (codePoints.length <= MAX_CHANNEL_NAME_CODE_POINTS) return joined;
   return `${codePoints.slice(0, MAX_CHANNEL_NAME_CODE_POINTS - 1).join("")}…`;
+}
+
+/**
+ * What the status means, as a predicate.
+ *
+ * The same three answers `RosterStatus` names, so this endpoint and the roster cannot come to
+ * disagree about what `archived` means: a deployment where one of them honoured the filter and the
+ * other did not would look exactly like an archive that does not work. Applied in both phases of
+ * `list` for the reason the delete guard repeats there — two statements, two snapshots.
+ *
+ * `deletedAt` is filtered separately and unconditionally: `all` is a filter over archive state only
+ * and is never a way to see deleted channels.
+ *
+ * A near-copy of `archiveFilter` in `roster/query.ts`, which is module-private there. If that one is
+ * ever exported, this should become a call to it rather than a second spelling of the same rule.
+ */
+function archiveFilter(status: RosterStatus, archivedAt: PgColumn) {
+  if (status === "active") return isNull(archivedAt);
+  if (status === "archived") return isNotNull(archivedAt);
+  return undefined;
+}
+
+type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
+
+/**
+ * How much of one `NOTIFY` payload this file will build before it splits it.
+ *
+ * Postgres refuses a payload over 8000 bytes. Everything below the gap is a deliberate margin: the
+ * count is bytes of UTF-8 as measured, and the refusal is on the server's own encoding of the same
+ * string, so a budget at the exact limit would be a bet on the two agreeing to the byte.
+ */
+const MAX_NOTIFY_PAYLOAD_BYTES = 7000;
+
+/**
+ * One roster announcement, split into payloads each of which fits.
+ *
+ * WHAT IS BOUNDED AND WHAT IS NOT. Of the fields an event carries, all but one are fixed or capped:
+ * `lastMessage` comes from `previewOf`, which caps it at 200 code points, and the ids are one
+ * channel id, one agent id and a handful of short literals. `memberIds` is the exception — it is one
+ * id per member of the channel, and nothing bounds how many members a channel has. A single payload
+ * naming all of them passes 8000 bytes somewhere around two hundred members, and because `pg_notify`
+ * runs inside the transaction that wrote the row, the refusal does not lose the announcement: it
+ * rolls back the write. Every message, archive and delete in a channel that size would fail
+ * permanently and surface as an opaque 500.
+ *
+ * So the member list is what gets split, and the payload's size is bounded by measuring it rather
+ * than by an argument about the half of it that happens to be short. The chunks partition the list:
+ * `channel_memberships` is keyed on `(channel_id, user_id)`, so a member appears in it once, appears
+ * in exactly one chunk, and hears the change exactly once. A second copy would be a second refetch
+ * of the whole roster for nothing.
+ *
+ * At least one id goes in every payload even when the base event alone is near the budget, which is
+ * what makes this terminate rather than loop. It cannot be reached by anything this file sends: the
+ * capped fields above come to a few hundred bytes.
+ */
+export function announcementPayloads(event: RosterActivityEvent): string[] {
+  const payloads: string[] = [];
+  let batch: string[] = [];
+  let batchBytes = Buffer.byteLength(
+    JSON.stringify({ ...event, memberIds: [] }),
+  );
+
+  for (const memberId of event.memberIds) {
+    // The comma as well as the id, because that is what the array actually costs per entry after the
+    // first, and the first is charged a comma it does not use.
+    const cost = Buffer.byteLength(JSON.stringify(memberId)) + 1;
+    if (batch.length > 0 && batchBytes + cost > MAX_NOTIFY_PAYLOAD_BYTES) {
+      payloads.push(JSON.stringify({ ...event, memberIds: batch }));
+      batch = [];
+      batchBytes = Buffer.byteLength(
+        JSON.stringify({ ...event, memberIds: [] }),
+      );
+    }
+    batch.push(memberId);
+    batchBytes += cost;
+  }
+  if (batch.length > 0) {
+    payloads.push(JSON.stringify({ ...event, memberIds: batch }));
+  }
+  return payloads;
+}
+
+/**
+ * Announce a roster change on the caller's own transaction.
+ *
+ * On the transaction rather than the pool, always, so the announcement rides the commit: a write
+ * that rolls back is never announced, and a refused one announces nothing at all.
+ */
+async function announce(
+  transaction: Pick<Transaction, "execute">,
+  event: RosterActivityEvent,
+): Promise<void> {
+  for (const payload of announcementPayloads(event)) {
+    await transaction.execute(
+      sql`select pg_notify(${CHANNEL_ACTIVITY_TOPIC}, ${payload})`,
+    );
+  }
 }
 
 export function createChannelStore(
@@ -174,7 +322,10 @@ export function createChannelStore(
           // Minted rather than a bare random id, so the thread says which deployment it belongs to
           // in a project that may hold more than one. See thread-identity.ts.
           const threadId = threadIdentity.mint();
-          // Named from the caller's ordering, which is the order the channel presents its agents in.
+          // Named from the ids as they were passed. Anything arriving over HTTP has been through
+          // `parseChannelInput`, which sorts them, so a channel created that way is named in the same
+          // order `get` and `list` return its agents in; a caller into the store that passes its own
+          // ordering is named in that ordering instead.
           const name = channelName(
             agentIds.map((agentId) => {
               const profile = profilesById.get(agentId);
@@ -201,7 +352,16 @@ export function createChannelStore(
             threadId,
           });
 
-          return { id, name, agentIds, threadId, active: true };
+          // Nothing is born archived: `archived_at` defaults to null and the insert above does not
+          // set it.
+          return {
+            id,
+            name,
+            agentIds,
+            threadId,
+            active: true,
+            archived: false,
+          };
         },
         { isolationLevel: "read committed" },
       );
@@ -213,8 +373,10 @@ export function createChannelStore(
           id: channels.id,
           name: channels.name,
           agentId: channelAgents.agentId,
+          profileAgentId: agentProfiles.agentId,
           threadId: intelligenceChannelMappings.threadId,
           deletedAt: agentProfiles.deletedAt,
+          archivedAt: channels.archivedAt,
         })
         .from(channels)
         .innerJoin(
@@ -231,8 +393,23 @@ export function createChannelStore(
             eq(intelligenceChannelMappings.userId, actor.id),
           ),
         )
-        .innerJoin(channelAgents, eq(channelAgents.channelId, channels.id))
-        .innerJoin(
+        /*
+         * The Bots are joined loosely, because they are a fact about the channel rather than a
+         * condition of its existence.
+         *
+         * `channel_agents` is deleted and reinserted on every tenant-package sync, so a channel with
+         * no rows there is reachable, and an inner join answered "does this channel exist" with the
+         * absence of a Bot row: opening it during a sync was a 404, and for good if the package no
+         * longer names a Bot for it. `roster/query.ts`'s `hydrateChannels` and `bot-chats/store.ts`
+         * join the same way for the same reason, so all three now agree about whether such a
+         * conversation exists.
+         *
+         * The thread mapping stays an inner join: a channel with no mapping for this person has no
+         * thread to open, which is a different thing from having no Bots, and the store has always
+         * answered `null` for it.
+         */
+        .leftJoin(channelAgents, eq(channelAgents.channelId, channels.id))
+        .leftJoin(
           agentProfiles,
           eq(agentProfiles.agentId, channelAgents.agentId),
         )
@@ -242,12 +419,22 @@ export function createChannelStore(
       const first = rows[0];
       if (!first) return null;
 
+      const linked = rows.filter((row) => row.agentId !== null);
       return {
         id: first.id,
         name: first.name,
-        agentIds: rows.map((row) => row.agentId),
+        agentIds: linked.map((row) => row.agentId as string),
         threadId: first.threadId,
-        active: rows.every((row) => row.deletedAt === null),
+        // A Bot is around when it has a profile and that profile has not been soft-deleted: with the
+        // profile joined loosely a null `deletedAt` means either of two things, and only one of them
+        // is a Bot that is still there. Vacuously true for a channel with no Bots — there is none to
+        // report as gone.
+        active: linked.every(
+          (row) => row.profileAgentId !== null && row.deletedAt === null,
+        ),
+        // Reported, not filtered on. See `AgentChannel.archived`: this read is how an archived
+        // conversation is opened again.
+        archived: first.archivedAt !== null,
       };
     },
 
@@ -257,6 +444,7 @@ export function createChannelStore(
         MAX_ROSTER_PAGE,
       );
       const cursor: RosterCursor | undefined = decodeRosterCursor(query.cursor);
+      const status = query.status ?? "active";
 
       /*
        * The page of channels is chosen first, and the agents are joined to that page.
@@ -268,7 +456,10 @@ export function createChannelStore(
       const page = await database
         .select({
           id: channels.id,
-          recency: sql<Date>`${RECENCY}`,
+          // Postgres' own rendering of the sort key's timestamp, carried as text. Never a `Date`:
+          // see `recencyCursorText` for the page boundary a millisecond `Date` used to floor, and the
+          // rows inside the discarded remainder that were then served on no page at all.
+          recencyKey: recencyCursorText(RECENCY),
           pinned: sql<boolean>`${channelMemberships.pinnedAt} is not null`,
         })
         .from(channels)
@@ -282,11 +473,10 @@ export function createChannelStore(
         .where(
           and(
             isNull(channels.deletedAt),
-            // One row comparison over the whole sort key, which only reads as "everything after the
-            // cursor" because every part of that key descends. See ROSTER_ORDER.
-            cursor
-              ? sql`(${PINNED_RANK}, ${RECENCY}, ${channels.id}) < (${cursor.pinned ? 1 : 0}::int, ${cursor.recency}::timestamptz, ${cursor.id})`
-              : undefined,
+            archiveFilter(status, channels.archivedAt),
+            // Built by the roster's own function over this query's own expressions, so the two reads
+            // cannot come to page by different rules. Absent cursor, absent predicate.
+            rosterCursorFilter(cursor, PINNED_RANK, RECENCY, channels.id),
           ),
         )
         .orderBy(...ROSTER_ORDER)
@@ -299,7 +489,9 @@ export function createChannelStore(
         page.length > limit && last
           ? encodeRosterCursor({
               pinned: last.pinned,
-              recency: new Date(last.recency).toISOString(),
+              // Handed on exactly as Postgres wrote it, unparsed. The `Date` round trip that used to
+              // be here is the defect `recencyCursorText` exists to remove.
+              recency: last.recencyKey,
               id: last.id,
             })
           : null;
@@ -311,12 +503,14 @@ export function createChannelStore(
           id: channels.id,
           name: channels.name,
           agentId: channelAgents.agentId,
+          profileAgentId: agentProfiles.agentId,
           threadId: intelligenceChannelMappings.threadId,
           deletedAt: agentProfiles.deletedAt,
           lastMessage: channels.lastMessage,
           lastMessageAt: channels.lastMessageAt,
           lastMessageAgentId: channels.lastMessageAgentId,
           createdAt: channels.createdAt,
+          archivedAt: channels.archivedAt,
           pinnedAt: channelMemberships.pinnedAt,
           lastReadAt: channelMemberships.lastReadAt,
         })
@@ -335,8 +529,12 @@ export function createChannelStore(
             eq(intelligenceChannelMappings.userId, actor.id),
           ),
         )
-        .innerJoin(channelAgents, eq(channelAgents.channelId, channels.id))
-        .innerJoin(
+        // Loosely, for the reason `get` gives at length: a channel mid-package-sync has no
+        // `channel_agents` rows, and an inner join here dropped it after phase 1 had already spent
+        // its slot on the page — so it was invisible and it wasted a row of every page it belonged
+        // to, permanently. `roster/query.ts` chose the page the same way and hydrates it the same way.
+        .leftJoin(channelAgents, eq(channelAgents.channelId, channels.id))
+        .leftJoin(
           agentProfiles,
           eq(agentProfiles.agentId, channelAgents.agentId),
         )
@@ -347,30 +545,41 @@ export function createChannelStore(
               wanted.map((row) => row.id),
             ),
             // Repeated, not inherited from the query that chose the page: these are two statements
-            // on two snapshots, so a delete that commits between them would otherwise hand back a
-            // channel this person can no longer see.
+            // on two snapshots, so a delete or an archive that commits between them would otherwise
+            // hand back a channel this person can no longer see, or one that has just left the list
+            // being read.
             isNull(channels.deletedAt),
+            archiveFilter(status, channels.archivedAt),
           ),
         )
         // The same order the page was chosen in, since the rows below are read in order.
         .orderBy(...ROSTER_ORDER, asc(channelAgents.agentId));
 
-      // One row per channel-agent pair; the ordering above keeps each channel's rows together and
-      // its agents in the same lexicographic order `get` returns.
+      // One row per channel-agent pair — or one row with no agent on it, for a channel that has none
+      // — folded into one summary each. The ordering above keeps a channel's rows together and its
+      // agents in the same lexicographic order `get` returns.
       const summaries = new Map<string, ChannelSummary>();
       for (const row of rows) {
+        const linked = row.agentId !== null;
+        // Both halves, for the reason `get` gives: with the profile joined loosely a null
+        // `deletedAt` means either "still here" or "never registered as a coworker".
+        const around = row.profileAgentId !== null && row.deletedAt === null;
         const summary = summaries.get(row.id);
         if (summary) {
-          summary.agentIds.push(row.agentId);
-          summary.active &&= row.deletedAt === null;
+          if (linked) {
+            summary.agentIds.push(row.agentId as string);
+            summary.active &&= around;
+          }
           continue;
         }
         summaries.set(row.id, {
           id: row.id,
           name: row.name,
-          agentIds: [row.agentId],
+          agentIds: linked ? [row.agentId as string] : [],
           threadId: row.threadId,
-          active: row.deletedAt === null,
+          // Vacuously true for a channel with no Bots in it: there is none to report as gone.
+          active: linked ? around : true,
+          archived: row.archivedAt !== null,
           lastMessage: row.lastMessage,
           lastMessageAt: row.lastMessageAt,
           lastMessageAgentId: row.lastMessageAgentId,
@@ -420,7 +629,7 @@ export function createChannelStore(
            * and nobody else. The hub delivers by that list, which is what carries the pin across
            * this person's own tabs and replicas without putting it on anybody else's roster.
            */
-          const event: RosterActivityEvent = {
+          await announce(transaction, {
             kind: "channel",
             id: channelId,
             channelId,
@@ -429,10 +638,7 @@ export function createChannelStore(
             lastMessageAt: null,
             lastMessageAgentId: null,
             pinned,
-          };
-          await transaction.execute(
-            sql`select pg_notify(${CHANNEL_ACTIVITY_TOPIC}, ${JSON.stringify(event)})`,
-          );
+          });
         },
         { isolationLevel: "read committed" },
       );
@@ -484,22 +690,35 @@ export function createChannelStore(
                 eq(channelMemberships.userId, actor.id),
               ),
             )
-            .where(eq(channels.id, channelId));
-          // Not a member, or no such channel: the same answer either way.
+            // Filtered on `deleted_at` like every sibling read here, so a deleted channel reads as
+            // not found in this statement and not only in the write below.
+            .where(and(eq(channels.id, channelId), isNull(channels.deletedAt)));
+          // Not a member, no such channel, or an already deleted one: the same answer every way,
+          // matching setPinned, markRead, setArchived, get and recordActivity.
           if (!row) throw new ChannelNotFoundError(channelId);
           // Package channels are configuration; the sync that wrote them owns them.
           if (row.packageId !== null) {
             throw new ChannelPackageOwnedError(channelId);
           }
-          // The guard on deletedAt is what makes a repeat call a no-op rather than a new stamp.
-          await transaction
+          /*
+           * The answer comes from the write, which is what makes a repeat delete a refusal.
+           *
+           * The guard on `deleted_at` was always here and always did its job — it wrote nothing the
+           * second time. What was missing is anybody looking: the call carried on to announce
+           * `deleted: true` to every member and let the route write a second `channel.deleted` row
+           * for a deletion that had already happened, and answered 204 as though it had done it.
+           * Reading the write's own answer is also what closes the gap the read above cannot: a
+           * delete committing between the two statements is refused here rather than announced twice.
+           */
+          const deleted = await transaction
             .update(channels)
             .set({ deletedAt: new Date(), updatedAt: new Date() })
-            .where(and(eq(channels.id, channelId), isNull(channels.deletedAt)));
+            .where(and(eq(channels.id, channelId), isNull(channels.deletedAt)))
+            .returning({ id: channels.id });
+          if (deleted.length === 0) throw new ChannelNotFoundError(channelId);
 
           // Read on this transaction, so the members told are the ones the channel had when it was
-          // hidden. Soft leaves the membership rows in place, so this reads the same list a repeat
-          // call would.
+          // hidden. Soft leaves the membership rows in place.
           const members = await transaction
             .select({ userId: channelMemberships.userId })
             .from(channelMemberships)
@@ -513,7 +732,7 @@ export function createChannelStore(
            * this, a second tab and a second replica keep rendering a row whose channel no longer
            * resolves until something else makes them refetch.
            */
-          const event: RosterActivityEvent = {
+          await announce(transaction, {
             kind: "channel",
             id: channelId,
             channelId,
@@ -522,10 +741,7 @@ export function createChannelStore(
             lastMessageAt: null,
             lastMessageAgentId: null,
             deleted: true,
-          };
-          await transaction.execute(
-            sql`select pg_notify(${CHANNEL_ACTIVITY_TOPIC}, ${JSON.stringify(event)})`,
-          );
+          });
         },
         { isolationLevel: "read committed" },
       );
@@ -534,11 +750,11 @@ export function createChannelStore(
     setArchived(actor, channelId, archived) {
       return database.transaction(
         async (transaction) => {
+          // `archived_at` itself is deliberately not read here: what the call did is decided by the
+          // guarded write below, not by this statement. This one answers whether the caller may act
+          // on the channel at all, and holds the row while the write settles the rest.
           const [row] = await transaction
-            .select({
-              packageId: channels.packageId,
-              archivedAt: channels.archivedAt,
-            })
+            .select({ packageId: channels.packageId })
             .from(channels)
             .innerJoin(
               channelMemberships,
@@ -547,10 +763,27 @@ export function createChannelStore(
                 eq(channelMemberships.userId, actor.id),
               ),
             )
-            // A deleted channel is not there to archive. `get` and `list` filter the same way, so
-            // without this a client holding a stale roster row could archive something invisible and
-            // announce it to every member, each of whom refetches for a row that cannot appear.
-            .where(and(eq(channels.id, channelId), isNull(channels.deletedAt)));
+            // A deleted channel is not there to archive, and `get` and `list` filter the same way. The
+            // write below carries the same guard and would refuse the archive on its own; what this
+            // one settles is the answer a caller holding a stale roster row gets — "not found", like
+            // every other path, rather than "nothing changed".
+            .where(and(eq(channels.id, channelId), isNull(channels.deletedAt)))
+            /*
+             * Locked, and only the channel row.
+             *
+             * Read committed gives a plain `select` a snapshot and no lock, so everything below
+             * would be a decision about the row as it was rather than as it is: a delete committing
+             * in the gap got its channel archived and announced anyway, and a concurrent archive got
+             * a second stamp and a second `channel.archived` audit row for one archiving. Holding the
+             * row is what makes the read and the write below one decision.
+             *
+             * `of channels` because the membership row joined here is not what is being changed, and
+             * locking it would put this method in the way of `setPinned` and `markRead`, which write
+             * that row. This takes the same lock `softDelete`'s and `recordActivity`'s writes take,
+             * and takes it first, so the three serialise on one row rather than waiting on each
+             * other in a cycle.
+             */
+            .for("update", { of: channels });
           // Not a member, no such channel, or a deleted one: the same answer every way, matching
           // setPinned, markRead, get and recordActivity, so membership is not probeable.
           if (!row) throw new ChannelNotFoundError(channelId);
@@ -565,21 +798,36 @@ export function createChannelStore(
             );
           }
 
-          // Already where the caller wants it. Returning here rather than writing is what makes a
-          // repeat call a no-op instead of a fresh stamp and a second announcement. `false` tells the
-          // caller nothing changed, which is what keeps the route's audit write conditional on it.
-          const alreadyThere = archived
-            ? row.archivedAt !== null
-            : row.archivedAt === null;
-          if (alreadyThere) return false;
-
-          await transaction
+          /*
+           * The state guard is on the write, and the answer comes from the write.
+           *
+           * `false` means the channel was already where the caller asked for it: the guard matched no
+           * row, so nothing was restamped and nothing is announced. The route keeps its audit write
+           * conditional on this answer, so clicking Archive twice cannot lay down two
+           * `channel.archived` rows for one archiving — and because the answer is what the write did
+           * rather than what an earlier statement read, two concurrent calls cannot both be told they
+           * did the archiving.
+           *
+           * The delete guard repeats what the locked read above established. It costs nothing, and it
+           * means the statement is right when read on its own.
+           */
+          const applied = await transaction
             .update(channels)
             .set({
               archivedAt: archived ? new Date() : null,
               updatedAt: new Date(),
             })
-            .where(eq(channels.id, channelId));
+            .where(
+              and(
+                eq(channels.id, channelId),
+                isNull(channels.deletedAt),
+                archived
+                  ? isNull(channels.archivedAt)
+                  : isNotNull(channels.archivedAt),
+              ),
+            )
+            .returning({ id: channels.id });
+          if (applied.length === 0) return false;
 
           // Read on this transaction, so the members told are the ones the channel had when it was
           // archived.
@@ -594,7 +842,7 @@ export function createChannelStore(
            * Announced inside the transaction, so it is delivered on commit and a refused archive — a
            * channel the package owns, or one the caller is not in — announces nothing at all.
            */
-          const event: RosterActivityEvent = {
+          await announce(transaction, {
             kind: "channel",
             id: channelId,
             channelId,
@@ -603,10 +851,7 @@ export function createChannelStore(
             lastMessageAt: null,
             lastMessageAgentId: null,
             archived,
-          };
-          await transaction.execute(
-            sql`select pg_notify(${CHANNEL_ACTIVITY_TOPIC}, ${JSON.stringify(event)})`,
-          );
+          });
 
           return true;
         },
@@ -639,7 +884,23 @@ export function createChannelStore(
                 eq(channelMemberships.channelId, channelId),
                 eq(channelMemberships.userId, actor.id),
               ),
-            );
+            )
+            /*
+             * Locked, because `archivedAt` read here decides what the event says.
+             *
+             * The write below clears `archived_at` under its own guard, which is correct on its own.
+             * What cannot be decided from a separate earlier snapshot is whether to SAY the
+             * conversation came back: an archive committing between the two left this read saying
+             * "not archived", the write clearing the flag anyway, and the event omitting
+             * `archived: false`. `app/src/lib/channels/use-channel-events.ts` refetches only when
+             * that field is present, so the conversation was restored in the database and stayed
+             * hidden on every viewer. Saying something in an archived conversation is how it comes
+             * back, which makes the restore direction the one that must not be lossy.
+             *
+             * `of channels` for the reason `setArchived` gives: the membership row is not what
+             * changes here, and locking it would collide with the methods that do write it.
+             */
+            .for("update", { of: channels });
           // Not a member, no such channel, or a deleted one: the same answer every way, so belonging
           // to a channel is not something an outsider can probe for.
           if (!membership) throw new ChannelNotFoundError(channelId);
@@ -686,18 +947,24 @@ export function createChannelStore(
               ),
             )
             .returning({ id: channels.id });
-          // Nothing changed, so there is nothing to announce: a stale report is not news.
-          if (applied.length === 0) return;
+          // Nothing changed, so there is nothing to announce and nothing to record: a stale report is
+          // not news, and it did not restore anything either.
+          if (applied.length === 0) return { restored: false };
+
+          // One fact, used twice: whether this report is what cleared the archive. The event carries
+          // it so the browser moves the row between lists, and the route writes `channel.unarchived`
+          // from the answer this method returns, so the two cannot disagree about what happened.
+          const restored = membership.archivedAt !== null;
 
           const members = await transaction
             .select({ userId: channelMemberships.userId })
             .from(channelMemberships)
             .where(eq(channelMemberships.channelId, channelId));
 
-          // Announced inside the transaction, so it is delivered on commit and a write that rolls
-          // back is never announced. The payload carries the members because the writer has already
-          // resolved them; NOTIFY caps at 8000 bytes, which a 200-character preview leaves room in.
-          const event: RosterActivityEvent = {
+          // The payload carries the members because the writer has already resolved them. See
+          // `announcementPayloads` for how its size is kept under NOTIFY's cap — the preview is
+          // capped, the member list is not, and it is the member list that is split.
+          await announce(transaction, {
             kind: "channel",
             id: channelId,
             channelId,
@@ -708,11 +975,10 @@ export function createChannelStore(
             // Only when this report is what restored it. On every other activity event the field is
             // absent, so a client patching a row does not have to distinguish "still not archived"
             // from "just came back".
-            ...(membership.archivedAt !== null ? { archived: false } : {}),
-          };
-          await transaction.execute(
-            sql`select pg_notify(${CHANNEL_ACTIVITY_TOPIC}, ${JSON.stringify(event)})`,
-          );
+            ...(restored ? { archived: false } : {}),
+          });
+
+          return { restored };
         },
         { isolationLevel: "read committed" },
       );
@@ -782,9 +1048,30 @@ type ActivityInputParseResult =
   | { ok: false; error: string };
 
 /**
+ * How long a reported message may be, in UTF-16 units.
+ *
+ * Units rather than code points because this is a size bound, and counting code points means walking
+ * the whole string to find out how long it is — the work the bound exists to avoid. It is generous
+ * for anything a person or a Bot says: `previewOf` keeps 200 code points of it for the roster, and
+ * the rest is stored by whoever holds the transcript, not here.
+ */
+const MAX_ACTIVITY_TEXT_UNITS = 16_000;
+
+/**
+ * How large the JSON around it may be.
+ *
+ * Wider than the cap above on purpose, and by a factor that no accepted message can close: the widest
+ * a 16,000-unit string gets inside JSON is six bytes a unit, when every one of them is a control
+ * character written as `\u0000`. So nothing `parseActivityInput` would accept is refused here first,
+ * and this exists only to stop the `JSON.parse` that runs before the parser is reached at all.
+ */
+const MAX_ACTIVITY_BODY_BYTES = 256 * 1024;
+
+/**
  * Parse a reported message.
  *
- * `at` comes from the client that saw the message, because only it knows when the message arrived, * but it is never trusted as a clock: the store compares it against what is stored and only ever
+ * `at` comes from the client that saw the message, because only it knows when the message arrived,
+ * but it is never trusted as a clock: the store compares it against what is stored and only ever
  * moves forwards, so a wrong one can lose a report, not corrupt the row.
  */
 export function parseActivityInput(input: unknown): ActivityInputParseResult {
@@ -795,6 +1082,11 @@ export function parseActivityInput(input: unknown): ActivityInputParseResult {
 
   if (typeof object.text !== "string" || object.text.trim().length === 0) {
     return { ok: false, error: "Text is required." };
+  }
+  // Refused rather than truncated. A shortened report is a lie about what was said, and this text is
+  // what the roster's preview is derived from and what a person reads back off the row.
+  if (object.text.length > MAX_ACTIVITY_TEXT_UNITS) {
+    return { ok: false, error: "Text is too long." };
   }
   if (object.agentId !== null && typeof object.agentId !== "string") {
     return { ok: false, error: "Agent ID must be a string or null." };
@@ -829,11 +1121,12 @@ export function createChannelRoutes(
   const routes = new Hono<{ Variables: AppVariables }>();
 
   /**
-   * Write the one audit row this file ever writes, tolerantly.
+   * Write one audit row, tolerantly.
    *
-   * Mirrors `record` in agents/routes.ts: never fatal, because the channel is already hidden and the
-   * caller has already been told so by the time this runs. A trail that is briefly unavailable is
-   * not a reason to report a failure that did not happen.
+   * Mirrors `record` in agents/routes.ts: never fatal, because the change has already happened and
+   * the caller has already been told so by the time this runs. A trail that is briefly unavailable is
+   * not a reason to report a failure that did not happen. It is said out loud instead, as one
+   * structured line, because nothing else can tell.
    *
    * Reached only after the store call resolves, so a refused change — a channel the package owns, or
    * one the caller is not in — writes nothing. The trail records acts, not attempts.
@@ -918,6 +1211,9 @@ export function createChannelRoutes(
       const url = new URL(context.req.url);
       const limit = Number.parseInt(url.searchParams.get("limit") ?? "", 10);
       const page = await store.list(context.var.actor, {
+        // Parsed by the roster's own function, so this endpoint and `GET /api/roster` cannot come to
+        // read `?status=` differently. Anything unrecognised reads as `active`.
+        status: parseRosterStatus(url.searchParams.get("status")),
         ...(url.searchParams.get("cursor")
           ? { cursor: url.searchParams.get("cursor") as string }
           : {}),
@@ -933,23 +1229,61 @@ export function createChannelRoutes(
     }
   });
 
-  routes.post("/:channelId/activity", requireUser, async (context) => {
-    const parsed = parseActivityInput(
-      await context.req.json().catch(() => null),
-    );
-    if (!parsed.ok) return context.json({ error: parsed.error }, 400);
-
-    try {
-      await store.recordActivity(
-        context.var.actor,
-        context.req.param("channelId"),
-        parsed.value,
+  routes.post(
+    "/:channelId/activity",
+    requireUser,
+    /*
+     * Two caps, and they are not interchangeable.
+     *
+     * `parseActivityInput` bounds the message, which is the semantic limit and the one that answers
+     * 400. It cannot bound the work that precedes it: `context.req.json()` below has already read and
+     * parsed the whole body by the time the parser sees an object. This is that half — the only place
+     * a multi-megabyte body can be turned away before it is parsed at all.
+     */
+    bodyLimit({
+      maxSize: MAX_ACTIVITY_BODY_BYTES,
+      // JSON, and named, because every other refusal on these routes is. The default is a plain-text
+      // "Payload Too Large" thrown as an exception, which a client parsing our error shape cannot
+      // read.
+      onError: (context) =>
+        context.json({ error: "Activity body is too large." }, 413),
+    }),
+    async (context) => {
+      const parsed = parseActivityInput(
+        await context.req.json().catch(() => null),
       );
-      return context.body(null, 204);
-    } catch (error) {
-      return mapStoreError(context, error);
-    }
-  });
+      if (!parsed.ok) return context.json({ error: parsed.error }, 400);
+
+      const channelId = context.req.param("channelId");
+      try {
+        const { restored } = await store.recordActivity(
+          context.var.actor,
+          channelId,
+          parsed.value,
+        );
+        /*
+         * The other way a channel is unarchived, and the row it owes the trail.
+         *
+         * Saying something in an archived channel restores it. That is a real unarchiving with a real
+         * actor, and the store cannot write it down — it holds no audit store — so this does, from
+         * what the store reports back. Without it the trail shows `channel.archived` and no matching
+         * `channel.unarchived` for a channel that is live and on every roster, which is the shape of
+         * audit bug `audit.ts` argues is worse than a silent trail: it is used to rule things out.
+         *
+         * `mechanism` separates it from somebody clicking Restore, because the two are different
+         * facts about how a conversation came back and the event type cannot tell them apart.
+         */
+        if (restored) {
+          await record(context, "channel.unarchived", channelId, {
+            mechanism: "activity",
+          });
+        }
+        return context.body(null, 204);
+      } catch (error) {
+        return mapStoreError(context, error);
+      }
+    },
+  );
 
   routes.put("/:channelId/pin", requireUser, async (context) => {
     const body = await context.req.json().catch(() => null);
@@ -1005,7 +1339,10 @@ export function createChannelRoutes(
           context,
           archived ? "channel.archived" : "channel.unarchived",
           channelId,
-          {},
+          // Named the way `channel.deleted` names its mechanism, and for a sharper reason: the
+          // activity route writes `channel.unarchived` too, when somebody typing in an archived
+          // channel brings it back. Without this a reader cannot tell a decision from a side effect.
+          { mechanism: "explicit" },
         );
       }
       return context.json({ archived });
@@ -1063,6 +1400,7 @@ function channelDto(channel: AgentChannel): AgentChannel {
     agentIds: channel.agentIds,
     threadId: channel.threadId,
     active: channel.active,
+    archived: channel.archived,
   };
 }
 

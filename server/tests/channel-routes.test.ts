@@ -7,7 +7,7 @@ import {
   test,
 } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import type { MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import {
@@ -26,6 +26,7 @@ import {
   type ChannelStore,
   createChannelRoutes,
   createChannelStore,
+  parseActivityInput,
   parseChannelInput,
 } from "../src/channels/routes";
 import { createThreadIdentity } from "../src/channels/thread-identity";
@@ -57,6 +58,7 @@ function channel(overrides: Partial<AgentChannel> = {}): AgentChannel {
     agentIds: ["agent-1", "agent-2"],
     threadId: "thread-1",
     active: true,
+    archived: false,
     ...overrides,
   };
 }
@@ -168,6 +170,37 @@ describe("channel input parser", () => {
   });
 });
 
+/**
+ * One cap, in the one parser both activity routes use: `bot-chats/routes.ts` imports this function
+ * rather than repeating it, so a bound here bounds that route too.
+ */
+describe("activity input parser", () => {
+  const at = "2026-01-01T00:00:00.000Z";
+
+  test("takes a message at the cap", () => {
+    expect(
+      parseActivityInput({ text: "a".repeat(16_000), agentId: null, at }).ok,
+    ).toBe(true);
+  });
+
+  test("refuses one over the cap rather than shortening it", () => {
+    // Refused, not truncated. A report the store shortened is a lie about what was said, and the
+    // preview it feeds is derived from the text rather than being the text.
+    expect(
+      parseActivityInput({ text: "a".repeat(16_001), agentId: null, at }),
+    ).toEqual({ ok: false, error: "Text is too long." });
+  });
+
+  test("measures the cap in UTF-16 units, not code points", () => {
+    // A size bound counted in code points means walking the whole string to find out how long it is,
+    // which is the work the bound exists to avoid. An astral character is two units, so 8,001 of
+    // them is over a cap of 16,000 units and well under it counted as characters.
+    expect(
+      parseActivityInput({ text: "😀".repeat(8_001), agentId: null, at }),
+    ).toEqual({ ok: false, error: "Text is too long." });
+  });
+});
+
 describe("channel routes", () => {
   test("attaches authentication middleware to every route before calling the store", async () => {
     const store = fakeStore();
@@ -232,6 +265,7 @@ describe("channel routes", () => {
         agentIds: ["agent-1"],
         threadId: "thread-1",
         active: true,
+        archived: false,
       },
     });
     expect(fetched.status).toBe(200);
@@ -320,6 +354,87 @@ describe("channel routes", () => {
 
     expect(response.status).toBe(599);
     expect(await json(response)).toEqual({ sentinel: "database disconnected" });
+  });
+
+  test("reads the archive status the caller asked for, and defaults to active", async () => {
+    const store = fakeStore();
+    const app = appFor(store);
+
+    await app.request("http://openbot.test/?status=archived");
+    await app.request("http://openbot.test/");
+    await app.request("http://openbot.test/?status=nonsense");
+
+    expect(store.calls).toEqual([
+      ["list", actor, { status: "archived" }],
+      ["list", actor, { status: "active" }],
+      // Unrecognised reads as active, which is the answer `parseRosterStatus` already gives the
+      // roster: a stale bookmark should show somebody their conversations rather than an error they
+      // cannot act on.
+      ["list", actor, { status: "active" }],
+    ]);
+  });
+
+  test("says whether each listed channel is archived", async () => {
+    const store = fakeStore({
+      async list() {
+        return {
+          channels: [
+            {
+              ...channel({ id: "channel-9", archived: true }),
+              lastMessage: "Filed away",
+              lastMessageAt: new Date("2026-01-01T00:00:00.000Z"),
+              lastMessageAgentId: "agent-1",
+              createdAt: new Date("2025-12-01T00:00:00.000Z"),
+              pinned: false,
+              lastReadAt: null,
+            },
+          ],
+          nextCursor: null,
+        };
+      },
+    });
+
+    const response = await appFor(store).request("http://openbot.test/");
+
+    expect(response.status).toBe(200);
+    // Without the field the endpoint hands an archived channel back as an ordinary active row and no
+    // caller can tell the difference. The roster reports it, and this is the same fact about the
+    // same row.
+    expect(await json(response)).toMatchObject({
+      channels: [{ id: "channel-9", archived: true }],
+    });
+  });
+
+  test("refuses an activity body too large to parse", async () => {
+    const store = fakeStore();
+    const app = appFor(store);
+
+    const response = await app.request(
+      "http://openbot.test/channel-1/activity",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          text: "a".repeat(400_000),
+          agentId: null,
+          at: "2026-01-01T00:00:00.000Z",
+        }),
+      },
+    );
+
+    /*
+     * 413 from the middleware, not 400 from the parser.
+     *
+     * The parser's own cap cannot prevent this: it runs after `context.req.json()` has already
+     * materialised and parsed the whole body. The two caps are not interchangeable, and the body
+     * limit is the wider of the two on purpose — it is sized so that no message the parser would
+     * accept can be refused here first.
+     */
+    expect(response.status).toBe(413);
+    expect(await json(response)).toEqual({
+      error: "Activity body is too large.",
+    });
+    expect(store.calls).toEqual([]);
   });
 
   test("pins through the authenticated actor and reports the new state", async () => {
@@ -991,6 +1106,8 @@ describe("channel store integration", () => {
       agentIds: canonicalAgentIds,
       threadId: created.threadId,
       active: true,
+      // Nothing is born archived.
+      archived: false,
     });
     const persisted = await persistedChannel(created.id);
     expect(persisted.channelRow?.name).toBe("Zulu, Alpha");
@@ -1348,7 +1465,18 @@ describe("channel soft delete", () => {
     expect(row?.deletedAt).not.toBeNull();
   });
 
-  test("deleting again is a no-op, not an error", async () => {
+  /*
+   * A repeat delete is not found, not a second deletion.
+   *
+   * This test asserted the opposite until the archive work went over it, and the old assertion was
+   * the behaviour rather than the intent. The second call found the row — its read carried no
+   * `deleted_at` filter — wrote nothing, because the update does carry one, and then went on to
+   * announce `deleted: true` to every member and let the route write a second `channel.deleted`
+   * audit row for a deletion that had already happened. Every sibling on this store answers
+   * `ChannelNotFoundError` for a deleted channel, and so does `BotChatStore.softDelete`, so the two
+   * kinds of conversation now answer a repeat delete the same way instead of 204 against 404.
+   */
+  test("deleting again is not found, not a second deletion", async () => {
     const actor = await createPersistentUser();
     const agentId = await createPersistentAgent({
       name: "Twice-deleted agent",
@@ -1358,9 +1486,21 @@ describe("channel soft delete", () => {
     createdChannelIds.push(created.id);
 
     await persistentStore.softDelete(actor, created.id);
+    const [afterFirst] = await database
+      .select({ deletedAt: channels.deletedAt })
+      .from(channels)
+      .where(eq(channels.id, created.id));
+
     await expect(
       persistentStore.softDelete(actor, created.id),
-    ).resolves.toBeUndefined();
+    ).rejects.toBeInstanceOf(ChannelNotFoundError);
+
+    // And the refusal left the first deletion's own stamp where it was.
+    const [afterSecond] = await database
+      .select({ deletedAt: channels.deletedAt })
+      .from(channels)
+      .where(eq(channels.id, created.id));
+    expect(afterSecond?.deletedAt).toEqual(afterFirst?.deletedAt);
   });
 
   test("refuses to delete a channel the caller is not a member of", async () => {
@@ -1474,6 +1614,230 @@ describe("channel soft delete", () => {
     await expect(
       persistentStore.softDelete(actor, channelId),
     ).rejects.toBeInstanceOf(ChannelPackageOwnedError);
+  });
+});
+
+/**
+ * `GET /api/channels` is a second implementation of the roster's read, and the archive is a feature
+ * the roster has. Filtering only on `deleted_at` handed an archived channel back as an ordinary
+ * active row, with nothing on it for a caller to tell by — a second implementation quietly ignoring
+ * the feature the first one added.
+ */
+describe("channel store archive visibility", () => {
+  async function twoChannels() {
+    const actor = await createPersistentUser();
+    const agentId = await createPersistentAgent({
+      name: "Archivable agent",
+      owner: actor,
+    });
+    const active = await persistentStore.create(actor, [agentId]);
+    createdChannelIds.push(active.id);
+    const archived = await persistentStore.create(actor, [agentId]);
+    createdChannelIds.push(archived.id);
+    await persistentStore.setArchived(actor, archived.id, true);
+    return { actor, active, archived };
+  }
+
+  test("answers the status the caller asked for", async () => {
+    const { actor, active, archived } = await twoChannels();
+    const idsOf = async (status?: "active" | "archived" | "all") =>
+      (await persistentStore.list(actor, status ? { status } : {})).channels
+        .map((row) => row.id)
+        .sort();
+
+    expect(await idsOf()).toEqual([active.id]);
+    expect(await idsOf("archived")).toEqual([archived.id]);
+    expect(await idsOf("all")).toEqual([active.id, archived.id].sort());
+  });
+
+  test("does not spend a page slot on a channel the status excludes", async () => {
+    // The archived one is created second, so it is the newer of the two.
+    const { actor, active } = await twoChannels();
+
+    const page = await persistentStore.list(actor, { limit: 1 });
+
+    /*
+     * The archived channel is the newer of the two, so it sorts first.
+     *
+     * The read is two statements — one chooses the page, the other rebuilds the rows on it — and both
+     * have to filter. A page chosen without the filter picks the archived channel, and the second
+     * statement then drops it: an empty page, with a cursor, while the channel somebody was actually
+     * looking for sits on the next one. `expect([])` is what that looks like from here.
+     */
+    expect(page.channels.map((row) => row.id)).toEqual([active.id]);
+    expect(page.nextCursor).toBeNull();
+  });
+
+  test("says which of the channels it returns is archived", async () => {
+    const { actor, active, archived } = await twoChannels();
+
+    const page = await persistentStore.list(actor, { status: "all" });
+    const archiveStateById = new Map(
+      page.channels.map((row) => [row.id, row.archived]),
+    );
+
+    expect(archiveStateById.get(archived.id)).toBe(true);
+    expect(archiveStateById.get(active.id)).toBe(false);
+  });
+
+  test("still reads an archived channel by id, and says that it is", async () => {
+    const { actor, archived } = await twoChannels();
+
+    // Deliberately not filtered: archived is hidden from a roster, not from a direct read, and the
+    // URL of an archived conversation still opens it. That is what makes archiving reversible rather
+    // than a deletion wearing a gentler name, and it is why the flag has to travel on the row.
+    // `BotChatStore.get` answers the same way.
+    expect(await persistentStore.get(actor, archived.id)).toMatchObject({
+      id: archived.id,
+      archived: true,
+    });
+  });
+});
+
+/**
+ * A channel whose Bots are momentarily gone.
+ *
+ * `channel_agents` is deleted and reinserted on every tenant-package sync, so a channel with no rows
+ * there is reachable. Both reads here inner-joined it, which answered "does this channel exist" with
+ * the absence of a Bot row: `get` said not found, and `list` chose the channel in its first statement
+ * and dropped it in its second — invisible, while still spending a slot on every page it belonged to.
+ * `roster/query.ts` was fixed the same way, and these assertions are its assertions, so the two
+ * endpoints cannot answer differently about the same channel.
+ */
+describe("channel store with no Bots linked", () => {
+  async function channelWithoutBots() {
+    const actor = await createPersistentUser();
+    const agentId = await createPersistentAgent({
+      name: "Unlinked agent",
+      owner: actor,
+    });
+    // The other channel first, so the Bot-less one is the newer of the two and therefore the row a
+    // page of one has to hold. A slot a read wastes is only visible when something is behind it.
+    const other = await persistentStore.create(actor, [agentId]);
+    createdChannelIds.push(other.id);
+    const orphan = await persistentStore.create(actor, [agentId]);
+    createdChannelIds.push(orphan.id);
+    await database
+      .delete(channelAgents)
+      .where(eq(channelAgents.channelId, orphan.id));
+    return { actor, orphan, other };
+  }
+
+  test("still reads it by id, with no Bots on it", async () => {
+    const { actor, orphan } = await channelWithoutBots();
+
+    expect(await persistentStore.get(actor, orphan.id)).toMatchObject({
+      id: orphan.id,
+      agentIds: [],
+      // Nothing has been retired: a channel with no coworkers in it has none to report as gone.
+      active: true,
+    });
+  });
+
+  test("does not report a Bot with no coworker profile as still around", async () => {
+    const actor = await createPersistentUser();
+    const agentId = await createPersistentAgent({
+      name: "Registered agent",
+      owner: actor,
+    });
+    const channel = await persistentStore.create(actor, [agentId]);
+    createdChannelIds.push(channel.id);
+
+    /*
+     * A Bot linked to the channel with no coworker profile at all.
+     *
+     * `channel_agents` references `agents`; a profile is a separate row. Joined loosely, a missing
+     * profile leaves `deleted_at` null, which is exactly what "not soft-deleted" cannot tell apart
+     * from a Bot that is still there — so the read has to test that the profile row is present as
+     * well, or a channel whose Bot was never registered renders as fully staffed.
+     */
+    const unregistered = persistentId("agent");
+    await database.insert(agents).values({
+      id: unregistered,
+      name: "Unregistered agent",
+      type: "remote_ag_ui",
+      configuration: { endpoint: "https://agent.example.test/ag-ui" },
+    });
+    createdAgentIds.push(unregistered);
+    await database
+      .insert(channelAgents)
+      .values({ channelId: channel.id, agentId: unregistered });
+
+    expect(await persistentStore.get(actor, channel.id)).toMatchObject({
+      active: false,
+    });
+    const page = await persistentStore.list(actor);
+    expect(page.channels.map((row) => row.active)).toEqual([false]);
+  });
+
+  test("keeps it on the page, and does not spend the slot twice", async () => {
+    const { actor, orphan, other } = await channelWithoutBots();
+
+    const first = await persistentStore.list(actor, { limit: 1 });
+
+    expect(first.channels.map((row) => row.id)).toEqual([orphan.id]);
+    expect(first.channels[0]?.agentIds).toEqual([]);
+    expect(first.channels[0]?.active).toBe(true);
+    expect(first.nextCursor).not.toBeNull();
+
+    const second = await persistentStore.list(actor, {
+      limit: 1,
+      cursor: first.nextCursor as string,
+    });
+    expect(second.channels.map((row) => row.id)).toEqual([other.id]);
+  });
+});
+
+/**
+ * Paging, over the case that made the cursor lose rows silently.
+ *
+ * `GET /api/channels` mints its cursor from the same sort key the roster does, and used to mint it
+ * from a JavaScript `Date`: milliseconds, where `timestamptz` holds microseconds. That floors the
+ * page boundary below the rows just served, and the next page's strict `<` then excludes every row
+ * inside the discarded remainder. A floor only ever loses rows, so there is no duplicate to notice
+ * it by — the rows are simply on no page at all.
+ */
+describe("channel store paging", () => {
+  test("walks channels whose recency is identical to the microsecond", async () => {
+    const actor = await createPersistentUser();
+    const agentId = await createPersistentAgent({
+      name: "Paging agent",
+      owner: actor,
+    });
+    const ids: string[] = [];
+    for (let made = 0; made < 3; made += 1) {
+      const created = await persistentStore.create(actor, [agentId]);
+      createdChannelIds.push(created.id);
+      ids.push(created.id);
+    }
+    /*
+     * Byte-identical recency, with a fractional part no millisecond clock can hold.
+     *
+     * Not contrived: `now()` carries microseconds, `tenant-package.ts` inserts every channel a
+     * package defines inside one transaction, and the recency of a channel nobody has spoken in is
+     * its `created_at`. A tenant whose package defines more channels than fit on one page lost the
+     * remainder from its sidebar permanently.
+     */
+    await database
+      .update(channels)
+      .set({ createdAt: sql`'2026-01-01 00:00:00.123456+00'::timestamptz` })
+      .where(inArray(channels.id, ids));
+
+    const walked: string[] = [];
+    let cursor: string | undefined;
+    // One more turn than there are pages, so a cursor that never advances fails as a wrong answer
+    // rather than as a hung test.
+    for (let page = 0; page < ids.length + 1; page += 1) {
+      const answer = await persistentStore.list(actor, {
+        limit: 1,
+        ...(cursor ? { cursor } : {}),
+      });
+      walked.push(...answer.channels.map((row) => row.id));
+      if (!answer.nextCursor) break;
+      cursor = answer.nextCursor;
+    }
+
+    expect(walked.sort()).toEqual([...ids].sort());
   });
 });
 
