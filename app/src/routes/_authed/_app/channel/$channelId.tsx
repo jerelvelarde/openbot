@@ -7,7 +7,7 @@ import {
 } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { motion, useReducedMotion } from "motion/react";
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { z } from "zod";
 import { AgentProfile } from "@/components/agents/agent-profile";
 import { hasUnseenActivity } from "@/components/app-sidebar/app-sidebar";
@@ -72,6 +72,39 @@ function ComputerViewPanel({
   );
 }
 
+/**
+ * Whether a live needs-you prompt should open the screen pane on its own.
+ *
+ * Exported for the test that pins the two answers a person notices, because both of them used to be
+ * "yes" and neither reads as a decision from the effect that calls this.
+ *
+ * A pane already open is left alone — the same rule the `onComputerActivity` subscription in
+ * `RouteComponent` follows for the other auto-open path. Taking the pane away from a settings panel
+ * somebody deliberately opened is not a way to explain that a Bot is stuck, and the amber dot on the
+ * Watch button says the same thing without seizing anything.
+ *
+ * A dismissal recorded for the current browser-activity run keeps the pane closed. Without that,
+ * closing the pane was inert while the prompt was live: `show(null)` clears `watch`, `useNeedsYou`
+ * resumes polling, the prompt is still there, and the pane reopens. This is the same `dismissedEpoch`
+ * the browser-activity path already writes, so one close covers both paths — and it covers one run,
+ * not the life of the screen, because the next run arrives with an epoch nobody dismissed and that
+ * path opens the pane again.
+ *
+ * Two nulls is the state before any browser action has been reported (`reportComputerActivity`
+ * counts from 1, so a real epoch is never null). A dismissal there holds until an action is
+ * reported, which is the same "until the next run" rule with no run yet to compare against.
+ */
+export function shouldOpenForNeedsYou(input: {
+  needsYou: boolean;
+  /** Either pane: settings and watch are one pane with two contents. */
+  isPaneOpen: boolean;
+  dismissedEpoch: number | null;
+  runEpoch: number | null;
+}): boolean {
+  if (!input.needsYou || input.isPaneOpen) return false;
+  return input.dismissedEpoch !== input.runEpoch;
+}
+
 function RouteComponent() {
   const { channelId } = Route.useParams();
   const { settings, watch } = Route.useSearch();
@@ -96,6 +129,18 @@ function RouteComponent() {
    * somebody just archived. A screen that read "active" would lose its summary — and with it,
    * unseen tracking and mark-read — the moment that happened, even while still open. "all" is the
    * only status guaranteed to still hold the row this screen is looking at.
+   *
+   * Only what is cached, though. Nothing in this app calls `fetchNextPage` on the roster, so a
+   * conversation sitting past the first page of "all" has no `summary` here at all: `unseen` is
+   * false, the effect below never fires, and opening the conversation never writes a read marker.
+   * Nothing looks wrong while it is open, because the sidebar suppresses the dot on the conversation
+   * you are in by id whatever its row says (`isUnread` in app-sidebar.tsx) — but the marker was never
+   * written, so the dot is back the moment you navigate away, and on a second device, where this is
+   * not the conversation on screen, it never went at all. The sidebar pages each status separately,
+   * so it can be showing a row from "active" that this screen's one page of "all" does not reach.
+   * The gap is app-wide and predates this screen; `bot.tsx` documents what its own resolver does
+   * with its version of it. Not fixed here: paging belongs to the query, which this screen does not
+   * own.
    */
   const roster = useInfiniteQuery(rosterListQueryOptions("all"));
   const summary = roster.data?.find((row) => row.id === channelId);
@@ -119,19 +164,39 @@ function RouteComponent() {
     }
   }, [channelId, unseen, markReadMutate]);
 
-  /*
-   * Needs-you prompts auto-open the screen panel, because the prompt with the reason on it — the
-   * amber "the assistant needs you" row, and the masked field for a credential — is drawn on the
-   * screen card in that panel. Nothing about a stuck Bot is actionable until this pane is open.
-   */
-  useEffect(() => {
-    if (!needsYou) return;
-    show("watch");
-  });
-
   // Browser activity may auto-open the screen once per run unless this run was dismissed.
   const dismissedEpoch = useRef<number | null>(null);
   const runEpoch = useRef<number | null>(null);
+
+  /*
+   * Settings and watch share one pane; opening either clears the other URL flag.
+   *
+   * Declared above the effect that calls it rather than below it, which is where this used to sit:
+   * that effect reached a `const` declared further down the function, and only got away with it
+   * because an effect body runs after the render that queued it.
+   *
+   * Memoised so that effect can name it as a dependency — a function rebuilt every render is a
+   * dependency array that fires every render, written a longer way. `isWatching` is a dependency
+   * because the dismissal reads it, so `show` changes identity whenever the pane opens or closes;
+   * neither of those re-runs can open anything, because one of them has a pane open and the other
+   * has just recorded a dismissal.
+   */
+  const show = useCallback(
+    (next: "settings" | "watch" | null) => {
+      // Dismissal applies only to the current browser-activity run.
+      if (next !== "watch" && isWatching)
+        dismissedEpoch.current = runEpoch.current;
+      return navigate({
+        search: (previous) => ({
+          ...previous,
+          settings: next === "settings" ? true : undefined,
+          watch: next === "watch" ? true : undefined,
+        }),
+      });
+    },
+    [isWatching, navigate],
+  );
+
   useEffect(() => {
     if (!agentId) return;
     return onComputerActivity((activity) => {
@@ -147,19 +212,33 @@ function RouteComponent() {
     });
   }, [agentId, navigate]);
 
-  // Settings and watch share one pane; opening either clears the other URL flag.
-  const show = (next: "settings" | "watch" | null) => {
-    // Dismissal applies only to the current browser-activity run.
-    if (next !== "watch" && isWatching)
-      dismissedEpoch.current = runEpoch.current;
-    return navigate({
-      search: (previous) => ({
-        ...previous,
-        settings: next === "settings" ? true : undefined,
-        watch: next === "watch" ? true : undefined,
-      }),
-    });
-  };
+  /*
+   * Needs-you prompts auto-open the screen panel, because the prompt with the reason on it — the
+   * amber "the assistant needs you" row, and the masked field for a credential — is drawn on the
+   * screen card in that panel. Nothing about a stuck Bot is actionable until this pane is open.
+   *
+   * A dependency array, which this effect used to be missing: it ran after every render — every
+   * roster socket patch, every mark-read, every refetch — and navigated on each one while `needsYou`
+   * was true. It self-limited only because opening the pane flips `useNeedsYou`'s `when` to false,
+   * which resets that hook's own state: a navigate-per-render held back by another file's behaviour
+   * rather than by anything this effect said.
+   *
+   * The two epochs are read out of refs, which do not re-render when they change, and that is
+   * enough. `onComputerActivity` above is what hears about a new run, and it opens the pane itself
+   * for an epoch nobody dismissed; this effect never has to notice the number moving.
+   */
+  useEffect(() => {
+    if (
+      !shouldOpenForNeedsYou({
+        needsYou,
+        isPaneOpen: isSettingsOpen || isWatching,
+        dismissedEpoch: dismissedEpoch.current,
+        runEpoch: runEpoch.current,
+      })
+    )
+      return;
+    void show("watch");
+  }, [needsYou, isSettingsOpen, isWatching, show]);
 
   return (
     <DetailPanel
@@ -169,7 +248,7 @@ function RouteComponent() {
       detail={
         agentId === undefined ? null : isWatching ? (
           // Manual watch remains active even when there is no current browser action.
-          <ComputerViewPanel agentId={agentId} name={channel?.data?.name} />
+          <ComputerViewPanel agentId={agentId} name={channel.data?.name} />
         ) : (
           <AgentProfile agentId={agentId} />
         )
@@ -251,11 +330,71 @@ function RouteComponent() {
       </div>
       <ChannelBody
         channel={channel.data}
+        error={channel.error}
         isPending={channel.isPending}
-        hasError={Boolean(channel.error)}
       />
     </DetailPanel>
   );
+}
+
+/** What the body of this screen has to say, once the detail query has been read. */
+export type ChannelBodyState =
+  | { kind: "loading" }
+  /** Nothing readable, and the reason, in place of the transcript. */
+  | { kind: "unavailable"; message: string }
+  | { kind: "unsupported" }
+  | {
+      kind: "chat";
+      channel: AgentChannel;
+      runtimeAgentId: string;
+      /** A failed refresh, said beside the transcript rather than instead of it. */
+      refreshProblem: string | undefined;
+    };
+
+/**
+ * THE BLOCKING STATE TURNS ON `channel`, NOT ON `error`.
+ *
+ * In React Query v5 a failed *refetch* keeps the previous `data` alongside the new `error`, and this
+ * screen refetches a lot: the client's defaults leave `staleTime` at 0 with `refetchOnMount` on, so
+ * returning to a channel refetches its detail, and `createChannelMutationOptions` invalidates
+ * `channelKeys.all`, which the open channel's detail query sits under. Consulting `error` for the
+ * blocking state swapped a live, readable transcript — and the composer's unsent draft with it, since
+ * `ChannelChat` unmounts — for one generic sentence, on nothing worse than a transient 500.
+ * `bot_.$botChatId.tsx` reasons the identical hazard through for its own conversation and reaches the
+ * same answer; the two screens are meant to agree, so change them together or not at all.
+ *
+ * A refetch that failed is still worth saying out loud, so it comes back as `refreshProblem` for the
+ * caller to draw next to the transcript. Nothing is unmounted for it.
+ *
+ * Both sentences carry `error.message` rather than a sentence of this screen's own. For an API
+ * refusal that is the server's own words: `client` throws the `error` field out of the response body,
+ * falling back to this query's `Could not load this channel` only when the server sent none. The
+ * literal below is reached only when there is no error to quote and no data either.
+ *
+ * Exported with `ChannelBodyState` for the test that pins the refetch case, which cannot be told
+ * from a first-load failure by looking at the rendered output alone.
+ */
+export function channelBodyState(input: {
+  channel: AgentChannel | undefined;
+  isPending: boolean;
+  error: Error | null;
+}): ChannelBodyState {
+  if (input.isPending) return { kind: "loading" };
+  if (!input.channel) {
+    return {
+      kind: "unavailable",
+      message: input.error?.message ?? "Could not load this channel.",
+    };
+  }
+  const runtimeAgentId =
+    input.channel.agentIds.length === 1 ? input.channel.agentIds[0] : undefined;
+  if (!runtimeAgentId) return { kind: "unsupported" };
+  return {
+    kind: "chat",
+    channel: input.channel,
+    runtimeAgentId,
+    refreshProblem: input.error?.message,
+  };
 }
 
 /**
@@ -265,25 +404,24 @@ function RouteComponent() {
 function ChannelBody({
   channel,
   isPending,
-  hasError,
+  error,
 }: {
   channel: AgentChannel | undefined;
   isPending: boolean;
-  hasError: boolean;
+  error: Error | null;
 }) {
+  const state = channelBodyState({ channel, isPending, error });
+
   // Nothing while the channel loads: a placeholder inside a local round-trip is a flicker.
-  if (isPending) return null;
-  if (hasError || !channel) {
+  if (state.kind === "loading") return null;
+  if (state.kind === "unavailable") {
     return (
       <p className="p-8 text-sm text-destructive" role="alert">
-        Could not load this channel.
+        {state.message}
       </p>
     );
   }
-
-  const runtimeAgentId =
-    channel.agentIds.length === 1 ? channel.agentIds[0] : undefined;
-  if (!runtimeAgentId) {
+  if (state.kind === "unsupported") {
     return (
       <p className="p-8 text-sm text-muted-foreground">
         This channel has more than one coworker, which is not supported yet.
@@ -291,12 +429,28 @@ function ChannelBody({
     );
   }
 
-  // Remount on channel changes so CopilotKit agent/thread state cannot leak between channels.
   return (
-    <ChannelChat
-      channel={channel}
-      key={channel.id}
-      runtimeAgentId={runtimeAgentId}
-    />
+    <>
+      {/*
+       * A plain sibling above the transcript, in the shape `bot_.$botChatId.tsx` uses for its own
+       * banners: the transcript below it is `flex-1`, so this takes the height of its sentence and
+       * the conversation keeps the rest. Nothing about the chat is torn down to show it.
+       */}
+      {state.refreshProblem ? (
+        <p
+          className="border-b bg-destructive/10 px-6 py-2 text-destructive text-sm"
+          data-testid="channel-refresh-problem"
+          role="alert"
+        >
+          {state.refreshProblem}
+        </p>
+      ) : null}
+      {/* Remount on channel changes so CopilotKit agent/thread state cannot leak between channels. */}
+      <ChannelChat
+        channel={state.channel}
+        key={state.channel.id}
+        runtimeAgentId={state.runtimeAgentId}
+      />
+    </>
   );
 }
