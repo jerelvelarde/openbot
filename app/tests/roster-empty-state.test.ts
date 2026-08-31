@@ -9,6 +9,7 @@ describe("emptyStateFor", () => {
         searching: false,
         total: 3,
         search: "",
+        loaded: true,
       }),
     ).toBeNull();
   });
@@ -19,6 +20,7 @@ describe("emptyStateFor", () => {
       searching: false,
       total: 0,
       search: "",
+      loaded: true,
     });
     expect(state?.title).toBe("No conversations yet");
   });
@@ -29,6 +31,7 @@ describe("emptyStateFor", () => {
       searching: true,
       total: 0,
       search: "  refnud  ",
+      loaded: true,
     });
     // Told "you don't have conversations yet" while holding a typo, a person reads their history as
     // gone. The search text is quoted so they can see what was actually looked for.
@@ -41,6 +44,7 @@ describe("emptyStateFor", () => {
       searching: false,
       total: 0,
       search: "",
+      loaded: true,
     });
     expect(state?.title).toBe("Nothing archived");
   });
@@ -51,12 +55,14 @@ describe("emptyStateFor", () => {
       searching: false,
       total: 0,
       search: "",
+      loaded: true,
     });
     const all = emptyStateFor({
       status: "all",
       searching: false,
       total: 0,
       search: "",
+      loaded: true,
     });
     expect(archived?.title).not.toBe(all?.title);
   });
@@ -67,8 +73,26 @@ describe("emptyStateFor", () => {
       searching: true,
       total: 0,
       search: "budget",
+      loaded: true,
     });
     // A search that matched nothing is a fact about the search, whichever list it ran against.
     expect(state?.description).toContain("budget");
+  });
+
+  test("says nothing while the roster hasn't answered yet, even though total reads 0", () => {
+    // `matchingItems(undefined, …)` returns `[]`, so a pending (or errored) roster arrives here as
+    // `total: 0` — indistinguishable from a genuinely empty one unless `loaded` says otherwise. This
+    // is the fifth nothing: "not known yet" is not "nothing", and rendering "No conversations yet"
+    // for it is precisely the regression this field exists to prevent — see the block comment above
+    // the `loaded` guard in `emptyStateFor` for the accidentally-safe code it replaced.
+    expect(
+      emptyStateFor({
+        status: "active",
+        searching: false,
+        total: 0,
+        search: "",
+        loaded: false,
+      }),
+    ).toBeNull();
   });
 });

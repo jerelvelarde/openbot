@@ -181,7 +181,18 @@ export function emptyStateFor(input: {
   searching: boolean;
   total: number;
   search: string;
+  /** Whether the roster has answered at all. `false` while pending, and while errored. */
+  loaded: boolean;
 }): { title: string; description: string } | null {
+  /*
+   * FIVE nothings, not four. "Not known yet" is not "nothing", and conflating them is the exact
+   * failure this docblock warns about below: while the query is pending `matchingItems` returns `[]`,
+   * so `total` is 0, and without this line a person's first paint tells them they have no
+   * conversations. The two inline blocks this replaced were accidentally safe — they tested
+   * `channels.data?.length === 0`, and `undefined === 0` is false — so collapsing them lost a guard
+   * nobody had written down.
+   */
+  if (!input.loaded) return null;
   if (input.total > 0) return null;
 
   if (input.searching) {
@@ -305,6 +316,16 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
     !searching &&
     status === "active" &&
     (channels.data?.length ?? 0) <= MAX_ANIMATED_ROWS;
+  // `channels.data` is undefined for both "pending" and "errored" (the infinite query's `select`
+  // flattens pages, so a genuinely empty roster is `[]`, not undefined) — see `emptyStateFor`'s
+  // `loaded` param for why that distinction has to reach it.
+  const empty = emptyStateFor({
+    status,
+    searching,
+    total: visibleItems.length,
+    search,
+    loaded: channels.data !== undefined,
+  });
 
   const handleSignOut = async () => {
     await signOut.mutateAsync();
@@ -362,26 +383,18 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
               <StatusFilter onChange={setStatus} value={status} />
             </SidebarMenuItem>
             <div className="w-full h-2" />
-            {(() => {
-              const empty = emptyStateFor({
-                status,
-                searching,
-                total: visibleItems.length,
-                search,
-              });
-              return empty ? (
-                <div className="py-4">
-                  <Empty className="border border-dashed min-h-[40dvh]">
-                    <EmptyHeader>
-                      <EmptyTitle>{empty.title}</EmptyTitle>
-                      <EmptyDescription className="text-pretty">
-                        {empty.description}
-                      </EmptyDescription>
-                    </EmptyHeader>
-                  </Empty>
-                </div>
-              ) : null;
-            })()}
+            {empty ? (
+              <div className="py-4">
+                <Empty className="border border-dashed min-h-[40dvh]">
+                  <EmptyHeader>
+                    <EmptyTitle>{empty.title}</EmptyTitle>
+                    <EmptyDescription className="text-pretty">
+                      {empty.description}
+                    </EmptyDescription>
+                  </EmptyHeader>
+                </Empty>
+              </div>
+            ) : null}
             <AnimatePresence initial={false}>
               {visibleItems.map((channel) => (
                 <Row
