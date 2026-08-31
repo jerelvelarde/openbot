@@ -50,6 +50,27 @@ export function linkFor(row: { kind: RosterKind; id: string }) {
 }
 
 /**
+ * Which conversation, if any, is the one on screen.
+ *
+ * The open conversation may be either kind — a channel or a bot chat — and each kind's id arrives
+ * under a different route param: `channelId` for one, `botChatId` for the other. This is the one
+ * place that knows that, so `Row`'s unread check (in `app-sidebar.tsx`) and `RosterRow`'s `isOpen`
+ * check below both resolve it here instead of each rolling its own — which is how they drifted
+ * apart before: `Row` once read only `params.channelId`, so on a bot chat route it always got
+ * `undefined`, which never equals a real id, so the conversation on screen lit its own unread dot
+ * the moment its Bot replied.
+ *
+ * When both params are somehow present, `channelId` wins — a precedence that is arbitrary, not
+ * meaningful, since no route ever matches both at once.
+ */
+export function openConversationId(params: {
+  channelId?: string;
+  botChatId?: string;
+}): string | undefined {
+  return params.channelId ?? params.botChatId;
+}
+
+/**
  * What the context menu offers, as a list of acts.
  *
  * The same three on both kinds. A menu whose Delete worked on channel rows and not on bot chat rows
@@ -118,7 +139,7 @@ export const RosterRow = memo(function RosterRow({
     strict: false,
     select: (params) => {
       const held = params as { channelId?: string; botChatId?: string };
-      return held.channelId === id || held.botChatId === id;
+      return openConversationId(held) === id;
     },
   });
 

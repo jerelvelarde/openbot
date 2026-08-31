@@ -1,5 +1,31 @@
 import { describe, expect, test } from "bun:test";
-import { linkFor, menuFor } from "../src/components/app-sidebar/roster-row";
+import {
+  linkFor,
+  menuFor,
+  openConversationId,
+} from "../src/components/app-sidebar/roster-row";
+
+describe("openConversationId", () => {
+  test("resolves a channel route from channelId alone", () => {
+    expect(openConversationId({ channelId: "channel_1" })).toBe("channel_1");
+  });
+
+  test("resolves a bot chat route from botChatId alone", () => {
+    expect(openConversationId({ botChatId: "botchat_1" })).toBe("botchat_1");
+  });
+
+  test("resolves to undefined when neither param is present", () => {
+    expect(openConversationId({})).toBeUndefined();
+  });
+
+  test("prefers channelId when both are present, an arbitrary but fixed choice", () => {
+    // No route ever matches both params at once, so this case cannot occur in the app — the
+    // precedence just has to be fixed, not meaningful, so the two callers agree on it.
+    expect(
+      openConversationId({ channelId: "channel_1", botChatId: "botchat_1" }),
+    ).toBe("channel_1");
+  });
+});
 
 describe("linkFor", () => {
   test("sends a channel row to the channel screen", () => {

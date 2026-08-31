@@ -56,7 +56,7 @@ import {
 } from "@/lib/roster/queries";
 import { Button } from "../ui/button";
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "../ui/empty";
-import { RosterRow } from "./roster-row";
+import { openConversationId, RosterRow } from "./roster-row";
 import { StatusFilter } from "./status-filter";
 
 const appLinkOptions = { to: "/" } satisfies LinkOptions;
@@ -231,16 +231,17 @@ function Row({
   // Whether this row is unread, as a boolean, for the same reason `RosterRow` computes `isOpen`
   // that way: navigating re-renders the rows whose answer changed, not the whole roster.
   //
-  // The open id comes from whichever route param matched — `channelId` for a channel route,
-  // `botChatId` for a bot chat route — mirroring `RosterRow`'s `isOpen` below. The two must stay
-  // in step: reading only `channelId` here once meant an open bot chat compared its own id against
-  // `undefined`, always true, so the row you were looking at lit its own unread dot the moment its
-  // Bot replied — the exact case `isUnread`'s docblock says never happens.
+  // The open id comes from `openConversationId`, resolved from whichever route param matched — the
+  // one function this and `RosterRow`'s `isOpen` (in roster-row.tsx) both call, so the two cannot
+  // resolve "which conversation is open" two different ways and drift apart. They used to: `Row`
+  // once read only `params.channelId`, so an open bot chat compared its own id against `undefined`,
+  // always true, so the row you were looking at lit its own unread dot the moment its Bot replied —
+  // the exact case `isUnread`'s docblock says never happens. See `openConversationId`'s docblock.
   const unread = useParams({
     strict: false,
     select: (params) => {
       const held = params as { channelId?: string; botChatId?: string };
-      return isUnread(channel, held.channelId ?? held.botChatId);
+      return isUnread(channel, openConversationId(held));
     },
   });
   return (
