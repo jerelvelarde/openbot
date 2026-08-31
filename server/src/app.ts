@@ -9,6 +9,7 @@ import {
   type AuditReader,
   type AuditStore,
   auditQueryFromUrl,
+  createAuditRecorder,
   recordAuditEvent,
 } from "./audit";
 import { createDevRequireUser } from "./auth/dev-actor";
@@ -32,9 +33,9 @@ import type { SandboxedStore } from "./components/sandboxed";
 import { createSandboxedRoutes } from "./components/sandboxed-routes";
 import type { ComponentStore } from "./components/store";
 import type { ComputerGateway } from "./computer/gateway";
+import type { PageFrameStore } from "./computer/page-frames";
 import type { PolicyStore } from "./computer/policy-store";
 import { createComputerRoutes } from "./computer/routes";
-import type { PageFrameStore } from "./computer/page-frames";
 import { configuredAuthProviders, type DeploymentConfig } from "./config";
 import type { CredentialAdminService, CredentialInput } from "./credentials";
 import { createIntelligenceClient } from "./intelligence-client";
@@ -64,13 +65,24 @@ async function recordPersonEvent(
   person: { id: string; email: string },
   payload: Record<string, unknown>,
 ) {
-  if (!auditStore) return;
-  await recordAuditEvent(auditStore, {
-    eventType,
-    targetType: "person",
-    targetId: person.id,
-    actorUserId: context.var.actor.id,
-    payload: { email: person.email, ...payload },
+  /*
+   * Through `createAuditRecorder`, so this write is tolerant like every other one.
+   *
+   * It used to call `recordAuditEvent` directly and unguarded, and every caller reaches it AFTER
+   * `peopleStore` has already committed — so a trail that was briefly unavailable reported failure
+   * for a role change that had already applied, on the three highest-consequence routes in this
+   * file. The administrator then retries an act that landed, and the screen and the response
+   * disagree about what is true. `createAuditRecorder`'s docblock argues that case at length; the
+   * point of sharing it is that the argument is applied rather than restated, so this delegates
+   * instead of repeating the try/catch.
+   */
+  await createAuditRecorder(auditStore, {
+    type: "person",
+    logType: "person-audit-write-failed",
+    logIdKey: "personId",
+  })(context.var.actor.id, eventType, person.id, {
+    email: person.email,
+    ...payload,
   });
 }
 
@@ -521,15 +533,15 @@ export function createApp(
         return context.json({ error: "There is no such provider." }, 404);
       }
 
-      if (auditStore) {
-        await recordAuditEvent(auditStore, {
-          eventType: "identity_provider.removed",
-          targetType: "identity_provider",
-          targetId: providerId,
-          actorUserId: context.var.actor.id,
-          payload: { removedBy: context.var.actor.email },
-        });
-      }
+      // Tolerant, and for the reason `recordPersonEvent` gives above: the provider is already gone
+      // by the time this runs, so a trail hiccup must not report a removal that happened as failed.
+      await createAuditRecorder(auditStore, {
+        type: "identity_provider",
+        logType: "identity-provider-audit-write-failed",
+        logIdKey: "providerId",
+      })(context.var.actor.id, "identity_provider.removed", providerId, {
+        removedBy: context.var.actor.email,
+      });
 
       return context.json({ removed: true });
     },
@@ -632,8 +644,17 @@ export function createApp(
     }
     return context.json({ package: await packageStatusReader.active() });
   });
-  // The CopilotKit runtime, behind the same session guard as every other API route. Mounted last so
-  // its own routing under /api/copilotkit cannot shadow an OpenBot route declared above.
+  /*
+   * The CopilotKit runtime, behind the same session guard as every other API route.
+   *
+   * This used to say it was "mounted last so its own routing cannot shadow an OpenBot route
+   * declared above". It is not mounted last — `/api/agents`, `/api/route`, `/api/channels`,
+   * `/api/bot-chats`, `/api/roster`, `/api/components`, `/api/plugins`, `/api/agent-tools/call`,
+   * `/api/sandboxed` and `/api/threads` all follow. Nothing is shadowed, because the handler
+   * carries its own `/api/copilotkit` basePath and matches nothing outside it, which is the real
+   * reason order does not matter here — and the reason worth writing down, since the ordering the
+   * old sentence relied on had already stopped being true.
+   */
   if (copilotHandler) {
     // Mounted at the ROOT with the handler carrying its own basePath. Mounting it at
     // "/api/copilotkit" as well double-prefixes it: Hono strips the prefix before the handler sees
@@ -807,8 +828,15 @@ export function createApp(
    * same two questions it asks of everything else and writes the same audit row.
    *
    * Authenticated by a shared secret rather than a session, because the caller is a service and has
-   * no person behind it. Absent secret means the route does not exist: a deployment that has not
-   * configured this refuses rather than accepting anybody who can reach the port.
+   * no person behind it.
+   *
+   * The mount is gated on `pluginStore`, NOT on the secret — an earlier version of this comment
+   * claimed an absent secret meant the route did not exist, which was never true of the code. What
+   * is true is that it is fail-closed either way: `authoriseAgentCall` answers 401 for an empty
+   * presented credential, and the `legacyToken && sameToken(...)` test short-circuits on the empty
+   * string, so an unconfigured deployment refuses every call rather than accepting any. The route
+   * answers 401 rather than 404, which is a different thing from not existing and is what a caller
+   * actually sees.
    */
   if (pluginStore) {
     const legacyToken = config.agentToolToken ?? "";
