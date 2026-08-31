@@ -1,5 +1,5 @@
 import type { InfiniteData, QueryClient } from "@tanstack/react-query";
-import { rosterKeys, type RosterPage } from "./queries";
+import { ROSTER_STATUSES, type RosterPage, rosterKeys } from "./queries";
 
 /**
  * Stamp one row's `lastReadAt` in every cached roster status list, patching the cache before the
@@ -13,7 +13,7 @@ import { rosterKeys, type RosterPage } from "./queries";
  */
 export function patchRosterRead(queryClient: QueryClient, id: string) {
   const now = new Date().toISOString();
-  for (const status of ["active", "archived", "all"] as const) {
+  for (const status of ROSTER_STATUSES) {
     queryClient.setQueryData(
       rosterKeys.list(status),
       (data: InfiniteData<RosterPage> | undefined) =>

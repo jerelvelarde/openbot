@@ -12,8 +12,19 @@ import { client } from "@/lib/client";
  */
 export type RosterKind = "channel" | "bot_chat";
 
+/**
+ * Every status there is, written down once.
+ *
+ * `RosterStatus` is derived from this tuple rather than declared beside it, so the array is the only
+ * place the list exists: a status added here widens the type, and every loop that walks all the lists
+ * — the socket patcher in `channels/use-channel-events.ts`, the read marker in `roster/read-marker.ts`
+ * — covers it without being edited. Those two used to spell the list out for themselves, which meant a
+ * fourth status would have type-checked cleanly while both loops silently skipped it.
+ */
+export const ROSTER_STATUSES = ["active", "archived", "all"] as const;
+
 /** Which conversations a list holds. `all` is active plus archived, and never deleted. */
-export type RosterStatus = "active" | "archived" | "all";
+export type RosterStatus = (typeof ROSTER_STATUSES)[number];
 
 export type RosterItem = {
   kind: RosterKind;
