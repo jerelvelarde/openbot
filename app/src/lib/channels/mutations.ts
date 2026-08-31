@@ -4,7 +4,7 @@ import {
   type QueryClient,
 } from "@tanstack/react-query";
 import { client, tryClient } from "@/lib/client";
-import { rosterKeys } from "@/lib/roster/queries";
+import { rosterKeys, type RosterPage } from "@/lib/roster/queries";
 import { type AgentChannel, type ChannelPage, channelKeys } from "./queries";
 
 /**
@@ -22,8 +22,12 @@ export function createChannelMutationOptions(queryClient: QueryClient) {
       });
       return ((await response.json()) as { channel: AgentChannel }).channel;
     },
-    onSuccess: () =>
-      queryClient.invalidateQueries({ queryKey: channelKeys.all }),
+    // Both keys: channelKeys backs the channels list this factory used to be the only reader of,
+    // and rosterKeys.all backs the sidebar now, which channelQueryOptions no longer reaches.
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: channelKeys.all });
+      void queryClient.invalidateQueries({ queryKey: rosterKeys.all });
+    },
   });
 }
 
@@ -66,8 +70,12 @@ export function setChannelPinnedMutationOptions(queryClient: QueryClient) {
         fallback: "Could not pin this channel",
       });
     },
-    onSuccess: () =>
-      queryClient.invalidateQueries({ queryKey: channelKeys.all }),
+    // Both keys: channelKeys still backs the open channel screen via channelQueryOptions, and
+    // rosterKeys.all backs the sidebar, which no longer reads channelKeys at all.
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: channelKeys.all });
+      void queryClient.invalidateQueries({ queryKey: rosterKeys.all });
+    },
   });
 }
 
@@ -78,6 +86,10 @@ export function setChannelPinnedMutationOptions(queryClient: QueryClient) {
  * opens, not a round-trip later. No rollback on failure and no invalidation — a mark-read that did
  * not land is a dot that returns on the next refetch, which is the truth reasserting itself, and a
  * refetch here would race the socket's own patches for nothing.
+ *
+ * Patches channelKeys.list() (the open channel screen still reads it) and all three roster status
+ * lists (the sidebar reads those instead now): unlike a bot chat, which only ever had the roster,
+ * a channel's row lives in both caches until the sidebar's old channel-list reader is gone for good.
  */
 export function markChannelReadMutationOptions(queryClient: QueryClient) {
   return mutationOptions({
@@ -115,6 +127,34 @@ export function markChannelReadMutationOptions(queryClient: QueryClient) {
             })),
           },
       );
+      for (const status of ["active", "archived", "all"] as const) {
+        queryClient.setQueryData(
+          rosterKeys.list(status),
+          (data: InfiniteData<RosterPage> | undefined) =>
+            data && {
+              ...data,
+              pages: data.pages.map((page) => ({
+                ...page,
+                items: page.items.map((row) =>
+                  row.id === channelId
+                    ? {
+                        ...row,
+                        /*
+                         * The later of now and the row's own lastMessageAt: lastMessageAt comes from
+                         * another clock, and a marker stamped "now" by a clock running behind it
+                         * would leave the row still reading as unseen — and the dot still lit.
+                         */
+                        lastReadAt:
+                          row.lastMessageAt && row.lastMessageAt > now
+                            ? row.lastMessageAt
+                            : now,
+                      }
+                    : row,
+                ),
+              })),
+            },
+        );
+      }
     },
   });
 }
@@ -128,11 +168,15 @@ export function deleteChannelMutationOptions(queryClient: QueryClient) {
         fallback: "Could not delete this channel",
       });
     },
-    // The roster only. The open channel's detail query would refetch into the fresh 404 and
-    // flash an error before the navigate-home lands; left alone, it keeps its cache and the
-    // navigation happens with nothing to complain about.
-    onSuccess: () =>
-      queryClient.invalidateQueries({ queryKey: channelKeys.list() }),
+    // The lists only, not the detail query: the open channel's detail query would refetch into
+    // the fresh 404 and flash an error before the navigate-home lands; left alone, it keeps its
+    // cache and the navigation happens with nothing to complain about. Both list keys, though —
+    // channelKeys.list() still backs the open channel screen, and rosterKeys.all backs the
+    // sidebar, which no longer reads channelKeys at all.
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: channelKeys.list() });
+      void queryClient.invalidateQueries({ queryKey: rosterKeys.all });
+    },
   });
 }
 

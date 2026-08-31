@@ -54,7 +54,10 @@ test("pinning PUTs the flag to the channel's pin route and invalidates the roste
   expect(seen[0]?.url).toBe("/api/channels/channel-1/pin");
   expect(seen[0]?.init?.method).toBe("PUT");
   expect(JSON.parse(String(seen[0]?.init?.body))).toEqual({ pinned: true });
-  expect(invalidated).toEqual([{ queryKey: ["channels"] }]);
+  expect(invalidated).toEqual([
+    { queryKey: ["channels"] },
+    { queryKey: ["roster"] },
+  ]);
 });
 
 test("deleting sends DELETE to the channel route and invalidates the roster", async () => {
@@ -73,7 +76,10 @@ test("deleting sends DELETE to the channel route and invalidates the roster", as
   expect(seen).toHaveLength(1);
   expect(seen[0]?.url).toBe("/api/channels/channel-1");
   expect(seen[0]?.init?.method).toBe("DELETE");
-  expect(invalidated).toEqual([{ queryKey: ["channels", "list"] }]);
+  expect(invalidated).toEqual([
+    { queryKey: ["channels", "list"] },
+    { queryKey: ["roster"] },
+  ]);
 });
 
 test("a refused delete surfaces the server's sentence", async () => {
