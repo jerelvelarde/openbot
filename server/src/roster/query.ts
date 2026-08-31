@@ -103,6 +103,46 @@ const STATUSES = new Set<RosterStatus>(["active", "archived", "all"]);
  * Case-sensitive, so the accepted set is exactly the three documented values and `ACTIVE` is a typo
  * rather than a second spelling anybody has to keep working.
  */
+/**
+ * `?limit=`, refused rather than reinterpreted.
+ *
+ * `Number.parseInt` stops at the first character it cannot read and keeps what came before, so
+ * `?limit=1e3` meant one row and `?limit=50abc` meant fifty — and the `NaN` fallback written to catch
+ * a malformed value never fired for either, because a prefix parse is not `NaN`. A caller cannot see
+ * through a page of one row answered 200 to a request for a thousand, so the only two outcomes are
+ * the number asked for and a 400.
+ *
+ * `0*[1-9]\d*` and not `\d+`, so a leading zero is fine and a value of zero is not: nought rows is a
+ * request neither endpoint can honour — both stores clamp it up to one — and answering it with a row
+ * is the same silent reinterpretation as the rest.
+ *
+ * ONE HOME, for the reason `parseRosterStatus` below has one: `GET /api/roster` and
+ * `GET /api/channels` answer about the same rows, so a `?limit=` one honours and the other rewrites
+ * is a single paging contract with two behaviours. Both endpoints grew this rule independently
+ * within an hour of each other, each correct, each a second spelling — which is exactly how the
+ * pair drifts.
+ *
+ * An absent or empty value reads as absent, the way an empty `?cursor=` does: a parameter that says
+ * nothing is not a parameter. `undefined` rather than a default, so omitting the key is what makes
+ * each store's own page size fire.
+ */
+const PAGE_LIMIT = /^0*[1-9]\d*$/;
+
+export function parsePageLimit(
+  raw: string | null,
+): { ok: true; limit: number | undefined } | { ok: false; error: string } {
+  const value = raw ?? "";
+  if (value === "") return { ok: true, limit: undefined };
+  if (!PAGE_LIMIT.test(value)) {
+    return { ok: false, error: "Limit must be a whole number of at least 1." };
+  }
+  // `Number`, not `Number.parseInt`: a value the test above somehow let through arrives as `NaN`
+  // rather than as a prefix of itself, and neither `Math.max` nor `Math.min` turns a `NaN` back into
+  // a number, so a store's clamp could not resolve one. More digits than a `double` carries reads as
+  // `Infinity`, which the clamp does resolve, to the same page a merely large number gets.
+  return { ok: true, limit: Number(value) };
+}
+
 export function parseRosterStatus(
   value: string | null | undefined,
 ): RosterStatus {

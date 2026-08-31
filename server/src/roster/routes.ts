@@ -14,21 +14,12 @@
 import type { Context, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import type { AppVariables } from "../auth/guards";
-import { parseRosterStatus, type RosterItem, type RosterStore } from "./query";
-
-/**
- * `?limit=` as this route reads it: a whole number of at least one, written in decimal digits.
- *
- * A shape check rather than a parse, because the parse was the bug. `Number.parseInt` stops at the
- * first character it cannot read and keeps what came before, so `?limit=1e3` was 1, `?limit=0x10` was
- * 0, and `?limit=50abc` was 50 — a caller asking for a thousand rows got one row and a 200, and the
- * `NaN` fallback that was supposed to catch a malformed value never fired for any of them.
- *
- * `0*[1-9]\d*` and not `\d+`, so a leading zero is fine and a value of zero is not: nought rows is a
- * request this endpoint cannot honour — the store clamps it up to one — and answering it with a row
- * is the same silent reinterpretation as the rest of them.
- */
-const LIMIT_PARAM = /^0*[1-9]\d*$/;
+import {
+  parsePageLimit,
+  parseRosterStatus,
+  type RosterItem,
+  type RosterStore,
+} from "./query";
 
 export function createRosterRoutes(
   store: RosterStore,
@@ -39,17 +30,9 @@ export function createRosterRoutes(
   routes.get("/", requireUser, async (context) => {
     try {
       const url = new URL(context.req.url);
-      const limit = url.searchParams.get("limit") ?? "";
-      // Refused, not reinterpreted. A caller cannot see through a page of one row answered 200 to a
-      // request for a thousand, so the only two outcomes for `?limit=` are the number it says and a
-      // 400. Empty reads as absent, the way an empty `cursor` does below: a parameter that says
-      // nothing is not a parameter.
-      if (limit !== "" && !LIMIT_PARAM.test(limit)) {
-        return context.json(
-          { error: "Limit must be a whole number of at least 1." },
-          400,
-        );
-      }
+      // Refused, not reinterpreted; `parsePageLimit` carries the reasoning and the rule.
+      const limit = parsePageLimit(url.searchParams.get("limit"));
+      if (!limit.ok) return context.json({ error: limit.error }, 400);
       const page = await store.list(context.var.actor, {
         status: parseRosterStatus(url.searchParams.get("status")),
         ...(url.searchParams.get("cursor")
@@ -59,9 +42,8 @@ export function createRosterRoutes(
         // it from being handed a `NaN` to clamp instead, which the clamp cannot resolve — neither
         // `Math.max` nor `Math.min` ever turns a `NaN` back into a number, so a page of `NaN` rows
         // would have been asked for silently. A number too large to hold is not that problem: more
-        // digits than a `double` carries reads as `Infinity`, which the store's
-        // `Math.min(..., MAX_ROSTER_PAGE)` resolves to the same page a merely large number gets.
-        ...(limit === "" ? {} : { limit: Number(limit) }),
+        // Omitting the key is what makes the store's own page size fire.
+        ...(limit.limit === undefined ? {} : { limit: limit.limit }),
       });
 
       return context.json({

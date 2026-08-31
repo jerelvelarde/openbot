@@ -45,6 +45,7 @@ import {
 } from "../roster/preview";
 import {
   archiveFilter,
+  parsePageLimit,
   parseRosterStatus,
   type RosterStatus,
 } from "../roster/query";
@@ -1287,19 +1288,6 @@ export function parseActivityInput(input: unknown): ActivityInputParseResult {
   };
 }
 
-/**
- * `?limit=` as this route reads it: a whole number of at least one, written in decimal digits.
- *
- * The same rule and the same spelling as `roster/routes.ts`, deliberately. A shape check rather than
- * a parse, because the parse was the bug: `Number.parseInt` keeps whatever it could read before the
- * first character it could not, so a caller asking for `1e3` rows got one row and a 200.
- *
- * `0*[1-9]\d*` and not `\d+`, so a leading zero is fine and a value of zero is not: nought rows is a
- * request this endpoint cannot honour — `list` clamps it up to one — and answering it with a row is
- * the same silent reinterpretation as the rest of them.
- */
-const LIMIT_PARAM = /^0*[1-9]\d*$/;
-
 export function createChannelRoutes(
   store: ChannelStore,
   requireUser: MiddlewareHandler<{ Variables: AppVariables }>,
@@ -1361,19 +1349,11 @@ export function createChannelRoutes(
   routes.get("/", requireUser, async (context) => {
     try {
       const url = new URL(context.req.url);
-      const limit = url.searchParams.get("limit") ?? "";
-      // Refused, not reinterpreted, and refused by the same rule `GET /api/roster` refuses by: these
-      // two endpoints answer about the same rows, so a `?limit=` one of them honours and the other
-      // silently rewrites is one paging contract with two behaviours. `Number.parseInt` was the bug —
-      // it stops at the first character it cannot read and keeps what came before, so `?limit=1e3`
-      // was 1 and `?limit=50abc` was 50, and the `NaN` fallback meant to catch a malformed value
-      // never fired for either. Empty reads as absent, the way an empty `cursor` does below.
-      if (limit !== "" && !LIMIT_PARAM.test(limit)) {
-        return context.json(
-          { error: "Limit must be a whole number of at least 1." },
-          400,
-        );
-      }
+      // Refused by the same rule `GET /api/roster` refuses by, from the same function: these two
+      // endpoints answer about the same rows, so one paging contract with two behaviours is the
+      // failure to avoid. `parsePageLimit` carries the reasoning.
+      const limit = parsePageLimit(url.searchParams.get("limit"));
+      if (!limit.ok) return context.json({ error: limit.error }, 400);
       const page = await store.list(context.var.actor, {
         // Parsed by the roster's own function, so this endpoint and `GET /api/roster` cannot come to
         // read `?status=` differently. Anything unrecognised reads as `active`.
@@ -1382,10 +1362,8 @@ export function createChannelRoutes(
           ? { cursor: url.searchParams.get("cursor") as string }
           : {}),
         // Omitting the key is what makes `list`'s own default fire. `Number` rather than
-        // `Number.parseInt`, so a value the check above somehow let through would arrive as `NaN`
-        // rather than as a prefix of itself — and `Math.max`/`Math.min` never turn a `NaN` back into
-        // a number, so the store's clamp cannot resolve one either.
-        ...(limit === "" ? {} : { limit: Number(limit) }),
+        // Omitting the key is what makes `list`'s own page size fire.
+        ...(limit.limit === undefined ? {} : { limit: limit.limit }),
       });
 
       return context.json({
