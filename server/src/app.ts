@@ -43,6 +43,7 @@ import { createPluginRoutes } from "./plugins/routes";
 import type { PluginStore } from "./plugins/store";
 import { REFUSAL_MARKER } from "./plugins/tools";
 import type { RosterStore } from "./roster/query";
+import { parsePageLimit } from "./roster/query";
 import { createRosterRoutes } from "./roster/routes";
 import type { IntentRouter } from "./routing/classify";
 import { createRoutingRoutes } from "./routing/routes";
@@ -334,7 +335,11 @@ export function createApp(
      * should not have to walk pages to reach them.
      */
     const url = new URL(context.req.url);
-    const limit = Number.parseInt(url.searchParams.get("limit") ?? "", 10);
+    // Refused by the house rule rather than prefix-parsed; see `parsePageLimit`. This reader kept
+    // the old behaviour after the two roster reads moved, which is the second spelling the move was
+    // meant to end.
+    const limit = parsePageLimit(url.searchParams.get("limit"));
+    if (!limit.ok) return context.json({ error: limit.error }, 400);
 
     return context.json(
       await peopleStore.list({
@@ -344,7 +349,7 @@ export function createApp(
         ...(url.searchParams.get("cursor")
           ? { cursor: url.searchParams.get("cursor") as string }
           : {}),
-        ...(Number.isFinite(limit) ? { limit } : {}),
+        ...(limit.limit === undefined ? {} : { limit: limit.limit }),
       }),
     );
   });

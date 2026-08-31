@@ -38,11 +38,8 @@ export function createRosterRoutes(
         ...(url.searchParams.get("cursor")
           ? { cursor: url.searchParams.get("cursor") as string }
           : {}),
-        // Omitting the key is what makes the store's own default fire; the check above is what keeps
-        // it from being handed a `NaN` to clamp instead, which the clamp cannot resolve — neither
-        // `Math.max` nor `Math.min` ever turns a `NaN` back into a number, so a page of `NaN` rows
-        // would have been asked for silently. A number too large to hold is not that problem: more
-        // Omitting the key is what makes the store's own page size fire.
+        // Omitting the key is what makes the store's own page size fire. Why a rejected value never
+        // reaches this line, and why `NaN` would be unrecoverable if one did, is at `parsePageLimit`.
         ...(limit.limit === undefined ? {} : { limit: limit.limit }),
       });
 

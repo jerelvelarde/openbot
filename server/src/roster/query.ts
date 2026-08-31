@@ -93,24 +93,23 @@ export type RosterStore = {
 
 const STATUSES = new Set<RosterStatus>(["active", "archived", "all"]);
 
-/**
- * Anything unrecognised reads as `"active"`.
- *
- * The same call `decodeRosterCursor` makes for a malformed cursor: the honest answer to a stale link
- * is the first page rather than a 400 a person cannot act on. A stale bookmark carrying a status this
- * deployment no longer has should show somebody their conversations, not an error.
- *
- * Case-sensitive, so the accepted set is exactly the three documented values and `ACTIVE` is a typo
- * rather than a second spelling anybody has to keep working.
- */
+/** The shape `parsePageLimit` accepts; its docblock carries the reasoning. */
+const PAGE_LIMIT = /^0*[1-9]\d*$/;
+
 /**
  * `?limit=`, refused rather than reinterpreted.
  *
  * `Number.parseInt` stops at the first character it cannot read and keeps what came before, so
  * `?limit=1e3` meant one row and `?limit=50abc` meant fifty — and the `NaN` fallback written to catch
  * a malformed value never fired for either, because a prefix parse is not `NaN`. A caller cannot see
- * through a page of one row answered 200 to a request for a thousand, so the only two outcomes are
- * the number asked for and a 400.
+ * through a page of one row answered 200 to a request for a thousand, so a value this cannot read is
+ * a 400 rather than a smaller number.
+ *
+ * A value it CAN read is still capped by whoever it is handed to — `MAX_ROSTER_PAGE` for the two
+ * roster reads, a hundred for the trail — so `?limit=1000` is answered with a full page and a
+ * cursor, not with a refusal. That is a ceiling rather than a reinterpretation: the caller gets rows
+ * it asked for and a cursor saying there are more, which is a different thing from being told one
+ * row is a thousand.
  *
  * `0*[1-9]\d*` and not `\d+`, so a leading zero is fine and a value of zero is not: nought rows is a
  * request neither endpoint can honour — both stores clamp it up to one — and answering it with a row
@@ -122,12 +121,14 @@ const STATUSES = new Set<RosterStatus>(["active", "archived", "all"]);
  * within an hour of each other, each correct, each a second spelling — which is exactly how the
  * pair drifts.
  *
+ * Every paged read in the server calls this: the two roster reads, the audit trail, and the people
+ * list. The first version of this paragraph claimed that while two of the four still prefix-parsed,
+ * which is the same defect as the one it describes, one level up.
+ *
  * An absent or empty value reads as absent, the way an empty `?cursor=` does: a parameter that says
  * nothing is not a parameter. `undefined` rather than a default, so omitting the key is what makes
  * each store's own page size fire.
  */
-const PAGE_LIMIT = /^0*[1-9]\d*$/;
-
 export function parsePageLimit(
   raw: string | null,
 ): { ok: true; limit: number | undefined } | { ok: false; error: string } {
@@ -143,6 +144,16 @@ export function parsePageLimit(
   return { ok: true, limit: Number(value) };
 }
 
+/**
+ * Anything unrecognised reads as `"active"`.
+ *
+ * The same call `decodeRosterCursor` makes for a malformed cursor: the honest answer to a stale link
+ * is the first page rather than a 400 a person cannot act on. A stale bookmark carrying a status this
+ * deployment no longer has should show somebody their conversations, not an error.
+ *
+ * Case-sensitive, so the accepted set is exactly the three documented values and `ACTIVE` is a typo
+ * rather than a second spelling anybody has to keep working.
+ */
 export function parseRosterStatus(
   value: string | null | undefined,
 ): RosterStatus {

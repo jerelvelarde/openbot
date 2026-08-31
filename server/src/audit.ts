@@ -3,6 +3,7 @@ import { HTTPException } from "hono/http-exception";
 import type { Database } from "./db/client";
 import { auditEvents } from "./db/schema";
 import { recencyCursorText } from "./roster/order";
+import { parsePageLimit } from "./roster/query";
 
 const sensitiveKeys = new Set([
   "access_token",
@@ -800,13 +801,12 @@ export function createAuditReader(database: Database): AuditReader {
  * being asked a question wrong answer in the one shape.
  */
 export function auditQueryFromUrl(url: URL): AuditEventQuery {
-  const requestedLimit = Number.parseInt(
-    url.searchParams.get("limit") ?? "50",
-    10,
-  );
-  const limit = Number.isFinite(requestedLimit)
-    ? Math.min(Math.max(requestedLimit, 1), 100)
-    : 50;
+  // The same rule the two roster reads refuse by. This surface had the prefix parse longest and is
+  // the one it mattered on most: `?limit=1e3` answered one row with a 200 on the trail whose whole
+  // argument for existing is that it gets used to rule things out.
+  const requested = parsePageLimit(url.searchParams.get("limit"));
+  if (!requested.ok) refuseAuditQuery(requested.error);
+  const limit = Math.min(Math.max(requested.limit ?? 50, 1), 100);
   const optional = (name: string) => url.searchParams.get(name) ?? undefined;
   /*
    * Anything `Date` can read, which is deliberately more than one format: a bound typed by hand is

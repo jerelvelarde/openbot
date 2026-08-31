@@ -1361,8 +1361,7 @@ export function createChannelRoutes(
         ...(url.searchParams.get("cursor")
           ? { cursor: url.searchParams.get("cursor") as string }
           : {}),
-        // Omitting the key is what makes `list`'s own default fire. `Number` rather than
-        // Omitting the key is what makes `list`'s own page size fire.
+        // Omitting the key is what makes `list`'s own page size fire; see `parsePageLimit`.
         ...(limit.limit === undefined ? {} : { limit: limit.limit }),
       });
 
