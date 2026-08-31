@@ -87,6 +87,16 @@ restoring it can reinstate entries for migrations that were renamed. `drizzle-ki
 "Everything's fine" in that state, because it compares schemas rather than checking that the journal
 and the directory agree. Compare `meta/_journal.json` against `ls server/drizzle/*.sql`.
 
+**If `drizzle-kit check` reports that two snapshots point to the same parent**, a series of
+migrations was renumbered without its snapshots being re-parented. Merging a branch that had grown
+its own 0020 onto a trunk that had grown a different one does this: renaming the incoming files to
+0024 and upwards settles the filenames, but each snapshot carries a `prevId` naming its parent by
+id, and the first of the renumbered ones still names whatever it branched from. Renumbering is only
+half the merge. The other half is that each renumbered snapshot has to be the cumulative schema at
+its point in the new order, so anything the trunk's migrations created between the fork and the
+merge has to be copied forward into all of them — otherwise the head snapshot is missing tables the
+database has, and the next `generate` writes a migration creating them a second time.
+
 ## Quality checks
 
 Run these before opening a pull request:
