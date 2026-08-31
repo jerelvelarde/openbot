@@ -25,6 +25,15 @@ function serverAnswering(status: number, body: unknown) {
     })) as unknown as typeof fetch;
 }
 
+/** A server answering with a status and a body the client cannot read, as a real one does. */
+function serverAnsweringUnreadably(status: number, body: string) {
+  globalThis.fetch = (async () =>
+    new Response(body, {
+      status,
+      headers: { "content-type": "text/plain" },
+    })) as unknown as typeof fetch;
+}
+
 describe("a computer call the server refused", () => {
   test("a person holding the wheel is reported as that, not as stale refs", async () => {
     serverAnswering(409, {
@@ -64,5 +73,75 @@ describe("a computer call the server refused", () => {
     expect(outcome.refused).toBe(true);
     expect(outcome.staleRefs).toBeUndefined();
     expect(outcome.humanHasControl).toBeUndefined();
+  });
+});
+
+describe("a computer call with no readable reason", () => {
+  /*
+   * The case that put a fabricated sentence in front of a person.
+   *
+   * While this deployment was crash-looping, every computer call came back with a status and a body
+   * that was not JSON. `body.error` was absent, the model was handed "That did not work.", and
+   * having no way to say the computer was unreachable it invented one: that no browser was
+   * available to it. These pin the three sentences that replace that.
+   */
+
+  test("no computer on the deployment says so, and tells the Bot not to guess", async () => {
+    // The routes are not mounted, so Hono answers 404 with plain text.
+    serverAnsweringUnreadably(404, "404 Not Found");
+
+    const outcome = await callComputer("bot-1", "/navigate", {
+      method: "POST",
+    });
+
+    expect(outcome.ok).toBe(false);
+    expect(String(outcome.reason)).toContain("no computer");
+    expect(String(outcome.reason)).toContain("rather than guessing");
+    // Not a refusal and not stale: nothing was decided and no snapshot moved.
+    expect(outcome.refused).toBeUndefined();
+    expect(outcome.staleRefs).toBeUndefined();
+  });
+
+  test("an unreachable computer is named as this deployment's fault", async () => {
+    for (const status of [502, 503, 504]) {
+      serverAnsweringUnreadably(
+        status,
+        "<html>Application failed to respond</html>",
+      );
+
+      const outcome = await callComputer("bot-1", "/navigate", {
+        method: "POST",
+      });
+
+      expect(outcome.ok).toBe(false);
+      expect(String(outcome.reason)).toContain("cannot be reached");
+      // The instruction that stops the invented explanation.
+      expect(String(outcome.reason)).toContain(
+        "do not offer a reason of your own",
+      );
+    }
+  });
+
+  test("anything else admits there is no reason available", async () => {
+    serverAnsweringUnreadably(500, "Internal Server Error");
+
+    const outcome = await callComputer("bot-1", "/navigate", {
+      method: "POST",
+    });
+
+    expect(String(outcome.reason)).toContain("gave no reason");
+    // No status code in the sentence: it is not something to repeat to a person.
+    expect(String(outcome.reason)).not.toContain("500");
+  });
+
+  test("a reason the server did give is still preferred over any of these", async () => {
+    // The status-based sentences are a fallback, never an override.
+    serverAnswering(404, { error: "That Bot has no computer." });
+
+    const outcome = await callComputer("bot-1", "/navigate", {
+      method: "POST",
+    });
+
+    expect(outcome.reason).toBe("That Bot has no computer.");
   });
 });

@@ -64,6 +64,42 @@ async function waitForPerson(
  * drawn nowhere else, so they are worth pinning without standing up the tool registrations and the
  * runtime around them.
  */
+/**
+ * What to tell the model when the server said nothing it could read.
+ *
+ * WHY THIS IS NOT "That did not work." A person once asked a Bot to open a page while this
+ * deployment was crash-looping. Every computer call answered with a status and a body that was not
+ * JSON, so `body.error` was absent and the model was handed four words. It could not say the
+ * computer was unreachable, because nothing had told it so, and it did what a model does with a
+ * failure it cannot explain: it invented an explanation — that no browser was available to it — and
+ * said that to the person instead.
+ *
+ * The status is the only thing left when the body is unreadable, and it is enough to separate the
+ * three cases that call for different sentences: this deployment has no computer at all, it has one
+ * and cannot be reached right now, or something else went wrong. A model given any of those can say
+ * something true. It is not given the number, because a status code is not a sentence anybody wants
+ * repeated to them.
+ */
+function reasonForStatus(status: number): string {
+  if (status === 404) {
+    return (
+      "This deployment has no computer, so there is nothing to browse with. Say that plainly " +
+      "rather than guessing why, and carry on with what you can do without one."
+    );
+  }
+  if (status === 502 || status === 503 || status === 504) {
+    return (
+      "Your computer cannot be reached right now. This is a fault on this deployment, not " +
+      "something you did and not something you can route around. Say so plainly, and do not " +
+      "offer a reason of your own for it."
+    );
+  }
+  return (
+    "That did not work, and the server gave no reason for it. Say that you could not do it " +
+    "rather than explaining why, because nothing here tells you why."
+  );
+}
+
 export async function callComputer(
   botId: string,
   path: string,
@@ -103,7 +139,7 @@ export async function callComputer(
   if (!response.ok) {
     return {
       ok: false,
-      reason: (body?.error as string) ?? "That did not work.",
+      reason: (body?.error as string) ?? reasonForStatus(response.status),
       // Preserve refusal/stale-ref/control distinctions for the model's next step.
       ...(response.status === 403
         ? { refused: true, rule: body?.rule ?? null }
