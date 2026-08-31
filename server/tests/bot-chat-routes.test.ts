@@ -2,9 +2,8 @@ import { describe, expect, test } from "bun:test";
 import type { MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import { AgentNotFoundError } from "../src/agents/profile-store";
-import type { AgentActor } from "../src/agents/profile-types";
 import type { AuditEventInput, AuditStore } from "../src/audit";
-import type { AppVariables } from "../src/auth/guards";
+import type { AppVariables, AuthenticatedActor } from "../src/auth/guards";
 import { createBotChatRoutes, parseAdoptInput } from "../src/bot-chats/routes";
 import {
   type BotChat,
@@ -13,7 +12,17 @@ import {
   BotChatThreadTakenError,
 } from "../src/bot-chats/store";
 
-const actor: AgentActor = {
+/**
+ * `AuthenticatedActor`, because that is what this goes into.
+ *
+ * It is stored as the Hono context's `actor`, whose type is `AppVariables["actor"]`, and it carries
+ * an `email` — which `AgentActor` does not have a field for. Annotated `AgentActor` it was two things
+ * at once: an object the annotation forbids the `email` of, and a value the middleware below assigns
+ * where a wider type is required. `server/tsconfig.json` excludes `tests`, so nothing said so. The
+ * store methods take `AgentActor` and receive this unchanged, which is what the assertions on
+ * `store.calls` compare against.
+ */
+const actor: AuthenticatedActor = {
   id: "user-1",
   email: "member@openbot.test",
   role: "user",
@@ -258,12 +267,12 @@ describe("POST /adopt", () => {
     ]);
   });
 
-  // The store throws BotChatThreadTakenError for three different situations — a thread that belongs
-  // to somebody else, the caller's own thread but one they soft-deleted themselves, and the caller's
-  // own live thread with a different Bot (see the comment on mapStoreError in
-  // ../src/bot-chats/routes.ts and on `adopt` in ../src/bot-chats/store.ts). All three answer with the
-  // same 409 and the same message, deliberately, so which one happened is not something this response
-  // lets a caller tell apart.
+  // The store throws BotChatThreadTakenError for four different situations — a thread that belongs to
+  // somebody else, the caller's own thread but one they soft-deleted themselves, the caller's own live
+  // thread with a different Bot, and a thread that is a channel's rather than a bot chat's (see the
+  // comment on mapStoreError in ../src/bot-chats/routes.ts and on `adopt` in
+  // ../src/bot-chats/store.ts). All four answer with the same 409 and the same message, deliberately,
+  // so which one happened is not something this response lets a caller tell apart.
   test("answers 409 for a thread that cannot be adopted", async () => {
     const store = fakeStore({
       async adopt() {
@@ -500,6 +509,31 @@ describe("POST /:id/activity", () => {
         { text: "Hello", agentId: null, at: new Date(at) },
       ],
     ]);
+  });
+
+  test("refuses an activity body too large to parse", async () => {
+    const store = fakeStore();
+    const response = await post(appFor(store), "/botchat_1/activity", {
+      text: "a".repeat(400_000),
+      agentId: null,
+      at: "2026-08-31T09:00:00.000Z",
+    });
+
+    /*
+     * 413 from the middleware, not 400 from the parser, and the same 413 the channel twin's activity
+     * route answers.
+     *
+     * `parseActivityInput`'s own 16,000-unit cap cannot prevent this: it runs after
+     * `context.req.json()` has already read and parsed the whole body, so the body above was
+     * materialised and parsed before the parser saw an object and only then refused. The two caps are
+     * not interchangeable, and the body limit is the wider of the two on purpose — no message the
+     * parser would accept can be refused here first.
+     */
+    expect(response.status).toBe(413);
+    expect(await response.json()).toEqual({
+      error: "Activity body is too large.",
+    });
+    expect(store.calls).toEqual([]);
   });
 
   test("refuses a report with no timestamp", async () => {

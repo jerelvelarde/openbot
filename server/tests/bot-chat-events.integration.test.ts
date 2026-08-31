@@ -112,6 +112,18 @@ async function announced(
   owner: string,
   stranger: string,
   act: () => Promise<void>,
+  /**
+   * How much longer to keep listening once the expected events have arrived.
+   *
+   * `expected` is a floor, not a count: the race below resolves the moment enough have arrived, and
+   * stopping the listener there discards a further event still in flight. A test whose point is
+   * partly that one of its acts announced NOTHING therefore passed whether or not that act stayed
+   * quiet. This window is what makes the exact count an assertion — the same reason
+   * `channel-archive.integration.test.ts` sleeps before its two "announces nothing" tests read their
+   * empty arrays. Omitted where every act in the test is meant to announce, because then there is no
+   * suppression to catch.
+   */
+  settleMs?: number,
 ) {
   const hub = createChannelEventHub();
   const heard: DeliveredRosterEvent[] = [];
@@ -138,6 +150,11 @@ async function announced(
         ),
       ),
     ]);
+    // Still listening, so an event that should not have been sent lands in `heard` and fails the
+    // count rather than arriving a tick after the listener was torn down.
+    if (settleMs !== undefined) {
+      await new Promise((resolve) => setTimeout(resolve, settleMs));
+    }
   } finally {
     await listener.stop();
   }
@@ -271,8 +288,17 @@ describe("what a bot chat announces", () => {
         await store.setArchived(actorFor(userId), chat.id, true);
         await store.setArchived(actorFor(userId), chat.id, false);
       },
+      /*
+       * The three acts above are meant to produce two events, so the middle one announcing anything
+       * is the defect this test exists to catch — and it is the one the two-event floor cannot see on
+       * its own. Waited out rather than raced: without the window the repeat's announcement could
+       * arrive after the listener was stopped and the assertion below would still read [true, false].
+       */
+      500,
     );
 
+    // Exactly two, in order. The length is the half that catches a no-op that announced.
+    expect(heard).toHaveLength(2);
     expect(heard.map((event) => event.archived)).toEqual([true, false]);
     expect(heard[0]).toMatchObject({ kind: "bot_chat", id: chat.id });
     expect(overheard).toEqual([]);

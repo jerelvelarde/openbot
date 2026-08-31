@@ -13,7 +13,14 @@ import {
 } from "../src/bot-chats/store";
 import { createThreadIdentity } from "../src/channels/thread-identity";
 import { createDatabase } from "../src/db/client";
-import { agentProfiles, agents, botChats, users } from "../src/db/schema";
+import {
+  agentProfiles,
+  agents,
+  botChats,
+  channels,
+  intelligenceChannelMappings,
+  users,
+} from "../src/db/schema";
 import { TEST_POOL } from "./support/database";
 
 const databaseUrl =
@@ -34,10 +41,17 @@ const testPrefix = `bot-chat-store-${randomUUID()}`;
 const createdUserIds: string[] = [];
 const createdAgentIds: string[] = [];
 const createdBotChatIds: string[] = [];
+const createdChannelIds: string[] = [];
 
 afterEach(async () => {
   for (const botChatId of createdBotChatIds.splice(0)) {
     await database.delete(botChats).where(eq(botChats.id, botChatId));
+  }
+  // Before the users below, and it takes the thread mapping with it: the mapping row cascades from
+  // both `channels` and `users`, and leaving it behind would leave a thread id claimed for the rest
+  // of the run.
+  for (const channelId of createdChannelIds.splice(0)) {
+    await database.delete(channels).where(eq(channels.id, channelId));
   }
   for (const agentId of createdAgentIds.splice(0)) {
     await database
@@ -110,6 +124,29 @@ async function seedAgentWithoutProfile(): Promise<string> {
   return id;
 }
 
+/**
+ * A channel that already holds a thread, and the thread id it holds.
+ *
+ * Inserted rather than created through `createChannelStore`, so this file does not take a dependency
+ * on the channel store to state a fact about `bot_chats`. What matters is the pair of rows: a channel
+ * and its `intelligence_channel_mappings` row, which is where a channel's thread id lives and where
+ * the unique index that guards it is declared.
+ */
+async function seedChannelThread(userId: string): Promise<string> {
+  const id = `channel_${randomUUID()}`;
+  const threadId = randomUUID();
+  await database.insert(channels).values({
+    id,
+    name: "Expense Manager",
+    description: "Private agent channel.",
+  });
+  await database
+    .insert(intelligenceChannelMappings)
+    .values({ userId, channelId: id, threadId });
+  createdChannelIds.push(id);
+  return threadId;
+}
+
 function actorFor(userId: string): AgentActor {
   return { id: userId, role: "user" };
 }
@@ -148,6 +185,34 @@ describe("creating a bot chat", () => {
     await expect(
       store.create(actorFor(userId), "no-such-agent"),
     ).rejects.toThrow(AgentNotFoundError);
+  });
+
+  test("refuses a Bot that has been retired", async () => {
+    const userId = await seedUser();
+    const agentId = await seedProfile();
+    await database
+      .update(agentProfiles)
+      .set({ deletedAt: new Date() })
+      .where(eq(agentProfiles.agentId, agentId));
+
+    /*
+     * The interesting path through `getWithin`, as opposed to a name that was never a Bot: the
+     * `agents` row is still there and the foreign key would accept it, so what refuses this is the
+     * profile filter and nothing else.
+     *
+     * It has to refuse. A retired Bot's existing conversations stay readable and report `active`
+     * false, which is what keeps a retirement from taking a transcript with it — but a new
+     * conversation with a coworker who has been retired is one nobody can ever get an answer in.
+     */
+    await expect(store.create(actorFor(userId), agentId)).rejects.toThrow(
+      AgentNotFoundError,
+    );
+
+    const rows = await database
+      .select({ id: botChats.id })
+      .from(botChats)
+      .where(eq(botChats.agentId, agentId));
+    expect(rows).toEqual([]);
   });
 });
 
@@ -250,6 +315,57 @@ describe("adopting a remembered thread", () => {
     // And the refusal left the conversation pointing where it did: the insert conflicts and does
     // nothing, so nothing re-points a live transcript at a Bot that did not say any of it.
     expect(row?.agentId).toBe(agentId);
+  });
+
+  test("refuses to adopt onto a Bot that has been retired", async () => {
+    const userId = await seedUser();
+    const agentId = await seedProfile();
+    const threadId = randomUUID();
+    await database
+      .update(agentProfiles)
+      .set({ deletedAt: new Date() })
+      .where(eq(agentProfiles.agentId, agentId));
+
+    // The same answer `create` gives, through the same `getWithin`, and it matters more here: this
+    // call is made on a thread id a browser remembered, so refusing it is what stops a retirement
+    // being worked around by whatever the last tab had in storage.
+    await expect(
+      store.adopt(actorFor(userId), agentId, threadId),
+    ).rejects.toThrow(AgentNotFoundError);
+
+    const rows = await database
+      .select({ id: botChats.id })
+      .from(botChats)
+      .where(eq(botChats.threadId, threadId));
+    expect(rows).toEqual([]);
+  });
+
+  test("refuses a thread that is already a channel's", async () => {
+    const userId = await seedUser();
+    const agentId = await seedProfile();
+    const threadId = await seedChannelThread(userId);
+
+    /*
+     * The uniqueness that decides every other adoption race is `bot_chats_thread_idx`, and it sees
+     * one table. A channel's thread is claimed by a separate unique index on
+     * `intelligence_channel_mappings.thread_id`, so the insert inside `adopt` conflicts with nothing
+     * and used to succeed here: two roster rows — one `channel`, one `bot_chat` — backed by one
+     * Intelligence transcript, with the bot chat free to name a Bot that is not in the channel.
+     *
+     * Reachable, and it is `adopt`'s own caller who reaches it: `threadId` is a field on
+     * `AgentChannel` and comes back from `GET /api/channels/:id`, so an adopter is handed the value
+     * rather than having to guess 74 bits of it.
+     */
+    await expect(
+      store.adopt(actorFor(userId), agentId, threadId),
+    ).rejects.toThrow(BotChatThreadTakenError);
+
+    // And nothing was written on the way to the refusal, so the thread has one conversation on it.
+    const rows = await database
+      .select({ id: botChats.id })
+      .from(botChats)
+      .where(eq(botChats.threadId, threadId));
+    expect(rows).toEqual([]);
   });
 
   test("refuses to hand back a thread the same person deleted", async () => {
@@ -379,6 +495,36 @@ describe("mostRecent", () => {
     await store.setArchived(actorFor(userId), chat.id, true);
 
     expect(await store.mostRecent(actorFor(userId), agentId)).toBeNull();
+  });
+
+  test("skips a deleted chat, so ?agent= does not land on one that is gone", async () => {
+    const userId = await seedUser();
+    const agentId = await seedProfile();
+    const chat = await store.create(actorFor(userId), agentId);
+    createdBotChatIds.push(chat.id);
+
+    await store.softDelete(actorFor(userId), chat.id);
+
+    /*
+     * A separate filter from the archive one above, and it fails differently. An archived chat handed
+     * back here would be restored by navigation; a deleted one handed back here is an id `get`
+     * answers null for, so the `?agent=` resolver would send the person straight to "this
+     * conversation is not here any more" instead of opening a fresh one.
+     */
+    expect(await store.mostRecent(actorFor(userId), agentId)).toBeNull();
+  });
+
+  test("finds nothing for somebody else's chat with the same Bot", async () => {
+    const owner = await seedUser();
+    const stranger = await seedUser();
+    const agentId = await seedProfile();
+    const chat = await store.create(actorFor(owner), agentId);
+    createdBotChatIds.push(chat.id);
+
+    // The `?agent=` resolver runs for whoever opened the Bot, and a public Bot is opened by
+    // everybody: without the owner filter it would land each of them in the first person's
+    // transcript.
+    expect(await store.mostRecent(actorFor(stranger), agentId)).toBeNull();
   });
 });
 
@@ -667,7 +813,17 @@ describe("recording activity", () => {
  *
  * Not in the plan's list, and added because nothing else runs them: `markRead` is hand-written SQL,
  * and a `greatest(...)` expression that has never executed is a statement nobody has checked
- * PostgreSQL accepts. Both also stand as the assertion that neither method consults `archived_at`.
+ * PostgreSQL accepts.
+ *
+ * Both also stand as the assertion that neither method consults `archived_at`, and both archive the
+ * conversation before the call under test for that claim to hold: an earlier version of this file
+ * made the claim while the `markRead` test never archived anything, so an `archived_at` term added to
+ * `markRead` would have left this file green. Both then assert the stamp is still there afterwards,
+ * because neither method has any business touching it.
+ *
+ * What they do consult is `deleted_at`, and the four tests after them are that pair: a deleted chat
+ * and somebody else's are refused by both, which is what keeps either call from announcing — or, for
+ * `markRead`, stamping — a row no roster can show.
  */
 describe("the caller's own state", () => {
   test("marks read no earlier than the last message, whatever this clock says", async () => {
@@ -683,15 +839,32 @@ describe("the caller's own state", () => {
       agentId: null,
       at: ahead,
     });
+    /*
+     * Archived after the message and before the read, which is the only order that leaves it
+     * archived: `recordActivity` clears `archived_at`, because saying something in a conversation is
+     * how it comes back.
+     *
+     * Here so this test carries the claim its describe makes. `markRead` deliberately does not
+     * consult `archived_at` — reading is the caller's own state and archived is hidden, not frozen —
+     * and without a stamp on the row an `archived_at` term added to that `WHERE` would match anyway
+     * and this file would stay green.
+     */
+    await store.setArchived(actorFor(userId), chat.id, true);
     await store.markRead(actorFor(userId), chat.id);
 
     const [row] = await database
-      .select({ lastReadAt: botChats.lastReadAt })
+      .select({
+        lastReadAt: botChats.lastReadAt,
+        archivedAt: botChats.archivedAt,
+      })
       .from(botChats)
       .where(eq(botChats.id, chat.id));
     // A marker stamped plainly "now" by a server running behind that clock would leave the row
     // reading as unseen, re-lighting the dot on every refetch until wall clock catches up.
     expect(row?.lastReadAt?.getTime()).toBeGreaterThanOrEqual(ahead.getTime());
+    // And the read did not touch the archive. Asserted as a stamp rather than with `not.toBeNull()`,
+    // which would hold just as happily for a row that had gone missing.
+    expect(row?.archivedAt).toBeInstanceOf(Date);
   });
 
   test("pins an archived chat, because archived is hidden and not frozen", async () => {
@@ -724,6 +897,93 @@ describe("the caller's own state", () => {
     // And neither call touched the archive. Only the roster query reads `archived_at`. Asserted as a
     // stamp for the reason above: `not.toBeNull()` would hold for a row that had gone missing.
     expect(unpinned?.archivedAt).toBeInstanceOf(Date);
+  });
+
+  test("refuses to pin a deleted chat", async () => {
+    const userId = await seedUser();
+    const agentId = await seedProfile();
+    const chat = await store.create(actorFor(userId), agentId);
+    createdBotChatIds.push(chat.id);
+
+    await store.softDelete(actorFor(userId), chat.id);
+
+    /*
+     * The `deleted_at` guard on the write, which is the one thing separating this from the archive
+     * case above. Without it the pin succeeds and announces, and the announcement sends this person's
+     * every tab to refetch a roster that cannot show the row — a refetch storm over a conversation
+     * nobody can see.
+     */
+    await expect(
+      store.setPinned(actorFor(userId), chat.id, true),
+    ).rejects.toThrow(BotChatNotFoundError);
+
+    const [row] = await database
+      .select({ pinnedAt: botChats.pinnedAt })
+      .from(botChats)
+      .where(eq(botChats.id, chat.id));
+    // The row outlives the deletion, and the refusal left it unstamped.
+    expect(row?.pinnedAt).toBeNull();
+  });
+
+  test("refuses to pin somebody else's chat", async () => {
+    const owner = await seedUser();
+    const stranger = await seedUser();
+    const agentId = await seedProfile();
+    const chat = await store.create(actorFor(owner), agentId);
+    createdBotChatIds.push(chat.id);
+
+    // The same "not found" a deleted chat gets, so ownership is not probeable — and the stranger's
+    // pin does not land on the owner's row.
+    await expect(
+      store.setPinned(actorFor(stranger), chat.id, true),
+    ).rejects.toThrow(BotChatNotFoundError);
+
+    const [row] = await database
+      .select({ pinnedAt: botChats.pinnedAt })
+      .from(botChats)
+      .where(eq(botChats.id, chat.id));
+    expect(row?.pinnedAt).toBeNull();
+  });
+
+  test("refuses to mark a deleted chat read", async () => {
+    const userId = await seedUser();
+    const agentId = await seedProfile();
+    const chat = await store.create(actorFor(userId), agentId);
+    createdBotChatIds.push(chat.id);
+
+    await store.softDelete(actorFor(userId), chat.id);
+
+    // The same guard `setPinned` carries, for the same reason: the row is gone from every roster, so
+    // nothing about it is markable.
+    await expect(store.markRead(actorFor(userId), chat.id)).rejects.toThrow(
+      BotChatNotFoundError,
+    );
+
+    const [row] = await database
+      .select({ lastReadAt: botChats.lastReadAt })
+      .from(botChats)
+      .where(eq(botChats.id, chat.id));
+    expect(row?.lastReadAt).toBeNull();
+  });
+
+  test("refuses to mark somebody else's chat read", async () => {
+    const owner = await seedUser();
+    const stranger = await seedUser();
+    const agentId = await seedProfile();
+    const chat = await store.create(actorFor(owner), agentId);
+    createdBotChatIds.push(chat.id);
+
+    await expect(store.markRead(actorFor(stranger), chat.id)).rejects.toThrow(
+      BotChatNotFoundError,
+    );
+
+    const [row] = await database
+      .select({ lastReadAt: botChats.lastReadAt })
+      .from(botChats)
+      .where(eq(botChats.id, chat.id));
+    // A bot chat keeps `last_read_at` on the conversation itself rather than on a membership row, so
+    // an unscoped write here would stamp the owner's own unread dot away.
+    expect(row?.lastReadAt).toBeNull();
   });
 });
 
@@ -788,5 +1048,65 @@ describe("archiving a bot chat", () => {
     await expect(
       store.setArchived(actorFor(userId), chat.id, true),
     ).rejects.toThrow(BotChatNotFoundError);
+  });
+});
+
+describe("deleting a bot chat", () => {
+  /*
+   * A repeat delete is not found, not a second deletion.
+   *
+   * The audit trail rests on this. `DELETE /api/bot-chats/:id` writes `bot_chat.deleted` after
+   * `softDelete` returns, and its comment says so out loud: "`softDelete` throws for a repeat, so
+   * reaching this line is itself the 'it happened this time' gate the archive route needs a boolean
+   * for." Nothing pinned that here — `setArchived` has its own no-op test and this did not — so a
+   * `deleted_at` term quietly dropped from the write would answer a second click 204, lay down a
+   * second `bot_chat.deleted` row, and announce `deleted: true` again to every one of the owner's
+   * tabs. `ChannelStore.softDelete` is pinned the same way in channel-routes.test.ts, whose comment
+   * names this method as the reason the two kinds now answer alike.
+   */
+  test("deleting again is not found, not a second deletion", async () => {
+    const userId = await seedUser();
+    const agentId = await seedProfile();
+    const chat = await store.create(actorFor(userId), agentId);
+    createdBotChatIds.push(chat.id);
+
+    await store.softDelete(actorFor(userId), chat.id);
+    const [afterFirst] = await database
+      .select({ deletedAt: botChats.deletedAt })
+      .from(botChats)
+      .where(eq(botChats.id, chat.id));
+    // Soft: the row is still there, stamped rather than gone, which is what makes a second call
+    // reachable at all.
+    expect(afterFirst?.deletedAt).toBeInstanceOf(Date);
+
+    await expect(store.softDelete(actorFor(userId), chat.id)).rejects.toThrow(
+      BotChatNotFoundError,
+    );
+
+    const [afterSecond] = await database
+      .select({ deletedAt: botChats.deletedAt })
+      .from(botChats)
+      .where(eq(botChats.id, chat.id));
+    // And the refusal left the first deletion's own stamp where it was, rather than restamping the
+    // row with the time of a click that deleted nothing.
+    expect(afterSecond?.deletedAt).toEqual(afterFirst?.deletedAt);
+  });
+
+  test("refuses somebody else's chat", async () => {
+    const owner = await seedUser();
+    const stranger = await seedUser();
+    const agentId = await seedProfile();
+    const chat = await store.create(actorFor(owner), agentId);
+    createdBotChatIds.push(chat.id);
+
+    await expect(store.softDelete(actorFor(stranger), chat.id)).rejects.toThrow(
+      BotChatNotFoundError,
+    );
+
+    const [row] = await database
+      .select({ deletedAt: botChats.deletedAt })
+      .from(botChats)
+      .where(eq(botChats.id, chat.id));
+    expect(row?.deletedAt).toBeNull();
   });
 });

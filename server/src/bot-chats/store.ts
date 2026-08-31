@@ -19,14 +19,15 @@ import {
   type AgentProfileStore,
 } from "../agents/profile-store";
 import type { AgentActor } from "../agents/profile-types";
-import {
-  CHANNEL_ACTIVITY_TOPIC,
-  type RosterActivityEvent,
-} from "../channels/events";
-import type { ChannelActivity } from "../channels/routes";
+import type { RosterActivityEvent } from "../channels/events";
+import { announce, type ChannelActivity } from "../channels/routes";
 import type { ThreadIdentity } from "../channels/thread-identity";
 import type { Database } from "../db/client";
-import { agentProfiles, botChats } from "../db/schema";
+import {
+  agentProfiles,
+  botChats,
+  intelligenceChannelMappings,
+} from "../db/schema";
 import { recencyOf } from "../roster/order";
 import { previewOf, titleOf } from "../roster/preview";
 
@@ -47,8 +48,9 @@ export type BotChatStore = {
   /**
    * Take over a thread the browser already had, so a conversation that predates this table is not
    * orphaned in Intelligence. Idempotent for the person who owns it with the same Bot; throws
-   * `BotChatThreadTakenError` when somebody else owns it, when they deleted it themselves, or when
-   * the thread is already a conversation with a different Bot.
+   * `BotChatThreadTakenError` when somebody else owns it, when they deleted it themselves, when the
+   * thread is already a conversation with a different Bot, and when the thread is a channel's rather
+   * than a bot chat's at all.
    */
   adopt(actor: AgentActor, agentId: string, threadId: string): Promise<BotChat>;
   /** The caller's own chat, or null for an unknown, deleted, or somebody else's one. */
@@ -222,18 +224,54 @@ export function createBotChatStore(
           // the insert below — they do not serialize here. What decides their race is the unique
           // index on `bot_chats.thread_id`, exercised in the conflict path a few lines down. If this
           // ever becomes `FOR UPDATE`, the two adopters would serialize instead. Note what would NOT
-          // happen: the insert below is unconditional and nothing reads before it, so the second
-          // adopter would still reach it, and it would still land in the conflict path — against a row
-          // committed before it began rather than one racing it. The conflict path does not become
-          // dead code, so do not delete it on that reasoning. What breaks is the test: "gives one row
-          // to two adoptions that race" in bot-chat-store.integration.test.ts would keep passing while
-          // no longer distinguishing this insert-first shape from a naive read-then-write.
+          // happen: the insert below is unconditional and nothing reads `bot_chats` before it — the
+          // one statement in between is the channel-thread check, which reads a table no adoption
+          // writes and so cannot send one adopter down a different path from the other — so the
+          // second adopter would still reach the insert, and it would still land in the conflict path
+          // — against a row committed before it began rather than one racing it. The conflict path
+          // does not become dead code, so do not delete it on that reasoning. What breaks is the
+          // test: "gives one row to two adoptions that race" in bot-chat-store.integration.test.ts
+          // would keep passing while no longer distinguishing this insert-first shape from a naive
+          // read-then-write.
           const profile = await profileStore.getWithin(
             transaction,
             actor,
             agentId,
           );
           if (!profile) throw new AgentNotFoundError(agentId);
+
+          /*
+           * A thread that is already a channel's is not a thread this table may claim, and this read
+           * is the only thing that says so.
+           *
+           * The uniqueness the insert below leans on is `bot_chats_thread_idx`, and it sees one
+           * table. A channel's thread is claimed under a separate unique index on
+           * `intelligence_channel_mappings.thread_id`, and nothing crosses the two — so without this
+           * the insert conflicted with nothing and succeeded, leaving two roster rows (one `channel`,
+           * one `bot_chat`) backed by one Intelligence transcript, the bot chat free to name a
+           * different Bot. That is the harm the fourth bullet below refuses inside this table,
+           * arriving from the other one.
+           *
+           * Reachable rather than theoretical: `threadId` is a field on `AgentChannel` and comes back
+           * from `GET /api/channels/:id`, so an adopter is handed the value instead of having to
+           * guess it.
+           *
+           * A plain read, and what it does and does not settle. A channel's thread is minted and
+           * never adopted (`create` in channels/routes.ts), so the only order that gets here is
+           * channel-first: by the time anything can name that thread id, the row this reads is
+           * committed, which is the whole of the path a caller can walk. What a read cannot exclude
+           * is a mapping that commits after it — there is no row yet to lock, no constraint spans the
+           * two tables, and the channel side does not consult `bot_chats` either. Closing that would
+           * take one index over both thread columns, which is a change to a table this file does not
+           * own.
+           */
+          const [channelThread] = await transaction
+            .select({ channelId: intelligenceChannelMappings.channelId })
+            .from(intelligenceChannelMappings)
+            .where(eq(intelligenceChannelMappings.threadId, threadId));
+          // The same error and the same 409 the three cases below answer with, so which of the four
+          // happened is not something a caller can tell apart.
+          if (channelThread) throw new BotChatThreadTakenError(threadId);
 
           const id = `botchat_${crypto.randomUUID()}`;
 
@@ -264,8 +302,8 @@ export function createBotChatStore(
             });
           }
 
-          // Somebody already has it. There are four shapes that row can take, and only one of them
-          // is an outcome this call should hand back:
+          // Somebody already has a `bot_chats` row on it. There are four shapes that row can take,
+          // and only one of them is an outcome this call should hand back:
           //
           //   - the caller's own live row with the Bot they named: return it. Two tabs adopting the
           //     same remembered thread is exactly the race this function exists to survive, so
@@ -510,8 +548,17 @@ export function createBotChatStore(
           if (applied.length === 0) return { restored: false };
 
           /*
-           * Announced inside the transaction, so it is delivered on commit and a write that rolls
-           * back is never announced.
+           * Announced through the channel side's `announce`, on this transaction, so it is delivered
+           * on commit and a write that rolls back is never announced.
+           *
+           * The channel side's helper and not a `pg_notify` of this file's own, which is what every
+           * announcement in this file used to be. `announce` measures each payload against a budget
+           * under NOTIFY's 8000-byte cap and splits the member list to fit; over the cap, `pg_notify`
+           * fails inside the transaction and takes the write with it, so an announcement that does
+           * not fit is a message that was never recorded. A bot chat's list is one id and its preview
+           * is capped by `previewOf`, so nothing here reaches that budget — but that is an argument
+           * about today's fields, and this file's header says a second spelling of the twin's
+           * behaviour is exactly what lets the two kinds of row drift apart. There is one spelling.
            *
            * `memberIds` is the owner and nobody else, because a bot chat has exactly one interested
            * party. No `channelId`: there is no channel, and an old replica reading that field finds
@@ -528,9 +575,7 @@ export function createBotChatStore(
             // carry an archive state the receiver then has to decide to ignore.
             ...(row.archivedAt !== null ? { archived: false } : {}),
           };
-          await transaction.execute(
-            sql`select pg_notify(${CHANNEL_ACTIVITY_TOPIC}, ${JSON.stringify(event)})`,
-          );
+          await announce(transaction, event);
 
           // The same fact the event above carries, for the route, which writes it to the trail: this
           // write is how an archived conversation comes back, and nobody performed that as an act.
@@ -565,6 +610,8 @@ export function createBotChatStore(
 
           // Deliberately no consultation of `archived_at`. Archived is hidden, not frozen, and a
           // person may well pin something they have put away.
+          //
+          // Through `announce` on this transaction, for the reasons `recordActivity` gives above.
           const event: RosterActivityEvent = {
             kind: "bot_chat",
             id,
@@ -574,9 +621,7 @@ export function createBotChatStore(
             lastMessageAgentId: null,
             pinned,
           };
-          await transaction.execute(
-            sql`select pg_notify(${CHANNEL_ACTIVITY_TOPIC}, ${JSON.stringify(event)})`,
-          );
+          await announce(transaction, event);
         },
         { isolationLevel: "read committed" },
       );
@@ -671,8 +716,9 @@ export function createBotChatStore(
             return false;
           }
 
-          // Announced inside the transaction, so it rides the commit and a refused archive announces
-          // nothing at all.
+          // Announced through `announce` on this transaction, so it rides the commit and a refused
+          // archive announces nothing at all. See `recordActivity` for why the helper rather than a
+          // `pg_notify` written here.
           const event: RosterActivityEvent = {
             kind: "bot_chat",
             id,
@@ -682,9 +728,7 @@ export function createBotChatStore(
             lastMessageAgentId: null,
             archived,
           };
-          await transaction.execute(
-            sql`select pg_notify(${CHANNEL_ACTIVITY_TOPIC}, ${JSON.stringify(event)})`,
-          );
+          await announce(transaction, event);
 
           return true;
         },
@@ -712,8 +756,9 @@ export function createBotChatStore(
           if (deleted.length === 0) throw new BotChatNotFoundError(id);
 
           /*
-           * Announced inside the transaction, so it is delivered on commit and a refused delete
-           * announces nothing.
+           * Announced through `announce` on this transaction, so it is delivered on commit and a
+           * refused delete announces nothing. See `recordActivity` for why the helper rather than a
+           * `pg_notify` written here.
            *
            * The owner is told even though they asked for it, because they may have several tabs and
            * several replicas open: without this the others keep rendering a row whose conversation
@@ -728,9 +773,7 @@ export function createBotChatStore(
             lastMessageAgentId: null,
             deleted: true,
           };
-          await transaction.execute(
-            sql`select pg_notify(${CHANNEL_ACTIVITY_TOPIC}, ${JSON.stringify(event)})`,
-          );
+          await announce(transaction, event);
         },
         { isolationLevel: "read committed" },
       );

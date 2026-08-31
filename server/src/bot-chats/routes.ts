@@ -12,10 +12,14 @@
  */
 import type { Context, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { AgentNotFoundError } from "../agents/profile-store";
 import { type AuditStore, createAuditRecorder } from "../audit";
 import type { AppVariables } from "../auth/guards";
-import { parseActivityInput } from "../channels/routes";
+import {
+  MAX_ACTIVITY_BODY_BYTES,
+  parseActivityInput,
+} from "../channels/routes";
 import {
   type BotChat,
   BotChatNotFoundError,
@@ -155,37 +159,61 @@ export function createBotChatRoutes(
     }
   });
 
-  routes.post("/:id/activity", requireUser, async (context) => {
-    const parsed = parseActivityInput(
-      await context.req.json().catch(() => null),
-    );
-    if (!parsed.ok) return context.json({ error: parsed.error }, 400);
-
-    const id = context.req.param("id");
-    try {
-      const { restored } = await store.recordActivity(
-        context.var.actor,
-        id,
-        parsed.value,
+  routes.post(
+    "/:id/activity",
+    requireUser,
+    /*
+     * The same body limit the channel twin's activity route carries, taken from the same constant, and
+     * not a second spelling of it.
+     *
+     * Two caps, and they are not interchangeable. `parseActivityInput` bounds the message, which is
+     * the semantic limit and the one that answers 400; it cannot bound the work in front of it,
+     * because `context.req.json()` below has already read and parsed the whole body by the time the
+     * parser sees an object. Without this middleware a multi-megabyte body was read and `JSON.parse`d
+     * in full and only then answered "Text is too long." — the parser's cap bounded the message and
+     * nothing about the body carrying it.
+     */
+    bodyLimit({
+      maxSize: MAX_ACTIVITY_BODY_BYTES,
+      // JSON, and named, because every other refusal on these routes is; the default is a plain-text
+      // "Payload Too Large" thrown as an exception, which a client parsing our error shape cannot
+      // read. The same status and the same message the channel twin answers with, so a roster's two
+      // kinds of row do not answer one oversized report differently.
+      onError: (context) =>
+        context.json({ error: "Activity body is too large." }, 413),
+    }),
+    async (context) => {
+      const parsed = parseActivityInput(
+        await context.req.json().catch(() => null),
       );
-      /*
-       * This route restores conversations without anybody asking it to: saying something in an
-       * archived one is how it comes back, so an ordinary message clears `archived_at`. Recorded when
-       * it actually happened, and named `activity` rather than `explicit`, so the trail can tell a
-       * restore somebody pressed from one that fell out of a message — the second is the one whose
-       * absence reads as the archive having undone itself. The same two words the channel twin's
-       * activity route uses, because they are the same two facts.
-       */
-      if (restored) {
-        await record(context.var.actor.id, "bot_chat.unarchived", id, {
-          mechanism: "activity",
-        });
+      if (!parsed.ok) return context.json({ error: parsed.error }, 400);
+
+      const id = context.req.param("id");
+      try {
+        const { restored } = await store.recordActivity(
+          context.var.actor,
+          id,
+          parsed.value,
+        );
+        /*
+         * This route restores conversations without anybody asking it to: saying something in an
+         * archived one is how it comes back, so an ordinary message clears `archived_at`. Recorded
+         * when it actually happened, and named `activity` rather than `explicit`, so the trail can
+         * tell a restore somebody pressed from one that fell out of a message — the second is the one
+         * whose absence reads as the archive having undone itself. The same two words the channel
+         * twin's activity route uses, because they are the same two facts.
+         */
+        if (restored) {
+          await record(context.var.actor.id, "bot_chat.unarchived", id, {
+            mechanism: "activity",
+          });
+        }
+        return context.body(null, 204);
+      } catch (error) {
+        return mapStoreError(context, error);
       }
-      return context.body(null, 204);
-    } catch (error) {
-      return mapStoreError(context, error);
-    }
-  });
+    },
+  );
 
   routes.put("/:id/pin", requireUser, async (context) => {
     const body = await context.req.json().catch(() => null);
@@ -297,19 +325,21 @@ function mapStoreError(context: Context, error: unknown): Response {
   }
   if (error instanceof BotChatThreadTakenError) {
     /*
-     * `adopt` throws this for three different situations, not one: a thread that belongs to somebody
-     * else, a thread that is the caller's own row but one *they* soft-deleted, and a thread that is
-     * the caller's own live row with a different Bot (see the second, third and fourth bullets of the
-     * comment inside `adopt` in bot-chats/store.ts). All three answer with this one message and this
-     * one status, deliberately, and not because they have anything in common besides the code:
+     * `adopt` throws this for four different situations, not one: a thread that belongs to somebody
+     * else, a thread that is the caller's own row but one *they* soft-deleted, a thread that is the
+     * caller's own live row with a different Bot (the second, third and fourth bullets of the comment
+     * inside `adopt` in bot-chats/store.ts), and a thread that is not a bot chat's at all but a
+     * channel's, which the check above those bullets refuses. All four answer with this one message
+     * and this one status, deliberately, and not because they have anything in common besides the
+     * code:
      *
      *   - the client already treats 409 as success here — it is what clears the remembered thread
      *     id in storage, whichever of the reasons produced it — so one status code correctly serves
-     *     all three;
+     *     all four;
      *   - naming which one happened would tell an outsider adopting a stranger's remembered thread
-     *     id whether that thread exists, who deleted it, and which Bot it belongs to, which is
-     *     exactly the kind of probe every other method in this file (and in the store beneath it) is
-     *     written to refuse.
+     *     id whether that thread exists, who deleted it, which Bot it belongs to, and whether it is
+     *     a channel they cannot see, which is exactly the kind of probe every other method in this
+     *     file (and in the store beneath it) is written to refuse.
      */
     return context.json(
       { error: "That conversation is no longer available." },
