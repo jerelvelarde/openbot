@@ -79,7 +79,13 @@ function rosterItemDto(item: RosterItem) {
  * writing still happens on `/api/channels` and `/api/bot-chats`. Kept as its own function anyway, in
  * the spot its siblings keep theirs, so the day `list` does throw something this route needs to turn
  * into a status code, it has one obvious home instead of a change to the route body itself.
+ *
+ * `never`, not `Response`, because that is what the body does: every path out of here rethrows. The
+ * consequence is worth stating rather than leaving a reader to infer it from a return type that
+ * promises a response — a store failure on this route reaches Hono unhandled and answers a generic
+ * 500. `context` is taken because its siblings take it and a mapping needs it; it is unused for
+ * exactly as long as there is nothing to map.
  */
-function mapStoreError(_context: Context, error: unknown): Response {
+function mapStoreError(_context: Context, error: unknown): never {
   throw error;
 }
