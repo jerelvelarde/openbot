@@ -4444,7 +4444,18 @@ export function emptyStateFor(input: {
   searching: boolean;
   total: number;
   search: string;
+  /** Whether the roster has answered at all. `false` while pending, and while errored. */
+  loaded: boolean;
 }): { title: string; description: string } | null {
+  /*
+   * FIVE nothings, not four. "Not known yet" is not "nothing", and conflating them is the exact
+   * failure this docblock warns about below: while the query is pending `matchingItems` returns `[]`,
+   * so `total` is 0, and without this line a person's first paint tells them they have no
+   * conversations. The two inline blocks this replaced were accidentally safe — they tested
+   * `channels.data?.length === 0`, and `undefined === 0` is false — so collapsing them lost a guard
+   * nobody had written down.
+   */
+  if (!input.loaded) return null;
   if (input.total > 0) return null;
 
   if (input.searching) {
@@ -4697,7 +4708,32 @@ since the roster is already in recency order and already loaded by the sidebar. 
 endpoint for a question the roster can answer.
 
 Then, in an effect: `resolveBotChat` and either `navigate` to the chat or create one and navigate to
-that. Render nothing while it resolves — the same rule the current screen follows, and for the same
+that.
+
+**Gate the effect on `roster.data === undefined`, NOT on `roster.isPending`.** `isPending` is false in
+the *error* state too, where `data` is still undefined — so on a failed roster load `mostRecent` reads
+`null`, the effect concludes there is nothing to open, and it creates a brand new durable `bot_chats`
+row. A transient 5xx would silently fork a second conversation with the same Bot and leave the real
+one unreachable from `?agent=`, in a feature whose whole point is that these rows are durable and
+nameable. Because `select` flattens the pages, `data === undefined` means exactly "pending or errored"
+and `[]` means a genuinely empty roster.
+
+**Attach a `.catch`, and render the failure.** A refused create otherwise leaves an unhandled rejection
+and a permanently blank pane: the once-only ref is already set, so nothing retries. Render
+`createBotChat.error` and `roster.error` in the same one-line-sentence treatment the unknown-Bot guard
+above already uses. The sibling screen does exactly this, and says why: there is no toast in this app,
+so silence reads as the app ignoring the click.
+
+**Clean up on unmount.** If the create resolves after the person has navigated away, `navigate` still
+fires and yanks them into the new chat. Use the `let current = true` / cleanup pair `bot-thread.ts`
+already uses.
+
+**`mostRecent` sees only the roster pages that happen to be cached**, and nothing in the app fetches
+further roster pages — so an existing chat sitting past page one resolves as `null` and this effect
+creates a duplicate. That limitation is pre-existing and app-wide; what is new is that acting on it
+now writes a durable row. Say so in a comment at minimum.
+
+Render nothing while it resolves — the same rule the current screen follows, and for the same
 reason: rendering the chat before the thread is known lets the packaged component mint an id of its
 own, and that is the one this deployment would then be stuck with.
 
