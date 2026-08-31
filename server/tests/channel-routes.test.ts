@@ -76,14 +76,24 @@ function fakeStore(
       calls.push(["get", receivedActor, id]);
       return channel({ id });
     },
+    async list(receivedActor, query) {
+      calls.push(["list", receivedActor, query]);
+      return { channels: [], nextCursor: null };
+    },
     async setPinned(receivedActor, id, pinned) {
       calls.push(["setPinned", receivedActor, id, pinned]);
     },
     async markRead(receivedActor, id) {
       calls.push(["markRead", receivedActor, id]);
     },
+    async setArchived(receivedActor, id, archived) {
+      calls.push(["setArchived", receivedActor, id, archived]);
+    },
     async softDelete(receivedActor, id) {
       calls.push(["softDelete", receivedActor, id]);
+    },
+    async recordActivity(receivedActor, id, activity) {
+      calls.push(["recordActivity", receivedActor, id, activity]);
     },
   };
 
