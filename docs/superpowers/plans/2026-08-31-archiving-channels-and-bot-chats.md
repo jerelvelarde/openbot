@@ -4181,7 +4181,10 @@ export function menuFor(row: { archived: boolean; pinned: boolean }) {
 
 - [ ] **Step 4: Branch the component on kind**
 
-Add `kind`, `archived`, and `active` to the props. Then:
+Add `kind` and `archived` to the props. **Not `active`** — the row renders nothing for it, and
+`ChannelSummary` has carried `active` all along without the sidebar ever using it; the place it is
+actionable is the screen the click leads to, which already shows a banner and disables the composer.
+A prop the row does not render is a prop the row should not take. Then:
 
 1. Replace the hardcoded `<Link to="/channel/$channelId" params={{ channelId }}>` with
    `<Link {...linkFor({ kind, id })}>`. The `className` and `activeProps` stay as they are — the row's
@@ -4551,7 +4554,7 @@ git commit -m "Filter the roster by Active, Archived, or All"
 ### Task 13: A Bot chat at its own URL
 
 **Files:**
-- Create: `app/src/routes/_authed/_app/bot.$botChatId.tsx`
+- Create: `app/src/routes/_authed/_app/bot_.$botChatId.tsx` — **note the trailing underscore on `bot_`**
 - Modify: `app/src/routes/_authed/_app/bot.tsx`
 - Test: `app/tests/bot-chat-resolver.test.ts`
 
