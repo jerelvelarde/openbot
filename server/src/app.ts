@@ -10,7 +10,6 @@ import {
   type AuditStore,
   auditQueryFromUrl,
   createAuditRecorder,
-  recordAuditEvent,
 } from "./audit";
 import { createDevRequireUser } from "./auth/dev-actor";
 import {
@@ -882,21 +881,30 @@ export function createApp(
          * is capped for the same reason: it is untrusted input, kept because "which tool was being
          * reached for" is the useful half of the question.
          */
-        if (auditStore) {
-          await recordAuditEvent(auditStore, {
-            eventType: "mcp.callback_refused",
-            targetType: "mcp_tool",
-            targetId:
-              typeof body?.name === "string"
-                ? body.name.slice(0, 120)
-                : "unknown",
-            payload: {
-              refusal: verdict.reason,
-              status: verdict.status,
-              note: "A caller could not prove which Bot it was, so no grant was consulted.",
-            },
-          });
-        }
+        /*
+         * Tolerant, like every other write in this file — and the last one here that was not.
+         *
+         * This one is a refusal, so an audit failure taking the request down would convert a correct
+         * security decision into a 500, which is the one outcome worse than not recording it.
+         *
+         * `null` for the actor rather than a placeholder: `createAuditRecorder` omits the column
+         * entirely for a null, which is what keeps the paragraph above true. There is nobody to
+         * attribute this to, and inventing somebody would put an unproven claim in the record.
+         */
+        await createAuditRecorder(auditStore, {
+          type: "mcp_tool",
+          logType: "agent-tool-refusal-audit-write-failed",
+          logIdKey: "tool",
+        })(
+          null,
+          "mcp.callback_refused",
+          typeof body?.name === "string" ? body.name.slice(0, 120) : "unknown",
+          {
+            refusal: verdict.reason,
+            status: verdict.status,
+            note: "A caller could not prove which Bot it was, so no grant was consulted.",
+          },
+        );
         return context.json({ error: verdict.reason }, verdict.status);
       }
 
