@@ -170,6 +170,16 @@ export function createBotChatStore(
           // Held for the same reason `create` holds it: this row names the agent, so the agent must
           // not be retired between the check and the insert. It also means an agent that does not
           // exist is refused by name rather than by a foreign-key violation from the driver.
+          //
+          // Load-bearing and easy to miss: `getWithin` takes its lock with `SELECT ... FOR SHARE`
+          // (see `lockProfileReadRow` in `profile-store.ts`), and share locks are compatible with
+          // each other. Two concurrent adopters of the same Bot both pass this line and both reach
+          // the insert below — they do not serialize here. What decides their race is the unique
+          // index on `bot_chats.thread_id`, exercised in the conflict path a few lines down. If this
+          // ever becomes `FOR UPDATE`, the two adopters would serialize instead, the second one's
+          // insert would stop conflicting, and the "gives one row to two adoptions that race" test in
+          // bot-chat-store.integration.test.ts would keep passing while no longer testing the thing
+          // its name says it tests.
           const profile = await profileStore.getWithin(
             transaction,
             actor,
@@ -200,21 +210,46 @@ export function createBotChatStore(
             return chatFrom({ ...row, profileDeletedAt: profile.deletedAt });
           }
 
-          // Somebody already has it. Whether that is this person calling twice or a different person
-          // entirely decides between idempotence and a refusal.
+          // Somebody already has it. There are three shapes that row can take, and only one of them
+          // is an outcome this call should hand back:
+          //
+          //   - the caller's own live row: return it. Two tabs adopting the same remembered thread is
+          //     exactly the race this function exists to survive, so idempotence here is the point.
+          //   - the caller's own row, but soft-deleted: refuse. Do NOT clear `deleted_at` and
+          //     resurrect it — that is the same "undone by navigation" mistake `mostRecent` already
+          //     refuses for archived rows, applied to a stronger act: a person who deleted this
+          //     conversation should not get it back because a background adoption they never asked
+          //     for found the thread id still sitting in a browser's storage. And returning it plain,
+          //     un-resurrected, is worse than refusing: a `BotChat` this function hands back is a
+          //     `BotChat` the obvious next move is to navigate to, and `get` filters deleted rows out,
+          //     so that move would land on "this conversation is not here any more." Refusing here
+          //     means the route above can answer 409, which the client already treats as success —
+          //     the refusal itself is what clears the remembered thread id.
+          //   - somebody else's row, live or deleted: refuse. This is the case the function is named
+          //     for, and it answers the same `BotChatThreadTakenError` as the case above so that
+          //     which one happened is not something the response lets a caller tell apart — ownership
+          //     and not-found read alike everywhere else in this store, and this is no exception.
           //
           // The profile is joined loosely, because the decision below has to come from the
           // `bot_chats` row alone: an inner join would turn a row whose Bot has no profile at all
           // into "taken by somebody else", which is a refusal for the wrong reason.
           const [existing] = await transaction
-            .select({ ...chatProjection, userId: botChats.userId })
+            .select({
+              ...chatProjection,
+              userId: botChats.userId,
+              deletedAt: botChats.deletedAt,
+            })
             .from(botChats)
             .leftJoin(
               agentProfiles,
               eq(agentProfiles.agentId, botChats.agentId),
             )
             .where(eq(botChats.threadId, threadId));
-          if (!existing || existing.userId !== actor.id) {
+          if (
+            !existing ||
+            existing.userId !== actor.id ||
+            existing.deletedAt !== null
+          ) {
             throw new BotChatThreadTakenError(threadId);
           }
           return chatFrom(existing);

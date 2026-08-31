@@ -166,6 +166,13 @@ describe("adopting a remembered thread", () => {
      * Sequentially, the second call finds the first's row and returns it — that is the test above, and
      * it passes even against a naive read-then-write. Concurrently, both find nothing and both insert,
      * and only the unique index stops one conversation becoming two rows pointing at one transcript.
+     *
+     * That depends on the two calls actually reaching their inserts concurrently rather than
+     * serializing earlier. `adopt` locks the agent's profile row with `profileStore.getWithin`, which
+     * takes `SELECT ... FOR SHARE` — and share locks do not exclude each other, so both adopters pass
+     * that point together. If that lock ever became `FOR UPDATE`, the second adopter would block until
+     * the first committed, find the row already there, and return it without ever reaching the insert
+     * this test means to exercise: green for the wrong reason, proving nothing about the constraint.
      */
     const [first, second] = await Promise.all([
       store.adopt(actorFor(userId), agentId, threadId),
@@ -193,6 +200,24 @@ describe("adopting a remembered thread", () => {
 
     await expect(
       store.adopt(actorFor(stranger), agentId, threadId),
+    ).rejects.toThrow(BotChatThreadTakenError);
+  });
+
+  test("refuses to hand back a thread the same person deleted", async () => {
+    const userId = await seedUser();
+    const agentId = await seedProfile();
+    const threadId = randomUUID();
+
+    const chat = await store.adopt(actorFor(userId), agentId, threadId);
+    createdBotChatIds.push(chat.id);
+    await store.softDelete(actorFor(userId), chat.id);
+
+    // Not resurrected, and not handed back either. A `BotChat` this call returned would be one the
+    // caller navigates straight to, and `get` answers null for a deleted row — so returning it here
+    // would be an id no read honours and no roster shows. Refusing is what lets the route above
+    // answer 409, which the client already treats as clearing the remembered thread id.
+    await expect(
+      store.adopt(actorFor(userId), agentId, threadId),
     ).rejects.toThrow(BotChatThreadTakenError);
   });
 });
