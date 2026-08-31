@@ -16,7 +16,11 @@ import {
   type AgentProfileStore,
 } from "../agents/profile-store";
 import type { AgentActor, AgentProfile } from "../agents/profile-types";
-import { type AuditStore, recordAuditEvent } from "../audit";
+import {
+  type AuditEventType,
+  type AuditStore,
+  recordAuditEvent,
+} from "../audit";
 import type { AppVariables } from "../auth/guards";
 import type { Database } from "../db/client";
 import {
@@ -807,18 +811,19 @@ export function createChannelRoutes(
    * caller has already been told so by the time this runs. A trail that is briefly unavailable is
    * not a reason to report a failure that did not happen.
    *
-   * Reached only after `softDelete` resolves, so a refused delete — a channel the package owns, or
+   * Reached only after the store call resolves, so a refused change — a channel the package owns, or
    * one the caller is not in — writes nothing. The trail records acts, not attempts.
    */
-  const recordDeleted = async (
+  const record = async (
     context: Context<{ Variables: AppVariables }>,
+    eventType: AuditEventType,
     channelId: string,
+    payload: Record<string, unknown>,
   ): Promise<void> => {
     if (!auditStore) return;
-    const actor = context.var.actor;
     try {
       await recordAuditEvent(auditStore, {
-        eventType: "channel.deleted",
+        eventType,
         targetType: "channel",
         targetId: channelId,
         /*
@@ -829,18 +834,16 @@ export function createChannelRoutes(
          * violate. It has no foreign key, and `initializeDevActorUser` writes that row at start-up
          * anyway, so neither half of the reason holds. It matters here more than most: single-user
          * is the mode `.env.example` ships switched on, so an unattributed row is what a fork sees
-         * by default, and "somebody deleted this conversation" is the whole point of the row.
+         * by default, and "somebody archived this conversation" is the whole point of the row.
          */
-        actorUserId: actor.id,
-        // Named rather than implied: the channel row and its thread are still there, and a later
-        // hard delete would be a different fact about the same channel.
-        payload: { mechanism: "soft" },
+        actorUserId: context.var.actor.id,
+        payload,
       });
     } catch (error) {
       console.error(
         JSON.stringify({
           type: "channel-audit-write-failed",
-          eventType: "channel.deleted",
+          eventType,
           channelId,
           error: String(error),
         }),
@@ -946,6 +949,35 @@ export function createChannelRoutes(
     }
   });
 
+  routes.put("/:channelId/archive", requireUser, async (context) => {
+    const body = await context.req.json().catch(() => null);
+    if (!isChannelInputObject(body)) {
+      return context.json(
+        { error: "Archive input must be a JSON object." },
+        400,
+      );
+    }
+    const { archived } = body as { archived?: unknown };
+    if (typeof archived !== "boolean") {
+      return context.json({ error: "Archived must be true or false." }, 400);
+    }
+
+    const channelId = context.req.param("channelId");
+    try {
+      await store.setArchived(context.var.actor, channelId, archived);
+      // Reached only once the store has resolved, so a refused archive writes nothing.
+      await record(
+        context,
+        archived ? "channel.archived" : "channel.unarchived",
+        channelId,
+        {},
+      );
+      return context.json({ archived });
+    } catch (error) {
+      return mapStoreError(context, error);
+    }
+  });
+
   routes.put("/:channelId/read", requireUser, async (context) => {
     try {
       await store.markRead(context.var.actor, context.req.param("channelId"));
@@ -959,7 +991,11 @@ export function createChannelRoutes(
     const channelId = context.req.param("channelId");
     try {
       await store.softDelete(context.var.actor, channelId);
-      await recordDeleted(context, channelId);
+      // Named rather than implied: the channel row and its thread are still there, and a later
+      // hard delete would be a different fact about the same channel.
+      await record(context, "channel.deleted", channelId, {
+        mechanism: "soft",
+      });
       return context.body(null, 204);
     } catch (error) {
       return mapStoreError(context, error);

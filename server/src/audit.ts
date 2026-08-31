@@ -68,6 +68,15 @@ export const auditEventTypes = [
    * `payload.mechanism` names how, so a later hard delete is distinguishable from this one.
    */
   "channel.deleted",
+  /**
+   * A channel hidden from every roster through the archive route, or restored through it —
+   * the reversible sibling of `channel.deleted`. Archiving is hidden, not frozen: `recordActivity`
+   * also clears the archive on its own when somebody speaks in one, but that path runs in the store,
+   * which holds no audit trail, so only a deliberate archive or restore through the route is recorded
+   * here.
+   */
+  "channel.archived",
+  "channel.unarchived",
   "agent.invoked",
   /**
    * An address this deployment declined to dial for a Bot, and why.
