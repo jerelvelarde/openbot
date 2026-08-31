@@ -19,12 +19,9 @@ import { useNeedsYou } from "@/components/computer/needs-you";
 import { DetailPanel } from "@/components/layout/detail-panel";
 import { Button } from "@/components/ui/button";
 import { markChannelReadMutationOptions } from "@/lib/channels/mutations";
-import {
-  type AgentChannel,
-  channelListQueryOptions,
-  channelQueryOptions,
-} from "@/lib/channels/queries";
+import { type AgentChannel, channelQueryOptions } from "@/lib/channels/queries";
 import { onComputerActivity } from "@/lib/copilot/computer-activity";
+import { rosterListQueryOptions } from "@/lib/roster/queries";
 
 const chatSearchSchema = z.object({
   settings: z.boolean().optional(),
@@ -94,8 +91,13 @@ function RouteComponent() {
    * This channel's roster summary, read out of the same infinite query the sidebar renders.
    * The detail query deliberately knows nothing about activity; the roster is where the socket
    * keeps lastMessageAt live, so it is the one honest source for "has something new been said".
+   *
+   * Read from "all", not "active": the conversation this screen has open may itself be the one
+   * somebody just archived. A screen that read "active" would lose its summary — and with it,
+   * unseen tracking and mark-read — the moment that happened, even while still open. "all" is the
+   * only status guaranteed to still hold the row this screen is looking at.
    */
-  const roster = useInfiniteQuery(channelListQueryOptions());
+  const roster = useInfiniteQuery(rosterListQueryOptions("all"));
   const summary = roster.data?.find((row) => row.id === channelId);
 
   /*
