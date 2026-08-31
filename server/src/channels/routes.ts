@@ -38,8 +38,8 @@ import {
   encodeRosterCursor,
   pinnedRank,
   RECENCY,
-  recencyCursorText,
   type RosterCursor,
+  recencyCursorText,
   rosterCursorFilter,
   rosterOrder,
 } from "../roster/order";
@@ -48,7 +48,11 @@ import {
   MAX_ROSTER_PAGE,
   previewOf,
 } from "../roster/preview";
-import { parseRosterStatus, type RosterStatus } from "../roster/query";
+import {
+  archiveFilter,
+  parseRosterStatus,
+  type RosterStatus,
+} from "../roster/query";
 import {
   CHANNEL_ACTIVITY_TOPIC,
   type ChannelEventHub,
@@ -193,26 +197,6 @@ function channelName(names: string[]) {
   const codePoints = Array.from(joined);
   if (codePoints.length <= MAX_CHANNEL_NAME_CODE_POINTS) return joined;
   return `${codePoints.slice(0, MAX_CHANNEL_NAME_CODE_POINTS - 1).join("")}…`;
-}
-
-/**
- * What the status means, as a predicate.
- *
- * The same three answers `RosterStatus` names, so this endpoint and the roster cannot come to
- * disagree about what `archived` means: a deployment where one of them honoured the filter and the
- * other did not would look exactly like an archive that does not work. Applied in both phases of
- * `list` for the reason the delete guard repeats there — two statements, two snapshots.
- *
- * `deletedAt` is filtered separately and unconditionally: `all` is a filter over archive state only
- * and is never a way to see deleted channels.
- *
- * A near-copy of `archiveFilter` in `roster/query.ts`, which is module-private there. If that one is
- * ever exported, this should become a call to it rather than a second spelling of the same rule.
- */
-function archiveFilter(status: RosterStatus, archivedAt: PgColumn) {
-  if (status === "active") return isNull(archivedAt);
-  if (status === "archived") return isNotNull(archivedAt);
-  return undefined;
 }
 
 type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0];

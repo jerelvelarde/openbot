@@ -51,9 +51,9 @@ import {
   encodeRosterCursor,
   pinnedRank,
   RECENCY,
+  type RosterCursor,
   recencyCursorText,
   recencyOf,
-  type RosterCursor,
   rosterCursorFilter,
   rosterOrder,
 } from "./order";
@@ -131,8 +131,13 @@ const BOT_CHAT_RECENCY = recencyOf(botChats.lastMessageAt, botChats.createdAt);
  *
  * `deletedAt` is filtered separately and unconditionally everywhere: `all` is a filter over archive
  * state only and is never a way to see deleted conversations.
+ *
+ * Exported for `ChannelStore.list`, which answers the same `?status=` over one of these two tables.
+ * It was left private and a second spelling of these three lines duly appeared there within the
+ * hour — the same drift this module's own header warns about, so the reason it is exported now is
+ * that being right twice is not a thing anybody maintains.
  */
-function archiveFilter(status: RosterStatus, archivedAt: PgColumn) {
+export function archiveFilter(status: RosterStatus, archivedAt: PgColumn) {
   if (status === "active") return isNull(archivedAt);
   if (status === "archived") return isNotNull(archivedAt);
   return undefined;
