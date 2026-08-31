@@ -35,9 +35,7 @@ describe("menuFor", () => {
     ]);
   });
 
-  test("offers the same three on both kinds", () => {
-    // A menu whose Delete works on half the rows is worse than a second soft-delete column, which is
-    // why bot_chats has deleted_at.
+  test("offers Unpin in place of Pin on a pinned row", () => {
     expect(menuFor({ archived: false, pinned: true })).toEqual([
       "unpin",
       "archive",

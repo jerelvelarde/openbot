@@ -8,7 +8,7 @@ import {
 } from "@tabler/icons-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
-import { memo, useState } from "react";
+import { memo, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import {
   ContextMenu,
@@ -65,6 +65,23 @@ export function menuFor(row: { archived: boolean; pinned: boolean }) {
 }
 
 /**
+ * Label and icon for the two toggle acts `menuFor` can name.
+ *
+ * Delete is deliberately absent: its label never toggles and its click opens a dialog instead of
+ * mutating, so it is rendered directly rather than forced through a lookup built for the two acts
+ * that do toggle.
+ */
+const ACT_META: Record<
+  "pin" | "unpin" | "archive" | "restore",
+  { icon: ReactNode; label: string }
+> = {
+  pin: { icon: <IconPin />, label: "Pin conversation" },
+  unpin: { icon: <IconPinnedOff />, label: "Unpin conversation" },
+  archive: { icon: <IconArchive />, label: "Archive" },
+  restore: { icon: <IconArchiveOff />, label: "Restore" },
+};
+
+/**
  * Memoized roster row. `use-channel-events` preserves unchanged row identity, and
  * `content-visibility` keeps off-screen rows cheap without virtualization.
  *
@@ -82,9 +99,6 @@ export const RosterRow = memo(function RosterRow({
   pinned,
   unread,
   archived,
-  // A retired Bot's chat still lists here, unrendered by this row for now — carried in the props
-  // because the roster already knows it and a later screen needs it, not because this row uses it.
-  active: _active,
 }: {
   kind: RosterKind;
   id: string;
@@ -95,7 +109,6 @@ export const RosterRow = memo(function RosterRow({
   pinned: boolean;
   unread: boolean;
   archived: boolean;
-  active: boolean;
 }) {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
@@ -174,6 +187,42 @@ export const RosterRow = memo(function RosterRow({
     setConfirming(false);
   };
 
+  // What the right-click menu offers, given this row's current state. Rendered below by iterating
+  // this array rather than by hardcoding the three items, so a rule this file no longer states
+  // correctly — like an archived row still saying "Archive" — is a rule this file no longer states
+  // at all, not a rule that quietly diverges between the tested function and the rendered menu.
+  const acts = menuFor({ archived, pinned });
+
+  const handlePinClick = () => {
+    setPinProblem(null);
+    if (kind === "channel") {
+      channelPinned.mutate(
+        { channelId: id, pinned: !pinned },
+        { onError: (thrown) => setPinProblem(thrown.message) },
+      );
+    } else {
+      botChatPinned.mutate(
+        { botChatId: id, pinned: !pinned },
+        { onError: (thrown) => setPinProblem(thrown.message) },
+      );
+    }
+  };
+
+  const handleArchiveClick = () => {
+    setArchiveProblem(null);
+    if (kind === "channel") {
+      channelArchived.mutate(
+        { channelId: id, archived: !archived },
+        { onError: (thrown) => setArchiveProblem(thrown.message) },
+      );
+    } else {
+      botChatArchived.mutate(
+        { botChatId: id, archived: !archived },
+        { onError: (thrown) => setArchiveProblem(thrown.message) },
+      );
+    }
+  };
+
   return (
     <>
       <ContextMenu>
@@ -218,55 +267,34 @@ export const RosterRow = memo(function RosterRow({
           </Link>
         </ContextMenuTrigger>
         <ContextMenuContent>
-          <ContextMenuItem
-            onClick={() => {
-              setPinProblem(null);
-              if (kind === "channel") {
-                channelPinned.mutate(
-                  { channelId: id, pinned: !pinned },
-                  { onError: (thrown) => setPinProblem(thrown.message) },
-                );
-              } else {
-                botChatPinned.mutate(
-                  { botChatId: id, pinned: !pinned },
-                  { onError: (thrown) => setPinProblem(thrown.message) },
-                );
-              }
-            }}
-          >
-            {pinned ? <IconPinnedOff /> : <IconPin />}
-            {pinned ? "Unpin conversation" : "Pin conversation"}
-          </ContextMenuItem>
-          <ContextMenuItem
-            onClick={() => {
-              setArchiveProblem(null);
-              if (kind === "channel") {
-                channelArchived.mutate(
-                  { channelId: id, archived: !archived },
-                  { onError: (thrown) => setArchiveProblem(thrown.message) },
-                );
-              } else {
-                botChatArchived.mutate(
-                  { botChatId: id, archived: !archived },
-                  { onError: (thrown) => setArchiveProblem(thrown.message) },
-                );
-              }
-            }}
-          >
-            {archived ? <IconArchiveOff /> : <IconArchive />}
-            {archived ? "Restore" : "Archive"}
-          </ContextMenuItem>
-          <ContextMenuItem
-            variant="destructive"
-            onClick={() => {
-              // A refusal from a previous attempt is not news about this one.
-              deleteConversation.reset();
-              setConfirming(true);
-            }}
-          >
-            <IconTrash />
-            Delete…
-          </ContextMenuItem>
+          {acts.map((act) =>
+            act === "delete" ? (
+              <ContextMenuItem
+                key="delete"
+                variant="destructive"
+                onClick={() => {
+                  // A refusal from a previous attempt is not news about this one.
+                  deleteConversation.reset();
+                  setConfirming(true);
+                }}
+              >
+                <IconTrash />
+                Delete…
+              </ContextMenuItem>
+            ) : (
+              <ContextMenuItem
+                key={act}
+                onClick={
+                  act === "pin" || act === "unpin"
+                    ? handlePinClick
+                    : handleArchiveClick
+                }
+              >
+                {ACT_META[act].icon}
+                {ACT_META[act].label}
+              </ContextMenuItem>
+            ),
+          )}
         </ContextMenuContent>
       </ContextMenu>
       {pinProblem ? (
