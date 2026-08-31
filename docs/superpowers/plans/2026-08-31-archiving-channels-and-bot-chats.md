@@ -2258,7 +2258,17 @@ frozen, and the roster query is the only read path that filters on it.
 - [ ] **Step 4: Run the test**
 
 Run: `bun test server/tests/bot-chat-store.integration.test.ts`
-Expected: PASS, 20 tests.
+Expected: PASS. The block above holds 22 cases — count `test(` rather than trusting this sentence.
+
+Three further cases belong here and are deliberately left for the implementer to add, because the
+block above never exercises the paths they cover:
+
+- **A stale report must not restore an archived chat.** The self-review below asks for it; the block
+  does not contain it.
+- **`markRead`.** Nothing above ever calls it, and its `greatest(now(), coalesce(...))` is
+  hand-written SQL. An expression that has never executed is one nobody has checked Postgres accepts.
+- **`setPinned` on an archived chat.** Nothing above calls it either, and the case doubles as the
+  assertion that pinning neither consults nor clears `archived_at`.
 
 - [ ] **Step 5: Commit**
 
