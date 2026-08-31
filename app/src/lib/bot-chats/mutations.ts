@@ -1,0 +1,188 @@
+import {
+  mutationOptions,
+  type InfiniteData,
+  type QueryClient,
+} from "@tanstack/react-query";
+import { client, tryClient } from "@/lib/client";
+import { rosterKeys, type RosterPage } from "@/lib/roster/queries";
+import type { BotChat } from "./queries";
+
+/**
+ * Start a new direct conversation with a Bot.
+ *
+ * Deliberately not idempotent: every call starts a conversation.
+ */
+export function createBotChatMutationOptions(queryClient: QueryClient) {
+  return mutationOptions({
+    mutationFn: (agentId: string): Promise<BotChat> =>
+      client<BotChat>("/api/bot-chats", "botChat", {
+        method: "POST",
+        body: { agentId },
+        fallback: "Could not start this conversation",
+      }),
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: rosterKeys.all }),
+  });
+}
+
+/**
+ * Adopt a thread the browser still remembers from before the roster existed, giving it a chat row.
+ *
+ * Idempotent on purpose: two tabs holding the same remembered thread both try to adopt it, and the
+ * server's unique constraint gives them back the same row rather than minting two.
+ */
+export function adoptBotChatMutationOptions(queryClient: QueryClient) {
+  return mutationOptions({
+    mutationFn: (variables: {
+      agentId: string;
+      threadId: string;
+    }): Promise<BotChat> =>
+      client<BotChat>("/api/bot-chats/adopt", "botChat", {
+        method: "POST",
+        body: variables,
+        fallback: "Could not open this conversation",
+      }),
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: rosterKeys.all }),
+  });
+}
+
+/**
+ * Report the last thing said in a bot chat.
+ *
+ * The client that ran the agent already has the message before platform replay can return it; the
+ * runtime exposes no run-completion hook and its run endpoint returns before the reply exists.
+ *
+ * Fire-and-forget on purpose: a failed preview update is a stale roster line, not a lost message.
+ */
+export function recordBotChatActivityMutationOptions() {
+  return mutationOptions({
+    mutationFn: async (variables: {
+      botChatId: string;
+      text: string;
+      agentId: string | null;
+      at: string;
+    }) => {
+      /* Still fire-and-forget: `tryClient` does not throw, and the result is not read. */
+      await tryClient(`/api/bot-chats/${variables.botChatId}/activity`, {
+        method: "POST",
+        body: {
+          agentId: variables.agentId,
+          at: variables.at,
+          text: variables.text,
+        },
+      });
+    },
+  });
+}
+
+/** Pin or unpin a bot chat for this member. A marker, not a reorder, so no optimistic sort. */
+export function setBotChatPinnedMutationOptions(queryClient: QueryClient) {
+  return mutationOptions({
+    mutationFn: async (variables: { botChatId: string; pinned: boolean }) => {
+      await client(`/api/bot-chats/${variables.botChatId}/pin`, {
+        method: "PUT",
+        body: { pinned: variables.pinned },
+        fallback: "Could not pin this conversation",
+      });
+    },
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: rosterKeys.all }),
+  });
+}
+
+/**
+ * Stamp a bot chat read for this member, patching the cache before the wire answers.
+ *
+ * Patched in onMutate rather than refetched on success: the dot must clear the instant the chat
+ * opens, not a round-trip later. No rollback on failure and no invalidation — a mark-read that did
+ * not land is a dot that returns on the next refetch, which is the truth reasserting itself, and a
+ * refetch here would race the socket's own patches for nothing.
+ *
+ * Patches all three status lists: unlike a channel, which has one cache to patch, a bot chat's row can
+ * be sitting in Active, Archived, or All, and the read has to clear wherever it is.
+ */
+export function markBotChatReadMutationOptions(queryClient: QueryClient) {
+  return mutationOptions({
+    mutationFn: async (botChatId: string) => {
+      await client(`/api/bot-chats/${botChatId}/read`, {
+        method: "PUT",
+        fallback: "Could not mark this conversation read",
+      });
+    },
+    onMutate: (botChatId) => {
+      const now = new Date().toISOString();
+      for (const status of ["active", "archived", "all"] as const) {
+        queryClient.setQueryData(
+          rosterKeys.list(status),
+          (data: InfiniteData<RosterPage> | undefined) =>
+            data && {
+              ...data,
+              pages: data.pages.map((page) => ({
+                ...page,
+                items: page.items.map((row) =>
+                  row.id === botChatId
+                    ? {
+                        ...row,
+                        /*
+                         * The later of now and the row's own lastMessageAt: lastMessageAt comes from
+                         * another clock, and a marker stamped "now" by a clock running behind it
+                         * would leave the row still reading as unseen — and the dot still lit.
+                         */
+                        lastReadAt:
+                          row.lastMessageAt && row.lastMessageAt > now
+                            ? row.lastMessageAt
+                            : now,
+                      }
+                    : row,
+                ),
+              })),
+            },
+        );
+      }
+    },
+  });
+}
+
+/**
+ * Archive or restore a bot chat for this member. Hidden, not frozen: the conversation stays live.
+ *
+ * Invalidates rather than patches, because the row moves between the Active, Archived, and All lists
+ * and a patch would leave it in two of them at once — that is a page-membership change, which a patch
+ * to one row's fields cannot express.
+ */
+export function setBotChatArchivedMutationOptions(queryClient: QueryClient) {
+  return mutationOptions({
+    mutationFn: async (variables: {
+      botChatId: string;
+      archived: boolean;
+    }) => {
+      await client(`/api/bot-chats/${variables.botChatId}/archive`, {
+        method: "PUT",
+        body: { archived: variables.archived },
+        fallback: variables.archived
+          ? "Could not archive this conversation"
+          : "Could not restore this conversation",
+      });
+    },
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: rosterKeys.all }),
+  });
+}
+
+/** Soft-delete a bot chat. The server keeps the transcript; the roster forgets. */
+export function deleteBotChatMutationOptions(queryClient: QueryClient) {
+  return mutationOptions({
+    mutationFn: async (botChatId: string) => {
+      await client(`/api/bot-chats/${botChatId}`, {
+        method: "DELETE",
+        fallback: "Could not delete this conversation",
+      });
+    },
+    // The roster only. The open chat's detail query would refetch into the fresh 404 and flash an
+    // error before the navigate-home lands; left alone, it keeps its cache and the navigation
+    // happens with nothing to complain about.
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: rosterKeys.all }),
+  });
+}
