@@ -2,7 +2,9 @@ import { describe, expect, test } from "bun:test";
 import type { MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import type { AgentActor } from "../src/agents/profile-types";
+import { createApp } from "../src/app";
 import type { AppVariables } from "../src/auth/guards";
+import { loadConfig } from "../src/config";
 import { createRosterRoutes } from "../src/roster/routes";
 import type {
   RosterItem,
@@ -10,6 +12,7 @@ import type {
   RosterQuery,
   RosterStore,
 } from "../src/roster/query";
+import { testEnvironment } from "./support/environment";
 
 const actor: AgentActor = { id: "user-1", role: "user" };
 
@@ -125,5 +128,55 @@ describe("GET /", () => {
     const response = await appFor(store).request("/");
 
     expect((await response.json()).nextCursor).toBe("next");
+  });
+});
+
+
+/*
+ * A deployment that mounted no roster store.
+ *
+ * Built through `createApp` rather than through this file's own `appFor`, because the behaviour under
+ * test belongs to the mount and not to the routes: `appFor` mounts `createRosterRoutes`, which is
+ * exactly the branch that is absent here.
+ */
+describe("GET /api/roster with no store mounted", () => {
+  function appWithoutRoster() {
+    return createApp(
+      loadConfig(testEnvironment()),
+      {
+        handler: () => new Response(null, { status: 204 }),
+        api: {
+          getSession: async () => ({
+            user: {
+              id: "user-1",
+              email: "somebody@openbot.test",
+              name: "Somebody",
+              image: null,
+            },
+          }),
+        },
+      } as never,
+      { rolesForUser: async () => ["user"] },
+    );
+  }
+
+  /*
+   * 503 and a reason, not Hono's bare `notFound()`.
+   *
+   * The sidebar has one read, so whatever this answers is the whole screen. `client()` in the browser
+   * takes its message from `body.error` and falls back to its own sentence when the body is not JSON,
+   * so a 404 carrying Hono's text body reaches somebody as "Could not load your conversations" with
+   * nothing in it about why — indistinguishable, from the outside, from having no conversations.
+   */
+  test("says the roster is unavailable rather than that it does not exist", async () => {
+    const response = await appWithoutRoster().request(
+      "http://openbot.test/api/roster",
+    );
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get("content-type")).toContain("application/json");
+    expect(await response.json()).toEqual({
+      error: "The roster is not available.",
+    });
   });
 });
