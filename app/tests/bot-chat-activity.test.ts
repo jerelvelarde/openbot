@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import type { Message } from "@ag-ui/core";
-import { botChatActivityWatcher } from "../src/lib/bot-chats/activity";
+import {
+  botChatActivityWatcher,
+  watcherFor,
+} from "../src/lib/bot-chats/activity";
 
 /**
  * What a bot chat reports to the roster, and what it stays quiet about.
@@ -11,8 +14,9 @@ import { botChatActivityWatcher } from "../src/lib/bot-chats/activity";
  * history announcing itself again, which must not. Getting the second one wrong is not cosmetic — a
  * report un-archives the conversation it lands on, so it would restore an archive by navigation.
  *
- * No render harness anywhere in this suite, which is why the decision lives in a plain state machine
- * and this file drives it directly.
+ * The decision lives in a plain state machine, so this file drives it directly, message by message:
+ * a rendered chat cannot be asked to replay a stored history on demand, and the replay is the case
+ * that matters most.
  */
 
 const BOT = "risk-analyst";
@@ -38,7 +42,11 @@ describe("what a bot chat reports", () => {
 
     expect(
       watcher.observed(typedHere("m1", "Book the Tuesday flight")),
-    ).toEqual({ agentId: null, text: "Book the Tuesday flight" });
+    ).toEqual({
+      agentId: null,
+      firstFromPerson: true,
+      text: "Book the Tuesday flight",
+    });
   });
 
   test("the Bot's reply reports as the Bot, which is what raises the unseen dot", () => {
@@ -48,6 +56,7 @@ describe("what a bot chat reports", () => {
 
     expect(watcher.observed(fromStream("m2", "assistant", "Booked."))).toEqual({
       agentId: BOT,
+      firstFromPerson: false,
       text: "Booked.",
     });
   });
@@ -60,10 +69,14 @@ describe("what a bot chat reports", () => {
 
     expect(
       watcher.observed(fromStream("m2", "assistant", "Let me look.")),
-    ).toEqual({ agentId: BOT, text: "Let me look." });
+    ).toEqual({ agentId: BOT, firstFromPerson: false, text: "Let me look." });
     expect(
       watcher.observed(fromStream("m3", "assistant", "£61 on Tuesday.")),
-    ).toEqual({ agentId: BOT, text: "£61 on Tuesday." });
+    ).toEqual({
+      agentId: BOT,
+      firstFromPerson: false,
+      text: "£61 on Tuesday.",
+    });
   });
 
   test("a replayed history reports nothing, so opening a conversation cannot restore its archive", () => {
@@ -154,6 +167,7 @@ describe("what a bot chat reports", () => {
     ).toBeNull();
     expect(watcher.observed(fromStream("m2", "assistant", "Got it."))).toEqual({
       agentId: BOT,
+      firstFromPerson: false,
       text: "Got it.",
     });
   });
@@ -182,7 +196,64 @@ describe("what a bot chat reports", () => {
           },
         ]),
       ),
-    ).toEqual({ agentId: null, text: "What is in this?" });
+    ).toEqual({
+      agentId: null,
+      firstFromPerson: true,
+      text: "What is in this?",
+    });
+  });
+
+  test("only the first thing a person says carries the flag the title refetch turns on", () => {
+    /*
+     * The flag is what buys "one refetch per conversation". The alternative — asking whether the
+     * conversation still has no title — answers "no title yet" for every message sent while that
+     * refetch is in flight, so a burst into a fresh conversation asks to be named once per message.
+     */
+    const watcher = botChatActivityWatcher(BOT);
+
+    expect(watcher.observed(typedHere("m1", "First"))?.firstFromPerson).toBe(
+      true,
+    );
+    expect(watcher.observed(typedHere("m2", "Second"))?.firstFromPerson).toBe(
+      false,
+    );
+    expect(
+      watcher.observed(fromStream("m3", "assistant", "Answer"))
+        ?.firstFromPerson,
+    ).toBe(false);
+  });
+
+  test("a message with no words does not spend the flag", () => {
+    // Nothing was reported, so the server has had no message to derive a title from: the flag has to
+    // wait for one that actually said something.
+    const watcher = botChatActivityWatcher(BOT);
+
+    watcher.observed(
+      typedHere("m1", [
+        {
+          metadata: {},
+          source: { mimeType: "image/png", type: "data", value: "AAAA" },
+          type: "image",
+        },
+      ]),
+    );
+
+    expect(
+      watcher.observed(typedHere("m2", "What is in this?"))?.firstFromPerson,
+    ).toBe(true);
+  });
+
+  test("a replayed person's turn does not spend the flag either", () => {
+    // It was not reported, so the server never saw it, so it cannot be the message the title came
+    // from. Spending the flag on it would leave a conversation with a replayed history permanently
+    // showing the Bot's name in the roster.
+    const watcher = botChatActivityWatcher(BOT);
+
+    watcher.observed(fromStream("h1", "user", "Yesterday's ask"));
+
+    expect(
+      watcher.observed(typedHere("m1", "Today's ask"))?.firstFromPerson,
+    ).toBe(true);
   });
 
   test("the reported text is trimmed, so a preview never starts with whitespace", () => {
@@ -190,7 +261,63 @@ describe("what a bot chat reports", () => {
 
     expect(watcher.observed(typedHere("m1", "  Book it\n"))).toEqual({
       agentId: null,
+      firstFromPerson: true,
       text: "Book it",
+    });
+  });
+});
+
+/**
+ * Which watcher a conversation gets, which is the difference between this file's rules holding and
+ * holding only for whoever remembers to re-mount the hook.
+ */
+describe("watcherFor", () => {
+  const chatA = { agentId: BOT, id: "botchat-1" };
+  const chatB = { agentId: "travel-agent", id: "botchat-2" };
+
+  test("nothing held yet gets a watcher for this conversation", () => {
+    expect(watcherFor(null, chatA).botChatId).toBe(chatA.id);
+  });
+
+  test("the same conversation keeps the watcher it already had", () => {
+    // The only reason a caller holds one at all: a re-subscribe must not lose the "already reported"
+    // set, or the tail of a thread this tab has already reported moves the roster a second time.
+    const held = watcherFor(null, chatA);
+
+    expect(watcherFor(held, chatA)).toBe(held);
+  });
+
+  test("a different conversation gets a watcher whose latch is closed", () => {
+    /*
+     * The failure this function exists to make impossible. A watcher carried across a navigation
+     * arrives with `spokenHere` already latched by the previous conversation, so the first thing the
+     * new one announces — its replayed history — is reported, which stamps `last_message_at` with
+     * the moment of the navigation and clears `archived_at` on the way past: an archived
+     * conversation un-archived by being opened.
+     */
+    const held = watcherFor(null, chatA);
+    held.watcher.observed(typedHere("m1", "Said in the first conversation"));
+
+    const next = watcherFor(held, chatB);
+
+    expect(next).not.toBe(held);
+    expect(next.botChatId).toBe(chatB.id);
+    expect(
+      next.watcher.observed(fromStream("h1", "assistant", "Stored answer")),
+    ).toBeNull();
+  });
+
+  test("a different conversation's watcher reports its own Bot", () => {
+    // The other thing a carried-over watcher gets wrong: it would attribute the new conversation's
+    // replies to the previous Bot, and the server refuses any agent id but the conversation's own.
+    const next = watcherFor(watcherFor(null, chatA), chatB);
+
+    next.watcher.observed(typedHere("m1", "Hello"));
+
+    expect(next.watcher.observed(fromStream("m2", "assistant", "Hi"))).toEqual({
+      agentId: chatB.agentId,
+      firstFromPerson: false,
+      text: "Hi",
     });
   });
 });

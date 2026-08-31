@@ -19,9 +19,8 @@ export function createChannelMutationOptions(queryClient: QueryClient) {
       });
       return ((await response.json()) as { channel: AgentChannel }).channel;
     },
-    // channelKeys.all no longer backs anything the sidebar reads — that reader is gone — but it
-    // still reaches channelKeys.detail, which channelQueryOptions does read; rosterKeys.all is
-    // what actually gets the new row into the sidebar.
+    // channelKeys.all is a prefix of channelKeys.detail, which channelQueryOptions reads;
+    // rosterKeys.all is what actually gets the new row into the sidebar.
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: channelKeys.all });
       void queryClient.invalidateQueries({ queryKey: rosterKeys.all });
@@ -85,7 +84,7 @@ export function setChannelPinnedMutationOptions(queryClient: QueryClient) {
  * refetch here would race the socket's own patches for nothing.
  *
  * Patches only the three roster status lists, via `patchRosterRead`: the sidebar is the one reader
- * of a channel's unread state now, and it reads the roster, not channelKeys.list().
+ * of a channel's unread state, and it reads the roster.
  */
 export function markChannelReadMutationOptions(queryClient: QueryClient) {
   return mutationOptions({
@@ -112,8 +111,8 @@ export function deleteChannelMutationOptions(queryClient: QueryClient) {
     },
     // Not the detail query: the open channel's detail query would refetch into the fresh 404 and
     // flash an error before the navigate-home lands; left alone, it keeps its cache and the
-    // navigation happens with nothing to complain about. Just rosterKeys.all — the sidebar is the
-    // only reader of the channel list now, and it reads the roster, not channelKeys.list().
+    // navigation happens with nothing to complain about. rosterKeys.all is what removes the row from
+    // the sidebar, which is the only reader of the channel list.
     onSuccess: () =>
       queryClient.invalidateQueries({ queryKey: rosterKeys.all }),
   });
@@ -124,6 +123,16 @@ export function deleteChannelMutationOptions(queryClient: QueryClient) {
  *
  * Invalidates rather than patches, because the row moves between the Active, Archived, and All lists
  * and a patch would leave it in two of them at once. `rosterKeys.all` is the prefix all three share.
+ *
+ * NOT `channelKeys.detail`, and a bot chat's archive does not invalidate its own detail query either.
+ * The two disagreed for a while: the bot chat's archive refetched its detail query on the stated
+ * grounds that the Bot chat screen renders `archived` off it, and this one did not, on no stated
+ * grounds. Neither position was the true one — nothing in the browser reads `archived` off a
+ * single-channel or single-bot-chat read at all. Both types declare the field because the wire sends
+ * it (see `AgentChannel.archived` above for why an undeclared field is worse than an unread one),
+ * and the only readers are the sidebar row and its menu, off `RosterItem`. An archived indicator on
+ * the channel or Bot chat screen would be the reader that earns the refetch, and it would want
+ * adding to both surfaces together.
  */
 export function setChannelArchivedMutationOptions(queryClient: QueryClient) {
   return mutationOptions({

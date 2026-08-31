@@ -2,9 +2,8 @@ import type { Message } from "@ag-ui/core";
 import { useAgent } from "@copilotkit/react-core/v2";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef } from "react";
-import { rosterKeys } from "@/lib/roster/queries";
 import { recordBotChatActivityMutationOptions } from "./mutations";
-import { type BotChat, botChatKeys } from "./queries";
+import type { BotChat } from "./queries";
 
 /**
  * Telling the roster what was just said in a direct conversation with a Bot.
@@ -26,7 +25,20 @@ import { type BotChat, botChatKeys } from "./queries";
  */
 
 /** What one report says: the words, and who said them. Null names the person. */
-export type BotChatActivity = { agentId: string | null; text: string };
+export type BotChatActivity = {
+  agentId: string | null;
+  text: string;
+  /**
+   * True on the first words a person says in this conversation, and never again — false on every
+   * message the Bot says, and on a person's later ones.
+   *
+   * The server derives the conversation's title from that one message, so this is what tells the
+   * hook which report is worth a refetch. A latch here rather than a test at the call site because
+   * the call site cannot tell: it would have to ask whether the title has arrived yet, and the
+   * answer is still "no" for every message sent while the refetch is in flight.
+   */
+  firstFromPerson: boolean;
+};
 
 /**
  * The part of AG-UI's `onNewMessage` payload this file reads.
@@ -71,8 +83,9 @@ function spokenText(message: Readonly<Message>): string {
 /**
  * Decides, message by message, what is worth reporting — and what is history saying itself again.
  *
- * A PLAIN STATE MACHINE RATHER THAN A HOOK, so every rule below can be tested without a render
- * harness (this suite has none). The hook underneath is then thin enough to read in one go.
+ * A PLAIN STATE MACHINE RATHER THAN A HOOK, so every rule below can be driven message by message
+ * from a test — a rendered chat cannot be asked to replay a history on demand — and so the hook
+ * underneath is thin enough to read in one go.
  *
  * THE REPLAY IS THE HAZARD THIS EXISTS FOR. Opening a conversation makes the packaged chat connect
  * the thread, and a fresh connect asks the gateway for the whole history, which arrives as ordinary
@@ -106,6 +119,8 @@ export function botChatActivityWatcher(
   const reported = new Set<string>();
   /** Whether a person has sent something from this browser, in this conversation. */
   let spokenHere = false;
+  /** Whether a person's words have already been reported, which the title is derived from. */
+  let reportedFromPerson = false;
 
   return {
     observed({ message, input }) {
@@ -132,11 +147,60 @@ export function botChatActivityWatcher(
       if (reported.has(message.id)) return null;
       reported.add(message.id);
 
+      const fromPerson = message.role === "user";
+      // Latched only on a message that is actually being reported: an attachment with no words never
+      // reaches here, and the title is derived from a message the server was told about.
+      const firstFromPerson = fromPerson && !reportedFromPerson;
+      if (fromPerson) reportedFromPerson = true;
+
       // `null` for the person, this Bot's id for the Bot. The server refuses any other agent id, and
       // the distinction is what decides both the title (only ever from a person's first message) and
       // the unseen dot (only ever raised by the Bot's).
-      return { agentId: message.role === "user" ? null : botAgentId, text };
+      return {
+        agentId: fromPerson ? null : botAgentId,
+        firstFromPerson,
+        text,
+      };
     },
+  };
+}
+
+/** A watcher and the conversation it belongs to, so a held one can be checked before it is reused. */
+export type HeldWatcher = {
+  botChatId: string;
+  watcher: BotChatActivityWatcher;
+};
+
+/**
+ * The watcher for this conversation, reusing a held one only when it is the same conversation.
+ *
+ * A WATCHER MUST NEVER OUTLIVE ITS CONVERSATION, and that requirement lives here rather than in a
+ * `key` on whoever renders the hook. Both of a watcher's pieces of memory are per-conversation: the
+ * `spokenHere` latch, and the set of message ids already reported. Carry either into a different
+ * conversation and the guarantees invert — the latch arrives already open, so the next thing that
+ * announces itself is reported even though nobody has typed anything, and the first thing to
+ * announce itself after a navigation is the new thread's replayed history. That would stamp
+ * `last_message_at` with the moment of the navigation and clear `archived_at` on the way past: an
+ * archived conversation un-archived by being opened, which is the one thing this file exists to
+ * prevent.
+ *
+ * The screen that calls the hook passes `key={botChat.id}`, which remounts the whole subtree on a
+ * change and so happens to make this impossible from that one call site — but that key was the only
+ * thing standing between a navigation and the failure above, which made a correct screen a
+ * precondition for a correct hook. Now the hook holds either way.
+ *
+ * Reused for the same id, deliberately, which is the reason a ref holds it at all: a re-subscribe
+ * (a new agent instance, a re-run effect) must not lose the "already reported" set, or the tail of
+ * the thread gets reported twice.
+ */
+export function watcherFor(
+  held: HeldWatcher | null,
+  botChat: Pick<BotChat, "agentId" | "id">,
+): HeldWatcher {
+  if (held?.botChatId === botChat.id) return held;
+  return {
+    botChatId: botChat.id,
+    watcher: botChatActivityWatcher(botChat.agentId),
   };
 }
 
@@ -156,13 +220,16 @@ export function useBotChatActivity(botChat: BotChat): void {
    */
   const { agent } = useAgent({ agentId: botChat.agentId });
   const queryClient = useQueryClient();
-  const recordActivity = useMutation(recordBotChatActivityMutationOptions());
+  const recordActivity = useMutation(
+    recordBotChatActivityMutationOptions(queryClient),
+  );
   /* The mutation object's identity changes per render; `mutate` is stable, so only it is a dep. */
   const record = recordActivity.mutate;
 
   /** One watcher per conversation, so its "already reported" set survives a re-subscribe. */
-  const watcher = useRef<BotChatActivityWatcher | null>(null);
-  watcher.current ??= botChatActivityWatcher(botChat.agentId);
+  const held = useRef<HeldWatcher | null>(null);
+  held.current = watcherFor(held.current, botChat);
+  const watcher = held.current.watcher;
 
   /** Read at report time rather than captured, so the effect does not re-subscribe when it changes. */
   const untitled = useRef(botChat.title === null);
@@ -171,47 +238,37 @@ export function useBotChatActivity(botChat: BotChat): void {
   useEffect(() => {
     const subscription = agent.subscribe?.({
       onNewMessage: (event) => {
-        const activity = watcher.current?.observed(event);
+        const activity = watcher.observed(event);
         if (!activity) return;
 
         /*
-         * ONE REFETCH, the first time a person speaks in a conversation that has no title yet.
+         * ONE REFETCH PER CONVERSATION: the first thing a person says in one that has no title yet.
          *
-         * `title` is derived server-side from that message, and nothing else in this app would ever
-         * hear about it: the socket's activity event carries the preview and the timestamp but not
-         * the name, and this deployment turns `refetchOnWindowFocus` off. Without this the roster
-         * keeps showing the Bot's name for every conversation with that Bot for the rest of the
-         * session — which is the exact thing a titled row exists to fix.
+         * Both halves are needed and neither is enough. `firstFromPerson` is latched in the watcher,
+         * so this stays one refetch however fast somebody types — read on its own, `untitled` is
+         * still true for every message sent before the invalidated detail query comes back, so a
+         * burst into a new conversation used to ask for a title several times over. `untitled` is
+         * what keeps a conversation that already has one from refetching at all.
          *
-         * In the mutation's own `onSuccess` rather than beside the call, so the refetch happens after
-         * the write and reads the title instead of racing it. `tryClient` resolves for a refused
-         * write too, so this can fire without a title to find; that costs one refetch and changes
-         * nothing, which is the fire-and-forget bargain and not error handling.
+         * What that costs: if the one refetch misses the title — the report was refused, or the read
+         * raced the write server-side — nothing here asks again, and the roster keeps showing the
+         * Bot's name for this conversation until something else loads it. That is the same
+         * fire-and-forget bargain the rest of this file makes, and the alternative is a refetch per
+         * message for the whole conversation.
+         *
+         * The refetch itself is in the mutation's own `onSuccess`, not passed per call — see
+         * `recordBotChatActivityMutationOptions`, where a per-call callback was being cancelled by
+         * the Bot's reply.
          */
-        const naming = activity.agentId === null && untitled.current;
-
-        record(
-          {
-            agentId: activity.agentId,
-            at: new Date().toISOString(),
-            botChatId: botChat.id,
-            text: activity.text,
-          },
-          naming
-            ? {
-                onSuccess: () => {
-                  void queryClient.invalidateQueries({
-                    queryKey: botChatKeys.detail(botChat.id),
-                  });
-                  void queryClient.invalidateQueries({
-                    queryKey: rosterKeys.all,
-                  });
-                },
-              }
-            : undefined,
-        );
+        record({
+          agentId: activity.agentId,
+          at: new Date().toISOString(),
+          botChatId: botChat.id,
+          derivesTitle: activity.firstFromPerson && untitled.current,
+          text: activity.text,
+        });
       },
     });
     return () => subscription?.unsubscribe();
-  }, [agent, botChat.id, queryClient, record]);
+  }, [agent, botChat.id, record, watcher]);
 }

@@ -10,12 +10,17 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useEffect } from "react";
 import { hasUnseenActivity } from "@/components/app-sidebar/app-sidebar";
 import { Button } from "@/components/ui/button";
+import { useBotNames } from "@/lib/agents/bot-names";
 import { useBotChatActivity } from "@/lib/bot-chats/activity";
 import {
   createBotChatMutationOptions,
   markBotChatReadMutationOptions,
 } from "@/lib/bot-chats/mutations";
-import { type BotChat, botChatQueryOptions } from "@/lib/bot-chats/queries";
+import {
+  type BotChat,
+  BotChatMissingError,
+  botChatQueryOptions,
+} from "@/lib/bot-chats/queries";
 import { useActiveBot } from "@/lib/copilot/active-bot";
 import { useLegacyThreadAdoption } from "@/lib/copilot/bot-thread";
 import { useStoppedTurn } from "@/lib/copilot/stopped-turn";
@@ -40,27 +45,43 @@ export const Route = createFileRoute("/_authed/_app/bot_/$botChatId")({
 
 function RouteComponent() {
   const { botChatId } = Route.useParams();
-  const { data: botChat, isPending } = useQuery(botChatQueryOptions(botChatId));
+  const {
+    data: botChat,
+    error,
+    isPending,
+  } = useQuery(botChatQueryOptions(botChatId));
 
   if (isPending) return null;
   if (!botChat) {
     /*
      * A sentence rather than a throw, for the reason `bot.tsx` already gives about a named Bot
-     * this deployment does not have: a stale link is not a crash. Reached for somebody else's
-     * chat too, which the server answers 404 for rather than 403.
+     * this deployment does not have: a stale link is not a crash.
      *
-     * Deliberately `!botChat`, not `error || !botChat`. In React Query v5 a failed *refetch* keeps
-     * the previous `data` around alongside the new `error` — and this screen refetches on every
-     * archive or restore now that `setBotChatArchivedMutationOptions` invalidates
-     * `botChatKeys.detail(...)`. Consulting `error` here would swap a live, still-open conversation
-     * for this sentence on nothing worse than a transient 500. A first-load failure has no `data`
-     * either way, so it still lands here without `error` in the condition.
+     * WHICH sentence is decided by the status, not by there being no data. "Not here any more" is
+     * true of a 404 — a stale link, or somebody else's chat, which the server answers 404 for rather
+     * than 403 — and it is a lie about every other way a first load fails: offline, a 500, a request
+     * aborted by a navigation. Telling somebody their conversation is gone when the network dropped
+     * is the worse of the two mistakes, and it is not one they can act on. `botChatQueryOptions`
+     * reads `response.status` itself and throws `BotChatMissingError` only for the 404, the same way
+     * `adoptBotChatMutationOptions` does for its 409.
+     *
+     * `error` is consulted only INSIDE `!botChat`, deliberately. In React Query v5 a failed
+     * *refetch* keeps the previous `data` alongside the new `error` — and this screen does refetch,
+     * once per conversation, when `useBotChatActivity` invalidates `botChatKeys.detail(...)` to pick
+     * up the title. Consulting `error` before `data` would swap a live, still-open conversation for
+     * one of these sentences on nothing worse than a transient 500.
      */
+    const missing = error instanceof BotChatMissingError;
     return (
-      <div className="flex h-screen items-center justify-center p-6">
+      <div className="flex h-screen flex-col items-center justify-center gap-1 p-6">
         <p className="text-muted-foreground text-sm">
-          This conversation is not here any more.
+          {missing
+            ? "This conversation is not here any more."
+            : "Could not load this conversation."}
         </p>
+        {missing || !error ? null : (
+          <p className="text-muted-foreground text-sm">{error.message}</p>
+        )}
       </div>
     );
   }
@@ -74,6 +95,7 @@ function RouteComponent() {
 
 function BotChatScreen({ botChat }: { botChat: BotChat }) {
   const navigate = Route.useNavigate();
+  const botName = useBotNames();
   const queryClient = useQueryClient();
   const createBotChat = useMutation(createBotChatMutationOptions(queryClient));
   const markRead = useMutation(markBotChatReadMutationOptions(queryClient));
@@ -140,12 +162,37 @@ function BotChatScreen({ botChat }: { botChat: BotChat }) {
     });
   };
 
+  /*
+   * Caught and dropped, not because there is nothing to say — `createBotChat.error` says it, in the
+   * header below — but because an unhandled rejection is not how it gets said. `mutateAsync` rejects
+   * on a refused create, and a rejection nobody handles reaches `window.onunhandledrejection`, where
+   * any error reporter reads it as an uncaught application fault rather than a server saying no.
+   * The mutation is still the record of what went wrong; this only declines to raise it twice, once
+   * properly and once as a crash. `BotResolver` — the only other place that creates a conversation —
+   * ends its own chain the same way, with an empty catch and its comment saying why.
+   */
+  const onNewChat = () => {
+    void startNew().catch(() => {});
+  };
+
   return (
     <div className="flex h-screen flex-col">
       <header className="border-b px-6 py-3">
         <div className="flex items-baseline justify-between">
+          {/*
+           * The Bot's own name when the conversation has no title yet, never a name written into
+           * this route. That default used to be "Browser Bot", which `bot.tsx` argues against at
+           * length for the default Bot id it used to hardcode: a Bot name in a route is a defect on
+           * every fork but the one it came from. It was also a disagreement with the sidebar, which
+           * falls back to the Bot's name for this same untitled row (server/src/roster/query.ts:
+           * `name: row.title || row.agentName`), so the header and the row named one conversation
+           * two different things.
+           *
+           * `useBotNames` falls back to the Bot's id while the coworker list is still loading, which
+           * is the one value that is never somebody else's name.
+           */}
           <h1 className="text-lg font-semibold">
-            {botChat.title ?? "Browser Bot"}
+            {botChat.title ?? botName(botChat.agentId)}
           </h1>
           {/*
            * Still labelled "New chat", even though pressing it no longer destroys anything: it is
@@ -160,7 +207,7 @@ function BotChatScreen({ botChat }: { botChat: BotChat }) {
            */}
           <Button
             disabled={createBotChat.isPending || !botChat.active}
-            onClick={() => void startNew()}
+            onClick={onNewChat}
             size="sm"
             variant="ghost"
           >
@@ -172,11 +219,10 @@ function BotChatScreen({ botChat }: { botChat: BotChat }) {
           Ask it to open a page and watch it work.
         </p>
         {/*
-         * `mutateAsync` throws on a refused create, and `startNew` doesn't catch it — the rejection
-         * is unhandled on purpose, same as everywhere else in this app: the mutation's own `error`
-         * is the record of what went wrong, and this is where it gets said out loud. There is no
-         * toast in this app, and silence here reads as the app ignoring the click, same reasoning as
-         * `pinProblem`/`archiveProblem` in `roster-row.tsx`.
+         * Where a refused create gets said out loud. The mutation's own `error` is the record — see
+         * `onNewChat` above for why the rejection is swallowed rather than left unhandled. There is
+         * no toast in this app, and silence here would read as the app ignoring the click, the same
+         * reasoning as the `problem` sentence in `roster-row.tsx`.
          */}
         {createBotChat.error ? (
           <p className="text-destructive text-sm" role="alert">

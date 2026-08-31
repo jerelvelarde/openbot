@@ -96,14 +96,33 @@ export function adoptBotChatMutationOptions(queryClient: QueryClient) {
  * runtime exposes no run-completion hook and its run endpoint returns before the reply exists.
  *
  * Fire-and-forget on purpose: a failed preview update is a stale roster line, not a lost message.
+ *
+ * WHY THE TITLE REFETCH LIVES HERE, in the mutation's own `onSuccess`, driven by a flag in the
+ * variables rather than by per-call callbacks at the call site. `useBotChatActivity` reports both
+ * directions of one conversation through a single `useMutation`, which is a single
+ * `MutationObserver`, and query-core's `MutationObserver.mutate` keeps per-call callbacks in one
+ * field and detaches the observer from whatever mutation is still in flight (@tanstack/query-core
+ * 5.102.2, `mutationObserver.js`: `this.#mutateOptions = options` then
+ * `this.#currentMutation?.removeObserver(this)`). So the Bot's reply — reported moments after the
+ * person's turn, and reported with no callbacks of its own — used to cancel the person's: the
+ * refetch was silently dropped on exactly the slow connection that makes two reports overlap, and
+ * the roster went on showing the Bot's name for every conversation with that Bot. A mutation's own
+ * `onSuccess` is invoked by the mutation (`mutation.js`: `await this.options.onSuccess?.(…)`), not
+ * by the observer, so there is nothing for a later call to overwrite or detach.
  */
-export function recordBotChatActivityMutationOptions() {
+export function recordBotChatActivityMutationOptions(queryClient: QueryClient) {
   return mutationOptions({
     mutationFn: async (variables: {
       botChatId: string;
       text: string;
       agentId: string | null;
       at: string;
+      /**
+       * Whether this is the report the server derives the conversation's title from — a person's
+       * first words in a conversation that has none yet. Client-side intent only: the server decides
+       * the title for itself from the message, and the body below is unchanged by it.
+       */
+      derivesTitle: boolean;
     }) => {
       /* Still fire-and-forget: `tryClient` does not throw, and the result is not read. */
       await tryClient(`/api/bot-chats/${variables.botChatId}/activity`, {
@@ -114,6 +133,24 @@ export function recordBotChatActivityMutationOptions() {
           text: variables.text,
         },
       });
+    },
+    onSuccess: (_data, variables) => {
+      if (!variables.derivesTitle) return;
+      /*
+       * `title` is derived server-side from the message this report just delivered, and nothing else
+       * in this app would ever hear about it: the socket's activity event carries the preview and the
+       * timestamp but not the name, and this deployment turns `refetchOnWindowFocus` off. The detail
+       * query is what the open screen's header reads; the roster is what the sidebar row reads.
+       *
+       * After the write rather than beside it, so the refetch reads the title instead of racing it.
+       * `tryClient` resolves for a refused write too, so this can fire with no title to find; that
+       * costs one refetch and changes nothing, which is the fire-and-forget bargain, not error
+       * handling.
+       */
+      void queryClient.invalidateQueries({
+        queryKey: botChatKeys.detail(variables.botChatId),
+      });
+      void queryClient.invalidateQueries({ queryKey: rosterKeys.all });
     },
   });
 }
@@ -165,11 +202,14 @@ export function markBotChatReadMutationOptions(queryClient: QueryClient) {
  * and a patch would leave it in two of them at once — that is a page-membership change, which a patch
  * to one row's fields cannot express.
  *
- * Also invalidates the detail query, unlike delete below: `BotChat` carries `archived`, and the Bot
- * chat screen renders straight from it, so a tab holding that screen open while the row is archived or
- * restored elsewhere needs the refetch to stop showing the stale state. Delete cannot afford the same
- * refetch — the row it would fetch is already gone — but archiving leaves the row exactly where it
- * was, still readable, so there is no 404 here for a refetch to trip over.
+ * `rosterKeys.all` ONLY, and the same as the channel's archive for the same reason. This used to
+ * invalidate `botChatKeys.detail` as well, justified by "the Bot chat screen renders `archived`
+ * straight off it" — it does not, and never did: the only readers of `archived` anywhere in the
+ * browser are the sidebar row and its menu, both off `RosterItem`. So the extra refetch bought
+ * nothing a person could see, while making the open screen re-read a row on every archive from
+ * anywhere, which is what forced its "not here any more" guard to reason carefully about a failed
+ * refetch. If an archived indicator ever does belong on the screen, this is the invalidation to
+ * bring back — with the reader that justifies it, in the same change.
  */
 export function setBotChatArchivedMutationOptions(queryClient: QueryClient) {
   return mutationOptions({
@@ -182,12 +222,8 @@ export function setBotChatArchivedMutationOptions(queryClient: QueryClient) {
           : "Could not restore this conversation",
       });
     },
-    onSuccess: (_data, variables) => {
-      void queryClient.invalidateQueries({ queryKey: rosterKeys.all });
-      void queryClient.invalidateQueries({
-        queryKey: botChatKeys.detail(variables.botChatId),
-      });
-    },
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: rosterKeys.all }),
   });
 }
 
@@ -200,10 +236,11 @@ export function deleteBotChatMutationOptions(queryClient: QueryClient) {
         fallback: "Could not delete this conversation",
       });
     },
-    // The roster only, deliberately not the detail query the way archive above does. The open chat's
-    // detail query would refetch into the fresh 404 and flash an error before the navigate-home lands;
-    // left alone, it keeps its cache and the navigation happens with nothing to complain about. Archive
-    // has no such row to lose, which is exactly why it invalidates and this one does not.
+    // The roster only, and deliberately not the detail query — which archive above does not
+    // invalidate either, but for a different reason worth keeping straight. Archive leaves the row
+    // exactly where it was and simply has no reader for the refetch to serve; this one has no row
+    // left at all. The open chat's detail query would refetch into the fresh 404 and flash an error
+    // before the navigate-home lands, so even gaining a reader would not make this one safe.
     onSuccess: () =>
       queryClient.invalidateQueries({ queryKey: rosterKeys.all }),
   });

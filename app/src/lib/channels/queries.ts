@@ -26,30 +26,19 @@ export type AgentChannel = {
   archived: boolean;
 };
 
-/** A channel plus the last thing said in it, which is what the roster renders. */
-export type ChannelSummary = AgentChannel & {
-  lastMessage: string | null;
-  /** ISO-8601, or null for a channel nobody has used yet. */
-  lastMessageAt: string | null;
-  lastMessageAgentId: string | null;
-  /** ISO-8601. Ordering falls back to this, so a channel just created sorts to the top. */
-  createdAt: string;
-  /** Whether this member pinned the channel. Pinned channels sort first in the roster. */
-  pinned: boolean;
-  /** ISO-8601 when this member last had the channel open, or null for never. The caller's, only. */
-  lastReadAt: string | null;
-};
-
+/**
+ * One channel, read one at a time. There is no list key here on purpose.
+ *
+ * A `list()` key lived here, with a `ChannelSummary`/`ChannelPage` pair to go with it, from when the
+ * sidebar paged through channels alone. It reads the roster now — channels and Bot chats in one
+ * ordering, which a channels-only list cannot express — and the summary types went unread with it.
+ * They are gone rather than kept for later: an exported page type with no fetch behind it reads as a
+ * live cache somebody should be patching, and `mutations.ts` had grown two comments explaining that
+ * a mutation reaches the roster "not channelKeys.list()" — discussing a key nothing could read.
+ */
 export const channelKeys = {
   all: ["channels"] as const,
-  list: () => ["channels", "list"] as const,
   detail: (channelId: string) => ["channels", "detail", channelId] as const,
-};
-
-/** One page of channels, and where the next one starts. */
-export type ChannelPage = {
-  channels: ChannelSummary[];
-  nextCursor: string | null;
 };
 
 export function channelQueryOptions(channelId: string) {
