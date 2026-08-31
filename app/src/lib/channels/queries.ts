@@ -14,6 +14,16 @@ export type AgentChannel = {
   agentIds: string[];
   threadId: string;
   active: boolean;
+  /**
+   * Whether the channel is put away. Hidden, not frozen — the conversation stays live, and saying
+   * something in it brings it back.
+   *
+   * Declared here because the wire sends it. Nothing validates a response against this type, so an
+   * undeclared field is ignored in silence rather than caught, which is the whole reason a mirror
+   * that has quietly stopped matching its server is worth avoiding: the next person to need the
+   * field reads this file, concludes it is not sent, and goes and adds it a second time.
+   */
+  archived: boolean;
 };
 
 /** A channel plus the last thing said in it, which is what the roster renders. */
