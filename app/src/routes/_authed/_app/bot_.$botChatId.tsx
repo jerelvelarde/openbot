@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { createBotChatMutationOptions } from "@/lib/bot-chats/mutations";
 import { type BotChat, botChatQueryOptions } from "@/lib/bot-chats/queries";
 import { useActiveBot } from "@/lib/copilot/active-bot";
+import { useLegacyThreadAdoption } from "@/lib/copilot/bot-thread";
 import { useStoppedTurn } from "@/lib/copilot/stopped-turn";
 
 /**
@@ -74,6 +75,8 @@ function BotChatScreen({ botChat }: { botChat: BotChat }) {
    * a provider this app does not mount.
    */
   const stopped = useStoppedTurn(botChat.agentId);
+  // No-op for every browser with no remembered key — which is every browser after the first visit.
+  useLegacyThreadAdoption(botChat.agentId);
 
   const startNew = async () => {
     const created = await createBotChat.mutateAsync(botChat.agentId);
