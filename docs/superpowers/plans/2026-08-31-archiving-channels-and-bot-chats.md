@@ -3885,13 +3885,17 @@ describe("applyRosterEvent", () => {
     expect(patched.pages[0]?.items.map((row) => row.id)).toEqual(["channel_2"]);
   });
 
-  test("ignores an archive for a row this cache does not hold", () => {
+  test("refetches an archive for a row this cache does not hold", () => {
     const data = cache([item("channel_1")]);
 
-    // Already absent from this list, so there is nothing to move and nothing to refetch for.
+    /*
+     * The list that must GAIN the row is the one that does not hold it. Returning `data` here was
+     * the bug that made restoring silently not propagate: an archived row is absent from Active by
+     * definition, so a restore refetched nothing and the conversation stayed invisible.
+     */
     expect(
       applyRosterEvent(data, event({ id: "botchat_9", archived: true })),
-    ).toBe(data);
+    ).toBe("refetch");
   });
 });
 ```
@@ -3913,8 +3917,13 @@ export type RosterActivityEvent = {
   /**
    * The channel's id, on a channel event from a server that still sends it.
    *
-   * @deprecated The server carries this alongside `id` for one release, so a rolling deploy cannot
-   * leave old replicas emitting a shape this file cannot read. Nothing here should use it.
+   * @deprecated Nothing here should read it.
+   *
+   * The wire keeps this field for one release for the sake of browser tabs still running the
+   * PREVIOUS bundle, which look for `channelId` and know nothing of `id`. It is not for old
+   * replicas: one of those emits `{channelId, ...}` with no `id` at all, which is a shape this file
+   * cannot read whatever we do here. `server/src/channels/events.ts` carries the server half of the
+   * reasoning.
    */
   channelId?: string;
   lastMessage: string | null;
@@ -3949,10 +3958,22 @@ goes immediately after `deleted`:
    * look handled. And checked even on an activity event, because an event that carries
    * `archived: false` is a report that restored the conversation — the move matters more than the
    * preview, and the refetch brings the preview too.
+   *
+   * Note the branch does NOT skip a list that lacks the row. See the branch body for why.
    */
   if (activity.archived !== undefined) {
-    // Already absent from this list: nothing to move, and nothing to refetch for.
-    if (holdingPage === -1) return data;
+    /*
+     * Unconditional, including when this list does not hold the row.
+     *
+     * An earlier draft returned `data` here when `holdingPage === -1`, reasoning that a list without
+     * the row has nothing to move. That is exactly backwards: the list that must *gain* the row is
+     * the one that does not hold it yet. Restoring was the broken direction — an archived row is
+     * absent from Active by definition, so a restore found nothing, refetched nothing, and the
+     * conversation did not reappear until the next refocus or reconnect. Saying something in an
+     * archived conversation is how it comes back, so that is the one path that must not be lossy.
+     *
+     * The cost is one refetch per archive event per member, and `memberIds` already scopes delivery.
+     */
     return "refetch";
   }
 ```
