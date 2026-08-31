@@ -912,8 +912,10 @@ function fakeStore(overrides: Partial<ChannelStore> = {}) {
 
 function recordingAuditStore() {
   const written: AuditEventInput[] = [];
+  // `insert`, not `record` — that is the method `AuditStore` actually declares, and the fixture in
+  // `channel-routes.test.ts` already uses it. Check the interface rather than trusting this block.
   const store: AuditStore = {
-    async record(event) {
+    async insert(event) {
       written.push(event);
     },
   };
@@ -1283,7 +1285,7 @@ about attributing the actor even in single-user mode.
 ```ts
   const record = async (
     context: Context<{ Variables: AppVariables }>,
-    eventType: string,
+    eventType: AuditEventType,
     channelId: string,
     payload: Record<string, unknown>,
   ): Promise<void> => {
@@ -1311,6 +1313,12 @@ about attributing the actor even in single-user mode.
 
 The existing delete route's call becomes
 `await record(context, "channel.deleted", channelId, { mechanism: "soft" });`.
+
+**Two things this step needs that are easy to miss, both of which break `bun run typecheck`.**
+`AuditEventInput.eventType` is `AuditEventType`, a strict string-literal union — not `string` — so
+`record`'s parameter must be typed `AuditEventType` and the two new names must be **registered in
+`auditEventTypes` in `server/src/audit.ts`**, with a short why-comment in that file's register. Typing
+the parameter `string` compiles nowhere. Add `server/src/audit.ts` to this task's file list.
 
 Add the route immediately after the pin route, so the two read together:
 
@@ -1348,7 +1356,7 @@ Add the route immediately after the pin route, so the two read together:
 - [ ] **Step 7: Run the test**
 
 Run: `bun test server/tests/channel-archive.test.ts`
-Expected: PASS, 14 tests.
+Expected: PASS. The block yields 13 — nine plain `test(` plus one `test.each` of four rows. Count them.
 
 - [ ] **Step 8: Fix the fake stores the change broke**
 
