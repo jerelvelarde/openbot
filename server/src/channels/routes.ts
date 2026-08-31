@@ -609,7 +609,10 @@ export function createChannelStore(
       return database.transaction(
         async (transaction) => {
           const [membership] = await transaction
-            .select({ channelId: channelMemberships.channelId })
+            .select({
+              channelId: channelMemberships.channelId,
+              archivedAt: channels.archivedAt,
+            })
             .from(channelMemberships)
             // Joined rather than checked on the membership alone, so a deleted channel is refused
             // too. `get` and `list` filter on `deleted_at`, so without this a client holding a stale
@@ -654,6 +657,14 @@ export function createChannelStore(
               lastMessage,
               lastMessageAt: activity.at,
               lastMessageAgentId: activity.agentId,
+              /*
+               * Saying something restores an archived channel.
+               *
+               * On this write rather than a separate one, so it lands under the same
+               * moves-forwards-only guard below: a report the store ignores as stale must not
+               * unarchive the conversation either. An ignored report is not news.
+               */
+              archivedAt: null,
               updatedAt: new Date(),
             })
             .where(
@@ -685,6 +696,10 @@ export function createChannelStore(
             lastMessage,
             lastMessageAt: activity.at.toISOString(),
             lastMessageAgentId: activity.agentId,
+            // Only when this report is what restored it. On every other activity event the field is
+            // absent, so a client patching a row does not have to distinguish "still not archived"
+            // from "just came back".
+            ...(membership.archivedAt !== null ? { archived: false } : {}),
           };
           await transaction.execute(
             sql`select pg_notify(${CHANNEL_ACTIVITY_TOPIC}, ${JSON.stringify(event)})`,
