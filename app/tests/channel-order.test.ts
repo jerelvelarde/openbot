@@ -1,15 +1,17 @@
 import { expect, test } from "bun:test";
 import { pinnedFirst } from "../src/components/app-sidebar/app-sidebar";
-import type { ChannelSummary } from "../src/lib/channels/queries";
+import type { RosterItem } from "../src/lib/roster/queries";
 
-/** A minimal but fully-typed channel summary, so tests build real objects rather than casts. */
-function channel(id: string, pinned: boolean): ChannelSummary {
+/** A minimal but fully-typed roster row, so tests build real objects rather than casts. */
+function channel(id: string, pinned: boolean): RosterItem {
   return {
+    kind: "channel",
     id,
     name: id,
     agentIds: [],
     threadId: `thread-${id}`,
     active: true,
+    archived: false,
     lastMessage: null,
     lastMessageAt: null,
     lastMessageAgentId: null,

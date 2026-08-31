@@ -3,17 +3,18 @@ import {
   hasUnseenActivity,
   isUnread,
 } from "../src/components/app-sidebar/app-sidebar";
-import type { ChannelSummary } from "../src/lib/channels/queries";
 import type { RosterItem } from "../src/lib/roster/queries";
 
-/** A minimal but fully-typed summary, so tests build real objects rather than casts. */
-function channel(overrides: Partial<ChannelSummary>): ChannelSummary {
+/** A minimal but fully-typed roster row, so tests build real objects rather than casts. */
+function channel(overrides: Partial<RosterItem>): RosterItem {
   return {
+    kind: "channel",
     id: "channel-1",
     name: "Assistant channel",
     agentIds: ["agent-1"],
     threadId: "thread-1",
     active: true,
+    archived: false,
     lastMessage: "hello",
     lastMessageAt: "2026-08-25T12:00:00.000Z",
     lastMessageAgentId: "agent-1",
