@@ -17,7 +17,9 @@ beforeAll(() => {
 
 afterEach(() => {
   cleanup();
-  window.localStorage.clear();
+  // Only this file's key: every test file in the process shares one localStorage, and clearing it
+  // wholesale reaches into whatever else happens to be mid-run.
+  window.localStorage.removeItem(SIDEBAR_STORAGE_KEY);
 });
 
 /*
@@ -26,6 +28,7 @@ afterEach(() => {
  * Running this file on its own is what exposes the difference.
  */
 const pane = () => document.querySelector('[data-slot="sidebar"]');
+const bars = () => document.querySelectorAll("div.h-14").length;
 
 const shell = (
   <SidebarShell width="300px">
@@ -51,12 +54,18 @@ test("PageShell renders with no SidebarProvider, and draws no toggle", () => {
   expect(view?.getByText("Coworker assistance")).not.toBeNull();
   expect(view?.queryByLabelText("Hide sidebar")).toBeNull();
   expect(view?.queryByLabelText("Show sidebar")).toBeNull();
+  // And no bar either: it carries the toggle and the Back link, and this screen has neither, so
+  // drawing it would be 56px of chrome holding nothing.
+  expect(bars()).toBe(0);
 });
 
 test("inside a shell, PageShell's toggle collapses the pane and remembers it", () => {
   const view = render(shell);
 
   expect(pane()?.getAttribute("data-state")).toBe("expanded");
+  // One bar, holding one toggle — not a second bar stacked on the shell's own chrome.
+  expect(bars()).toBe(1);
+  expect(view.getAllByLabelText("Hide sidebar")).toHaveLength(1);
 
   act(() => {
     fireEvent.click(view.getByLabelText("Hide sidebar"));
