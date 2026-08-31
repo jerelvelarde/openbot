@@ -207,16 +207,41 @@ An unrecognised `status` reads as `active`. That follows the local convention se
 `decodeChannelCursor`, where a malformed value reads as the first page because that is the honest
 answer to a stale link, rather than a 400 that a person cannot act on.
 
-### If Drizzle fights
+### Two phases, and the union sits in the first
 
-The known risk in this design is `unionAll` composing with `orderBy` and `limit` in drizzle-orm
-0.45. If it does not, the fallback is to fetch `limit + 1` from each branch with the same cursor
-predicate and merge in TypeScript.
+`channels.list` is already two-phase, and this is the structural fact the whole query rests on
+(`channels/routes.ts:305-435`):
 
-That fallback is correct but strictly worse: it puts the sort rule in a second place inside the very
-module that exists to own it, and it over-fetches up to `limit` extra rows per page. It is recorded
-here as an accepted trade rather than left to be discovered and quietly adopted during
-implementation.
+1. **Choose the page.** A narrow select — `(id, recency, pinned)` — carrying the cursor, the order,
+   and `limit + 1`. One row per channel. Its own comment explains why: the hydrated row set is one
+   row per channel-agent pair, so a limit applied there "would cut a channel in half: its second Bot
+   would arrive on the next page as a separate entry with the same id."
+2. **Hydrate.** Join the chosen ids to agents and mappings, then fold one-row-per-pair into
+   summaries in TypeScript.
+
+The union belongs in phase 1 only, where both branches project the same four narrow columns —
+`(kind, id, recency, pinned)` — with no arrays and no aggregates:
+
+```
+select 'channel' as kind, channels.id, <recency>, <pinned> from channels ⋈ memberships(actor)
+union all
+select 'bot_chat' as kind, bot_chats.id, <recency>, <pinned> from bot_chats where user_id = actor
+order by pinned desc, recency desc, id desc
+limit n + 1
+```
+
+Phase 2 stays two separate hydrations, one per kind, each shaped exactly like the query it replaces.
+Their results are then interleaved back into the order phase 1 returned, which is the only ordering
+authority in the module.
+
+This removes the risk that a straight `unionAll` over two fully-hydrated, differently-shaped selects
+would have carried. The union is over two narrow, identically-shaped selects, which is the case
+drizzle-orm 0.45's `unionAll` composes with `orderBy` and `limit` cleanly. If it still fights, the
+fallback is one raw parameterised `sql` union for phase 1 — **not** merging in TypeScript, which
+would put the sort rule in a second place inside the very module that exists to own it.
+
+The `RECENCY` and `PINNED_RANK` fragments move here from `channels/routes.ts`, and the channels list
+route imports them back. That keeps one definition rather than two that must agree.
 
 ## Routes
 
@@ -453,7 +478,7 @@ split in `server/tests`.
 1. Migration `0020`: `bot_chats`, `channels.archived_at`, indexes.
 2. `channels.setArchived`, its route, audit events, and the additive event field.
 3. `bot-chats` store and routes.
-4. `roster/query.ts` and `GET /api/roster`.
+4. `roster/query.ts` and `GET /api/roster`, as a two-phase read whose phase 1 is the union.
 5. Client: roster queries, bot chat queries and mutations, channel archive mutation.
 6. Sidebar: `roster-row.tsx`, the tri-state filter, the four empty states.
 7. Bot screen: `/bot/$botChatId`, the `?agent=` resolver, adoption on first load.
