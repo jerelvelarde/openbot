@@ -115,12 +115,18 @@ export type ChannelStore = {
    *
    * Throws ChannelNotFoundError for a non-member, an unknown channel, or a deleted one, and
    * ChannelPackageOwnedError for a channel the tenant package defines.
+   *
+   * Returns whether anything actually changed.
+   *
+   * The route needs to know, because it audits the act: a repeat call that neither restamps nor
+   * announces must not write a trail row either. `record`'s own docblock says the trail records acts,
+   * not attempts, and `softDelete` enforces that by throwing on a repeat — this one returns instead.
    */
   setArchived(
     actor: AgentActor,
     channelId: string,
     archived: boolean,
-  ): Promise<void>;
+  ): Promise<boolean>;
   recordActivity(
     actor: AgentActor,
     channelId: string,
@@ -525,8 +531,8 @@ export function createChannelStore(
       );
     },
 
-    async setArchived(actor, channelId, archived) {
-      await database.transaction(
+    setArchived(actor, channelId, archived) {
+      return database.transaction(
         async (transaction) => {
           const [row] = await transaction
             .select({
@@ -560,11 +566,12 @@ export function createChannelStore(
           }
 
           // Already where the caller wants it. Returning here rather than writing is what makes a
-          // repeat call a no-op instead of a fresh stamp and a second announcement.
+          // repeat call a no-op instead of a fresh stamp and a second announcement. `false` tells the
+          // caller nothing changed, which is what keeps the route's audit write conditional on it.
           const alreadyThere = archived
             ? row.archivedAt !== null
             : row.archivedAt === null;
-          if (alreadyThere) return;
+          if (alreadyThere) return false;
 
           await transaction
             .update(channels)
@@ -600,6 +607,8 @@ export function createChannelStore(
           await transaction.execute(
             sql`select pg_notify(${CHANNEL_ACTIVITY_TOPIC}, ${JSON.stringify(event)})`,
           );
+
+          return true;
         },
         { isolationLevel: "read committed" },
       );
@@ -979,14 +988,26 @@ export function createChannelRoutes(
 
     const channelId = context.req.param("channelId");
     try {
-      await store.setArchived(context.var.actor, channelId, archived);
-      // Reached only once the store has resolved, so a refused archive writes nothing.
-      await record(
-        context,
-        archived ? "channel.archived" : "channel.unarchived",
+      const changed = await store.setArchived(
+        context.var.actor,
         channelId,
-        {},
+        archived,
       );
+      // Reached only once the store has resolved, so a refused archive writes nothing. And only when
+      // the store actually moved the flag: `setArchived` returns `false` for a repeat call on a
+      // channel already in the requested state, and clicking Archive twice must not lay down two
+      // `channel.archived` rows for one archiving. The response below is unconditional either way —
+      // the caller asked for a state and that state now holds — so a 200 here can coincide with no
+      // trail write at all. That is deliberate, not a bug: the HTTP contract answers "is it archived
+      // now", not "did this call do the archiving".
+      if (changed) {
+        await record(
+          context,
+          archived ? "channel.archived" : "channel.unarchived",
+          channelId,
+          {},
+        );
+      }
       return context.json({ archived });
     } catch (error) {
       return mapStoreError(context, error);

@@ -69,8 +69,17 @@ export type BotChatStore = {
   /**
    * Archive or restore. Hidden, not frozen: the conversation stays live and `recordActivity` clears
    * the archive on its own.
+   *
+   * Returns whether anything actually changed, matching `ChannelStore.setArchived` — the two are one
+   * idea applied twice, and letting only one of them report change is exactly how they would drift.
+   * Bot chats have no audit route today, so nothing yet consumes this, but the shape stays symmetric
+   * against the day one arrives.
    */
-  setArchived(actor: AgentActor, id: string, archived: boolean): Promise<void>;
+  setArchived(
+    actor: AgentActor,
+    id: string,
+    archived: boolean,
+  ): Promise<boolean>;
   /** Hide the conversation. Soft: the row and the thread survive, every read filters. */
   softDelete(actor: AgentActor, id: string): Promise<void>;
 };
@@ -479,8 +488,8 @@ export function createBotChatStore(
       if (updated.length === 0) throw new BotChatNotFoundError(id);
     },
 
-    async setArchived(actor, id, archived) {
-      await database.transaction(
+    setArchived(actor, id, archived) {
+      return database.transaction(
         async (transaction) => {
           const [row] = await transaction
             .select({ archivedAt: botChats.archivedAt })
@@ -497,11 +506,12 @@ export function createBotChatStore(
           if (!row) throw new BotChatNotFoundError(id);
 
           // Already where the caller wants it. Returning here rather than writing is what makes a
-          // repeat call a no-op instead of a fresh stamp and a second announcement.
+          // repeat call a no-op instead of a fresh stamp and a second announcement. `false` reports
+          // that nothing changed, matching `ChannelStore.setArchived`.
           const alreadyThere = archived
             ? row.archivedAt !== null
             : row.archivedAt === null;
-          if (alreadyThere) return;
+          if (alreadyThere) return false;
 
           await transaction
             .update(botChats)
@@ -525,6 +535,8 @@ export function createBotChatStore(
           await transaction.execute(
             sql`select pg_notify(${CHANNEL_ACTIVITY_TOPIC}, ${JSON.stringify(event)})`,
           );
+
+          return true;
         },
         { isolationLevel: "read committed" },
       );

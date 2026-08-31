@@ -72,6 +72,7 @@ function fakeStore(
     },
     async setArchived(receivedActor, id, archived) {
       calls.push(["setArchived", receivedActor, id, archived]);
+      return true;
     },
     async softDelete(receivedActor, id) {
       calls.push(["softDelete", receivedActor, id]);

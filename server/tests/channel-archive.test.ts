@@ -62,6 +62,7 @@ function fakeStore(overrides: Partial<ChannelStore> = {}) {
     },
     async setArchived(receivedActor, id, archived) {
       calls.push(["setArchived", receivedActor, id, archived]);
+      return true;
     },
     async softDelete(receivedActor, id) {
       calls.push(["softDelete", receivedActor, id]);
@@ -196,6 +197,41 @@ describe("PUT /:channelId/archive", () => {
     await archive(appFor(store, audit.store), { archived: true });
 
     // The trail records acts, not attempts.
+    expect(audit.written).toEqual([]);
+  });
+
+  test("answers 200 and writes no audit row for a channel already archived", async () => {
+    const audit = recordingAuditStore();
+    // `false` is what the store returns when the channel was already in the requested state — the
+    // same no-op the store itself refuses to restamp or announce.
+    const store = fakeStore({
+      async setArchived() {
+        return false;
+      },
+    });
+    const response = await archive(appFor(store, audit.store), {
+      archived: true,
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ archived: true });
+    // Clicking Archive twice must not lay down a second `channel.archived` row for one archiving.
+    expect(audit.written).toEqual([]);
+  });
+
+  test("answers 200 and writes no audit row for a channel already active", async () => {
+    const audit = recordingAuditStore();
+    const store = fakeStore({
+      async setArchived() {
+        return false;
+      },
+    });
+    const response = await archive(appFor(store, audit.store), {
+      archived: false,
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ archived: false });
     expect(audit.written).toEqual([]);
   });
 

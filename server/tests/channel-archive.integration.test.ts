@@ -219,6 +219,30 @@ describe("archiving a channel, in the database", () => {
     expect(second?.archivedAt).toEqual(first?.archivedAt);
   });
 
+  test("reports whether the call actually changed anything", async () => {
+    const owner = await createUser();
+    const agentId = await createAgent(owner);
+    const channel = await createChannel(owner, [agentId]);
+
+    // A genuine transition, in each direction, reports true.
+    await expect(store.setArchived(owner, channel.id, true)).resolves.toBe(
+      true,
+    );
+    await expect(store.setArchived(owner, channel.id, false)).resolves.toBe(
+      true,
+    );
+
+    // A repeat call in the state already reached reports false — the route's audit write depends on
+    // this to tell "changed" from "already there".
+    await expect(store.setArchived(owner, channel.id, false)).resolves.toBe(
+      false,
+    );
+    await store.setArchived(owner, channel.id, true);
+    await expect(store.setArchived(owner, channel.id, true)).resolves.toBe(
+      false,
+    );
+  });
+
   test("restores by clearing the column, not by writing a second flag", async () => {
     const owner = await createUser();
     const agentId = await createAgent(owner);
