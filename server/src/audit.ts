@@ -1,6 +1,8 @@
-import { and, desc, eq, gt, inArray, lt, or } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, lte, sql } from "drizzle-orm";
+import { HTTPException } from "hono/http-exception";
 import type { Database } from "./db/client";
 import { auditEvents } from "./db/schema";
+import { recencyCursorText } from "./roster/order";
 
 const sensitiveKeys = new Set([
   "access_token",
@@ -416,6 +418,17 @@ export type AuditEventQuery = {
   actorUserId?: string;
   targetType?: string;
   targetId?: string;
+  /**
+   * The window, inclusive at both ends: a row written at exactly this instant is on the page.
+   *
+   * Both were exclusive, which is not what a date filter implies and was worst where somebody is
+   * most likely to reach for one: a `from` naming the instant a row was written excluded that row, so
+   * a date taken off the screen and used as a bound dropped the row it was taken from.
+   *
+   * As precise as the string given and no more: a `to` naming a millisecond still ends before a row
+   * 456 microseconds into it, because that is what asking for that instant means. `auditQueryFromUrl`
+   * refuses anything it cannot read as an instant at all.
+   */
   from?: string;
   to?: string;
 };
@@ -427,10 +440,90 @@ export type AuditReader = {
   }>;
 };
 
+/**
+ * Where a page stopped: the boundary row's timestamp and its id, in sort order.
+ *
+ * `createdAt` IS NEVER A `Date`, IN EITHER DIRECTION. It is Postgres' own rendering of the boundary to
+ * microseconds, carried as text and cast back to `timestamptz` in the predicate. A JS `Date` holds
+ * milliseconds and `audit_events.created_at` is a `timestamptz` defaulted from `now()`, which carries
+ * microseconds, so minting the cursor from the decoded `Date` floored the boundary downward. The next
+ * page then asked for rows before the floor and skipped every row inside the discarded remainder:
+ * served on no page at all, and because a floor only ever loses rows, with no duplicate anywhere to
+ * notice it by.
+ *
+ * The same defect and the same fix as `roster/order.ts`, whose `recencyCursorText` this file uses
+ * rather than repeating the format string — including its evidence for why `::text` and `to_char(...,
+ * 'OF')` were both rejected. A hand-copied second copy of a rule like that one is what that module
+ * was factored to prevent, so borrowing one function across a module boundary is the lesser of two
+ * couplings.
+ *
+ * It matters more here than on a sidebar, for the reason `mcp.call_failed` above sets out at length:
+ * this trail is used to rule things out. A missing row on the roster is a conversation somebody
+ * scrolls for; a missing row here is an investigator concluding something did not happen. The trail is
+ * also the largest table in the deployment, so pages past the first are the normal way it is read.
+ *
+ * `audit.test.ts` walks five rows written inside one millisecond. Before this, paging them one at a
+ * time served two.
+ */
 type AuditCursor = {
   createdAt: string;
   id: string;
 };
+
+/** The boundary timestamp as the cursor carries it. See `AuditCursor`. */
+const CURSOR_CREATED_AT = recencyCursorText(sql`${auditEvents.createdAt}`);
+
+/**
+ * A cursor timestamp, shaped as `recencyCursorText` writes it.
+ *
+ * One to six fractional digits, so a cursor minted before that function was used here is still
+ * accepted: `Date.prototype.toISOString` wrote three, and a page somebody has open across the deploy
+ * names a real position in an ordering that has not changed.
+ */
+const CURSOR_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/;
+
+/** The canonical rendering of a `uuid`, which is the only form this column is ever read back as. */
+const CURSOR_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Whether Postgres will read this as a timestamp, decided here rather than by letting it try.
+ *
+ * The shape alone is not enough: `2026-02-30T00:00:00Z` matches it and `timestamptz` answers
+ * `date/time field value out of range`. So the parsed instant is rendered back and compared against
+ * the seconds it came from, which is what catches a component that rolled over into the next month.
+ * `readsAsTimestamp` in `roster/order.ts` makes the same check the other way round, by rebuilding the
+ * fields it read.
+ *
+ * The fraction is not compared, because `Date` cannot hold it; the shape above is what constrains it.
+ */
+function readsAsCursorTimestamp(value: string): boolean {
+  if (!CURSOR_TIMESTAMP.test(value)) return false;
+  const at = new Date(value);
+  return (
+    !Number.isNaN(at.getTime()) &&
+    at.toISOString().startsWith(value.slice(0, 19))
+  );
+}
+
+/**
+ * A refusal an administrator can act on, rather than a 500 that says nothing.
+ *
+ * `app.ts` registers no `onError`, so an ordinary `Error` thrown anywhere under these routes becomes
+ * Hono's default plain-text "Internal Server Error" and whatever the thrower had to say is discarded.
+ * An `HTTPException` carrying its own response does not: the status is 400 and the body is the
+ * `{ error }` shape every other refusal on these routes uses.
+ *
+ * The message is on the exception as well as in the body, so a log of the throw says the same thing
+ * the caller was told, and `cause` keeps the parse error that provoked it rather than dropping it.
+ */
+function refuseAuditQuery(message: string, cause?: unknown): never {
+  throw new HTTPException(400, {
+    message,
+    cause,
+    res: Response.json({ error: message }, { status: 400 }),
+  });
+}
 
 function normalizedKey(key: string) {
   return key.replaceAll(/[^a-zA-Z0-9]/g, "").toLowerCase();
@@ -496,6 +589,13 @@ export async function recordAuditEvent(
  *
  * `record` in agents/routes.ts is deliberately NOT folded in here: it drops the development actor,
  * so folding it would change what it writes rather than where the code lives.
+ *
+ * NULL IS FOR A WRITE WITH NOBODY TO NAME, and it is not the same as the development actor above. A
+ * callback refused before the caller proved which Bot it was has no actor to record: the Bot id and
+ * the actor both arrive in the credential that just failed to verify, so writing either down would
+ * put an unproven claim in the one place that is supposed to be believed. A null leaves the column
+ * unset, which is the shape such a row already had; an empty string would be a claim about somebody
+ * called "".
  */
 export function createAuditRecorder(
   auditStore: AuditStore | undefined,
@@ -509,7 +609,7 @@ export function createAuditRecorder(
   },
 ) {
   return async (
-    actorUserId: string,
+    actorUserId: string | null,
     eventType: AuditEventType,
     targetId: string,
     payload: Record<string, unknown>,
@@ -520,7 +620,9 @@ export function createAuditRecorder(
         eventType,
         targetType: target.type,
         targetId,
-        actorUserId,
+        // Omitted rather than sent as null, so a row with no actor is written exactly as a caller
+        // that never mentioned one would have written it.
+        ...(actorUserId === null ? {} : { actorUserId }),
         payload,
       });
     } catch (error) {
@@ -548,19 +650,47 @@ function encodeCursor(cursor: AuditCursor) {
   return Buffer.from(JSON.stringify(cursor)).toString("base64url");
 }
 
+/**
+ * A malformed cursor is refused, where the roster degrades one to its first page.
+ *
+ * `decodeRosterCursor` answers `undefined` and serves page one on purpose, and its reasoning is right
+ * for a sidebar: a link somebody has open across a deploy names a position in an ordering that
+ * changed, and the honest answer to a stale link is the top of a list they can see for themselves.
+ *
+ * The trail is the other case. Page one in place of the page that was asked for is a screen of rows
+ * with nothing on it to say they are not the rows after the boundary, and this trail's value is that
+ * it gets used to rule things out. A reader who cannot tell "the newest rows" from "the rows after
+ * yours" cannot rule anything out, so the refusal is said out loud instead.
+ *
+ * The rest of the roster's reasoning does not reach here either. That cursor goes stale because part
+ * of its sort key was added after it was minted; this one's two fields are unchanged, and the
+ * millisecond form `toISOString` used to mint is still accepted, so a deploy does not make one
+ * malformed. One that is malformed was truncated in transit or edited by hand.
+ *
+ * `id` IS CHECKED FOR BEING A UUID, not merely for being there. It reaches Postgres as `::uuid` in the
+ * keyset comparison, and the two ways a cursor can carry the wrong thing both used to arrive there:
+ * `{"id":123}` was truthy enough for the old check and answered `operator does not exist: uuid <
+ * integer`, and an id edited by hand answered `invalid input syntax for type uuid`. Both from inside
+ * the read, and both therefore the bare 500 the rest of this docblock is about.
+ */
 function decodeCursor(cursor: string): AuditCursor {
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(
-      Buffer.from(cursor, "base64url").toString("utf8"),
-    ) as AuditCursor;
-
-    if (!parsed.id || Number.isNaN(Date.parse(parsed.createdAt))) {
-      throw new Error("invalid cursor");
-    }
-    return parsed;
-  } catch {
-    throw new Error("cursor must be a valid audit page cursor");
+    parsed = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+  } catch (error) {
+    refuseAuditQuery("cursor must be a valid audit page cursor", error);
   }
+
+  const { createdAt, id } = (parsed ?? {}) as Partial<AuditCursor>;
+  if (
+    typeof id !== "string" ||
+    !CURSOR_ID.test(id) ||
+    typeof createdAt !== "string" ||
+    !readsAsCursorTimestamp(createdAt)
+  ) {
+    refuseAuditQuery("cursor must be a valid audit page cursor");
+  }
+  return { createdAt, id };
 }
 
 export function createAuditReader(database: Database): AuditReader {
@@ -584,26 +714,44 @@ export function createAuditReader(database: Database): AuditReader {
           : undefined,
         query.targetId ? eq(auditEvents.targetId, query.targetId) : undefined,
         query.from
-          ? gt(auditEvents.createdAt, new Date(query.from))
+          ? gte(auditEvents.createdAt, new Date(query.from))
           : undefined,
-        query.to ? lt(auditEvents.createdAt, new Date(query.to)) : undefined,
+        query.to ? lte(auditEvents.createdAt, new Date(query.to)) : undefined,
       ];
       const cursor = query.cursor ? decodeCursor(query.cursor) : undefined;
 
       if (cursor) {
+        /*
+         * One row comparison over the whole sort key, which reads as "everything after the cursor"
+         * only because both parts of that key descend. `rosterCursorFilter` pages the roster the same
+         * way.
+         *
+         * No new index, and none needed: `audit_events_type_time_idx` and its two siblings each carry
+         * `created_at desc, id desc` after the columns they filter on, and Postgres takes the row
+         * comparison as an index condition on them — `explain` on a filtered page answers `Index Only
+         * Scan ... Index Cond: (event_type = ... AND ROW(created_at, id) < ROW(...))`.
+         *
+         * The boundary is bound as the text the cursor carries and cast here, never parsed in
+         * TypeScript on the way past. That is the whole point of `AuditCursor`.
+         */
         conditions.push(
-          or(
-            lt(auditEvents.createdAt, new Date(cursor.createdAt)),
-            and(
-              eq(auditEvents.createdAt, new Date(cursor.createdAt)),
-              lt(auditEvents.id, cursor.id),
-            ),
-          ),
+          sql`(${auditEvents.createdAt}, ${auditEvents.id}) < (${cursor.createdAt}::timestamptz, ${cursor.id}::uuid)`,
         );
       }
 
       const rows = await database
-        .select()
+        .select({
+          id: auditEvents.id,
+          actorUserId: auditEvents.actorUserId,
+          eventType: auditEvents.eventType,
+          targetType: auditEvents.targetType,
+          targetId: auditEvents.targetId,
+          payload: auditEvents.payload,
+          createdAt: auditEvents.createdAt,
+          // Selected alongside the decoded column rather than instead of it: the two are the same
+          // instant at two precisions, and each is read by something that cannot use the other.
+          cursorAt: CURSOR_CREATED_AT,
+        })
         .from(auditEvents)
         .where(and(...conditions))
         .orderBy(desc(auditEvents.createdAt), desc(auditEvents.id))
@@ -613,23 +761,44 @@ export function createAuditReader(database: Database): AuditReader {
       const last = page.at(-1);
 
       return {
-        events: page.map((event) => ({
-          ...event,
-          createdAt: event.createdAt.toISOString(),
-          payload: event.payload as Record<string, unknown>,
+        /*
+         * The millisecond form for the reader, the microsecond one for the cursor.
+         *
+         * `createdAt` is what the screen prints and what `new Date(...)` in the browser parses, and
+         * nothing compares it against the column again. The cursor does exactly that, which is why it
+         * is the half that cannot afford to lose the remainder.
+         */
+        events: page.map((row) => ({
+          id: row.id,
+          actorUserId: row.actorUserId,
+          eventType: row.eventType,
+          targetType: row.targetType,
+          targetId: row.targetId,
+          payload: row.payload as Record<string, unknown>,
+          createdAt: row.createdAt.toISOString(),
         })),
         nextCursor:
           hasNextPage && last
-            ? encodeCursor({
-                id: last.id,
-                createdAt: last.createdAt.toISOString(),
-              })
+            ? encodeCursor({ id: last.id, createdAt: last.cursorAt })
             : undefined,
       };
     },
   };
 }
 
+/**
+ * The query as the URL asked for it, with the two parameters that cannot be clamped refused instead.
+ *
+ * `limit` is clamped, because every number is either in range or nearest to one end of it. A date is
+ * not: `from=yesterday` is an Invalid Date, drizzle's timestamp mapper calls `toISOString()` on it,
+ * and that throws a `RangeError` from inside the read — where nothing knows which parameter was at
+ * fault and, with no `onError` registered in `app.ts`, Hono answered its default plain-text 500. So
+ * the refusal is made here, at the edge, where the offending parameter still has a name.
+ *
+ * A cursor is refused by `decodeCursor` rather than here, because that is where it is read as
+ * something other than text. Both refusals go through `refuseAuditQuery`, so the trail's two ways of
+ * being asked a question wrong answer in the one shape.
+ */
 export function auditQueryFromUrl(url: URL): AuditEventQuery {
   const requestedLimit = Number.parseInt(
     url.searchParams.get("limit") ?? "50",
@@ -639,6 +808,18 @@ export function auditQueryFromUrl(url: URL): AuditEventQuery {
     ? Math.min(Math.max(requestedLimit, 1), 100)
     : 50;
   const optional = (name: string) => url.searchParams.get(name) ?? undefined;
+  /*
+   * Anything `Date` can read, which is deliberately more than one format: a bound typed by hand is
+   * usually a plain `2026-08-31` and a bound copied off the screen is a full ISO instant, and both
+   * are honest answers to "when". What is refused is a string that names no instant at all.
+   */
+  const instant = (name: string) => {
+    const value = optional(name);
+    if (value !== undefined && Number.isNaN(new Date(value).getTime())) {
+      refuseAuditQuery(`${name} must be a date, and "${value}" is not one.`);
+    }
+    return value;
+  };
 
   return {
     cursor: optional("cursor"),
@@ -647,7 +828,7 @@ export function auditQueryFromUrl(url: URL): AuditEventQuery {
     actorUserId: optional("actorUserId"),
     targetType: optional("targetType"),
     targetId: optional("targetId"),
-    from: optional("from"),
-    to: optional("to"),
+    from: instant("from"),
+    to: instant("to"),
   };
 }
