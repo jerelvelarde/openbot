@@ -41,6 +41,13 @@ import { createPluginRoutes } from "./plugins/routes";
 import type { PluginStore } from "./plugins/store";
 import { REFUSAL_MARKER } from "./plugins/tools";
 import { createRoutineRoutes, type RoutineStore } from "./routines/routes";
+import { createRepositoryRoutes } from "./repositories/routes";
+import { createRepoTaskRoutes } from "./repositories/task-routes";
+import type {
+  RepoTaskRecord,
+  RepoTaskStore,
+  RepositoryStore,
+} from "./repositories/store";
 import type { RoutineRunner } from "./routines/runner";
 import type { IntentRouter } from "./routing/classify";
 import { createRoutingRoutes } from "./routing/routes";
@@ -190,6 +197,18 @@ export function createApp(
    * has no door for this at all, not a locked one.
    */
   routineStore?: RoutineStore,
+  /**
+   * Repositories a coworker may be handed work on, and the tasks handed out.
+   *
+   * Appended for the reason the two above it were: these are positional, so inserting one anywhere
+   * else silently shifts every existing call site's arguments by one. Absent leaves the routes
+   * unmounted rather than mounted and refusing, which is the shape every optional store here takes.
+   */
+  repositories?: {
+    store: RepositoryStore;
+    tasks: RepoTaskStore;
+    enqueue?: (task: RepoTaskRecord) => Promise<void>;
+  },
 ) {
   const app = new Hono<{ Variables: AppVariables }>();
 
@@ -820,6 +839,24 @@ export function createApp(
     app.route(
       "/api/channels",
       createChannelRoutes(channelStore, requireUser, channelEvents, auditStore),
+    );
+  }
+
+  if (repositories) {
+    app.route(
+      "/api/repositories",
+      createRepositoryRoutes(repositories.store, requireUser),
+    );
+    app.route(
+      "/api/repo-tasks",
+      createRepoTaskRoutes(
+        {
+          tasks: repositories.tasks,
+          repositories: repositories.store,
+          ...(repositories.enqueue ? { enqueue: repositories.enqueue } : {}),
+        },
+        requireUser,
+      ),
     );
   }
 

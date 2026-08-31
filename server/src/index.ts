@@ -34,6 +34,10 @@ import { createThreadIdentity } from "./channels/thread-identity";
 import { createSandboxedStore } from "./components/sandboxed";
 import { createComponentStore } from "./components/store";
 import { createComputerGateway } from "./computer/gateway";
+import {
+  createRepositoryStore,
+  createRepoTaskStore,
+} from "./repositories/store";
 import { computerTools } from "./computer/tools";
 import { createPageFrameStore } from "./computer/page-frames";
 import { startPolicyListener } from "./computer/policy-listener";
@@ -308,6 +312,15 @@ const pluginStore = createPluginStore({
    */
   redirectUri: config.publicUrl ? redirectUriFor(config.publicUrl) : undefined,
 });
+
+/*
+ * Repositories, and the work handed out on them.
+ *
+ * The repository store takes the plugin store because reachability is an ordinary grant: writes go
+ * through it so a repository grant leaves the same audit row every other grant leaves.
+ */
+const repositoryStore = createRepositoryStore(database, pluginStore);
+const repoTaskStore = createRepoTaskStore(database);
 
 /**
  * Routines, and the one moment its tools are told what to act on.
@@ -1067,6 +1080,8 @@ const app = createApp(
   routineRunner,
   // A person's own standing instructions: the list, and a switch to stop one.
   routineStore,
+  // Repositories a coworker may be handed work on, and what has been handed out.
+  { store: repositoryStore, tasks: repoTaskStore },
 );
 
 /**
