@@ -67,7 +67,7 @@ Integration tests (`*.integration.test.ts`) need PostgreSQL at `DATABASE_URL`, d
 | `app/src/lib/bot-chats/mutations.ts` | Bot chat writes |
 | `app/src/components/app-sidebar/roster-row.tsx` | The roster row, branching on `kind` (replaces `channel.tsx`) |
 | `app/src/components/app-sidebar/status-filter.tsx` | The Active / Archived / All control |
-| `app/src/routes/_authed/_app/bot.$botChatId.tsx` | One Bot chat, at its own URL |
+| `app/src/routes/_authed/_app/bot_.$botChatId.tsx` | One Bot chat, at its own URL. The `bot_` underscore opts out of nesting — without it the route is a child of `/bot`, which renders no `<Outlet />`, and never renders at all |
 
 ### Modified
 
@@ -4086,7 +4086,7 @@ Follows `openbot-screen-layout` for the `Item`/`Button` size and variant vocabul
 
 **Interfaces:**
 - Consumes: `RosterItem` and `rosterKeys` from Task 9; the archive mutations from Task 9.
-- Produces: `RosterRow`, a memoized component taking `{ kind, id, participantIds, name, lastMessage, lastMessageAt, pinned, unread, archived, active }`.
+- Produces: `RosterRow`, a memoized component taking `{ kind, id, participantIds, name, lastMessage, lastMessageAt, pinned, unread, archived }` — no `active`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -4523,8 +4523,8 @@ Replace the two inline empty blocks with one:
             })()}
 ```
 
-And pass the new props through `ChannelRow` (rename it `Row`) to `RosterRow`: `kind`, `archived`, and
-`active`.
+And pass the new props through `ChannelRow` (rename it `Row`) to `RosterRow`: `kind` and `archived`.
+**Not `active`** — it was removed from the props, so passing it is an excess-property error. See Task 11.
 
 `animateOrder` keeps its rule and its comment. Add `status` to what disables animation — switching
 status replaces the whole list, and animating that is the same thrash filtering was.
@@ -4601,7 +4601,7 @@ Expected: FAIL — `resolveBotChat` is not exported.
 
 - [ ] **Step 3: Write the new route**
 
-Create `app/src/routes/_authed/_app/bot.$botChatId.tsx`. It is the body of the existing `BotChat`
+Create `app/src/routes/_authed/_app/bot_.$botChatId.tsx` — **trailing underscore on `bot_`**. It is the body of the existing `BotChat`
 component with the thread coming from the server instead of `localStorage`.
 
 ```tsx
@@ -4612,7 +4612,7 @@ component with the thread coming from the server instead of `localStorage`.
  * survives a different browser, and `New chat` no longer destroys what it replaces — the previous
  * conversation is a roster row somebody can click.
  */
-export const Route = createFileRoute("/_authed/_app/bot/$botChatId")({
+export const Route = createFileRoute("/_authed/_app/bot_/$botChatId")({
   component: RouteComponent,
 });
 
@@ -4846,7 +4846,14 @@ export function useLegacyThreadAdoption(agentId: string): void {
 ```
 
 Its effect: read `remembered(agentId)`; return if null; `checkKnown`; `shouldAdopt`; if so
-`adopt.mutateAsync({ agentId, threadId })`, then `forget(agentId)`. Guard with the same
+`adopt.mutateAsync({ agentId, threadId })`, then `forget(agentId)`.
+
+**A 409 must be caught, not merely documented.** `mutateAsync` rejects on 409, so a literal reading of
+the line above never reaches `forget` — and the server now answers 409 for two cases, including a
+thread whose row this same person soft-deleted. Without the catch, somebody who deletes an adopted
+legacy chat gets an adoption that 409s on every visit, forever, because the key is never cleared. So
+catch the rejection, inspect it, and treat 409 as success by calling `forget` anyway; any other
+failure keeps the key for the next attempt. Guard with the same
 still-mounted / still-this-agent `current` flag pattern the existing effect uses, and copy that reason:
 the agent may have changed or the component may have unmounted while the request was in flight.
 
@@ -4861,7 +4868,7 @@ calls.
 
 - [ ] **Step 5: Call it from the Bot screen**
 
-In `bot.$botChatId.tsx`'s screen component, `useLegacyThreadAdoption(botChat.agentId)`. It is a no-op
+In `bot_.$botChatId.tsx`'s screen component, `useLegacyThreadAdoption(botChat.agentId)`. It is a no-op
 for every browser that has no remembered key, which is every browser after the first visit.
 
 - [ ] **Step 6: Run the tests**
