@@ -28,6 +28,7 @@ import { Route as AuthedAdminPlaygroundRouteImport } from './routes/_authed/admi
 import { Route as AuthedAdminSkillsRouteImport } from './routes/_authed/admin/skills'
 import { Route as AuthedSettingsIndexRouteImport } from './routes/_authed/settings/index'
 import { Route as AuthedAppAgentsIndexRouteImport } from './routes/_authed/_app/agents/index'
+import { Route as AuthedAppBotBotChatIdRouteImport } from './routes/_authed/_app/bot.$botChatId'
 import { Route as AuthedAppChannelChannelIdRouteImport } from './routes/_authed/_app/channel/$channelId'
 import { Route as AuthedAppChannelNewRouteImport } from './routes/_authed/_app/channel/new'
 import { Route as AuthedAdminComponentsIndexRouteImport } from './routes/_authed/admin/components/index'
@@ -134,6 +135,11 @@ const AuthedAppAgentsIndexRoute = AuthedAppAgentsIndexRouteImport.update({
   path: '/agents/',
   getParentRoute: () => AuthedAppRoute,
 } as any)
+const AuthedAppBotBotChatIdRoute = AuthedAppBotBotChatIdRouteImport.update({
+  id: '/$botChatId',
+  path: '/$botChatId',
+  getParentRoute: () => AuthedAppBotRoute,
+} as any)
 const AuthedAppChannelChannelIdRoute =
   AuthedAppChannelChannelIdRouteImport.update({
     id: '/channel/$channelId',
@@ -203,7 +209,7 @@ export interface FileRoutesByFullPath {
   '/sign': typeof SignRoute
   '/admin': typeof AuthedAdminRouteRouteWithChildren
   '/settings': typeof AuthedSettingsRouteRouteWithChildren
-  '/bot': typeof AuthedAppBotRoute
+  '/bot': typeof AuthedAppBotRouteWithChildren
   '/skills': typeof AuthedAppSkillsRoute
   '/admin/audit': typeof AuthedAdminAuditRoute
   '/admin/boundaries': typeof AuthedAdminBoundariesRoute
@@ -215,6 +221,7 @@ export interface FileRoutesByFullPath {
   '/admin/skills': typeof AuthedAdminSkillsRoute
   '/admin/': typeof AuthedAdminIndexRoute
   '/settings/': typeof AuthedSettingsIndexRoute
+  '/bot/$botChatId': typeof AuthedAppBotBotChatIdRoute
   '/channel/$channelId': typeof AuthedAppChannelChannelIdRoute
   '/channel/new': typeof AuthedAppChannelNewRoute
   '/admin/components/$name': typeof AuthedAdminComponentsNameRoute
@@ -231,7 +238,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof AuthedAppIndexRoute
   '/sign': typeof SignRoute
-  '/bot': typeof AuthedAppBotRoute
+  '/bot': typeof AuthedAppBotRouteWithChildren
   '/skills': typeof AuthedAppSkillsRoute
   '/admin/audit': typeof AuthedAdminAuditRoute
   '/admin/boundaries': typeof AuthedAdminBoundariesRoute
@@ -243,6 +250,7 @@ export interface FileRoutesByTo {
   '/admin/skills': typeof AuthedAdminSkillsRoute
   '/admin': typeof AuthedAdminIndexRoute
   '/settings': typeof AuthedSettingsIndexRoute
+  '/bot/$botChatId': typeof AuthedAppBotBotChatIdRoute
   '/channel/$channelId': typeof AuthedAppChannelChannelIdRoute
   '/channel/new': typeof AuthedAppChannelNewRoute
   '/admin/components/$name': typeof AuthedAdminComponentsNameRoute
@@ -263,7 +271,7 @@ export interface FileRoutesById {
   '/_authed/admin': typeof AuthedAdminRouteRouteWithChildren
   '/_authed/settings': typeof AuthedSettingsRouteRouteWithChildren
   '/_authed/_app': typeof AuthedAppRouteWithChildren
-  '/_authed/_app/bot': typeof AuthedAppBotRoute
+  '/_authed/_app/bot': typeof AuthedAppBotRouteWithChildren
   '/_authed/_app/skills': typeof AuthedAppSkillsRoute
   '/_authed/admin/audit': typeof AuthedAdminAuditRoute
   '/_authed/admin/boundaries': typeof AuthedAdminBoundariesRoute
@@ -276,6 +284,7 @@ export interface FileRoutesById {
   '/_authed/_app/': typeof AuthedAppIndexRoute
   '/_authed/admin/': typeof AuthedAdminIndexRoute
   '/_authed/settings/': typeof AuthedSettingsIndexRoute
+  '/_authed/_app/bot/$botChatId': typeof AuthedAppBotBotChatIdRoute
   '/_authed/_app/channel/$channelId': typeof AuthedAppChannelChannelIdRoute
   '/_authed/_app/channel/new': typeof AuthedAppChannelNewRoute
   '/_authed/admin/components/$name': typeof AuthedAdminComponentsNameRoute
@@ -308,6 +317,7 @@ export interface FileRouteTypes {
     | '/admin/skills'
     | '/admin/'
     | '/settings/'
+    | '/bot/$botChatId'
     | '/channel/$channelId'
     | '/channel/new'
     | '/admin/components/$name'
@@ -336,6 +346,7 @@ export interface FileRouteTypes {
     | '/admin/skills'
     | '/admin'
     | '/settings'
+    | '/bot/$botChatId'
     | '/channel/$channelId'
     | '/channel/new'
     | '/admin/components/$name'
@@ -368,6 +379,7 @@ export interface FileRouteTypes {
     | '/_authed/_app/'
     | '/_authed/admin/'
     | '/_authed/settings/'
+    | '/_authed/_app/bot/$botChatId'
     | '/_authed/_app/channel/$channelId'
     | '/_authed/_app/channel/new'
     | '/_authed/admin/components/$name'
@@ -522,6 +534,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthedAppAgentsIndexRouteImport
       parentRoute: typeof AuthedAppRoute
     }
+    '/_authed/_app/bot/$botChatId': {
+      id: '/_authed/_app/bot/$botChatId'
+      path: '/$botChatId'
+      fullPath: '/bot/$botChatId'
+      preLoaderRoute: typeof AuthedAppBotBotChatIdRouteImport
+      parentRoute: typeof AuthedAppBotRoute
+    }
     '/_authed/_app/channel/$channelId': {
       id: '/_authed/_app/channel/$channelId'
       path: '/channel/$channelId'
@@ -662,8 +681,20 @@ const AuthedSettingsRouteRouteChildren: AuthedSettingsRouteRouteChildren = {
 const AuthedSettingsRouteRouteWithChildren =
   AuthedSettingsRouteRoute._addFileChildren(AuthedSettingsRouteRouteChildren)
 
+interface AuthedAppBotRouteChildren {
+  AuthedAppBotBotChatIdRoute: typeof AuthedAppBotBotChatIdRoute
+}
+
+const AuthedAppBotRouteChildren: AuthedAppBotRouteChildren = {
+  AuthedAppBotBotChatIdRoute: AuthedAppBotBotChatIdRoute,
+}
+
+const AuthedAppBotRouteWithChildren = AuthedAppBotRoute._addFileChildren(
+  AuthedAppBotRouteChildren,
+)
+
 interface AuthedAppRouteChildren {
-  AuthedAppBotRoute: typeof AuthedAppBotRoute
+  AuthedAppBotRoute: typeof AuthedAppBotRouteWithChildren
   AuthedAppSkillsRoute: typeof AuthedAppSkillsRoute
   AuthedAppIndexRoute: typeof AuthedAppIndexRoute
   AuthedAppChannelChannelIdRoute: typeof AuthedAppChannelChannelIdRoute
@@ -672,7 +703,7 @@ interface AuthedAppRouteChildren {
 }
 
 const AuthedAppRouteChildren: AuthedAppRouteChildren = {
-  AuthedAppBotRoute: AuthedAppBotRoute,
+  AuthedAppBotRoute: AuthedAppBotRouteWithChildren,
   AuthedAppSkillsRoute: AuthedAppSkillsRoute,
   AuthedAppIndexRoute: AuthedAppIndexRoute,
   AuthedAppChannelChannelIdRoute: AuthedAppChannelChannelIdRoute,
