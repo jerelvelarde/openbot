@@ -95,7 +95,11 @@ describe("a computer call with no readable reason", () => {
     });
 
     expect(outcome.ok).toBe(false);
-    expect(String(outcome.reason)).toContain("no computer");
+    // What the client observed, not a claim about configuration it cannot check: a renamed route
+    // or an edge 404 reaches here too.
+    expect(String(outcome.reason)).toContain(
+      "no computer endpoint on this deployment",
+    );
     expect(String(outcome.reason)).toContain("rather than guessing");
     // Not a refusal and not stale: nothing was decided and no snapshot moved.
     expect(outcome.refused).toBeUndefined();
@@ -129,9 +133,42 @@ describe("a computer call with no readable reason", () => {
       method: "POST",
     });
 
+    expect(outcome.ok).toBe(false);
     expect(String(outcome.reason)).toContain("gave no reason");
-    // No status code in the sentence: it is not something to repeat to a person.
-    expect(String(outcome.reason)).not.toContain("500");
+    // No digits at all, rather than merely not this status: a check for "500" would pass just as
+    // happily if the code started embedding some other number.
+    expect(String(outcome.reason)).not.toMatch(/\d/);
+  });
+
+  test("a JSON body whose error is not a sentence is still nothing readable", async () => {
+    // `??` alone only catches null and undefined. These all parse, so the old guard handed the
+    // model an empty string or "[object Object]" — in the exact case the fallback existed for.
+    for (const error of ["", "   ", { code: 502 }, 502, null]) {
+      serverAnswering(503, { error });
+
+      const outcome = await callComputer("bot-1", "/navigate", {
+        method: "POST",
+      });
+
+      expect(outcome.ok).toBe(false);
+      expect(String(outcome.reason)).toContain("cannot be reached");
+    }
+  });
+
+  test("fetch failing outright also tells the Bot not to invent a reason", async () => {
+    // No status to reason from at all, which is the case likeliest to produce an invention.
+    globalThis.fetch = (async () => {
+      throw new TypeError("Failed to fetch");
+    }) as unknown as typeof fetch;
+
+    const outcome = await callComputer("bot-1", "/navigate", {
+      method: "POST",
+    });
+
+    expect(outcome.ok).toBe(false);
+    expect(String(outcome.reason)).toContain(
+      "do not offer a reason of your own",
+    );
   });
 
   test("a reason the server did give is still preferred over any of these", async () => {

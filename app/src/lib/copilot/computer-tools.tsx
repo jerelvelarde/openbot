@@ -58,12 +58,18 @@ async function waitForPerson(
 }
 
 /**
- * Exported for the test that covers what a Bot is told when a call is refused.
+ * The reason the server actually supplied, when it supplied one worth repeating.
  *
- * The distinctions this draws from a status and a body decide the model's next step, and they are
- * drawn nowhere else, so they are worth pinning without standing up the tool registrations and the
- * runtime around them.
+ * Checked rather than cast. `??` alone only catches null and undefined, so a body carrying
+ * `error: ""` handed the model an empty string and one carrying `error: {code: 502}` handed it
+ * "[object Object]" — both of them defeating the fallback in precisely the case it was written for.
+ * A body whose `error` is not a sentence is the server saying nothing readable.
  */
+function givenReason(body: Record<string, unknown> | null): string | undefined {
+  const given = typeof body?.error === "string" ? body.error.trim() : "";
+  return given === "" ? undefined : given;
+}
+
 /**
  * What to tell the model when the server said nothing it could read.
  *
@@ -82,9 +88,18 @@ async function waitForPerson(
  */
 function reasonForStatus(status: number): string {
   if (status === 404) {
+    /*
+     * WHAT WAS OBSERVED, not what it implies.
+     *
+     * "This deployment has no computer" is the usual cause and is what the mounting check in
+     * `app.ts` produces, but it is a claim about configuration that this code cannot check. A
+     * renamed route, or an edge answering for a service with no live deployment, reaches here too —
+     * and a model told the first sentence repeats it to a person as fact. That is the same
+     * fabrication this function exists to stop, moved out of the model and into the codebase.
+     */
     return (
-      "This deployment has no computer, so there is nothing to browse with. Say that plainly " +
-      "rather than guessing why, and carry on with what you can do without one."
+      "There is no computer endpoint on this deployment to browse with. Say that plainly rather " +
+      "than guessing why, and carry on with what you can do without one."
     );
   }
   if (status === 502 || status === 503 || status === 504) {
@@ -100,6 +115,13 @@ function reasonForStatus(status: number): string {
   );
 }
 
+/**
+ * Exported for the test that covers what a Bot is told when a call is refused.
+ *
+ * The distinctions this draws from a status and a body decide the model's next step, and they are
+ * drawn nowhere else, so they are worth pinning without standing up the tool registrations and the
+ * runtime around them.
+ */
 export async function callComputer(
   botId: string,
   path: string,
@@ -125,9 +147,18 @@ export async function callComputer(
     if (error instanceof DOMException && error.name === "AbortError") {
       return { ok: false, reason: "Stopped.", stopped: true };
     }
+    /*
+     * The barest failure of the lot, and until now the one that said least.
+     *
+     * `fetch` throwing means the request never got an answer at all, so there is not even a status
+     * to reason from. That is the case most likely to produce an invented explanation, and it kept
+     * the one sentence that does not forbid one.
+     */
     return {
       ok: false,
-      reason: "The assistant's computer could not be reached.",
+      reason:
+        "Your computer could not be reached at all. This is a fault on this deployment, not " +
+        "something you did. Say so plainly, and do not offer a reason of your own for it.",
     };
   }
 
@@ -139,7 +170,7 @@ export async function callComputer(
   if (!response.ok) {
     return {
       ok: false,
-      reason: (body?.error as string) ?? reasonForStatus(response.status),
+      reason: givenReason(body) ?? reasonForStatus(response.status),
       // Preserve refusal/stale-ref/control distinctions for the model's next step.
       ...(response.status === 403
         ? { refused: true, rule: body?.rule ?? null }
