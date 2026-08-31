@@ -40,6 +40,25 @@ enable it for you.
 
 **Not in it:**
 
+### Give the Bots a volume too
+
+Give it a volume at `/workspace`. Without one, everything a Bot has saved is destroyed by every
+redeploy — its notes, its files, any repository it checked out — because those live in the container
+and nothing else keeps them.
+
+`WORKSPACE_DIR` will not move it. `agent-computer` reads that variable, so it does point the browser
+somewhere else, but the mount is what has to change: pointing the variable at a path with no volume
+under it simply relocates the data that gets thrown away.
+
+**`/profiles` is the same decision, made separately.** That is where the browser keeps its logins, so
+without a volume there a Bot is signed out of everything on each deploy. It is a second mount, and
+worth having wherever a Bot signs in to anything.
+
+A volume arrives owned by root and hides the ownership the image set at build time, which would
+leave the browser unable to write to its own workspace. `workspace-init` puts that back before the
+browser starts, so no manual step is needed — but it means the image has to carry that oneshot, so
+mount the volume onto a deployment that already has it rather than an older one.
+
 **The supervisor.** It gives each Bot its own container, which needs a Docker socket, which no
 serverless container platform permits. Without it, every Bot shares the one browser, exactly as they
 do on a laptop with no supervisor configured. A shared browser means shared logins, shared files and

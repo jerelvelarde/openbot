@@ -18,5 +18,9 @@ if [ "${EMBEDDED_COMPUTER:-on}" != "on" ]; then
 fi
 cd /app/agent-computer
 export PORT=4100
-export WORKSPACE_DIR=/workspace
+# WORKSPACE_DIR is NOT exported here. The image sets it (`Dockerfile`), `with-contenv` delivers it,
+# and `agent-computer` reads it. Hardcoding it a second time here shadowed any operator value and,
+# worse, let this service and `workspace-init` disagree about which directory to prepare: the oneshot
+# would chown the configured path, this would use /workspace, and the mount that mattered stayed
+# root-owned while everything reported success.
 exec s6-setuidgid pwuser /usr/local/bin/bun src/index.ts
