@@ -1,0 +1,258 @@
+diff --git a/packages/react-core/src/v2/components/OpenGenerativeUIRenderer.tsx b/packages/react-core/src/v2/components/OpenGenerativeUIRenderer.tsx
+index f3509ea..63ce98c 100644
+--- a/packages/react-core/src/v2/components/OpenGenerativeUIRenderer.tsx
++++ b/packages/react-core/src/v2/components/OpenGenerativeUIRenderer.tsx
+@@ -172,6 +172,10 @@ const OpenGenerativeUIActivityRendererInner = React.memo(
+   function OpenGenerativeUIActivityRendererInner({ content }: InnerProps) {
+     const initialHeight = content.initialHeight ?? 200;
+     const [autoHeight, setAutoHeight] = useState<number | null>(null);
++    // Mirrors `sandboxReadyRef` as state so effects that need to wait for the
++    // sandbox can list it as a dependency and re-run once it exists. The ref
++    // stays for the synchronous "queue or run" checks below.
++    const [sandboxReady, setSandboxReady] = useState(false);
+     const sandboxFunctions = useSandboxFunctions();
+ 
+     const localApi = useMemo(() => {
+@@ -324,6 +328,7 @@ const OpenGenerativeUIActivityRendererInner = React.memo(
+       executedIndexRef.current = 0;
+       jsFunctionsInjectedRef.current = false;
+       sandboxReadyRef.current = false;
++      setSandboxReady(false);
+       pendingQueueRef.current = [];
+ 
+       // Dynamic import to avoid SSR issues (websandbox references `self` at module level)
+@@ -352,6 +357,7 @@ const OpenGenerativeUIActivityRendererInner = React.memo(
+           sandbox.promise.then(() => {
+             if (cancelled) return;
+             sandboxReadyRef.current = true;
++            setSandboxReady(true);
+ 
+             // Prevent scrollbars — the container auto-sizes to fit content
+             sandbox.run(`
+@@ -388,6 +394,7 @@ const OpenGenerativeUIActivityRendererInner = React.memo(
+           sandboxRef.current = null;
+         }
+         sandboxReadyRef.current = false;
++        setSandboxReady(false);
+         setAutoHeight(null);
+       };
+     }, [fullHtml, css, localApi]);
+@@ -428,13 +435,20 @@ const OpenGenerativeUIActivityRendererInner = React.memo(
+       }
+     }, [content.jsExpressions?.length]);
+ 
+-    // Effect 4 — One-shot height measurement (fires once when generation completes)
++    // Effect 4 — One-shot height measurement (fires once generation is done and
++    // the sandbox is ready). Both conditions are dependencies: an activity
++    // restored from persisted thread history arrives with `generating: false`
++    // already set, so this effect first runs before the asynchronously created
++    // sandbox exists and has to run again once it does. Without `sandboxReady`
++    // in the dependency list the measurement would never happen for restored
++    // activities and the wrapper would stay at `initialHeight`, clipping any
++    // taller interface (the wrapper is `overflow: hidden`).
+     // Uses body.scrollHeight (not documentElement.scrollHeight) because the latter
+     // is clamped to the iframe viewport and can never shrink below the current size.
+     const generationDone = content.generating === false;
+     useEffect(() => {
+       const sandbox = sandboxRef.current;
+-      if (!generationDone || !sandbox) return;
++      if (!generationDone || !sandboxReady || !sandbox) return;
+ 
+       let handled = false;
+       const onMessage = (e: MessageEvent) => {
+@@ -464,16 +478,12 @@ const OpenGenerativeUIActivityRendererInner = React.memo(
+         })();
+       `;
+ 
+-      if (sandboxReadyRef.current) {
+-        sandbox.run(measureOnce);
+-      } else {
+-        pendingQueueRef.current.push(measureOnce);
+-      }
++      sandbox.run(measureOnce);
+ 
+       return () => {
+         window.removeEventListener("message", onMessage);
+       };
+-    }, [generationDone]);
++    }, [generationDone, sandboxReady]);
+ 
+     const height = autoHeight ?? initialHeight;
+ 
+diff --git a/packages/react-core/src/v2/components/__tests__/OpenGenerativeUIRenderer.test.tsx b/packages/react-core/src/v2/components/__tests__/OpenGenerativeUIRenderer.test.tsx
+index 903efe7..7c3f207 100644
+--- a/packages/react-core/src/v2/components/__tests__/OpenGenerativeUIRenderer.test.tsx
++++ b/packages/react-core/src/v2/components/__tests__/OpenGenerativeUIRenderer.test.tsx
+@@ -671,4 +671,172 @@ describe("OpenGenerativeUIActivityRenderer", () => {
+       expect(options.frameContent).not.toBe("<head></head><body></body>");
+     });
+   });
++
++  describe("height measurement", () => {
++    /** The code the renderer runs inside the sandbox to measure body height */
++    function measureCalls() {
++      return mockRun.mock.calls.filter(
++        (c: unknown[]) =>
++          typeof c[0] === "string" && (c[0] as string).includes("__ck_resize"),
++      );
++    }
++
++    /** Simulate the sandboxed iframe posting its measured height back */
++    async function postResize(height: number) {
++      await act(async () => {
++        window.dispatchEvent(
++          new MessageEvent("message", {
++            data: { type: "__ck_resize", height },
++            source: mockIframe.contentWindow,
++          }),
++        );
++      });
++    }
++
++    it("measures height when generation completes after the sandbox exists", async () => {
++      const { container, rerender } = render(
++        <OpenGenerativeUIActivityRenderer
++          activityType="open-generative-ui"
++          content={{
++            initialHeight: 300,
++            html: ["<head></head><body><div>Tall</div></body>"],
++            htmlComplete: true,
++            cssComplete: true,
++            generating: true,
++          }}
++          message={{}}
++          agent={{}}
++        />,
++      );
++      await flushImport();
++      await act(async () => {
++        mockPromiseResolve();
++        await mockPromise;
++      });
++
++      rerender(
++        <OpenGenerativeUIActivityRenderer
++          activityType="open-generative-ui"
++          content={{
++            initialHeight: 300,
++            html: ["<head></head><body><div>Tall</div></body>"],
++            htmlComplete: true,
++            cssComplete: true,
++            generating: false,
++          }}
++          message={{}}
++          agent={{}}
++        />,
++      );
++      await flushImport();
++
++      expect(measureCalls().length).toBeGreaterThanOrEqual(1);
++      await postResize(346);
++
++      const div = container.firstElementChild as HTMLElement;
++      expect(div.style.height).toBe("346px");
++    });
++
++    // Regression: an activity restored from persisted thread history arrives
++    // with `generating: false` on the very first render, so the sandbox does
++    // not yet exist when the measurement effect first runs. The measurement
++    // must still happen once the sandbox becomes ready, otherwise the wrapper
++    // keeps `initialHeight` and clips content (it is `overflow: hidden`).
++    it("measures height when generating is already false on first render", async () => {
++      const { container } = renderRenderer({
++        initialHeight: 300,
++        html: ["<head></head><body><div>Tall</div></body>"],
++        htmlComplete: true,
++        cssComplete: true,
++        generating: false,
++      });
++      await flushImport();
++      await act(async () => {
++        mockPromiseResolve();
++        await mockPromise;
++      });
++      await flushImport();
++
++      expect(measureCalls().length).toBeGreaterThanOrEqual(1);
++      await postResize(346);
++
++      const div = container.firstElementChild as HTMLElement;
++      expect(div.style.height).toBe("346px");
++    });
++
++    // Regression: the same root cause — when html changes after generation has
++    // already finished the sandbox is recreated and `autoHeight` is reset to
++    // null, so the new sandbox has to be measured again.
++    it("re-measures after the sandbox is recreated for new html", async () => {
++      // First pass goes through the live-streaming path so the initial
++      // measurement succeeds even without the fix.
++      const { container, rerender } = render(
++        <OpenGenerativeUIActivityRenderer
++          activityType="open-generative-ui"
++          content={{
++            initialHeight: 300,
++            html: ["<head></head><body><div>First</div></body>"],
++            htmlComplete: true,
++            cssComplete: true,
++            generating: true,
++          }}
++          message={{}}
++          agent={{}}
++        />,
++      );
++      await flushImport();
++      await act(async () => {
++        mockPromiseResolve();
++        await mockPromise;
++      });
++      rerender(
++        <OpenGenerativeUIActivityRenderer
++          activityType="open-generative-ui"
++          content={{
++            initialHeight: 300,
++            html: ["<head></head><body><div>First</div></body>"],
++            htmlComplete: true,
++            cssComplete: true,
++            generating: false,
++          }}
++          message={{}}
++          agent={{}}
++        />,
++      );
++      await flushImport();
++      await postResize(346);
++      expect((container.firstElementChild as HTMLElement).style.height).toBe(
++        "346px",
++      );
++
++      mockRun.mockClear();
++      resetMockPromise();
++      rerender(
++        <OpenGenerativeUIActivityRenderer
++          activityType="open-generative-ui"
++          content={{
++            initialHeight: 300,
++            html: ["<head></head><body><div>Second, taller</div></body>"],
++            htmlComplete: true,
++            cssComplete: true,
++            generating: false,
++          }}
++          message={{}}
++          agent={{}}
++        />,
++      );
++      await flushImport();
++      await act(async () => {
++        mockPromiseResolve();
++        await mockPromise;
++      });
++      await flushImport();
++
++      expect(measureCalls().length).toBeGreaterThanOrEqual(1);
++      await postResize(512);
++
++      const div = container.firstElementChild as HTMLElement;
++      expect(div.style.height).toBe("512px");
++    });
++  });
+ });
