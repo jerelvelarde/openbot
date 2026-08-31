@@ -176,10 +176,13 @@ export function createBotChatStore(
           // each other. Two concurrent adopters of the same Bot both pass this line and both reach
           // the insert below — they do not serialize here. What decides their race is the unique
           // index on `bot_chats.thread_id`, exercised in the conflict path a few lines down. If this
-          // ever becomes `FOR UPDATE`, the two adopters would serialize instead, the second one's
-          // insert would stop conflicting, and the "gives one row to two adoptions that race" test in
-          // bot-chat-store.integration.test.ts would keep passing while no longer testing the thing
-          // its name says it tests.
+          // ever becomes `FOR UPDATE`, the two adopters would serialize instead. Note what would NOT
+          // happen: the insert below is unconditional and nothing reads before it, so the second
+          // adopter would still reach it, and it would still land in the conflict path — against a row
+          // committed before it began rather than one racing it. The conflict path does not become
+          // dead code, so do not delete it on that reasoning. What breaks is the test: "gives one row
+          // to two adoptions that race" in bot-chat-store.integration.test.ts would keep passing while
+          // no longer distinguishing this insert-first shape from a naive read-then-write.
           const profile = await profileStore.getWithin(
             transaction,
             actor,

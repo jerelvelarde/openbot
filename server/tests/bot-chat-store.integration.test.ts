@@ -171,8 +171,10 @@ describe("adopting a remembered thread", () => {
      * serializing earlier. `adopt` locks the agent's profile row with `profileStore.getWithin`, which
      * takes `SELECT ... FOR SHARE` — and share locks do not exclude each other, so both adopters pass
      * that point together. If that lock ever became `FOR UPDATE`, the second adopter would block until
-     * the first committed, find the row already there, and return it without ever reaching the insert
-     * this test means to exercise: green for the wrong reason, proving nothing about the constraint.
+     * the first committed and then still reach the insert — `adopt` reads nothing before it — but that
+     * insert would conflict against an already-committed row instead of a concurrent one. This test
+     * would stay green while no longer distinguishing insert-first from a naive read-then-write, which
+     * is the only thing it exists to prove.
      */
     const [first, second] = await Promise.all([
       store.adopt(actorFor(userId), agentId, threadId),
