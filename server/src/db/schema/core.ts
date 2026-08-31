@@ -273,6 +273,18 @@ export const channels = pgTable(
      * deleting is for everyone — per-member hiding would be a membership fact instead.
      */
     deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    /**
+     * When this channel was archived, or null.
+     *
+     * Channel grain, like `deletedAt` and for the same reason: archiving is for everyone in the
+     * channel. Per-member hiding would be a membership fact instead, and would enter the roster's
+     * sort key, which this grain deliberately avoids.
+     *
+     * Archived is hidden, not frozen. Reads and writes stay open — `setPinned`, `markRead` and
+     * `recordActivity` do not consult this — and saying something clears it. The roster query is the
+     * only read path that filters on it.
+     */
+    archivedAt: timestamp("archived_at", { withTimezone: true }),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
