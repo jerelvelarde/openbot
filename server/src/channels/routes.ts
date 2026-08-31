@@ -105,6 +105,18 @@ export type ChannelStore = {
    * tenant package defines, which configuration owns rather than any member.
    */
   softDelete(actor: AgentActor, channelId: string): Promise<void>;
+  /**
+   * Archive or restore the channel for every member. Hidden, not frozen: the conversation stays
+   * live, and `recordActivity` clears the archive on its own.
+   *
+   * Throws ChannelNotFoundError for a non-member, an unknown channel, or a deleted one, and
+   * ChannelPackageOwnedError for a channel the tenant package defines.
+   */
+  setArchived(
+    actor: AgentActor,
+    channelId: string,
+    archived: boolean,
+  ): Promise<void>;
   recordActivity(
     actor: AgentActor,
     channelId: string,
@@ -500,6 +512,86 @@ export function createChannelStore(
             lastMessageAt: null,
             lastMessageAgentId: null,
             deleted: true,
+          };
+          await transaction.execute(
+            sql`select pg_notify(${CHANNEL_ACTIVITY_TOPIC}, ${JSON.stringify(event)})`,
+          );
+        },
+        { isolationLevel: "read committed" },
+      );
+    },
+
+    async setArchived(actor, channelId, archived) {
+      await database.transaction(
+        async (transaction) => {
+          const [row] = await transaction
+            .select({
+              packageId: channels.packageId,
+              archivedAt: channels.archivedAt,
+            })
+            .from(channels)
+            .innerJoin(
+              channelMemberships,
+              and(
+                eq(channelMemberships.channelId, channels.id),
+                eq(channelMemberships.userId, actor.id),
+              ),
+            )
+            // A deleted channel is not there to archive. `get` and `list` filter the same way, so
+            // without this a client holding a stale roster row could archive something invisible and
+            // announce it to every member, each of whom refetches for a row that cannot appear.
+            .where(and(eq(channels.id, channelId), isNull(channels.deletedAt)));
+          // Not a member, no such channel, or a deleted one: the same answer every way, matching
+          // setPinned, markRead, get and recordActivity, so membership is not probeable.
+          if (!row) throw new ChannelNotFoundError(channelId);
+          // Package channels are configuration; the sync that wrote them owns them. Archiving is
+          // channel grain, so one member archiving one hides configuration from everybody with
+          // nothing to put it back — no sync writes archived_at. That is a deletion wearing a
+          // reversible name.
+          if (row.packageId !== null) {
+            throw new ChannelPackageOwnedError(
+              channelId,
+              archived ? "archived" : "restored",
+            );
+          }
+
+          // Already where the caller wants it. Returning here rather than writing is what makes a
+          // repeat call a no-op instead of a fresh stamp and a second announcement.
+          const alreadyThere = archived
+            ? row.archivedAt !== null
+            : row.archivedAt === null;
+          if (alreadyThere) return;
+
+          await transaction
+            .update(channels)
+            .set({
+              archivedAt: archived ? new Date() : null,
+              updatedAt: new Date(),
+            })
+            .where(eq(channels.id, channelId));
+
+          // Read on this transaction, so the members told are the ones the channel had when it was
+          // archived.
+          const members = await transaction
+            .select({ userId: channelMemberships.userId })
+            .from(channelMemberships)
+            .where(eq(channelMemberships.channelId, channelId));
+
+          /*
+           * Every member, because archiving is for all of them.
+           *
+           * Announced inside the transaction, so it is delivered on commit and a refused archive — a
+           * channel the package owns, or one the caller is not in — announces nothing at all.
+           */
+          const event: RosterActivityEvent = {
+            kind: "channel",
+            id: channelId,
+            channelId,
+            memberIds: members.map((member) => member.userId),
+            lastMessage: null,
+            lastMessageAt: null,
+            lastMessageAgentId: null,
+            archived,
           };
           await transaction.execute(
             sql`select pg_notify(${CHANNEL_ACTIVITY_TOPIC}, ${JSON.stringify(event)})`,
