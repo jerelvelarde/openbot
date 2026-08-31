@@ -10,6 +10,7 @@ import {
 import type { ExternalLinkCreationStore } from "./link-store";
 import { readExternalLinkToken } from "./link-token";
 import type { ExternalProviderIdentity } from "./schema-types";
+import type { IntelligenceConversationClient } from "./intelligence-conversations";
 import type { ExternalThreadStore } from "./thread-store";
 import type { ExternalWebTurnStore } from "./web-turn-store";
 
@@ -71,6 +72,11 @@ type ExternalLinkRoutesOptions = {
   agentProfileStore: Pick<AgentProfileStore, "get" | "listAccessibleIds">;
   threadStore: ExternalThreadStore;
   webTurnStore: ExternalWebTurnStore;
+  /**
+   * The managed capability. Optional so a deployment without Intelligence
+   * Channels keeps the read-only surface rather than failing to start.
+   */
+  conversations?: IntelligenceConversationClient;
 };
 
 function tokenFrom(value: unknown): string | undefined {
@@ -125,8 +131,41 @@ export function createExternalLinkRoutes({
   agentProfileStore,
   threadStore,
   webTurnStore,
+  conversations,
 }: ExternalLinkRoutesOptions) {
   const routes = new Hono<{ Variables: AppVariables }>();
+
+  /**
+   * The conversation reference for a thread, minting one if we do not hold it.
+   *
+   * Minting lazily on open, rather than at bind time or on a backfill, is what
+   * makes the capability self-healing: a thread bound before managed support
+   * existed becomes writable the first time somebody opens it, and a reference
+   * revoked by a re-activation is replaced on the next open instead of failing
+   * every send until an operator notices.
+   *
+   * Every failure returns null. "Not writable" is the ordinary answer here, and
+   * a managed outage must degrade the composer rather than break the page.
+   */
+  async function ensureConversationRef(
+    channelsThreadId: string,
+    appUserId: string,
+  ): Promise<string | null> {
+    const stored = await webTurnStore.conversationRef(channelsThreadId);
+    if (stored !== null) return stored;
+    if (!conversations) return null;
+
+    const minted = await conversations.mintReference({
+      threadId: channelsThreadId,
+      appUserId,
+    });
+    if (minted === null) return null;
+    await webTurnStore.rememberConversationRef({
+      channelsThreadId,
+      conversationRef: minted,
+    });
+    return minted;
+  }
 
   routes.get("/slack", requireUser, async (context) => {
     try {
@@ -250,7 +289,8 @@ export function createExternalLinkRoutes({
       // deployment without managed support degrades to the read-only surface on
       // its own rather than through a flag someone has to remember to unset.
       readOnly:
-        (await webTurnStore.conversationRef(binding.channelsThreadId)) === null,
+        (await ensureConversationRef(binding.channelsThreadId, actor.id)) ===
+        null,
     });
   });
 
@@ -336,13 +376,61 @@ export function createExternalLinkRoutes({
     });
 
     /*
-     * Accepted, not completed. Delivery into the Slack thread is the managed
-     * path's job and is not wired yet (CopilotKit/CopilotKit#6751), so this
-     * returns the durable operation id rather than pretending the message has
-     * landed. Nothing acknowledges success before Slack has the message.
+     * Delivery is the managed path's job, so this hands the turn over and
+     * records what it was told.
+     *
+     * Still 202, never 200: an accepted turn is durably queued inside
+     * Intelligence, echoed into the Slack thread and answered by the agent, all
+     * after this response has been sent. Reporting 200 would claim a Slack
+     * message that does not exist yet.
      */
+    if (!conversations) {
+      // The claim stands. A capability that vanished between the writability
+      // check and the send is an outage, not the author's mistake, so the turn
+      // stays `accepted` and is not marked failed.
+      return context.json(
+        { operationId: claim.operationId, status: "accepted" },
+        202,
+      );
+    }
+
+    const delivery = await conversations.submitTurn({
+      reference: conversationRef,
+      appUserId: actor.id,
+      displayName: actor.name ?? actor.email ?? "A teammate",
+      idempotencyKey: parsed.value.idempotencyKey,
+      text: parsed.value.text,
+    });
+
+    if (delivery.kind === "rejected") {
+      // A refusal is the only signal a revoked or superseded reference gives
+      // us, so the thread returns to read-only rather than keeping a composer
+      // that will fail on every send. The next open mints a fresh reference if
+      // the conversation is still writable.
+      await webTurnStore.forgetConversationRef(threadId);
+      await webTurnStore.settle({
+        operationId: claim.operationId,
+        status: "failed",
+        failureCategory: delivery.reason,
+      });
+      return context.json({ error: READ_ONLY_MESSAGE }, 409);
+    }
+
+    if (delivery.kind === "accepted") {
+      await webTurnStore.settle({
+        operationId: claim.operationId,
+        status: "delivered",
+      });
+    }
+
+    // `unavailable` deliberately leaves the turn `accepted`: the managed side
+    // may have taken it, and marking it failed would invite a resubmission that
+    // produces a second Slack message.
     return context.json(
-      { operationId: claim.operationId, status: "accepted" },
+      {
+        operationId: claim.operationId,
+        status: delivery.kind === "accepted" ? "delivered" : "accepted",
+      },
       202,
     );
   });

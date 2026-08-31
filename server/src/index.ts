@@ -52,6 +52,7 @@ import {
 } from "./credentials";
 import { createDatabase } from "./db/client";
 import { createExternalLinkStore } from "./external/link-store";
+import { createIntelligenceConversationClient } from "./external/intelligence-conversations";
 import { createExternalLinkRoutes } from "./external/routes";
 import { createExternalThreadStore } from "./external/thread-store";
 import { createExternalWebTurnStore } from "./external/web-turn-store";
@@ -606,6 +607,14 @@ const externalLinkRoutes = createExternalLinkRoutes({
   agentProfileStore,
   threadStore: approvalThreadStore,
   webTurnStore: externalWebTurnStore,
+  // The surface name travels with every authored turn and is rendered as
+  // attribution in the provider thread, so it is this deployment's identity
+  // rather than a generic "web".
+  conversations: createIntelligenceConversationClient({
+    apiUrl: config.runtime.intelligence.apiUrl,
+    apiKey: config.runtime.intelligence.apiKey,
+    surface: "openbot",
+  }),
 });
 
 const app = createApp(

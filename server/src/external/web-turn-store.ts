@@ -39,6 +39,31 @@ export type ExternalWebTurnStore = {
     idempotencyKey: string;
     authorUserId: string;
   }) => Promise<ExternalWebTurnClaim>;
+  /**
+   * Records the reference Intelligence issued for a thread.
+   *
+   * Upsert rather than insert: a reference is refreshable, and a thread that is
+   * re-activated gets a new one under the same key. The sidecar table exists
+   * precisely so this can overwrite, which `external_thread_bindings` cannot.
+   */
+  rememberConversationRef: (input: {
+    channelsThreadId: string;
+    conversationRef: string;
+  }) => Promise<void>;
+  /**
+   * Removes a reference that the managed side no longer honours.
+   *
+   * Called when a submission is refused outright, which is the only signal a
+   * revoked or superseded reference gives us. Dropping it returns the thread to
+   * read-only rather than leaving a composer that fails on every send.
+   */
+  forgetConversationRef: (channelsThreadId: string) => Promise<void>;
+  /** Advances a claimed turn to its terminal state after delivery is decided. */
+  settle: (input: {
+    operationId: string;
+    status: Exclude<ExternalWebTurnStatus, "accepted">;
+    failureCategory?: string;
+  }) => Promise<void>;
 };
 
 function asStatus(value: string): ExternalWebTurnStatus {
@@ -149,5 +174,61 @@ export function createExternalWebTurnStore(
     return winner;
   }
 
-  return { conversationRef, threadsWithConversationRef, claim };
+  async function rememberConversationRef(input: {
+    channelsThreadId: string;
+    conversationRef: string;
+  }): Promise<void> {
+    await database
+      .insert(externalThreadConversationRefs)
+      .values({
+        channelsThreadId: input.channelsThreadId,
+        conversationRef: input.conversationRef,
+      })
+      .onConflictDoUpdate({
+        target: externalThreadConversationRefs.channelsThreadId,
+        set: {
+          conversationRef: input.conversationRef,
+          refreshedAt: new Date(),
+        },
+      });
+  }
+
+  async function forgetConversationRef(
+    channelsThreadId: string,
+  ): Promise<void> {
+    await database
+      .delete(externalThreadConversationRefs)
+      .where(
+        eq(externalThreadConversationRefs.channelsThreadId, channelsThreadId),
+      );
+  }
+
+  async function settle(input: {
+    operationId: string;
+    status: Exclude<ExternalWebTurnStatus, "accepted">;
+    failureCategory?: string;
+  }): Promise<void> {
+    await database
+      .update(externalWebTurns)
+      .set({
+        status: input.status,
+        // The CHECK constraint pairs these two, so a delivered turn must clear
+        // any category rather than leave a stale one behind.
+        failureCategory:
+          input.status === "failed"
+            ? (input.failureCategory ?? "unknown")
+            : null,
+        updatedAt: new Date(),
+      })
+      .where(eq(externalWebTurns.operationId, input.operationId));
+  }
+
+  return {
+    conversationRef,
+    threadsWithConversationRef,
+    claim,
+    rememberConversationRef,
+    forgetConversationRef,
+    settle,
+  };
 }
