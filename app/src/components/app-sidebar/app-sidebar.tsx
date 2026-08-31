@@ -46,17 +46,18 @@ import {
 } from "@/components/ui/sidebar";
 import { signOutMutationOptions } from "@/lib/auth/mutations";
 import { currentUserQueryOptions } from "@/lib/auth/queries";
-import {
-  type ChannelSummary,
-  channelListQueryOptions,
-} from "@/lib/channels/queries";
-import { useChannelEvents } from "@/lib/channels/use-channel-events";
+import { useRosterEvents } from "@/lib/channels/use-channel-events";
 import { appConfig } from "@/lib/generated/application-config";
 import { EASE_OUT, ENTRANCE_SECONDS } from "@/lib/motion";
-import type { RosterStatus } from "@/lib/roster/queries";
+import {
+  type RosterItem,
+  type RosterStatus,
+  rosterListQueryOptions,
+} from "@/lib/roster/queries";
 import { Button } from "../ui/button";
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "../ui/empty";
-import { Channel } from "./channel";
+import { RosterRow } from "./roster-row";
+import { StatusFilter } from "./status-filter";
 
 const appLinkOptions = { to: "/" } satisfies LinkOptions;
 const adminLinkOptions = { to: "/admin" } satisfies LinkOptions;
@@ -96,20 +97,23 @@ const MAX_ANIMATED_ROWS = 60;
  *
  * An empty query returns the input array unchanged rather than a copy, so typing and clearing does
  * not hand `AnimatePresence` a new array identity and restage the whole list.
+ *
+ * Unchanged in body for the roster's two kinds: a channel and a bot chat both project `name` and
+ * `lastMessage`, so the filter above already searches both without knowing which kind a given row is.
  */
-function matchingChannels(
-  channels: ChannelSummary[] | undefined,
+function matchingItems(
+  items: RosterItem[] | undefined,
   query: string,
-): ChannelSummary[] {
-  if (!channels) {
+): RosterItem[] {
+  if (!items) {
     return [];
   }
   const needle = query.trim().toLowerCase();
   if (!needle) {
-    return channels;
+    return items;
   }
-  return channels.filter((channel) =>
-    [channel.name, channel.lastMessage].some((field) =>
+  return items.filter((item) =>
+    [item.name, item.lastMessage].some((field) =>
       field?.toLowerCase().includes(needle),
     ),
   );
@@ -125,7 +129,7 @@ function matchingChannels(
  * reason `byRecency` in use-channel-events.ts mirrors the recency rule. A stable partition, so the
  * recency order inside each group is whatever arrived.
  */
-export function pinnedFirst(channels: ChannelSummary[]): ChannelSummary[] {
+export function pinnedFirst(channels: RosterItem[]): RosterItem[] {
   return [...channels].sort((a, b) => Number(b.pinned) - Number(a.pinned));
 }
 
@@ -136,7 +140,7 @@ export function pinnedFirst(channels: ChannelSummary[]): ChannelSummary[] {
  * words needs no marker. ISO-8601 strings compare correctly as strings, which is the same bet the
  * server's recency sort already makes.
  */
-export function hasUnseenActivity(channel: ChannelSummary): boolean {
+export function hasUnseenActivity(channel: RosterItem): boolean {
   if (channel.lastMessageAgentId === null || channel.lastMessageAt === null) {
     return false;
   }
@@ -147,7 +151,7 @@ export function hasUnseenActivity(channel: ChannelSummary): boolean {
 
 /** Unseen activity somewhere you are not looking. The open channel never shows the dot. */
 export function isUnread(
-  channel: ChannelSummary,
+  channel: RosterItem,
   openChannelId: string | undefined,
 ): boolean {
   return channel.id !== openChannelId && hasUnseenActivity(channel);
@@ -209,15 +213,15 @@ export function emptyStateFor(input: {
  * moves to the top. Nothing else animates, a roster that reacts to being read is a roster that
  * moves under the cursor.
  */
-function ChannelRow({
+function Row({
   channel,
   animateOrder,
 }: {
-  channel: ChannelSummary;
+  channel: RosterItem;
   animateOrder: boolean;
 }) {
   const shouldReduceMotion = useReducedMotion();
-  // Whether this row is unread, as a boolean, for the same reason `Channel` computes `isOpen`
+  // Whether this row is unread, as a boolean, for the same reason `RosterRow` computes `isOpen`
   // that way: navigating re-renders the rows whose answer changed, not the whole roster.
   const unread = useParams({
     strict: false,
@@ -235,8 +239,9 @@ function ChannelRow({
       layout={animateOrder && !shouldReduceMotion ? "position" : false}
       transition={{ duration: ENTRANCE_SECONDS, ease: EASE_OUT }}
     >
-      <Channel
-        channelId={channel.id}
+      <RosterRow
+        kind={channel.kind}
+        id={channel.id}
         participantIds={channel.agentIds}
         name={channel.name}
         lastMessage={channel.lastMessage ?? undefined}
@@ -247,6 +252,7 @@ function ChannelRow({
         }
         pinned={channel.pinned}
         unread={unread}
+        archived={channel.archived}
       />
     </motion.div>
   );
@@ -257,20 +263,32 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const signOut = useMutation(signOutMutationOptions(queryClient));
-  const channels = useInfiniteQuery(channelListQueryOptions());
-  // One socket for the app, opened where the roster is kept live.
-  useChannelEvents();
+  const [status, setStatus] = useState<RosterStatus>("active");
+  const channels = useInfiniteQuery(rosterListQueryOptions(status));
+  // One socket for the app, opened where the roster is kept live. No status argument: the channel
+  // screen reads the roster too, so the status this sidebar happens to have on screen is not
+  // knowable from inside the hook. It patches all three cached lists instead — see its own docblock.
+  useRosterEvents();
   const [search, setSearch] = useState("");
   const searching = search.trim().length > 0;
-  const visibleChannels = pinnedFirst(matchingChannels(channels.data, search));
+  const visibleItems = pinnedFirst(matchingItems(channels.data, search));
   /*
    * FILTERING DOES NOT ANIMATE. Rows exit and relayout on every keystroke otherwise, which is a
    * list thrashing under somebody who is still typing — and the moving target is the very thing
    * they are trying to read. Order animation is for a channel that was just spoken in, which is
    * occasional; this is not.
+   *
+   * SWITCHING STATUS DOES NOT ANIMATE EITHER, for the same reason. Active and Archived are disjoint,
+   * but All holds both, so a row moving into or out of All can keep the same key across the click
+   * while its position in the array shifts — layout animation reads that as the row leaping, when
+   * really the list underneath it was just swapped out for a different one. Restricting animation to
+   * the Active view is the same call `!searching` makes: skip the case where the list itself just
+   * changed shape, rather than chase every way that can happen.
    */
   const animateOrder =
-    !searching && (channels.data?.length ?? 0) <= MAX_ANIMATED_ROWS;
+    !searching &&
+    status === "active" &&
+    (channels.data?.length ?? 0) <= MAX_ANIMATED_ROWS;
 
   const handleSignOut = async () => {
     await signOut.mutateAsync();
@@ -324,42 +342,33 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
                 </InputGroupAddon>
               </InputGroup>
             </SidebarMenuItem>
+            <SidebarMenuItem>
+              <StatusFilter onChange={setStatus} value={status} />
+            </SidebarMenuItem>
             <div className="w-full h-2" />
-            {/*
-             * TWO DIFFERENT NOTHINGS, AND SAYING THE WRONG ONE IS ALARMING. A roster nobody has
-             * used yet needs telling how to start. A roster that simply does not match what is in
-             * the box has to say so and quote it back — told "you don't have channels yet" while
-             * holding a typo, a person reads their conversations as gone.
-             */}
-            {searching && visibleChannels.length === 0 ? (
-              <div className="py-4">
-                <Empty className="border border-dashed min-h-[40dvh]">
-                  <EmptyHeader>
-                    <EmptyTitle>No channels match your search</EmptyTitle>
-                    <EmptyDescription className="text-pretty">
-                      Nothing here is named “{search.trim()}”, and nobody has
-                      said it recently either.
-                    </EmptyDescription>
-                  </EmptyHeader>
-                </Empty>
-              </div>
-            ) : null}
-            {!searching && channels.data?.length === 0 ? (
-              <div className="py-4">
-                <Empty className="border border-dashed min-h-[40dvh]">
-                  <EmptyHeader>
-                    <EmptyTitle>You don't have channels yet</EmptyTitle>
-                    <EmptyDescription className="text-pretty">
-                      Start talking to agents and your channels will appear
-                      here.
-                    </EmptyDescription>
-                  </EmptyHeader>
-                </Empty>
-              </div>
-            ) : null}
+            {(() => {
+              const empty = emptyStateFor({
+                status,
+                searching,
+                total: visibleItems.length,
+                search,
+              });
+              return empty ? (
+                <div className="py-4">
+                  <Empty className="border border-dashed min-h-[40dvh]">
+                    <EmptyHeader>
+                      <EmptyTitle>{empty.title}</EmptyTitle>
+                      <EmptyDescription className="text-pretty">
+                        {empty.description}
+                      </EmptyDescription>
+                    </EmptyHeader>
+                  </Empty>
+                </div>
+              ) : null;
+            })()}
             <AnimatePresence initial={false}>
-              {visibleChannels.map((channel) => (
-                <ChannelRow
+              {visibleItems.map((channel) => (
+                <Row
                   key={channel.id}
                   animateOrder={animateOrder}
                   channel={channel}
