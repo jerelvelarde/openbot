@@ -1,7 +1,6 @@
 import {
   and,
   asc,
-  desc,
   eq,
   exists,
   inArray,
@@ -27,6 +26,19 @@ import {
   channels,
   intelligenceChannelMappings,
 } from "../db/schema";
+import {
+  decodeRosterCursor,
+  encodeRosterCursor,
+  pinnedRank,
+  RECENCY,
+  type RosterCursor,
+  rosterOrder,
+} from "../roster/order";
+import {
+  DEFAULT_ROSTER_PAGE,
+  MAX_ROSTER_PAGE,
+  previewOf,
+} from "../roster/preview";
 import {
   CHANNEL_ACTIVITY_TOPIC,
   type ChannelActivityEvent,
@@ -72,77 +84,8 @@ export type ChannelPage = {
 
 export type ChannelQuery = { cursor?: string; limit?: number };
 
-/**
- * How many channels one page holds.
- *
- * The sidebar asked for all of them on every render, one row per channel-agent pair, and nothing
- * removes a channel: somebody who talks to their Bot daily accumulates thousands, so a query that is
- * instant in a demo returns thousands of rows on every page load for every employee, and grows
- * monotonically. A page is what a sidebar can show anyway.
- */
-const DEFAULT_CHANNEL_PAGE = 50;
-
-/** The most a caller may ask for, so the endpoint cannot be talked back into reading everything. */
-const MAX_CHANNEL_PAGE = 200;
-
-/**
- * Where a page stopped: every part of the sort, in sort order.
- *
- * `pinned` leads, because the ordering does: a keyset cursor has to name the whole sort key or the
- * next page is selected by a different rule than the page it follows, which serves some channels
- * twice and others never. `recency` and `id` are both here for the same reason — two channels can
- * share a timestamp.
- */
-type ChannelCursor = { pinned: boolean; recency: string; id: string };
-
-function encodeChannelCursor(cursor: ChannelCursor): string {
-  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
-}
-
-/**
- * A malformed cursor reads as the first page, which is the honest answer to a stale link.
- *
- * A cursor minted before `pinned` existed is malformed by this definition, and deliberately: it
- * describes a position in an ordering this query no longer has.
- */
-function decodeChannelCursor(
-  value: string | undefined,
-): ChannelCursor | undefined {
-  if (!value) return undefined;
-  try {
-    const parsed = JSON.parse(
-      Buffer.from(value, "base64url").toString("utf8"),
-    ) as ChannelCursor;
-    return typeof parsed?.id === "string" &&
-      typeof parsed?.recency === "string" &&
-      typeof parsed?.pinned === "boolean"
-      ? parsed
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * The roster's sort key, as SQL, in the order it sorts.
- *
- * Every part descends, which is what lets the cursor be one row comparison rather than a nest of
- * ORs: a pin is 1 and no pin is 0, so `desc` puts pinned channels first, and both remaining parts
- * already wanted `desc`. Starting a conversation counts as activity — a channel somebody just made
- * has nothing said in it yet and is the one they are about to type in, so ordering on the message
- * alone would bury it under every channel that has one.
- *
- * The browser repeats the recency half when the socket patches a row, and lifts pinned rows at
- * render; both must agree with this, or the list reorders itself on the next event. See `byRecency`
- * in use-channel-events.ts and `pinnedFirst` in app-sidebar.tsx.
- */
-const PINNED_RANK = sql`case when ${channelMemberships.pinnedAt} is not null then 1 else 0 end`;
-const RECENCY = sql`coalesce(${channels.lastMessageAt}, ${channels.createdAt})`;
-const ROSTER_ORDER = [
-  sql`${PINNED_RANK} desc`,
-  sql`${RECENCY} desc`,
-  desc(channels.id),
-];
+const PINNED_RANK = pinnedRank(channelMemberships.pinnedAt);
+const ROSTER_ORDER = rosterOrder(PINNED_RANK, RECENCY, channels.id);
 
 export type ChannelStore = {
   create(actor: AgentActor, agentIds: string[]): Promise<AgentChannel>;
@@ -171,23 +114,6 @@ export type ChannelStore = {
 
 const PRIVATE_AGENT_CHANNEL_DESCRIPTION = "Private agent channel.";
 const MAX_CHANNEL_NAME_CODE_POINTS = 120;
-const MAX_ACTIVITY_CODE_POINTS = 200;
-
-/**
- * Reduce a message to one line of plain text.
- *
- * A preview is rendered as text wherever a roster appears, so control characters have nothing to do
- * there: at best they are invisible, at worst a terminal escape somebody put in a message follows it
- * into a log. Newlines collapse to spaces because a preview is one line by definition.
- */
-function previewOf(text: string) {
-  // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping them is the point.
-  const flattened = text.replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").trim();
-  const collapsed = flattened.replace(/\s+/g, " ");
-  const codePoints = Array.from(collapsed);
-  if (codePoints.length <= MAX_ACTIVITY_CODE_POINTS) return collapsed;
-  return `${codePoints.slice(0, MAX_ACTIVITY_CODE_POINTS - 1).join("")}…`;
-}
 
 function channelName(names: string[]) {
   const joined = names.join(", ");
@@ -305,10 +231,10 @@ export function createChannelStore(
 
     async list(actor, query = {}) {
       const limit = Math.min(
-        Math.max(query.limit ?? DEFAULT_CHANNEL_PAGE, 1),
-        MAX_CHANNEL_PAGE,
+        Math.max(query.limit ?? DEFAULT_ROSTER_PAGE, 1),
+        MAX_ROSTER_PAGE,
       );
-      const cursor = decodeChannelCursor(query.cursor);
+      const cursor: RosterCursor | undefined = decodeRosterCursor(query.cursor);
 
       /*
        * The page of channels is chosen first, and the agents are joined to that page.
@@ -349,7 +275,7 @@ export function createChannelStore(
       const last = wanted.at(-1);
       const nextCursor =
         page.length > limit && last
-          ? encodeChannelCursor({
+          ? encodeRosterCursor({
               pinned: last.pinned,
               recency: new Date(last.recency).toISOString(),
               id: last.id,
