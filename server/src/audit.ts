@@ -470,6 +470,72 @@ export async function recordAuditEvent(
   });
 }
 
+/**
+ * A tolerant writer of one row, for a route that has already done the thing.
+ *
+ * WHY THIS IS NOT INLINE IN EACH ROUTE FILE. It was, twice, and both copies carried a comment saying
+ * they mirrored each other down to the reasoning — which is an accurate description of two things
+ * that drift the first time somebody changes one. The attribution argument below is the part that
+ * would drift silently: it is a decision about which rows are worth attributing, not a detail of
+ * either surface.
+ *
+ * NEVER FATAL. Every caller reaches this after its store call has resolved, so the archive, restore
+ * or removal has already happened and the caller has already been told so. A trail that is briefly
+ * unavailable is not a reason to report a failure that did not occur. It is said out loud instead, as
+ * one structured line, because nothing else can tell.
+ *
+ * ACTS, NOT ATTEMPTS. Reaching this at all is the caller's guarantee: a refused change writes
+ * nothing, and neither does a repeat, which is why the stores answer whether they changed anything.
+ *
+ * ATTRIBUTED, INCLUDING IN SINGLE-USER MODE. Other audited surfaces drop the actor id when it is the
+ * local development one, on the grounds that `audit_events.actor_user_id` has a foreign key into
+ * `users` that it would violate. It has no foreign key, and `initializeDevActorUser` writes that row
+ * at start-up anyway, so neither half of that reason holds. It matters here more than most:
+ * single-user is the mode `.env.example` ships switched on, so an unattributed row is what a fork
+ * sees by default, and "somebody put this conversation away" is the whole point of the row.
+ *
+ * `record` in agents/routes.ts is deliberately NOT folded in here: it drops the development actor,
+ * so folding it would change what it writes rather than where the code lives.
+ */
+export function createAuditRecorder(
+  auditStore: AuditStore | undefined,
+  target: {
+    /** `audit_events.target_type` for every row this writes. */
+    type: string;
+    /** The `type` of the structured line logged when a write fails. */
+    logType: string;
+    /** What the failed-write line calls the id, kept per-surface so the logs read as they always did. */
+    logIdKey: string;
+  },
+) {
+  return async (
+    actorUserId: string,
+    eventType: AuditEventType,
+    targetId: string,
+    payload: Record<string, unknown>,
+  ): Promise<void> => {
+    if (!auditStore) return;
+    try {
+      await recordAuditEvent(auditStore, {
+        eventType,
+        targetType: target.type,
+        targetId,
+        actorUserId,
+        payload,
+      });
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          type: target.logType,
+          eventType,
+          [target.logIdKey]: targetId,
+          error: String(error),
+        }),
+      );
+    }
+  };
+}
+
 export function createAuditStore(database: Database): AuditStore {
   return {
     insert: async (event) => {

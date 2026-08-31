@@ -10,7 +10,6 @@ import {
   or,
   sql,
 } from "drizzle-orm";
-import type { PgColumn } from "drizzle-orm/pg-core";
 import type { Context, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
@@ -19,11 +18,7 @@ import {
   type AgentProfileStore,
 } from "../agents/profile-store";
 import type { AgentActor, AgentProfile } from "../agents/profile-types";
-import {
-  type AuditEventType,
-  type AuditStore,
-  recordAuditEvent,
-} from "../audit";
+import { type AuditStore, createAuditRecorder } from "../audit";
 import type { AppVariables } from "../auth/guards";
 import type { Database } from "../db/client";
 import {
@@ -1105,52 +1100,14 @@ export function createChannelRoutes(
   const routes = new Hono<{ Variables: AppVariables }>();
 
   /**
-   * Write one audit row, tolerantly.
-   *
-   * Mirrors `record` in agents/routes.ts: never fatal, because the change has already happened and
-   * the caller has already been told so by the time this runs. A trail that is briefly unavailable is
-   * not a reason to report a failure that did not happen. It is said out loud instead, as one
-   * structured line, because nothing else can tell.
-   *
-   * Reached only after the store call resolves, so a refused change — a channel the package owns, or
-   * one the caller is not in — writes nothing. The trail records acts, not attempts.
+   * Write one audit row, tolerantly. See `createAuditRecorder` for every reason it behaves this way,
+   * including why a refused change and a repeat both write nothing.
    */
-  const record = async (
-    context: Context<{ Variables: AppVariables }>,
-    eventType: AuditEventType,
-    channelId: string,
-    payload: Record<string, unknown>,
-  ): Promise<void> => {
-    if (!auditStore) return;
-    try {
-      await recordAuditEvent(auditStore, {
-        eventType,
-        targetType: "channel",
-        targetId: channelId,
-        /*
-         * Attributed, including in single-user mode.
-         *
-         * The other audited surfaces drop this id when the actor is the local development one, on
-         * the grounds that `audit_events.actor_user_id` has a foreign key into `users` that it would
-         * violate. It has no foreign key, and `initializeDevActorUser` writes that row at start-up
-         * anyway, so neither half of the reason holds. It matters here more than most: single-user
-         * is the mode `.env.example` ships switched on, so an unattributed row is what a fork sees
-         * by default, and "somebody archived this conversation" is the whole point of the row.
-         */
-        actorUserId: context.var.actor.id,
-        payload,
-      });
-    } catch (error) {
-      console.error(
-        JSON.stringify({
-          type: "channel-audit-write-failed",
-          eventType,
-          channelId,
-          error: String(error),
-        }),
-      );
-    }
-  };
+  const record = createAuditRecorder(auditStore, {
+    type: "channel",
+    logType: "channel-audit-write-failed",
+    logIdKey: "channelId",
+  });
 
   // Before `/:channelId`, or "events" is read as a channel id.
   if (events) {
@@ -1258,7 +1215,7 @@ export function createChannelRoutes(
          * facts about how a conversation came back and the event type cannot tell them apart.
          */
         if (restored) {
-          await record(context, "channel.unarchived", channelId, {
+          await record(context.var.actor.id, "channel.unarchived", channelId, {
             mechanism: "activity",
           });
         }
@@ -1320,7 +1277,7 @@ export function createChannelRoutes(
       // now", not "did this call do the archiving".
       if (changed) {
         await record(
-          context,
+          context.var.actor.id,
           archived ? "channel.archived" : "channel.unarchived",
           channelId,
           // Named the way `channel.deleted` names its mechanism, and for a sharper reason: the
@@ -1350,7 +1307,7 @@ export function createChannelRoutes(
       await store.softDelete(context.var.actor, channelId);
       // Named rather than implied: the channel row and its thread are still there, and a later
       // hard delete would be a different fact about the same channel.
-      await record(context, "channel.deleted", channelId, {
+      await record(context.var.actor.id, "channel.deleted", channelId, {
         mechanism: "soft",
       });
       return context.body(null, 204);

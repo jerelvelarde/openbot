@@ -13,11 +13,7 @@
 import type { Context, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import { AgentNotFoundError } from "../agents/profile-store";
-import {
-  type AuditEventType,
-  type AuditStore,
-  recordAuditEvent,
-} from "../audit";
+import { type AuditStore, createAuditRecorder } from "../audit";
 import type { AppVariables } from "../auth/guards";
 import { parseActivityInput } from "../channels/routes";
 import {
@@ -102,50 +98,14 @@ export function createBotChatRoutes(
   const routes = new Hono<{ Variables: AppVariables }>();
 
   /**
-   * Write one row to the trail, tolerantly.
-   *
-   * Mirrors `record` in channels/routes.ts, down to the reasoning: never fatal, because by the time
-   * this runs the conversation has already been archived, restored or removed and the caller has
-   * already been told so. A trail that is briefly unavailable is not a reason to report a failure that
-   * did not happen — and the failure is said out loud, because a silent trail is worse than an
-   * unavailable one.
-   *
-   * Reached only after the store call resolves, and only where the store reports it changed
-   * something, so a refused act and a repeat click both write nothing. The trail records acts, not
-   * attempts.
+   * Write one row to the trail, tolerantly. See `createAuditRecorder` for every reason it behaves
+   * this way, including why a refused act and a repeat click both write nothing.
    */
-  const record = async (
-    context: Context<{ Variables: AppVariables }>,
-    eventType: AuditEventType,
-    botChatId: string,
-    payload: Record<string, unknown>,
-  ): Promise<void> => {
-    if (!auditStore) return;
-    try {
-      await recordAuditEvent(auditStore, {
-        eventType,
-        targetType: "bot_chat",
-        targetId: botChatId,
-        /*
-         * Attributed, including in single-user mode, for the reason channels/routes.ts gives at
-         * length: `audit_events.actor_user_id` has no foreign key to violate, `initializeDevActorUser`
-         * writes that row at start-up anyway, and single-user is the mode `.env.example` ships
-         * switched on — so an unattributed row is what a fork sees by default.
-         */
-        actorUserId: context.var.actor.id,
-        payload,
-      });
-    } catch (error) {
-      console.error(
-        JSON.stringify({
-          type: "bot-chat-audit-write-failed",
-          eventType,
-          botChatId,
-          error: String(error),
-        }),
-      );
-    }
-  };
+  const record = createAuditRecorder(auditStore, {
+    type: "bot_chat",
+    logType: "bot-chat-audit-write-failed",
+    logIdKey: "botChatId",
+  });
 
   routes.post("/", requireUser, async (context) => {
     const parsed = parseCreateInput(await context.req.json().catch(() => null));
@@ -217,7 +177,7 @@ export function createBotChatRoutes(
        * activity route uses, because they are the same two facts.
        */
       if (restored) {
-        await record(context, "bot_chat.unarchived", id, {
+        await record(context.var.actor.id, "bot_chat.unarchived", id, {
           mechanism: "activity",
         });
       }
@@ -281,7 +241,7 @@ export function createBotChatRoutes(
        */
       if (changed) {
         await record(
-          context,
+          context.var.actor.id,
           archived ? "bot_chat.archived" : "bot_chat.unarchived",
           id,
           // Named the way `bot_chat.deleted` names its mechanism, and for a sharper reason: the
@@ -305,7 +265,9 @@ export function createBotChatRoutes(
       // would be a different fact about the same conversation. `softDelete` throws for a repeat, so
       // reaching this line is itself the "it happened this time" gate the archive route needs a
       // boolean for.
-      await record(context, "bot_chat.deleted", id, { mechanism: "soft" });
+      await record(context.var.actor.id, "bot_chat.deleted", id, {
+        mechanism: "soft",
+      });
       return context.body(null, 204);
     } catch (error) {
       return mapStoreError(context, error);
