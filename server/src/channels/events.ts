@@ -15,23 +15,66 @@ import postgres from "postgres";
 
 export const CHANNEL_ACTIVITY_TOPIC = "channel_activity";
 
-export type ChannelActivityEvent = {
-  channelId: string;
-  /** Who may receive it. Resolved by the writer, which already had to check membership. */
+/**
+ * Live roster activity, from whoever ran an agent to everybody who can see the conversation.
+ *
+ * TWO KINDS NOW. A channel has members; a bot chat has exactly one owner. Both are rows in one
+ * roster, so both announce through here, and `memberIds` carries whoever may receive it either way —
+ * the hub's delivery rule needs no knowledge of which kind it is holding.
+ */
+export type RosterActivityEvent = {
+  /** Which kind of row this is about. The browser needs it to render, not to find the row. */
+  kind: "channel" | "bot_chat";
+  /**
+   * The row's id.
+   *
+   * Globally unique across both kinds, because ids are prefixed (`channel_...`, `botchat_...`). That
+   * is what lets one cursor page a mixed list and one patch function find a row without being told
+   * its kind.
+   */
+  id: string;
+  /**
+   * The channel's id, on a channel event only.
+   *
+   * @deprecated Carried alongside `id` for exactly one release, then removed.
+   *
+   * WHY IT IS STILL HERE. A rolling deploy runs new and old replicas at once. The old ones LISTEN on
+   * this topic and read `channelId`; a straight rename would have them deliver malformed events to
+   * every client they hold, and renaming the topic instead would drop events for the length of the
+   * rollout. So this release is additive and the field goes in the next one, once no replica predates
+   * `id`. `accounts.issuer` in core.ts ships nullable for the same reason.
+   *
+   * A bot chat event has no `channelId`, so an old replica delivers one with the field undefined. Its
+   * clients read the channels list, find no such row, and refetch — which is the same harmless path a
+   * stale roster already takes.
+   */
+  channelId?: string;
+  /** Who may receive it. Resolved by the writer, which already had to check who that is. */
   memberIds: string[];
   lastMessage: string | null;
   lastMessageAt: string | null;
   lastMessageAgentId: string | null;
-  /** The channel is hidden from every member's roster. Absent on an ordinary activity event. */
+  /** The conversation is hidden from every roster. Absent on an ordinary activity event. */
   deleted?: true;
   /**
    * One member's pin, changed. Absent on an ordinary activity event.
    *
-   * A pin lives on one membership row, so the writer names that member alone in `memberIds` and the
-   * hub's delivery rule does the rest: nobody else in the channel hears a pin they did not make.
+   * A channel pin lives on one membership row, so the writer names that member alone in `memberIds`
+   * and the hub's delivery rule does the rest: nobody else in the channel hears a pin they did not
+   * make. A bot chat's owner is the only candidate either way.
    */
   pinned?: boolean;
+  /**
+   * The conversation's archive state, changed. Absent on an ordinary activity event.
+   *
+   * Also set to `false` on an activity event that restored an archived conversation, because saying
+   * something in one is how it comes back.
+   */
+  archived?: boolean;
 };
+
+/** @deprecated Use {@link RosterActivityEvent}. Kept so existing imports keep compiling. */
+export type ChannelActivityEvent = RosterActivityEvent;
 
 type Send = (payload: string) => void;
 
@@ -39,7 +82,7 @@ export type ChannelEventHub = {
   /** Attach a connection for a person. Returns the detach. */
   register(userId: string, send: Send): () => void;
   /** Fan one event out to this instance's own connections. */
-  deliver(event: ChannelActivityEvent): void;
+  deliver(event: RosterActivityEvent): void;
   connectionCount(userId: string): number;
 };
 
@@ -97,7 +140,7 @@ export async function startChannelActivityListener(
 
   await connection.listen(CHANNEL_ACTIVITY_TOPIC, (payload) => {
     try {
-      hub.deliver(JSON.parse(payload) as ChannelActivityEvent);
+      hub.deliver(JSON.parse(payload) as RosterActivityEvent);
     } catch {
       // A payload we cannot read is not a reason to tear down the subscription: the roster query is
       // still correct, and the next refetch shows whatever this event would have.
