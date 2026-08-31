@@ -1,6 +1,19 @@
 import { useQuery } from "@tanstack/react-query";
 import { createFileRoute, Link } from "@tanstack/react-router";
+import {
+  IconChevronRight,
+  IconPlugConnected,
+  IconSparkles,
+  IconTag,
+} from "@tabler/icons-react";
 import { AbstractAvatar } from "@/components/agents/abstract-avatar";
+import {
+  CeilingGrid,
+  ConnectorAsk,
+  Glance,
+  hueFor,
+  SkillCard,
+} from "@/components/agents/template-anatomy";
 import {
   Claim,
   STRANGER_WROTE_IT,
@@ -10,6 +23,7 @@ import { PageSection, PageShell } from "@/components/layout/page-shell";
 import { Button } from "@/components/ui/button";
 import { ClientError } from "@/lib/client";
 import { describeBoundary } from "@/lib/templates/boundary";
+import { templateCategoryLabel } from "@/lib/templates/categories";
 import { galleryTemplateQueryOptions } from "@/lib/templates/queries";
 
 /**
@@ -99,7 +113,11 @@ export function TemplateDetail({ slug }: { slug: string }) {
 
   const { entry, template, digest, yaml } = detail.data;
   const seed = entry.avatarSeed || entry.slug;
+  const hue = hueFor(seed);
   const ceiling = describeBoundary(template.boundary);
+  const categoryLabel = entry.category
+    ? (templateCategoryLabel(entry.category) ?? "Not filed")
+    : "Not filed";
 
   return (
     <PageShell
@@ -122,34 +140,178 @@ export function TemplateDetail({ slug }: { slug: string }) {
       title={entry.name}
     >
       {/*
-       * The drawing and the role, together, because this page is about one coworker rather than about
-       * a file. It is the avatar the imported Bot will actually have — the same seed — so the page is
-       * a preview of the thing rather than a description of it.
+       * WHO THIS COWORKER IS, given the weight the rest of the page borrows from.
+       *
+       * A person arriving here is deciding whether this is the right template at all, and the four
+       * facts that answer it — the drawing, the job title, where it runs, and what it brings — were
+       * previously a thin strip indistinguishable from the sections under it. It is one block now,
+       * with the identity and the three counts inside a single bordered card, so the top of the page
+       * reads as a description of a coworker rather than as the first of nine equal sections.
+       *
+       * `mt-8` because `PageShell`'s header supplies no bottom margin and this is the first child:
+       * without it the card sits flush against the summary, and the tiles sat flush against the card.
+       * Every gap here is deliberate rather than inherited.
        */}
-      <div className="flex items-center gap-3 rounded-lg border border-border bg-card px-4 py-3">
-        <AbstractAvatar name={entry.name} seed={seed} size={40} />
-        <div className="min-w-0">
-          <p className="font-medium text-sm">{entry.title}</p>
-          <p className="text-muted-foreground text-xs">
-            {entry.runtime === "managed"
-              ? "Runs on this deployment's own Bot."
-              : "Runs at an address the importer supplies."}
-          </p>
+      <div className="mt-8 overflow-hidden rounded-xl border border-border bg-card">
+        <div
+          className="flex items-center gap-4 px-5 py-5"
+          style={{
+            backgroundImage: `radial-gradient(80% 140% at 10% 0%, oklch(0.72 0.11 ${hue} / 0.13), transparent 60%)`,
+          }}
+        >
+          <AbstractAvatar name={entry.name} seed={seed} size={56} />
+          <div className="min-w-0">
+            <p className="font-semibold text-base leading-tight">
+              {entry.title}
+            </p>
+            {/*
+             * One sentence for both ways a deployment honours `runtime: managed` — on the managed
+             * Bot it runs, or in its own process — because from here the difference is invisible and
+             * ought to be. A card carries no plan, so it knows what the file asked for and not what
+             * this deployment would do about it; the consent screen has the plan and says which of
+             * the two it will be.
+             */}
+            <p className="mt-0.5 text-muted-foreground text-sm">
+              {entry.runtime === "managed"
+                ? "Runs on this deployment itself."
+                : "Runs at an address the importer supplies."}
+            </p>
+          </div>
+        </div>
+
+        {/*
+         * THE THREE QUESTIONS SOMEBODY ARRIVES WITH, answered before any prose starts.
+         *
+         * Everything below this card is a stranger's words and deserves to be read slowly. This is
+         * not: it is the format's own structured fields, and a person deciding whether this template
+         * is even the right one should not have to read four screens of instructions to learn that
+         * it asks for two connectors and brings three skills.
+         */}
+        <div className="grid gap-px border-border border-t bg-border sm:grid-cols-3">
+          <Glance
+            icon={<IconSparkles className="size-4" />}
+            label="Skills it brings"
+            value={
+              template.skills.length === 1
+                ? "1 skill"
+                : `${template.skills.length} skills`
+            }
+          />
+          <Glance
+            icon={<IconPlugConnected className="size-4" />}
+            label="Connectors it asks for"
+            value={
+              template.requests.connectors.length === 0
+                ? "None"
+                : template.requests.connectors
+                    .map((connector) => connector.id)
+                    .join(", ")
+            }
+          />
+          <Glance
+            icon={<IconTag className="size-4" />}
+            label="Kind of work"
+            value={categoryLabel}
+          />
         </div>
       </div>
 
+      <PageSection
+        description="The ceiling the author wrote into the file. This deployment compiles it into rules scoped to this one coworker when it is imported, and they only ever subtract from what a Bot may already do."
+        title="What it will be allowed to do"
+      >
+        <div className="grid gap-3">
+          <CeilingGrid boundary={template.boundary} />
+          {/*
+           * The sentences stay, and they are the authority. `describeBoundary` is shared with the
+           * consent screen and the Boundaries screen precisely so one ceiling is never described
+           * two ways, and the grid above is an index over the same object rather than a second
+           * wording — it compresses, it does not paraphrase.
+           */}
+          <ul className="grid gap-1">
+            {ceiling.map((sentence) => (
+              <li className="text-muted-foreground text-sm" key={sentence}>
+                {sentence}
+              </li>
+            ))}
+          </ul>
+        </div>
+      </PageSection>
+      <PageSection
+        description="What the author says this coworker needs. Every line is a request and none of it is a grant: importing writes these to a ledger as asked-for, and somebody decides each one afterwards on the screens that already decide grants."
+        title="What it can reach"
+      >
+        <div className="grid gap-2">
+          {template.requests.connectors.map((connector) => (
+            <ConnectorAsk
+              id={connector.id}
+              key={connector.id}
+              tools={connector.tools}
+              why={connector.why}
+            />
+          ))}
+
+          {template.requests.components.map((component) => (
+            <div
+              className="grid gap-1.5 rounded-lg border border-border bg-card p-3"
+              key={component.name}
+            >
+              <p className="font-medium font-mono text-sm">{component.name}</p>
+              <p className="text-muted-foreground text-sm">{component.why}</p>
+            </div>
+          ))}
+
+          {template.requests.connectors.length === 0 &&
+          template.requests.components.length === 0 ? (
+            <p className="text-muted-foreground text-sm">
+              It asks for nothing. This coworker works with what every Bot here
+              already has.
+            </p>
+          ) : null}
+        </div>
+      </PageSection>
+      {template.skills.length > 0 ? (
+        <PageSection
+          description="A skill is an instruction somebody invokes with a slash. It grants nothing: what a Bot may call is its grants, and naming a tool here only narrows what is offered out of what it already holds."
+          title={
+            template.skills.length === 1
+              ? "Its skill"
+              : `Its ${template.skills.length} skills`
+          }
+        >
+          <div className="grid gap-2">
+            {template.skills.map((skill) => (
+              <SkillCard
+                instructions={skill.instructions}
+                key={skill.slug}
+                slug={skill.slug}
+                summary={skill.summary}
+                title={skill.title}
+                tools={skill.tools}
+              />
+            ))}
+          </div>
+        </PageSection>
+      ) : null}
       <PageSection
         description={STRANGER_WROTE_IT}
         title="The instructions it carries"
       >
         {/*
-         * FIRST, and that ordering is the argument. What a Bot will be TOLD is a larger fact about it
-         * than what it may reach, and a page that led with a capability list would be teaching people
-         * to skim the prose on the way to the part that looks like the security-relevant one.
+         * AFTER THE CAPABILITIES, WHICH REVERSES WHAT THIS PAGE USED TO ARGUE, deliberately.
+         *
+         * The old ordering put this first on the grounds that what a Bot will be TOLD is a larger
+         * fact than what it may reach. That holds for somebody who has already chosen this template
+         * and is now reading it closely. It does not hold for the far commoner arrival: somebody
+         * deciding whether this is the right template at all, for whom four screens of a stranger's
+         * prose stood between them and the two facts that answer it in a glance.
+         *
+         * Nothing is hidden by the change and nothing is skimmed past — the capability sections
+         * above are short and structured, and this text is still whole, still verbatim, and still
+         * the substance of the page rather than an appendix to it.
          */}
         <Verbatim capped={false}>{template.bot.roleDescription}</Verbatim>
       </PageSection>
-
       {/*
        * SETUP, ABOVE THE SKILLS RATHER THAN AT THE BOTTOM.
        *
@@ -167,102 +329,6 @@ export function TemplateDetail({ slug }: { slug: string }) {
           <Verbatim capped={false}>{template.notes}</Verbatim>
         </PageSection>
       ) : null}
-
-      {template.skills.length > 0 ? (
-        <PageSection
-          description="A skill is an instruction somebody invokes with a slash. It grants nothing: what a Bot may call is its grants, and naming a tool here only narrows what is offered out of what it already holds."
-          title={
-            template.skills.length === 1
-              ? "Its skill"
-              : `Its ${template.skills.length} skills`
-          }
-        >
-          <div className="grid gap-5">
-            {template.skills.map((skill) => (
-              <div className="grid gap-2" key={skill.slug}>
-                <div>
-                  <p className="font-medium text-sm">{skill.title}</p>
-                  <p className="font-mono text-muted-foreground text-xs">
-                    /{skill.slug}
-                  </p>
-                </div>
-                <p className="text-muted-foreground text-sm">{skill.summary}</p>
-                <Verbatim capped={false}>{skill.instructions}</Verbatim>
-                {skill.tools.length > 0 ? (
-                  <p className="text-muted-foreground text-xs">
-                    It names {skill.tools.join(", ")}. Naming a tool is not
-                    being given it.
-                  </p>
-                ) : null}
-              </div>
-            ))}
-          </div>
-        </PageSection>
-      ) : null}
-
-      {/*
-       * THE ASKS, WITH THE AUTHOR'S OWN REASONS, and resolved against nothing.
-       *
-       * Whether this deployment has Drive is a question about the deployment, and it is answered on
-       * the consent screen where it changes what the button does. Answering it here as well would put
-       * a second resolution path in front of a stranger's file, and two paths that must agree are two
-       * paths that eventually do not.
-       */}
-      <PageSection
-        description="What the author says this coworker needs. Every line is a request and none of it is a grant: importing writes these to a ledger as asked-for, and somebody decides each one afterwards on the screens that already decide grants."
-        title="What it asks for"
-      >
-        <div className="grid gap-4">
-          {template.requests.connectors.map((connector) => (
-            <div className="grid gap-1.5" key={connector.id}>
-              <p className="font-mono font-medium text-sm">{connector.id}</p>
-              <p className="text-muted-foreground text-sm">{connector.why}</p>
-              {connector.tools.length > 0 ? (
-                <ul className="grid gap-1">
-                  {connector.tools.map((tool) => (
-                    <li className="text-xs" key={tool.ref}>
-                      <span className="font-mono">{tool.ref}</span>
-                      <span className="text-muted-foreground">
-                        {" "}
-                        — {tool.why}
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              ) : null}
-            </div>
-          ))}
-
-          {template.requests.components.map((component) => (
-            <div className="grid gap-1.5" key={component.name}>
-              <p className="font-mono font-medium text-sm">{component.name}</p>
-              <p className="text-muted-foreground text-sm">{component.why}</p>
-            </div>
-          ))}
-
-          {template.requests.connectors.length === 0 &&
-          template.requests.components.length === 0 ? (
-            <p className="text-muted-foreground text-sm">
-              It asks for nothing. This coworker works with what every Bot here
-              already has.
-            </p>
-          ) : null}
-        </div>
-      </PageSection>
-
-      <PageSection
-        description="The ceiling the author wrote into the file. This deployment compiles it into rules scoped to this one coworker when it is imported, and they only ever subtract from what a Bot may already do."
-        title="What it will be allowed to do"
-      >
-        <ul className="grid gap-1">
-          {ceiling.map((sentence) => (
-            <li className="text-muted-foreground text-sm" key={sentence}>
-              {sentence}
-            </li>
-          ))}
-        </ul>
-      </PageSection>
-
       <PageSection
         description="Where this came from, as far as anything here can tell. The author and the address are the author's own words and nothing has checked either."
         title="Provenance"
@@ -292,7 +358,6 @@ export function TemplateDetail({ slug }: { slug: string }) {
           />
         </div>
       </PageSection>
-
       {/*
        * THE FILE ITSELF, last and in full.
        *
@@ -306,7 +371,18 @@ export function TemplateDetail({ slug }: { slug: string }) {
         description="Serialised from the document this deployment parsed. It is what the consent screen would show you, and what you could have been handed by any other means."
         title="The file"
       >
-        <Verbatim capped={false}>{yaml}</Verbatim>
+        <details className="group">
+          <summary className="flex cursor-pointer list-none items-center gap-1 text-muted-foreground text-sm hover:text-foreground">
+            <IconChevronRight
+              aria-hidden
+              className="size-4 transition-transform group-open:rotate-90"
+            />
+            Show the file
+          </summary>
+          <div className="mt-2">
+            <Verbatim capped={false}>{yaml}</Verbatim>
+          </div>
+        </details>
       </PageSection>
     </PageShell>
   );
