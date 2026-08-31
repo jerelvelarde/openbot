@@ -149,12 +149,19 @@ export function hasUnseenActivity(channel: RosterItem): boolean {
   );
 }
 
-/** Unseen activity somewhere you are not looking. The open channel never shows the dot. */
+/**
+ * Unseen activity somewhere you are not looking. The open conversation never shows the dot.
+ *
+ * The open conversation may be either kind — a channel or a bot chat — and the two live under
+ * different route params (`channelId`, `botChatId`). This function does not know or care which:
+ * it takes whichever id the caller resolved from the matching param and compares it plainly, so
+ * the "somewhere you are not looking" rule is enforced identically for both kinds.
+ */
 export function isUnread(
   channel: RosterItem,
-  openChannelId: string | undefined,
+  openId: string | undefined,
 ): boolean {
-  return channel.id !== openChannelId && hasUnseenActivity(channel);
+  return channel.id !== openId && hasUnseenActivity(channel);
 }
 
 /**
@@ -223,10 +230,18 @@ function Row({
   const shouldReduceMotion = useReducedMotion();
   // Whether this row is unread, as a boolean, for the same reason `RosterRow` computes `isOpen`
   // that way: navigating re-renders the rows whose answer changed, not the whole roster.
+  //
+  // The open id comes from whichever route param matched — `channelId` for a channel route,
+  // `botChatId` for a bot chat route — mirroring `RosterRow`'s `isOpen` below. The two must stay
+  // in step: reading only `channelId` here once meant an open bot chat compared its own id against
+  // `undefined`, always true, so the row you were looking at lit its own unread dot the moment its
+  // Bot replied — the exact case `isUnread`'s docblock says never happens.
   const unread = useParams({
     strict: false,
-    select: (params) =>
-      isUnread(channel, (params as { channelId?: string }).channelId),
+    select: (params) => {
+      const held = params as { channelId?: string; botChatId?: string };
+      return isUnread(channel, held.channelId ?? held.botChatId);
+    },
   });
   return (
     <motion.div
