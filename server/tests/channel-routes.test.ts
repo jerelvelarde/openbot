@@ -18,7 +18,7 @@ import type { AgentActor } from "../src/agents/profile-types";
 import { createApp } from "../src/app";
 import type { AuditEventInput, AuditStore } from "../src/audit";
 import { DEV_ACTOR } from "../src/auth/dev-actor";
-import type { AppVariables } from "../src/auth/guards";
+import type { AppVariables, AuthenticatedActor } from "../src/auth/guards";
 import {
   type AgentChannel,
   ChannelNotFoundError,
@@ -26,6 +26,7 @@ import {
   type ChannelStore,
   createChannelRoutes,
   createChannelStore,
+  MAX_ACTIVITY_CLOCK_SKEW_MS,
   parseActivityInput,
   parseChannelInput,
 } from "../src/channels/routes";
@@ -97,6 +98,11 @@ function fakeStore(
     },
     async recordActivity(receivedActor, id, activity) {
       calls.push(["recordActivity", receivedActor, id, activity]);
+      // The outcome the interface promises, which the route destructures. Returning nothing type-
+      // checked as `Promise<void>` and answered a bare 500 from a `TypeError` the moment a request
+      // actually reached this method; the only activity test in the file was turned away at 413 by
+      // the body limit first, so nothing noticed. Both sibling fakes return the same shape.
+      return { restored: false };
     },
   };
 
@@ -198,6 +204,141 @@ describe("activity input parser", () => {
     expect(
       parseActivityInput({ text: "😀".repeat(8_001), agentId: null, at }),
     ).toEqual({ ok: false, error: "Text is too long." });
+  });
+
+  test("takes a report a person made, with no agent on it", () => {
+    expect(
+      parseActivityInput({ text: "One more thing", agentId: null, at }),
+    ).toEqual({
+      ok: true,
+      value: { text: "One more thing", agentId: null, at: new Date(at) },
+    });
+  });
+
+  test("trims a real agent ID", () => {
+    expect(
+      parseActivityInput({ text: "One more thing", agentId: " agent-1 ", at }),
+    ).toMatchObject({ ok: true, value: { agentId: "agent-1" } });
+  });
+
+  test.each([[" "], ["   "], ["\t\n"]])(
+    "refuses a whitespace-only agent ID: %p",
+    (agentId) => {
+      /*
+       * Trimmed to `""` this was accepted, and `""` is neither `null` — which is how "a person said
+       * this" is spelled — nor an id any store can resolve. So `recordActivity` looked the empty
+       * string up in `channel_agents`, threw `AgentNotFoundError("")`, and a malformed request came
+       * back as 404 "Agent not found." Every sibling parser refuses it outright.
+       */
+      expect(
+        parseActivityInput({ text: "One more thing", agentId, at }),
+      ).toEqual({
+        ok: false,
+        error: "Agent ID must be a non-empty string or null.",
+      });
+    },
+  );
+
+  test.each([[42], [{}], [[]], [false], [undefined]])(
+    "refuses an agent ID that is neither a string nor null: %p",
+    (agentId) => {
+      expect(
+        parseActivityInput({ text: "One more thing", agentId, at }),
+      ).toEqual({ ok: false, error: "Agent ID must be a string or null." });
+    },
+  );
+
+  test("refuses a report with no timestamp at all", () => {
+    expect(
+      parseActivityInput({ text: "One more thing", agentId: null }),
+    ).toEqual({ ok: false, error: "Timestamp is required." });
+  });
+
+  test("refuses a timestamp with no zone, whose instant depends on where the server runs", () => {
+    // `new Date("2026-08-31T12:00")` is read in the server process's own local zone, so two clients
+    // sending the identical string landed at two different instants depending on where the process
+    // happened to run — and that instant is what the store's moves-forwards-only guard compares.
+    expect(
+      parseActivityInput({
+        text: "One more thing",
+        agentId: null,
+        at: "2026-08-31T12:00",
+      }),
+    ).toEqual({
+      ok: false,
+      error: "Timestamp must be an ISO-8601 date and time with a time zone.",
+    });
+  });
+
+  test.each([
+    // Accepted by a bare `new Date` while the refusal said "ISO-8601": the parser was looser than its
+    // own error message.
+    ["12/25/2026"],
+    ["Sat, 31 Aug 2026 12:00:00 GMT"],
+    // A date with no time of day, and an offset with no colon: neither is a reported message time.
+    ["2026-08-31"],
+    ["2026-08-31T12:00:00+0200"],
+    // The right shape and an impossible month.
+    ["2026-13-01T00:00:00Z"],
+    [""],
+  ])(
+    "refuses a timestamp that is not a zoned ISO-8601 date and time: %p",
+    (value) => {
+      expect(
+        parseActivityInput({
+          text: "One more thing",
+          agentId: null,
+          at: value,
+        }),
+      ).toEqual({
+        ok: false,
+        error: "Timestamp must be an ISO-8601 date and time with a time zone.",
+      });
+    },
+  );
+
+  test.each([
+    ["a minute behind this server", -60_000],
+    ["half the allowance ahead of it", MAX_ACTIVITY_CLOCK_SKEW_MS / 2],
+  ])("keeps a timestamp %s exactly as reported", (_label, offset) => {
+    const reported = new Date(Date.now() + offset).toISOString();
+
+    expect(
+      parseActivityInput({
+        text: "One more thing",
+        agentId: null,
+        at: reported,
+      }),
+    ).toMatchObject({ ok: true, value: { at: new Date(reported) } });
+  });
+
+  test("clamps a timestamp further ahead than the allowance", () => {
+    /*
+     * The one direction that could corrupt the row rather than lose a report.
+     *
+     * Both stores write this value to `last_message_at` under a guard that only moves forwards, so an
+     * unbounded `at` in the year 3000 pinned the row to the top of every member's roster for good,
+     * turned every later genuine report into a no-op, and — because clearing `archived_at` rides that
+     * same guarded write — left an archived conversation that speaking in it could no longer bring
+     * back. Nothing in the API undoes any of it.
+     */
+    const before = Date.now();
+    const parsed = parseActivityInput({
+      text: "One more thing",
+      agentId: null,
+      at: "3000-01-01T00:00:00.000Z",
+    });
+    const after = Date.now();
+
+    if (!parsed.ok) throw new Error(parsed.error);
+    // Clamped rather than refused: a report is a message somebody sent, and turning away every report
+    // a fast-clocked client makes loses all of them instead of bounding one.
+    expect(parsed.value.at.getTime()).toBeGreaterThanOrEqual(
+      before + MAX_ACTIVITY_CLOCK_SKEW_MS,
+    );
+    expect(parsed.value.at.getTime()).toBeLessThanOrEqual(
+      after + MAX_ACTIVITY_CLOCK_SKEW_MS,
+    );
   });
 });
 
@@ -342,8 +483,12 @@ describe("channel routes", () => {
       },
     });
     const app = appFor(store);
+    // A status no channel route can produce, so the response can only have come from the handler
+    // below. 418 rather than the 599 that was here: Hono types the statuses it will serialise, and
+    // 599 is not one of them, which is a type error the suite cannot see because it does not compile
+    // its own tests.
     app.onError((error, context) =>
-      context.json({ sentinel: error.message }, 599),
+      context.json({ sentinel: error.message }, 418),
     );
 
     const response = await app.request("http://openbot.test/", {
@@ -352,8 +497,59 @@ describe("channel routes", () => {
       body: JSON.stringify({ agentIds: ["agent-1"] }),
     });
 
-    expect(response.status).toBe(599);
+    expect(response.status).toBe(418);
     expect(await json(response)).toEqual({ sentinel: "database disconnected" });
+  });
+
+  test.each([
+    // Every one of these was answered 200 with a page nobody asked for. `Number.parseInt` keeps what
+    // it could read before the first character it could not — `1e3` was 1, `50abc` was 50 — and a
+    // value it cannot read at all fell through to the default page instead. Either way the answer
+    // looks exactly like an answer, and the caller cannot tell it was rewritten.
+    ["1e3"],
+    ["0x10"],
+    ["50abc"],
+    ["-5"],
+    ["5.5"],
+    ["+5"],
+    [" 5"],
+    ["lots"],
+    // Nought rows is a request this endpoint cannot honour: the store clamps it up to one, which is
+    // the same reinterpretation wearing a rounder number.
+    ["0"],
+  ])(
+    "refuses a limit that is not a whole number of at least 1: %p",
+    async (limit) => {
+      const store = fakeStore();
+
+      const response = await appFor(store).request(
+        `http://openbot.test/?limit=${encodeURIComponent(limit)}`,
+      );
+
+      expect(response.status).toBe(400);
+      expect(await json(response)).toEqual({
+        error: "Limit must be a whole number of at least 1.",
+      });
+      // Refused before the read, so a malformed page request cannot come back looking like an answer.
+      expect(store.calls).toEqual([]);
+    },
+  );
+
+  test("passes a limit it accepts, and treats an empty one as absent", async () => {
+    const store = fakeStore();
+    const app = appFor(store);
+
+    await app.request("http://openbot.test/?limit=25");
+    // A leading zero is a whole number written oddly, not a malformed one.
+    await app.request("http://openbot.test/?limit=007");
+    // A parameter that says nothing is not a parameter, which is how an empty `cursor` is read too.
+    await app.request("http://openbot.test/?limit=");
+
+    expect(store.calls).toEqual([
+      ["list", actor, { status: "active", limit: 25 }],
+      ["list", actor, { status: "active", limit: 7 }],
+      ["list", actor, { status: "active" }],
+    ]);
   });
 
   test("reads the archive status the caller asked for, and defaults to active", async () => {
@@ -403,6 +599,40 @@ describe("channel routes", () => {
     expect(await json(response)).toMatchObject({
       channels: [{ id: "channel-9", archived: true }],
     });
+  });
+
+  test("reports activity through the authenticated actor and answers 204", async () => {
+    const store = fakeStore();
+    const app = appFor(store);
+    const at = "2026-01-01T00:00:00.000Z";
+
+    const response = await app.request(
+      "http://openbot.test/channel-1/activity",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: "One more thing", agentId: null, at }),
+      },
+    );
+
+    /*
+     * The half the body-limit test below cannot reach.
+     *
+     * That request is turned away at 413 before the store is called at all, which is why it was the
+     * only activity test here for so long — and why the fake above could return `undefined` where the
+     * interface promises an outcome, leaving the route to destructure `restored` off it and answer a
+     * bare 500 for every well-formed report. A route test that never reaches the store cannot notice
+     * that the store it was handed is not one.
+     */
+    expect(response.status).toBe(204);
+    expect(store.calls).toEqual([
+      [
+        "recordActivity",
+        actor,
+        "channel-1",
+        { text: "One more thing", agentId: null, at: new Date(at) },
+      ],
+    ]);
   });
 
   test("refuses an activity body too large to parse", async () => {
@@ -683,14 +913,40 @@ describe("channel delete audit", () => {
    * The channel is already hidden and the caller has already been told so by the time this runs. A
    * trail that is briefly unavailable is not a reason to report a failure that did not happen.
    */
-  test("still answers when the audit write throws", async () => {
-    const response = await appWithAudit(fakeStore(), {
-      insert: async () => {
-        throw new Error("audit table is unreachable");
-      },
-    }).request("http://openbot.test/channel-1", { method: "DELETE" });
+  test("still answers when the audit write throws, and says so", async () => {
+    const lines: Record<string, unknown>[] = [];
+    const wasConsoleError = console.error;
+    console.error = (line: unknown) => {
+      try {
+        lines.push(JSON.parse(String(line)) as Record<string, unknown>);
+      } catch {
+        // Something else in the process logging prose rather than a structured line. Not ours.
+      }
+    };
+    let response: Response;
+    try {
+      response = await appWithAudit(fakeStore(), {
+        insert: async () => {
+          throw new Error("audit table is unreachable");
+        },
+      }).request("http://openbot.test/channel-1", { method: "DELETE" });
+    } finally {
+      console.error = wasConsoleError;
+    }
 
     expect(response.status).toBe(204);
+    // Swallowed, and said out loud. Collected rather than left to print into the suite's output,
+    // where nobody was checking its shape and the line was noise either way.
+    expect(
+      lines.filter((line) => line.type === "channel-audit-write-failed"),
+    ).toEqual([
+      {
+        type: "channel-audit-write-failed",
+        eventType: "channel.deleted",
+        channelId: "channel-1",
+        error: "Error: audit table is unreachable",
+      },
+    ]);
   });
 
   test("deletes without a trail when the deployment keeps none", async () => {
@@ -826,15 +1082,25 @@ function persistentId(kind: string) {
   return `${testPrefix}-${kind}-${randomUUID()}`;
 }
 
-async function createPersistentUser(): Promise<AgentActor> {
+/**
+ * A user, described the way the routes describe one.
+ *
+ * `AuthenticatedActor` rather than `AgentActor`, and it carries the email the row actually has: these
+ * fixtures are handed to the store, which asks for the narrower `AgentActor`, and also set as the
+ * Hono context `actor`, which is the wider type. Annotated as the narrow one, the fixture that has to
+ * be set on a context does not compile — a type error the suite cannot see, because it does not
+ * compile its own tests.
+ */
+async function createPersistentUser(): Promise<AuthenticatedActor> {
   const userId = persistentId("user");
+  const email = `${userId}@example.test`;
   await database.insert(users).values({
     id: userId,
-    email: `${userId}@example.test`,
+    email,
     name: "Channel Store Test User",
   });
   createdUserIds.push(userId);
-  return { id: userId, role: "user" };
+  return { id: userId, email, role: "user" };
 }
 
 async function createPersistentAgent(options: {
@@ -1785,6 +2051,193 @@ describe("channel store with no Bots linked", () => {
       cursor: first.nextCursor as string,
     });
     expect(second.channels.map((row) => row.id)).toEqual([other.id]);
+  });
+});
+
+/**
+ * A channel this person has no thread mapping for.
+ *
+ * `intelligence_channel_mappings` carries the `threadId` a summary needs, and the statement that
+ * rebuilds a page inner-joins it on `(channel, person)`: without that row there is nothing to build a
+ * summary from, and `get` has always answered null for the same reason. Choosing the page without the
+ * same term meant the first statement picked such a channel and the second dropped it — so the
+ * channel was on no page while still spending its slot on every page it belonged to, permanently
+ * rather than for the width of a race. A page of one holding only that channel came back empty with a
+ * live cursor, and a client that stops at an empty page shows no conversations at all.
+ * `roster/query.ts` guards its own channel branch with the same term, so the two endpoints cannot
+ * answer differently about the same channel.
+ */
+describe("channel store with no thread mapping", () => {
+  async function channelWithoutMapping() {
+    const actor = await createPersistentUser();
+    const agentId = await createPersistentAgent({
+      name: "Unmapped agent",
+      owner: actor,
+    });
+    // The other channel first, so the unmapped one is the newer of the two and therefore the row a
+    // page of one is built around. A slot a read wastes is only visible when something is behind it.
+    const other = await persistentStore.create(actor, [agentId]);
+    createdChannelIds.push(other.id);
+    const unmapped = await persistentStore.create(actor, [agentId]);
+    createdChannelIds.push(unmapped.id);
+    await database
+      .delete(intelligenceChannelMappings)
+      .where(eq(intelligenceChannelMappings.channelId, unmapped.id));
+    return { actor, unmapped, other };
+  }
+
+  test("does not spend a page slot on it", async () => {
+    const { actor, other } = await channelWithoutMapping();
+
+    const page = await persistentStore.list(actor, { limit: 1 });
+
+    // The channel behind it, rather than an empty page carrying a live cursor.
+    expect(page.channels.map((row) => row.id)).toEqual([other.id]);
+    expect(page.nextCursor).toBeNull();
+  });
+
+  test("is on no page of the walk, and leaves no page empty", async () => {
+    const { actor, unmapped, other } = await channelWithoutMapping();
+
+    const pages: { ids: string[]; more: boolean }[] = [];
+    let cursor: string | undefined;
+    // One more turn than there are visible channels, so a cursor that never advances fails as a wrong
+    // answer rather than as a hung test.
+    for (let page = 0; page < 3; page += 1) {
+      const answer = await persistentStore.list(actor, {
+        limit: 1,
+        ...(cursor ? { cursor } : {}),
+      });
+      pages.push({
+        ids: answer.channels.map((row) => row.id),
+        more: answer.nextCursor !== null,
+      });
+      if (!answer.nextCursor) break;
+      cursor = answer.nextCursor;
+    }
+
+    const walked = pages.flatMap((page) => page.ids);
+    expect(walked).toEqual([other.id]);
+    expect(walked).not.toContain(unmapped.id);
+    // And no page came back empty. A slot spent on a channel that cannot be rebuilt looks from
+    // outside like a page of nothing carrying a live cursor, and a client that stops there shows no
+    // conversations at all — so walking to the end is not enough to say the read is right.
+    expect(pages.filter((page) => page.ids.length === 0)).toEqual([]);
+  });
+});
+
+/**
+ * `list`, with a delete committing between its two statements.
+ *
+ * Every inner join in the statement that rebuilds a page is now matched by a term in the statement
+ * that chooses it, which leaves a concurrent write as the only way for a chosen channel to fail to be
+ * rebuilt. What that looks like from outside is a page that is simply short — which is exactly how
+ * the two earlier versions of this bug stayed invisible for as long as they did. So a short page now
+ * leaves a structured line behind, and this is the case that produces one.
+ */
+describe("channel store list, interleaved", () => {
+  /**
+   * A store whose `list` runs `between` after it has chosen the page and before it rebuilds it.
+   *
+   * A race between two connections is a test only if the interleaving is chosen rather than hoped
+   * for, and `list` takes no locks to block on, so there is no write to time this against. The
+   * database handed to the store hooks every query's `then` — which is what awaiting a drizzle query
+   * calls — and runs the write immediately before the second query it is asked to execute. The write
+   * therefore lands with the first statement's rows in hand and the second not yet sent.
+   *
+   * Counted on execution rather than on `select`, because the two are not the same number: the
+   * statement that chooses the page builds a subquery for its `exists` term, and a subquery is
+   * compiled into SQL rather than awaited.
+   */
+  function storeInterleavedWith(between: () => Promise<void>) {
+    let executed = 0;
+    const hooked = Object.create(database) as typeof database;
+    Object.defineProperty(hooked, "select", {
+      value: (...columns: unknown[]) => {
+        const builder = (
+          database.select as unknown as (
+            ...args: unknown[]
+          ) => Record<string, unknown>
+        )(...columns);
+        const from = (
+          builder.from as (...args: unknown[]) => Record<string, unknown>
+        ).bind(builder);
+        builder.from = (...tables: unknown[]) => {
+          const query = from(...tables);
+          const execute = (query.execute as () => Promise<unknown>).bind(query);
+          // Defined rather than assigned, because a drizzle query already is a thenable and this
+          // shadows the one it inherits. Awaiting it is what calls this.
+          // biome-ignore lint/suspicious/noThenProperty: the thenable is drizzle's, not this test's — shadowing `then` is the only hook the store's own `await` runs through.
+          Object.defineProperty(query, "then", {
+            value: (onFulfilled: never, onRejected: never) => {
+              executed += 1;
+              const before = executed === 2 ? between() : Promise.resolve();
+              return before.then(execute).then(onFulfilled, onRejected);
+            },
+          });
+          return query;
+        };
+        return builder;
+      },
+    });
+    return createChannelStore(
+      hooked,
+      profileStore,
+      createThreadIdentity("test-deployment"),
+    );
+  }
+
+  test("drops a channel deleted before it could be rebuilt, and says which", async () => {
+    const actor = await createPersistentUser();
+    const agentId = await createPersistentAgent({
+      name: "Vanishing agent",
+      owner: actor,
+    });
+    const staying = await persistentStore.create(actor, [agentId]);
+    createdChannelIds.push(staying.id);
+    const vanishing = await persistentStore.create(actor, [agentId]);
+    createdChannelIds.push(vanishing.id);
+
+    const store = storeInterleavedWith(async () => {
+      await database
+        .update(channels)
+        .set({ deletedAt: new Date() })
+        .where(eq(channels.id, vanishing.id));
+    });
+
+    const lines: Record<string, unknown>[] = [];
+    const wasConsoleError = console.error;
+    console.error = (line: unknown) => {
+      try {
+        lines.push(JSON.parse(String(line)) as Record<string, unknown>);
+      } catch {
+        // Something else in the process logging prose rather than a structured line. Not ours.
+      }
+    };
+    let page: Awaited<ReturnType<typeof persistentStore.list>>;
+    try {
+      page = await store.list(actor);
+    } finally {
+      console.error = wasConsoleError;
+    }
+
+    // Dropping it is right — it is deleted, and the second statement filters on that. The page being
+    // short is the part nothing used to say out loud.
+    expect(page.channels.map((row) => row.id)).toEqual([staying.id]);
+    const dropped = lines.filter(
+      (line) => line.type === "channel-rows-not-hydrated",
+    );
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]).toMatchObject({
+      actorUserId: actor.id,
+      status: "active",
+      chosen: 2,
+      hydrated: 1,
+      ids: [vanishing.id],
+    });
+    // The note is what tells the next reader whether one of these lines is a race or a disagreement
+    // between the two statements, which is the only reason the line is worth writing.
+    expect(typeof dropped[0]?.note).toBe("string");
   });
 });
 

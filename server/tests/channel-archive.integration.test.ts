@@ -1,6 +1,6 @@
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { createAgentProfileStore } from "../src/agents/profile-store";
 import type { AgentActor } from "../src/agents/profile-types";
 import {
@@ -10,6 +10,7 @@ import {
 } from "../src/channels/events";
 import {
   ChannelNotFoundError,
+  ChannelPackageOwnedError,
   createChannelStore,
 } from "../src/channels/routes";
 import { createThreadIdentity } from "../src/channels/thread-identity";
@@ -19,6 +20,7 @@ import {
   agents,
   channelMemberships,
   channels,
+  deploymentPackages,
   intelligenceChannelMappings,
   users,
 } from "../src/db/schema";
@@ -42,6 +44,7 @@ const testPrefix = `channel-archive-${randomUUID()}`;
 const createdUserIds: string[] = [];
 const createdAgentIds: string[] = [];
 const createdChannelIds: string[] = [];
+const createdPackageIds: string[] = [];
 
 afterEach(async () => {
   for (const channelId of createdChannelIds.splice(0)) {
@@ -49,6 +52,12 @@ afterEach(async () => {
       .delete(intelligenceChannelMappings)
       .where(eq(intelligenceChannelMappings.channelId, channelId));
     await database.delete(channels).where(eq(channels.id, channelId));
+  }
+  // After the channels, because a channel row references the package that defines it.
+  for (const packageId of createdPackageIds.splice(0)) {
+    await database
+      .delete(deploymentPackages)
+      .where(eq(deploymentPackages.id, packageId));
   }
   for (const agentId of createdAgentIds.splice(0)) {
     await database
@@ -93,6 +102,21 @@ async function createChannel(owner: AgentActor, agentIds: string[]) {
   return channel;
 }
 
+/** A deployment package, for the ownership check that refuses to touch what configuration owns. */
+async function createPackage() {
+  const [row] = await database
+    .insert(deploymentPackages)
+    .values({
+      tenantId: `${testPrefix}-tenant-${randomUUID()}`,
+      sourcePath: "/tmp/none",
+      checksum: "0",
+    })
+    .returning({ id: deploymentPackages.id });
+  if (!row) throw new Error("package row was not created");
+  createdPackageIds.push(row.id);
+  return row.id;
+}
+
 /**
  * A crowd of members, inserted directly: `create` adds only the caller.
  *
@@ -134,7 +158,12 @@ async function createMembers(channelId: string, count: number) {
  */
 async function heldWrite(
   channelId: string,
-  values: { archivedAt?: Date | null; deletedAt?: Date | null },
+  values: {
+    archivedAt?: Date | null;
+    deletedAt?: Date | null;
+    /** What a tenant-package sync writes onto a channel row that already exists. */
+    packageId?: string | null;
+  },
 ) {
   let markApplied: () => void = () => {};
   let release: () => void = () => {};
@@ -367,9 +396,11 @@ describe("archiving a channel, in the database", () => {
  * looked. Read committed gives a plain `select` a snapshot and no lock, so a call that decides from
  * one and then writes on `id` alone decides about a row that no longer exists.
  *
- * `softDelete` is tested here too, rather than beside the rest of its own tests in
- * `channel-routes.test.ts`: it is the third method that had to start taking its answer from its
- * write, it shares this hazard exactly, and it shares the helper above.
+ * `softDelete`, `setPinned` and `markRead` are tested here too, rather than beside the rest of their
+ * own tests in `channel-routes.test.ts`: all three share this hazard exactly and share the helper
+ * above. The last two are the shape the others are not — the row they write is the membership and the
+ * row they have to decide from is the channel, so no guard on the row being written can close the gap
+ * and holding the channel across both statements is the only thing that does.
  */
 describe("deciding from a read, and writing on it", () => {
   test("does not stamp again when another archive commits mid-call", async () => {
@@ -443,6 +474,132 @@ describe("deciding from a read, and writing on it", () => {
       .from(channels)
       .where(eq(channels.id, channel.id));
     expect(row?.deletedAt).toEqual(stamp);
+  });
+
+  test("refuses a delete once a package claims the channel mid-call", async () => {
+    const owner = await createUser();
+    const agentId = await createAgent(owner);
+    const channel = await createChannel(owner, [agentId]);
+    const packageId = await createPackage();
+
+    const other = await heldWrite(channel.id, { packageId });
+    const deleting = store.softDelete(owner, channel.id);
+    await Bun.sleep(REACHED_THE_WRITE);
+    await other.finish();
+
+    /*
+     * The ownership check is the one thing here that the write cannot re-check for itself.
+     *
+     * `deleted_at` is a term in the update, so a delete landing in the gap is caught by the write. But
+     * `package_id` is not, and cannot be — the check is "does configuration own this", and the answer
+     * decides whether to refuse rather than what to write. Read on a plain `select` under read
+     * committed, that answer came from a snapshot with no lock behind it, and
+     * `synchronizeTenantPackage` upserts `package_id` onto channel rows that already exist: a sync
+     * committing in the gap got its channel soft-deleted anyway, which is the one thing
+     * `ChannelPackageOwnedError` exists to prevent and which no sync puts back. `setArchived`'s twin
+     * of this read has always held the row; the two were asymmetric, and this was the one that was
+     * wrong.
+     */
+    await expect(deleting).rejects.toBeInstanceOf(ChannelPackageOwnedError);
+
+    const [row] = await database
+      .select({ deletedAt: channels.deletedAt })
+      .from(channels)
+      .where(eq(channels.id, channel.id));
+    expect(row?.deletedAt).toBeNull();
+  });
+
+  test("refuses a pin whose channel's deletion commits mid-call", async () => {
+    const owner = await createUser();
+    const agentId = await createAgent(owner);
+    const channel = await createChannel(owner, [agentId]);
+
+    const other = await heldWrite(channel.id, { deletedAt: new Date() });
+    const pinning = store.setPinned(owner, channel.id, true);
+    await Bun.sleep(REACHED_THE_WRITE);
+    await other.finish();
+
+    /*
+     * A pin writes `channel_memberships` and its guard is about `channels`, which is what made this
+     * the one guard in the file that a lock on the row being written could not close.
+     *
+     * It was an `exists` subquery on the write. Under read committed that subquery reads `channels` on
+     * the writing statement's own snapshot and takes no lock there, so a delete committing in the gap
+     * left the pin applied and announced for a channel that is gone from every roster — every tab of
+     * this person's refetching a roster that cannot show the row, which is the outcome the guard's own
+     * comment says it prevents. The bot-chat twin has no such gap: for it the pin and the `deleted_at`
+     * are columns of one row.
+     */
+    await expect(pinning).rejects.toBeInstanceOf(ChannelNotFoundError);
+
+    const [row] = await database
+      .select({ pinnedAt: channelMemberships.pinnedAt })
+      .from(channelMemberships)
+      .where(
+        and(
+          eq(channelMemberships.channelId, channel.id),
+          eq(channelMemberships.userId, owner.id),
+        ),
+      );
+    expect(row?.pinnedAt).toBeNull();
+  });
+
+  test("refuses a read marker whose channel's deletion commits mid-call", async () => {
+    const owner = await createUser();
+    const agentId = await createAgent(owner);
+    const channel = await createChannel(owner, [agentId]);
+
+    const other = await heldWrite(channel.id, { deletedAt: new Date() });
+    const marking = store.markRead(owner, channel.id);
+    await Bun.sleep(REACHED_THE_WRITE);
+    await other.finish();
+
+    // The same two-table gap `setPinned` had, and the same fix. What it left behind was a
+    // `last_read_at` on a conversation no read will ever return again.
+    await expect(marking).rejects.toBeInstanceOf(ChannelNotFoundError);
+
+    const [row] = await database
+      .select({ lastReadAt: channelMemberships.lastReadAt })
+      .from(channelMemberships)
+      .where(
+        and(
+          eq(channelMemberships.channelId, channel.id),
+          eq(channelMemberships.userId, owner.id),
+        ),
+      );
+    expect(row?.lastReadAt).toBeNull();
+  });
+
+  test("refuses a report whose channel's deletion commits mid-call", async () => {
+    const owner = await createUser();
+    const agentId = await createAgent(owner);
+    const channel = await createChannel(owner, [agentId]);
+
+    const other = await heldWrite(channel.id, { deletedAt: new Date() });
+    const reporting = store.recordActivity(owner, channel.id, {
+      text: "Anybody there",
+      agentId: null,
+      at: new Date(),
+    });
+    await Bun.sleep(REACHED_THE_WRITE);
+    await other.finish();
+
+    /*
+     * The delete direction of the same method the restore test below covers.
+     *
+     * `recordActivity`'s update names the channel id and the moves-forwards-only comparison and
+     * nothing else — no `deleted_at` term — so everything keeping a report off a deleted channel rests
+     * on the locked read above it. Without the lock the read decides from a snapshot taken before the
+     * delete, and a client holding a stale roster row bumps `last_message` on a channel nobody can
+     * see and announces it to every member, each of whom refetches for an invisible row.
+     */
+    await expect(reporting).rejects.toBeInstanceOf(ChannelNotFoundError);
+
+    const [row] = await database
+      .select({ lastMessage: channels.lastMessage })
+      .from(channels)
+      .where(eq(channels.id, channel.id));
+    expect(row?.lastMessage).toBeNull();
   });
 
   /*

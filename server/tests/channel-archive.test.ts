@@ -1,9 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import type { MiddlewareHandler } from "hono";
 import { Hono } from "hono";
-import type { AgentActor } from "../src/agents/profile-types";
 import type { AuditEventInput, AuditStore } from "../src/audit";
-import type { AppVariables } from "../src/auth/guards";
+import type { AppVariables, AuthenticatedActor } from "../src/auth/guards";
 import type { RosterActivityEvent } from "../src/channels/events";
 import {
   type AgentChannel,
@@ -12,9 +11,18 @@ import {
   ChannelPackageOwnedError,
   type ChannelStore,
   createChannelRoutes,
+  MAX_NOTIFY_PAYLOAD_BYTES,
 } from "../src/channels/routes";
 
-const actor: AgentActor = {
+/**
+ * The caller, described the way the routes describe one.
+ *
+ * `AuthenticatedActor`, not `AgentActor`: this fixture is set as the Hono context `actor`, which is
+ * the wider of the two, and it carries an email the narrower type has no field for. Annotated as
+ * `AgentActor` it did not compile — a type error the suite cannot see, because it does not compile its
+ * own tests. The store methods below take the narrower type and this is assignable to it.
+ */
+const actor: AuthenticatedActor = {
   id: "user-1",
   email: "member@openbot.test",
   role: "user",
@@ -89,6 +97,34 @@ function recordingAuditStore() {
     insert: async (event) => void written.push(event),
   };
   return { store, written };
+}
+
+/**
+ * Run one request with `console.error` collected, and hand back this surface's structured lines.
+ *
+ * The tolerant audit recorder swallows a failed write and logs it, which is the whole of what makes
+ * a silent trail detectable. Left unstubbed, that line printed into the suite's output on every run
+ * and its shape was never checked — which is what `bot-chat-routes.test.ts` does for its own side.
+ */
+async function loggedDuring(run: () => Promise<Response>) {
+  const lines: Record<string, unknown>[] = [];
+  const wasConsoleError = console.error;
+  console.error = (line: unknown) => {
+    try {
+      lines.push(JSON.parse(String(line)) as Record<string, unknown>);
+    } catch {
+      // Something else in the process logging prose rather than a structured line. Not ours.
+    }
+  };
+  try {
+    const response = await run();
+    return {
+      response,
+      lines: lines.filter((line) => line.type === "channel-audit-write-failed"),
+    };
+  } finally {
+    console.error = wasConsoleError;
+  }
 }
 
 function appFor(store: ChannelStore, auditStore?: AuditStore) {
@@ -254,18 +290,29 @@ describe("PUT /:channelId/archive", () => {
     expect(audit.written).toEqual([]);
   });
 
-  test("still answers when the trail is unavailable", async () => {
+  test("still answers when the trail is unavailable, and says so", async () => {
     const failing: AuditStore = {
       insert: async () => {
         throw new Error("trail unreachable");
       },
     };
-    const response = await archive(appFor(fakeStore(), failing), {
-      archived: true,
-    });
+    const logged = await loggedDuring(() =>
+      archive(appFor(fakeStore(), failing), { archived: true }),
+    );
 
     // The channel is already archived and the caller already told by the time this runs.
-    expect(response.status).toBe(200);
+    expect(logged.response.status).toBe(200);
+    // Swallowed, and said out loud: a trail that quietly stops recording is worse than one that is
+    // briefly unavailable, and nothing else can tell. Asserted rather than left to print into the
+    // suite's output, where its shape was never checked.
+    expect(logged.lines).toEqual([
+      {
+        type: "channel-audit-write-failed",
+        eventType: "channel.archived",
+        channelId: "channel_1",
+        error: "Error: trail unreachable",
+      },
+    ]);
   });
 });
 
@@ -329,7 +376,7 @@ describe("POST /:channelId/activity", () => {
     expect(audit.written).toEqual([]);
   });
 
-  test("still answers 204 when the trail is unavailable", async () => {
+  test("still answers 204 when the trail is unavailable, and says so", async () => {
     const failing: AuditStore = {
       insert: async () => {
         throw new Error("trail unreachable");
@@ -341,9 +388,24 @@ describe("POST /:channelId/activity", () => {
       },
     });
 
+    const logged = await loggedDuring(() =>
+      reportActivity(appFor(store, failing)),
+    );
+
     // The message is already stored and the channel already restored by the time this runs. A trail
     // that is briefly unavailable is not a reason to report a failure that did not happen.
-    expect((await reportActivity(appFor(store, failing))).status).toBe(204);
+    expect(logged.response.status).toBe(204);
+    // And the unarchiving that went unrecorded is named, with the mechanism that distinguishes it
+    // from somebody clicking Restore — a reader of the log has the same question a reader of the
+    // trail would have had.
+    expect(logged.lines).toEqual([
+      {
+        type: "channel-audit-write-failed",
+        eventType: "channel.unarchived",
+        channelId: "channel_1",
+        error: "Error: trail unreachable",
+      },
+    ]);
   });
 });
 
@@ -351,7 +413,9 @@ describe("POST /:channelId/activity", () => {
  * The size of what gets announced, without a database in the way.
  *
  * `pg_notify` refuses a payload over 8000 bytes, and it runs inside the transaction that wrote the
- * row, so an overflow does not lose the announcement — it loses the write.
+ * row, so an overflow does not lose the announcement — it loses the write. What is asserted below is
+ * `MAX_NOTIFY_PAYLOAD_BYTES` rather than the 8000: the gap between them is a deliberate margin, and a
+ * test that only checks the hard limit passes while the margin erodes to nothing.
  */
 describe("announcementPayloads", () => {
   function event(memberIds: string[]): RosterActivityEvent {
@@ -366,6 +430,19 @@ describe("announcementPayloads", () => {
       lastMessageAgentId: "agent_00000000-0000-4000-8000-000000000000",
     };
   }
+
+  test("announces nothing at all to nobody", () => {
+    /*
+     * No members, no payloads — so `announce` sends no `NOTIFY` whatsoever.
+     *
+     * Unreachable from every caller in `channels/routes.ts` today: `setPinned` names the caller
+     * alone, and the other three read `channel_memberships` on a channel whose membership they have
+     * just verified, so the list always holds at least the person who acted. Pinned here because the
+     * function is exported and tested on its own, and because the emptiness is the one input for
+     * which "every member hears it exactly once" and "nothing is sent" are the same sentence.
+     */
+    expect(announcementPayloads(event([]))).toEqual([]);
+  });
 
   test("stays one notification for a channel of the size channels are", () => {
     // What the round-trip tests describe and depend on: one NOTIFY, delivered to both members of a
@@ -383,7 +460,9 @@ describe("announcementPayloads", () => {
 
     expect(payloads.length).toBeGreaterThan(1);
     for (const payload of payloads) {
-      expect(Buffer.byteLength(payload)).toBeLessThanOrEqual(8000);
+      expect(Buffer.byteLength(payload)).toBeLessThanOrEqual(
+        MAX_NOTIFY_PAYLOAD_BYTES,
+      );
     }
     // The chunks partition the list: everybody is named once, in order, and nobody is named twice. A
     // second copy is a second whole-roster refetch in somebody's tab for nothing.

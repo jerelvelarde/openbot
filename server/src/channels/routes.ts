@@ -202,8 +202,12 @@ type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
  * Postgres refuses a payload over 8000 bytes. Everything below the gap is a deliberate margin: the
  * count is bytes of UTF-8 as measured, and the refusal is on the server's own encoding of the same
  * string, so a budget at the exact limit would be a bet on the two agreeing to the byte.
+ *
+ * Exported so a test asserts against this budget rather than against Postgres' hard limit. A test
+ * that only checks 8000 passes while the margin erodes to nothing, which is the whole of what the
+ * margin is for.
  */
-const MAX_NOTIFY_PAYLOAD_BYTES = 7000;
+export const MAX_NOTIFY_PAYLOAD_BYTES = 7000;
 
 /**
  * One roster announcement, split into payloads each of which fits.
@@ -259,8 +263,12 @@ export function announcementPayloads(event: RosterActivityEvent): string[] {
  *
  * On the transaction rather than the pool, always, so the announcement rides the commit: a write
  * that rolls back is never announced, and a refused one announces nothing at all.
+ *
+ * Exported for `bot-chats/store.ts`, which announces onto the same topic for the same roster. A
+ * `pg_notify` built inline there is a second answer to the size question `announcementPayloads`
+ * already answers by measuring, and the two kinds of row are read by one sidebar.
  */
-async function announce(
+export async function announce(
   transaction: Pick<Transaction, "execute">,
   event: RosterActivityEvent,
 ): Promise<void> {
@@ -453,6 +461,33 @@ export function createChannelStore(
           and(
             isNull(channels.deletedAt),
             archiveFilter(status, channels.archivedAt),
+            /*
+             * The thread mapping decides visibility, so it is decided here, where the page is chosen.
+             *
+             * A summary carries a `threadId`, and the statement below gets it by inner-joining
+             * `intelligence_channel_mappings` on this channel and this person: a channel without that
+             * row cannot become a summary at all. Left out of this statement, this statement could
+             * choose such a channel, the one below could not rebuild it, and the row was dropped
+             * while still occupying its slot on every page — invisibly, and for as long as the
+             * mapping was missing rather than for the width of a race. A page of one holding only
+             * that channel came back empty with a live cursor, and a client that stops at an empty
+             * page shows no conversations at all.
+             *
+             * `exists` rather than a join, because nothing here reads the mapping's columns and the
+             * primary key on `(user_id, channel_id)` answers it directly. `roster/query.ts` guards
+             * its own channel branch with the same term, for the same reason.
+             */
+            exists(
+              database
+                .select({ present: sql`1` })
+                .from(intelligenceChannelMappings)
+                .where(
+                  and(
+                    eq(intelligenceChannelMappings.channelId, channels.id),
+                    eq(intelligenceChannelMappings.userId, actor.id),
+                  ),
+                ),
+            ),
             // Built by the roster's own function over this query's own expressions, so the two reads
             // cannot come to page by different rules. Absent cursor, absent predicate.
             rosterCursorFilter(cursor, PINNED_RANK, RECENCY, channels.id),
@@ -511,7 +546,9 @@ export function createChannelStore(
         // Loosely, for the reason `get` gives at length: a channel mid-package-sync has no
         // `channel_agents` rows, and an inner join here dropped it after phase 1 had already spent
         // its slot on the page — so it was invisible and it wasted a row of every page it belonged
-        // to, permanently. `roster/query.ts` chose the page the same way and hydrates it the same way.
+        // to, permanently. Every join that is still inner above is matched by a term in the statement
+        // that chose the page, which is what leaves a concurrent write as the only way to lose a row
+        // here. `roster/query.ts` chose the page the same way and hydrates it the same way.
         .leftJoin(channelAgents, eq(channelAgents.channelId, channels.id))
         .leftJoin(
           agentProfiles,
@@ -567,12 +604,75 @@ export function createChannelStore(
           lastReadAt: row.lastReadAt,
         });
       }
+
+      /*
+       * A drop leaves a record, because the last two times this went wrong nothing did.
+       *
+       * The comments above now argue that the only way to choose a channel here and fail to rebuild
+       * it is a delete or an archive committing between the two statements. That argument has been
+       * wrong twice — first over `channel_agents`, then over the thread mapping — and both times the
+       * damage was not the dropped row but how long it stayed invisible: the page simply came back
+       * short. So the argument is checked at runtime as well as made. Under a concurrent write this
+       * line appears once for that channel and never again; any other cause repeats it on every read
+       * of that page. `roster/query.ts` keeps the same line for the same reason.
+       */
+      if (summaries.size !== wanted.length) {
+        const rebuilt = new Set(summaries.keys());
+        console.error(
+          JSON.stringify({
+            type: "channel-rows-not-hydrated",
+            actorUserId: actor.id,
+            status,
+            chosen: wanted.length,
+            hydrated: summaries.size,
+            ids: wanted.map((row) => row.id).filter((id) => !rebuilt.has(id)),
+            note: "This read chose these channels and could not rebuild them. Expected once for a channel deleted or archived between the two statements; repeated for the same id means the two statements disagree about who can see what.",
+          }),
+        );
+      }
+
       return { channels: [...summaries.values()], nextCursor };
     },
 
     async setPinned(actor, channelId, pinned) {
       await database.transaction(
         async (transaction) => {
+          /*
+           * The channel is held first, and only then is the membership written.
+           *
+           * A deleted channel is not there to pin, and `get` and `list` filter the same way. That was
+           * guarded by an `exists` subquery on the write, which under read committed reads `channels`
+           * on the statement's own snapshot and takes no lock on it: a `softDelete` committing
+           * between the snapshot and the write left the pin applied and announced, sending this
+           * person's tabs to refetch a roster that cannot show the row — the outcome the guard was
+           * there to prevent. The bot-chat twin has no such gap because for it the pin and the
+           * `deleted_at` are columns of one row, and `isNull(deletedAt)` on the row it updates is
+           * therefore atomic. Here they are two tables, so the guarantee has to come from holding the
+           * channel across both statements.
+           *
+           * `of channels`, and nothing else. The channel is the row this decision depends on; the
+           * membership row is locked by the write below on its own account, so naming it here too
+           * would widen the lock set without adding a guarantee. What matters is the order: this
+           * takes the same lock `setArchived` and `recordActivity` take, and takes it before touching
+           * the membership, so no path in this file holds a membership row while waiting on a
+           * channel — the ordering that would let two of them deadlock.
+           */
+          const [locked] = await transaction
+            .select({ id: channels.id })
+            .from(channels)
+            .innerJoin(
+              channelMemberships,
+              and(
+                eq(channelMemberships.channelId, channels.id),
+                eq(channelMemberships.userId, actor.id),
+              ),
+            )
+            .where(and(eq(channels.id, channelId), isNull(channels.deletedAt)))
+            .for("update", { of: channels });
+          // Not a member, no such channel, or a deleted one: the same answer every way, matching
+          // recordActivity and `get`.
+          if (!locked) throw new ChannelNotFoundError(channelId);
+
           const updated = await transaction
             .update(channelMemberships)
             .set({ pinnedAt: pinned ? new Date() : null })
@@ -580,25 +680,12 @@ export function createChannelStore(
               and(
                 eq(channelMemberships.channelId, channelId),
                 eq(channelMemberships.userId, actor.id),
-                // A deleted channel is not there to pin. Without this, pinning one succeeds and
-                // announces, and the announcement sends this person's tabs to refetch a roster that
-                // cannot show the row. `get` and `list` filter the same way.
-                exists(
-                  transaction
-                    .select({ one: sql`1` })
-                    .from(channels)
-                    .where(
-                      and(
-                        eq(channels.id, channelId),
-                        isNull(channels.deletedAt),
-                      ),
-                    ),
-                ),
               ),
             )
             .returning({ channelId: channelMemberships.channelId });
-          // Not a member, no such channel, or a deleted one: the same answer every way, matching
-          // recordActivity and `get`.
+          // The answer still comes from the write. The read above holds the channel and has already
+          // found the membership, and nothing in this codebase deletes a membership row, so no path
+          // reaches this today — but a pin that wrote nothing must not be announced.
           if (updated.length === 0) throw new ChannelNotFoundError(channelId);
 
           /*
@@ -624,36 +711,55 @@ export function createChannelStore(
     },
 
     async markRead(actor, channelId) {
-      const updated = await database
-        .update(channelMemberships)
-        .set({
-          /*
-           * The later of this clock and the channel's own last-message stamp. last_message_at is
-           * written from the reporting browser's clock and is not bounded; a marker stamped
-           * plainly "now" by a server running behind it would leave the row reading as unseen for
-           * every member, re-lighting the dot on each refetch until wall clock catches up.
-           */
-          lastReadAt: sql`greatest(now(), coalesce((select ${channels.lastMessageAt} from ${channels} where ${channels.id} = ${channelMemberships.channelId}), now()))`,
-        })
-        .where(
-          and(
-            eq(channelMemberships.channelId, channelId),
-            eq(channelMemberships.userId, actor.id),
-            // A deleted channel is not there to read. The same guard `setPinned` carries, for the
-            // same reason: the row is gone from every roster, so nothing about it is markable.
-            exists(
-              database
-                .select({ one: sql`1` })
-                .from(channels)
-                .where(
-                  and(eq(channels.id, channelId), isNull(channels.deletedAt)),
-                ),
-            ),
-          ),
-        )
-        .returning({ channelId: channelMemberships.channelId });
-      // Not a member, or no such channel: the same answer either way, matching setPinned.
-      if (updated.length === 0) throw new ChannelNotFoundError(channelId);
+      await database.transaction(
+        async (transaction) => {
+          // The channel is held first, and only then is the marker stamped — the shape `setPinned`
+          // explains at length, for the same reason: a deleted channel is gone from every roster, so
+          // nothing about it is markable, and an `exists` on the write cannot say that about the row
+          // as it is rather than as this statement's snapshot found it. What it leaves behind is a
+          // `last_read_at` on a conversation no read will ever return again.
+          const [locked] = await transaction
+            .select({ id: channels.id })
+            .from(channels)
+            .innerJoin(
+              channelMemberships,
+              and(
+                eq(channelMemberships.channelId, channels.id),
+                eq(channelMemberships.userId, actor.id),
+              ),
+            )
+            .where(and(eq(channels.id, channelId), isNull(channels.deletedAt)))
+            .for("update", { of: channels });
+          // Not a member, no such channel, or a deleted one: the same answer every way, matching
+          // setPinned.
+          if (!locked) throw new ChannelNotFoundError(channelId);
+
+          const updated = await transaction
+            .update(channelMemberships)
+            .set({
+              /*
+               * The later of this clock and the channel's own last-message stamp. last_message_at is
+               * written from the reporting browser's clock, and although `parseActivityInput` now
+               * bounds how far ahead of this server that clock may be, the bound is not zero: a
+               * marker stamped plainly "now" by a server running behind would leave the row reading
+               * as unseen for every member, re-lighting the dot on each refetch until wall clock
+               * catches up.
+               */
+              lastReadAt: sql`greatest(now(), coalesce((select ${channels.lastMessageAt} from ${channels} where ${channels.id} = ${channelMemberships.channelId}), now()))`,
+            })
+            .where(
+              and(
+                eq(channelMemberships.channelId, channelId),
+                eq(channelMemberships.userId, actor.id),
+              ),
+            )
+            .returning({ channelId: channelMemberships.channelId });
+          // As in `setPinned`: the answer comes from the write, and the locked read above is what
+          // makes it unreachable rather than the other way round.
+          if (updated.length === 0) throw new ChannelNotFoundError(channelId);
+        },
+        { isolationLevel: "read committed" },
+      );
     },
 
     async softDelete(actor, channelId) {
@@ -671,7 +777,23 @@ export function createChannelStore(
             )
             // Filtered on `deleted_at` like every sibling read here, so a deleted channel reads as
             // not found in this statement and not only in the write below.
-            .where(and(eq(channels.id, channelId), isNull(channels.deletedAt)));
+            .where(and(eq(channels.id, channelId), isNull(channels.deletedAt)))
+            /*
+             * Locked, the way `setArchived`'s twin of this read is.
+             *
+             * The two were asymmetric and one of them had to be wrong. This is the one: the write
+             * below re-checks `deleted_at` and therefore needs no lock for that, but it cannot
+             * re-check `package_id`, and that is the check this read exists for. `tenant-package.ts`
+             * upserts `package_id` onto channel rows that already exist, so a sync committing between
+             * this read and the write below soft-deleted a channel the deployment package owns —
+             * exactly what `ChannelPackageOwnedError` is here to refuse, and nothing puts such a
+             * channel back. Holding the row makes the check and the write one decision.
+             *
+             * `of channels` for the reason `setArchived` gives, and this method waits on nothing else
+             * afterwards: it takes one channel row's lock, writes that row, and reads the memberships
+             * without locking them.
+             */
+            .for("update", { of: channels });
           // Not a member, no such channel, or an already deleted one: the same answer every way,
           // matching setPinned, markRead, setArchived, get and recordActivity.
           if (!row) throw new ChannelNotFoundError(channelId);
@@ -1043,15 +1165,49 @@ const MAX_ACTIVITY_TEXT_UNITS = 16_000;
  * a 16,000-unit string gets inside JSON is six bytes a unit, when every one of them is a control
  * character written as `\u0000`. So nothing `parseActivityInput` would accept is refused here first,
  * and this exists only to stop the `JSON.parse` that runs before the parser is reached at all.
+ *
+ * Exported for `bot-chats/routes.ts`, whose activity route reads a body of the same shape and has to
+ * turn away the same sizes. Imported rather than restated so the two cannot drift apart.
  */
-const MAX_ACTIVITY_BODY_BYTES = 256 * 1024;
+export const MAX_ACTIVITY_BODY_BYTES = 256 * 1024;
+
+/**
+ * How far ahead of this server's clock a reported `at` may be.
+ *
+ * Not zero: the stamp comes from the machine that saw the message, and two clocks a few seconds
+ * apart is ordinary rather than an error. Not unbounded, which is what it was — and unbounded above
+ * is the dangerous direction, because both stores write this value to `last_message_at` under a
+ * guard that only ever moves forwards. One report carrying a year-3000 stamp therefore pinned the row
+ * to the top of every member's roster permanently, made every later genuine report a no-op, and —
+ * because clearing `archived_at` rides that same guarded write — left an archived conversation that
+ * saying something in could no longer bring back. There is no API that undoes any of it.
+ *
+ * Five minutes is generous for a clock and short enough that a client which lies by the whole
+ * allowance has pinned the row for five minutes rather than for good.
+ */
+export const MAX_ACTIVITY_CLOCK_SKEW_MS = 5 * 60 * 1000;
+
+/**
+ * The one shape of `at` this parser accepts: a calendar date and time with an explicit zone.
+ *
+ * A zone is required because `new Date("2026-08-31T12:00")` is read in the server process's own local
+ * zone, so two clients sending the identical string landed at two different instants depending on
+ * where the process happened to run — and that instant is then compared against what is stored. The
+ * bare `new Date` this replaces also accepted "12/25/2026" while the refusal below said ISO-8601, so
+ * the parser was looser than its own error message.
+ */
+const ISO_8601_WITH_ZONE =
+  /^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}(:\d{2}(\.\d+)?)?([Zz]|[+-]\d{2}:\d{2})$/;
 
 /**
  * Parse a reported message.
  *
  * `at` comes from the client that saw the message, because only it knows when the message arrived,
- * but it is never trusted as a clock: the store compares it against what is stored and only ever
- * moves forwards, so a wrong one can lose a report, not corrupt the row.
+ * and it is trusted no further than that. Two bounds hold it: the store compares it against what is
+ * stored and only ever moves forwards, and this parser refuses a stamp with no zone and clamps one
+ * more than `MAX_ACTIVITY_CLOCK_SKEW_MS` ahead of this server's clock. Between them a wrong clock can
+ * lose a report; it cannot leave the row pinned to the top of every roster with every later report a
+ * no-op and its archive no longer clearable by speaking in it.
  */
 export function parseActivityInput(input: unknown): ActivityInputParseResult {
   if (!isChannelInputObject(input)) {
@@ -1070,13 +1226,55 @@ export function parseActivityInput(input: unknown): ActivityInputParseResult {
   if (object.agentId !== null && typeof object.agentId !== "string") {
     return { ok: false, error: "Agent ID must be a string or null." };
   }
+  /*
+   * Whitespace is not an agent, and it is not a person either.
+   *
+   * Trimmed to `""` it was neither `null` — which is how "a person said this" is spelled — nor an id
+   * any store can resolve, so `recordActivity` looked up the empty string in `channel_agents`, failed
+   * to find it, and threw `AgentNotFoundError("")`: a malformed request answered 404 "Agent not
+   * found." Every sibling parser refuses it outright — `parseChannelInput` here, and both of
+   * `bot-chats/routes.ts`'s — and this one was the outlier.
+   */
+  if (
+    typeof object.agentId === "string" &&
+    object.agentId.trim().length === 0
+  ) {
+    return { ok: false, error: "Agent ID must be a non-empty string or null." };
+  }
   if (typeof object.at !== "string") {
     return { ok: false, error: "Timestamp is required." };
   }
-  const at = new Date(object.at);
-  if (Number.isNaN(at.getTime())) {
-    return { ok: false, error: "Timestamp must be an ISO-8601 date." };
+  if (!ISO_8601_WITH_ZONE.test(object.at)) {
+    return {
+      ok: false,
+      error: "Timestamp must be an ISO-8601 date and time with a time zone.",
+    };
   }
+  const reported = new Date(object.at);
+  // The shape is right and the value is still not a date: "2026-13-01T00:00:00Z" gets this far. An
+  // impossible day inside a real month does not — `Date` rolls "2026-02-30" into March, and a stamp
+  // that lands a couple of days out is held down by the ceiling below like any other.
+  if (Number.isNaN(reported.getTime())) {
+    return {
+      ok: false,
+      error: "Timestamp must be an ISO-8601 date and time with a time zone.",
+    };
+  }
+
+  /*
+   * Clamped, not refused.
+   *
+   * A report is a message somebody actually sent. The store's guard is built so that a wrong clock
+   * loses a report; refusing here would make a wrong clock lose every report that client ever makes,
+   * with nothing the person could do about it. Clamped, the stamp is never more than the allowance
+   * ahead of this server, successive reports from that client still advance as long as this server's
+   * clock has ticked between them, and the bound is what makes this function's docblock true.
+   *
+   * Only the ceiling. A stamp in the past needs no defending: the store's guard already ignores one
+   * older than what is stored, and an old stamp cannot pin a row or hide a later message.
+   */
+  const ceiling = Date.now() + MAX_ACTIVITY_CLOCK_SKEW_MS;
+  const at = reported.getTime() > ceiling ? new Date(ceiling) : reported;
 
   return {
     ok: true,
@@ -1088,6 +1286,19 @@ export function parseActivityInput(input: unknown): ActivityInputParseResult {
     },
   };
 }
+
+/**
+ * `?limit=` as this route reads it: a whole number of at least one, written in decimal digits.
+ *
+ * The same rule and the same spelling as `roster/routes.ts`, deliberately. A shape check rather than
+ * a parse, because the parse was the bug: `Number.parseInt` keeps whatever it could read before the
+ * first character it could not, so a caller asking for `1e3` rows got one row and a 200.
+ *
+ * `0*[1-9]\d*` and not `\d+`, so a leading zero is fine and a value of zero is not: nought rows is a
+ * request this endpoint cannot honour — `list` clamps it up to one — and answering it with a row is
+ * the same silent reinterpretation as the rest of them.
+ */
+const LIMIT_PARAM = /^0*[1-9]\d*$/;
 
 export function createChannelRoutes(
   store: ChannelStore,
@@ -1150,7 +1361,19 @@ export function createChannelRoutes(
   routes.get("/", requireUser, async (context) => {
     try {
       const url = new URL(context.req.url);
-      const limit = Number.parseInt(url.searchParams.get("limit") ?? "", 10);
+      const limit = url.searchParams.get("limit") ?? "";
+      // Refused, not reinterpreted, and refused by the same rule `GET /api/roster` refuses by: these
+      // two endpoints answer about the same rows, so a `?limit=` one of them honours and the other
+      // silently rewrites is one paging contract with two behaviours. `Number.parseInt` was the bug —
+      // it stops at the first character it cannot read and keeps what came before, so `?limit=1e3`
+      // was 1 and `?limit=50abc` was 50, and the `NaN` fallback meant to catch a malformed value
+      // never fired for either. Empty reads as absent, the way an empty `cursor` does below.
+      if (limit !== "" && !LIMIT_PARAM.test(limit)) {
+        return context.json(
+          { error: "Limit must be a whole number of at least 1." },
+          400,
+        );
+      }
       const page = await store.list(context.var.actor, {
         // Parsed by the roster's own function, so this endpoint and `GET /api/roster` cannot come to
         // read `?status=` differently. Anything unrecognised reads as `active`.
@@ -1158,7 +1381,11 @@ export function createChannelRoutes(
         ...(url.searchParams.get("cursor")
           ? { cursor: url.searchParams.get("cursor") as string }
           : {}),
-        ...(Number.isFinite(limit) ? { limit } : {}),
+        // Omitting the key is what makes `list`'s own default fire. `Number` rather than
+        // `Number.parseInt`, so a value the check above somehow let through would arrive as `NaN`
+        // rather than as a prefix of itself — and `Math.max`/`Math.min` never turn a `NaN` back into
+        // a number, so the store's clamp cannot resolve one either.
+        ...(limit === "" ? {} : { limit: Number(limit) }),
       });
 
       return context.json({
