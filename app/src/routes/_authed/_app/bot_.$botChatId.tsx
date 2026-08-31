@@ -14,25 +14,34 @@ import { useStoppedTurn } from "@/lib/copilot/stopped-turn";
  * The thread comes from the row now, not from `localStorage`. What that buys: this URL is
  * shareable, survives a different browser, and `New chat` no longer destroys what it replaces —
  * the previous conversation is a roster row somebody can click.
+ *
+ * Filename carries a trailing underscore (`bot_.$botChatId.tsx`) to opt out of nesting under
+ * `/bot`: `bot.tsx` renders a full-screen component with no `<Outlet />`, so a plain child route
+ * would never render — only its parent would. The underscore is stripped from the URL, so
+ * `fullPath` is still `/bot/$botChatId` and this makes the route a child of `_app` (which does
+ * render an `<Outlet />`) instead.
  */
-export const Route = createFileRoute("/_authed/_app/bot/$botChatId")({
+export const Route = createFileRoute("/_authed/_app/bot_/$botChatId")({
   component: RouteComponent,
 });
 
 function RouteComponent() {
   const { botChatId } = Route.useParams();
-  const {
-    data: botChat,
-    isPending,
-    error,
-  } = useQuery(botChatQueryOptions(botChatId));
+  const { data: botChat, isPending } = useQuery(botChatQueryOptions(botChatId));
 
   if (isPending) return null;
-  if (error || !botChat) {
+  if (!botChat) {
     /*
      * A sentence rather than a throw, for the reason `bot.tsx` already gives about a named Bot
      * this deployment does not have: a stale link is not a crash. Reached for somebody else's
      * chat too, which the server answers 404 for rather than 403.
+     *
+     * Deliberately `!botChat`, not `error || !botChat`. In React Query v5 a failed *refetch* keeps
+     * the previous `data` around alongside the new `error` — and this screen refetches on every
+     * archive or restore now that `setBotChatArchivedMutationOptions` invalidates
+     * `botChatKeys.detail(...)`. Consulting `error` here would swap a live, still-open conversation
+     * for this sentence on nothing worse than a transient 500. A first-load failure has no `data`
+     * either way, so it still lands here without `error` in the condition.
      */
     return (
       <div className="flex h-screen items-center justify-center p-6">
@@ -85,8 +94,19 @@ function BotChatScreen({ botChat }: { botChat: BotChat }) {
            * Still labelled "New chat", even though pressing it no longer destroys anything: it is
            * still the control that starts a conversation, and the roster is where the previous one
            * now lives.
+           *
+           * Disabled once the Bot is retired, not just while the request is in flight: `create`
+           * resolves the profile through `getWithin`, which filters a retired profile out, so the
+           * server always refuses this for a retired Bot. Leaving the button enabled next to a
+           * composer this same screen already disables for the same reason would invite a click
+           * that is guaranteed to fail.
            */}
-          <Button onClick={() => void startNew()} size="sm" variant="ghost">
+          <Button
+            disabled={createBotChat.isPending || !botChat.active}
+            onClick={() => void startNew()}
+            size="sm"
+            variant="ghost"
+          >
             <IconPlus />
             New chat
           </Button>
@@ -94,6 +114,18 @@ function BotChatScreen({ botChat }: { botChat: BotChat }) {
         <p className="text-sm text-muted-foreground">
           Ask it to open a page and watch it work.
         </p>
+        {/*
+         * `mutateAsync` throws on a refused create, and `startNew` doesn't catch it — the rejection
+         * is unhandled on purpose, same as everywhere else in this app: the mutation's own `error`
+         * is the record of what went wrong, and this is where it gets said out loud. There is no
+         * toast in this app, and silence here reads as the app ignoring the click, same reasoning as
+         * `pinProblem`/`archiveProblem` in `roster-row.tsx`.
+         */}
+        {createBotChat.error ? (
+          <p className="text-destructive text-sm" role="alert">
+            {createBotChat.error.message}
+          </p>
+        ) : null}
       </header>
       {/*
        * Both banners render as plain siblings in this fixed order, never one nested inside the

@@ -28,7 +28,7 @@ import { Route as AuthedAdminPlaygroundRouteImport } from './routes/_authed/admi
 import { Route as AuthedAdminSkillsRouteImport } from './routes/_authed/admin/skills'
 import { Route as AuthedSettingsIndexRouteImport } from './routes/_authed/settings/index'
 import { Route as AuthedAppAgentsIndexRouteImport } from './routes/_authed/_app/agents/index'
-import { Route as AuthedAppBotBotChatIdRouteImport } from './routes/_authed/_app/bot.$botChatId'
+import { Route as AuthedAppBotBotChatIdRouteImport } from './routes/_authed/_app/bot_.$botChatId'
 import { Route as AuthedAppChannelChannelIdRouteImport } from './routes/_authed/_app/channel/$channelId'
 import { Route as AuthedAppChannelNewRouteImport } from './routes/_authed/_app/channel/new'
 import { Route as AuthedAdminComponentsIndexRouteImport } from './routes/_authed/admin/components/index'
@@ -136,9 +136,9 @@ const AuthedAppAgentsIndexRoute = AuthedAppAgentsIndexRouteImport.update({
   getParentRoute: () => AuthedAppRoute,
 } as any)
 const AuthedAppBotBotChatIdRoute = AuthedAppBotBotChatIdRouteImport.update({
-  id: '/$botChatId',
-  path: '/$botChatId',
-  getParentRoute: () => AuthedAppBotRoute,
+  id: '/bot_/$botChatId',
+  path: '/bot/$botChatId',
+  getParentRoute: () => AuthedAppRoute,
 } as any)
 const AuthedAppChannelChannelIdRoute =
   AuthedAppChannelChannelIdRouteImport.update({
@@ -209,7 +209,7 @@ export interface FileRoutesByFullPath {
   '/sign': typeof SignRoute
   '/admin': typeof AuthedAdminRouteRouteWithChildren
   '/settings': typeof AuthedSettingsRouteRouteWithChildren
-  '/bot': typeof AuthedAppBotRouteWithChildren
+  '/bot': typeof AuthedAppBotRoute
   '/skills': typeof AuthedAppSkillsRoute
   '/admin/audit': typeof AuthedAdminAuditRoute
   '/admin/boundaries': typeof AuthedAdminBoundariesRoute
@@ -238,7 +238,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof AuthedAppIndexRoute
   '/sign': typeof SignRoute
-  '/bot': typeof AuthedAppBotRouteWithChildren
+  '/bot': typeof AuthedAppBotRoute
   '/skills': typeof AuthedAppSkillsRoute
   '/admin/audit': typeof AuthedAdminAuditRoute
   '/admin/boundaries': typeof AuthedAdminBoundariesRoute
@@ -271,7 +271,7 @@ export interface FileRoutesById {
   '/_authed/admin': typeof AuthedAdminRouteRouteWithChildren
   '/_authed/settings': typeof AuthedSettingsRouteRouteWithChildren
   '/_authed/_app': typeof AuthedAppRouteWithChildren
-  '/_authed/_app/bot': typeof AuthedAppBotRouteWithChildren
+  '/_authed/_app/bot': typeof AuthedAppBotRoute
   '/_authed/_app/skills': typeof AuthedAppSkillsRoute
   '/_authed/admin/audit': typeof AuthedAdminAuditRoute
   '/_authed/admin/boundaries': typeof AuthedAdminBoundariesRoute
@@ -284,7 +284,7 @@ export interface FileRoutesById {
   '/_authed/_app/': typeof AuthedAppIndexRoute
   '/_authed/admin/': typeof AuthedAdminIndexRoute
   '/_authed/settings/': typeof AuthedSettingsIndexRoute
-  '/_authed/_app/bot/$botChatId': typeof AuthedAppBotBotChatIdRoute
+  '/_authed/_app/bot_/$botChatId': typeof AuthedAppBotBotChatIdRoute
   '/_authed/_app/channel/$channelId': typeof AuthedAppChannelChannelIdRoute
   '/_authed/_app/channel/new': typeof AuthedAppChannelNewRoute
   '/_authed/admin/components/$name': typeof AuthedAdminComponentsNameRoute
@@ -379,7 +379,7 @@ export interface FileRouteTypes {
     | '/_authed/_app/'
     | '/_authed/admin/'
     | '/_authed/settings/'
-    | '/_authed/_app/bot/$botChatId'
+    | '/_authed/_app/bot_/$botChatId'
     | '/_authed/_app/channel/$channelId'
     | '/_authed/_app/channel/new'
     | '/_authed/admin/components/$name'
@@ -534,12 +534,12 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthedAppAgentsIndexRouteImport
       parentRoute: typeof AuthedAppRoute
     }
-    '/_authed/_app/bot/$botChatId': {
-      id: '/_authed/_app/bot/$botChatId'
-      path: '/$botChatId'
+    '/_authed/_app/bot_/$botChatId': {
+      id: '/_authed/_app/bot_/$botChatId'
+      path: '/bot/$botChatId'
       fullPath: '/bot/$botChatId'
       preLoaderRoute: typeof AuthedAppBotBotChatIdRouteImport
-      parentRoute: typeof AuthedAppBotRoute
+      parentRoute: typeof AuthedAppRoute
     }
     '/_authed/_app/channel/$channelId': {
       id: '/_authed/_app/channel/$channelId'
@@ -681,31 +681,21 @@ const AuthedSettingsRouteRouteChildren: AuthedSettingsRouteRouteChildren = {
 const AuthedSettingsRouteRouteWithChildren =
   AuthedSettingsRouteRoute._addFileChildren(AuthedSettingsRouteRouteChildren)
 
-interface AuthedAppBotRouteChildren {
-  AuthedAppBotBotChatIdRoute: typeof AuthedAppBotBotChatIdRoute
-}
-
-const AuthedAppBotRouteChildren: AuthedAppBotRouteChildren = {
-  AuthedAppBotBotChatIdRoute: AuthedAppBotBotChatIdRoute,
-}
-
-const AuthedAppBotRouteWithChildren = AuthedAppBotRoute._addFileChildren(
-  AuthedAppBotRouteChildren,
-)
-
 interface AuthedAppRouteChildren {
-  AuthedAppBotRoute: typeof AuthedAppBotRouteWithChildren
+  AuthedAppBotRoute: typeof AuthedAppBotRoute
   AuthedAppSkillsRoute: typeof AuthedAppSkillsRoute
   AuthedAppIndexRoute: typeof AuthedAppIndexRoute
+  AuthedAppBotBotChatIdRoute: typeof AuthedAppBotBotChatIdRoute
   AuthedAppChannelChannelIdRoute: typeof AuthedAppChannelChannelIdRoute
   AuthedAppChannelNewRoute: typeof AuthedAppChannelNewRoute
   AuthedAppAgentsIndexRoute: typeof AuthedAppAgentsIndexRoute
 }
 
 const AuthedAppRouteChildren: AuthedAppRouteChildren = {
-  AuthedAppBotRoute: AuthedAppBotRouteWithChildren,
+  AuthedAppBotRoute: AuthedAppBotRoute,
   AuthedAppSkillsRoute: AuthedAppSkillsRoute,
   AuthedAppIndexRoute: AuthedAppIndexRoute,
+  AuthedAppBotBotChatIdRoute: AuthedAppBotBotChatIdRoute,
   AuthedAppChannelChannelIdRoute: AuthedAppChannelChannelIdRoute,
   AuthedAppChannelNewRoute: AuthedAppChannelNewRoute,
   AuthedAppAgentsIndexRoute: AuthedAppAgentsIndexRoute,
