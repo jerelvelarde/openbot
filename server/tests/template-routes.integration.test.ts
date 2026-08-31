@@ -241,12 +241,26 @@ boundary:
 `;
 }
 
-/** Trail rows this suite's actors wrote, newest last. Scoped by actor, never by time. */
+/**
+ * Trail rows this suite's actors wrote, newest last. Scoped by actor, never by time.
+ *
+ * "Newest last" has to be asked for. Without an ORDER BY a read returns rows in whatever order the
+ * scan reaches them, and Postgres starts a sequential scan wherever another backend already has one
+ * open and wraps around: on a table the rest of the suite is writing to, an unordered read comes
+ * back rotated often enough to fail a run and pass the retry. Two tests below take the last row as
+ * the one their own request wrote, and one of them read the other's refusal instead.
+ *
+ * `created_at` decides it, because each request is its own transaction and `now()` is the
+ * transaction's clock. `id` only breaks a tie within one transaction, where it is arbitrary rather
+ * than chronological -- it is here so that a test which ever depends on that order fails every run
+ * instead of one in twenty.
+ */
 async function trail(eventType: string) {
   const rows = await database
     .select()
     .from(auditEvents)
-    .where(eq(auditEvents.eventType, eventType));
+    .where(eq(auditEvents.eventType, eventType))
+    .orderBy(auditEvents.createdAt, auditEvents.id);
   return rows.filter((row) => {
     const actor = (row.payload as { actor?: unknown }).actor;
     return (
