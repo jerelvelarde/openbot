@@ -131,7 +131,6 @@ describe("GET /", () => {
   });
 });
 
-
 /*
  * A deployment that mounted no roster store.
  *
