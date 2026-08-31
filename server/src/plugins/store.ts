@@ -58,7 +58,14 @@ import { transportFor } from "./transport";
  * reachability to a vendor's tools. A second table would be a second thing to reason about and a
  * second thing for a fork to reimplement.
  */
-export type PluginKind = "mcp" | "skill" | "bot";
+/*
+ * `repo` and `repo_push` are one repository's reachability, split the way MCP splits a vendor's
+ * tools. `repo` is "may check this out and read it"; `repo_push` is "may also leave a mark on it".
+ * Two rows rather than a level column, because that is how this table already expresses the
+ * difference between reading Jira and writing to it, and because a level column would be a fourth
+ * shape of grant for a question the existing shape answers.
+ */
+export type PluginKind = "mcp" | "skill" | "bot" | "repo" | "repo_push";
 
 /**
  * What an audit row about a grant is a row ABOUT.
@@ -71,6 +78,7 @@ export type PluginKind = "mcp" | "skill" | "bot";
 function grantTargetType(kind: PluginKind): string {
   if (kind === "mcp") return "mcp_tool";
   if (kind === "bot") return "agent";
+  if (kind === "repo" || kind === "repo_push") return "repository";
   return "skill";
 }
 

@@ -169,6 +169,13 @@
       "when": 1787841174859,
       "tag": "0023_routines_owner_index",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1788145789542,
+      "tag": "0024_repositories_and_repo_tasks",
+      "breakpoints": true
     }
   ]
 }
