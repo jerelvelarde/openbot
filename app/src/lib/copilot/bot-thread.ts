@@ -1,24 +1,25 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useEffect } from "react";
+import { adoptBotChatMutationOptions } from "@/lib/bot-chats/mutations";
 import { tryClient } from "@/lib/client";
-import { newId } from "../new-id";
 
 /**
- * The thread the direct Bot chat talks in.
+ * The conversation a browser remembers from before Bot chats had rows.
  *
- * Two things it has to be. Minted by this deployment, so the conversation says where it came from
- * in a project that may hold more than one. And the same one tomorrow, because a chat that takes a
- * new thread on every load has no history to come back to.
+ * WHAT THIS USED TO BE. The one place a direct Bot chat's thread id lived: `localStorage`, one per
+ * Bot, re-verified on every mount because Intelligence is free to forget the thread behind an id —
+ * expiry, environment reset, a wiped development database — and a remembered id nobody upstream
+ * recognises does not fail loudly. Every send just opens a new, empty thread under the old id and
+ * the chat answers as if nothing had ever been said.
  *
- * Kept per Bot: the chat is bound to one Bot at a time, and two Bots sharing a thread would read
- * each other's conversation.
+ * WHAT IT IS NOW. Threads come from `bot_chats` rows, so none of that applies going forward. What
+ * remains is one release-crossing job: a browser upgrading into this feature is holding an id for a
+ * real conversation that has no row, and without adopting it that transcript is orphaned in
+ * Intelligence for good.
  *
- * "Tomorrow" is a promise this module cannot keep on its own, though. The id survives in
- * `localStorage` forever, but Intelligence is free to forget the thread behind it — expiry,
- * environment reset, a wiped dev database. Remembering an id nobody upstream recognises does not
- * fail loudly: every send just opens a new, empty thread under the old id, and the chat answers as
- * if nothing had ever been said, with no error on screen to explain why. So before this hook hands
- * out a remembered id, it asks Intelligence whether that id still means something, and only keeps
- * pretending the history is there when the answer says it is.
+ * The check is what makes adoption safe rather than merely enthusiastic. Adopting an id Intelligence
+ * has forgotten would manufacture a roster row with nothing behind it: a conversation that looks
+ * recoverable and is empty when opened. So only a provable "yes" adopts.
  */
 
 const KEY = "openbot.bot-thread";
@@ -37,22 +38,17 @@ function remembered(agentId: string): string | null {
   }
 }
 
-function remember(agentId: string, threadId: string): void {
+/**
+ * Clears the remembered thread once it no longer needs protecting — adopted, or proven gone.
+ * Mirrors `remembered`'s own try/catch: storage can be unavailable or full, and failing to forget is
+ * no worse than failing to remember in the first place — the conversation still works either way,
+ * it is only the next visit's shortcut that is lost.
+ */
+function forget(agentId: string): void {
   try {
-    window.localStorage.setItem(botThreadKey(agentId), threadId);
+    window.localStorage.removeItem(botThreadKey(agentId));
   } catch {
-    // As above: the conversation still works, it just will not be here next time.
-  }
-}
-
-async function mint(): Promise<string | null> {
-  try {
-    const response = await tryClient("/api/threads/mint", { method: "POST" });
-    if (!response.ok) return null;
-    const body = (await response.json()) as { threadId?: unknown };
-    return typeof body.threadId === "string" ? body.threadId : null;
-  } catch {
-    return null;
+    // As above: nothing here is worth crashing over.
   }
 }
 
@@ -113,123 +109,97 @@ export function threadToUse(input: {
   return input.known === false ? "fresh" : "remembered";
 }
 
-export type BotThread = {
-  /** `undefined` until it is known, which is not the same as absent: rendering the chat before
-   * then would let it mint an id of its own, and that is the one this deployment would then be
-   * stuck with. */
-  threadId: string | undefined;
-  /**
-   * `"unavailable"` means the check that guards a remembered thread failed to get a clean answer,
-   * so this render is going ahead on a thread id that history may or may not still exist for and
-   * nobody can currently say which. `"ready"` covers every case where that question was either
-   * answered or never needed asking.
-   */
-  history: "ready" | "unavailable";
-  /** Mints a fresh thread and starts using it from now on, independent of whatever was
-   * remembered. */
-  startNew: () => void;
-};
+/**
+ * Whether a remembered thread is worth adopting.
+ *
+ * The inverse of `threadToUse`'s question, and deliberately built on it rather than beside it: there
+ * is one rule about when a remembered id can be trusted, and two spellings of it would drift.
+ */
+export function shouldAdopt(input: {
+  remembered: string | null;
+  known: boolean | undefined;
+}): boolean {
+  return (
+    input.remembered !== null &&
+    input.known === true &&
+    threadToUse(input) === "remembered"
+  );
+}
 
 /**
- * The thread the direct Bot chat talks in, resolved once per `agentId` and re-verified on every
- * mount rather than trusted forever — see the module doc for why a remembered id can go stale.
+ * The exact sentence `POST /api/bot-chats/adopt` answers with on a 409 — see `mapStoreError` in
+ * server/src/bot-chats/routes.ts, which answers `BotChatThreadTakenError` with this one sentence for
+ * two different reasons at once (a thread somebody else already owns, and a thread this same person
+ * already owns but soft-deleted), deliberately, so a caller here cannot and need not tell them apart.
+ *
+ * It is also the only thing left here to check against. `client` (app/src/lib/client.ts) — which
+ * `adoptBotChatMutationOptions` calls — throws a plain `Error` built from the response body's `error`
+ * field, or a fallback sentence when there is none; the HTTP status itself never reaches the caller.
+ * So this cannot be `error.status === 409` — there is no such property to read. Matching the sentence
+ * is what is left, and it is exact only because this route has no other way to produce it: a 400
+ * fails validation before `adopt` runs, a 404 says "Agent not found.", and an uncaught failure falls
+ * back to the fallback sentence `adoptBotChatMutationOptions` passes to `client`, not to this one. If
+ * the server ever rewords that sentence, this constant has to move with it, or a 409 stops being
+ * recognised and the every-visit retry loop `useLegacyThreadAdoption` exists to prevent comes back.
  */
-export function useBotThread(agentId: string): BotThread {
-  const [threadId, setThreadId] = useState<string | undefined>(undefined);
-  const [history, setHistory] = useState<"ready" | "unavailable">("ready");
-  // Mirrors the effect's own `current` flag so `startNew` — which runs from an event handler, not
-  // from the effect — can tell whether it is still safe to touch state: the agent may have changed
-  // or the component may have unmounted while its mint was in flight.
-  const mountedRef = useRef(true);
-  // Shared between the effect's own resolution mint and `startNew`'s mint so the two can never
-  // race each other into two POST /mint calls fighting over the same localStorage slot.
-  const mintingRef = useRef(false);
-  // Set once `startNew` has taken over, so the mount-time check that is still in flight does not
-  // then overwrite the fresh thread with the remembered one. `checkKnown` is a read, not a mint, so
-  // `mintingRef` is clear while it runs and would not have stopped `startNew` starting during it.
-  const startedNewRef = useRef(false);
+const ADOPT_CONFLICT_MESSAGE = "That conversation is no longer available.";
+
+function isAdoptConflict(error: unknown): boolean {
+  return error instanceof Error && error.message === ADOPT_CONFLICT_MESSAGE;
+}
+
+/**
+ * Rescue a remembered conversation, once per Bot.
+ *
+ * Runs on the Bot screen. `forget` only after the adoption has landed, so an adoption that failed —
+ * offline, a 500, the tab closing — is retried next time rather than losing the id that is the only
+ * remaining pointer to that transcript.
+ *
+ * A 409 is a success for this purpose: somebody already has the thread, which is the outcome adoption
+ * wanted. Only an error that leaves the thread unclaimed is worth keeping the key for.
+ */
+export function useLegacyThreadAdoption(agentId: string): void {
+  const queryClient = useQueryClient();
+  const adopt = useMutation(adoptBotChatMutationOptions(queryClient));
+  // Extracted for the effect's dependency array: `adopt` itself is a fresh object every render, but
+  // `mutateAsync` is stable, and depending on the object would re-run this effect (and re-ask
+  // Intelligence, harmlessly but pointlessly) far more often than "once per Bot".
+  const adoptThread = adopt.mutateAsync;
 
   useEffect(() => {
     let current = true;
-    mountedRef.current = true;
-    // A new agent resolves from scratch, so any earlier `startNew` no longer speaks for this one.
-    startedNewRef.current = false;
-    setThreadId(undefined);
-    setHistory("ready");
 
-    const adoptFresh = () => {
-      mintingRef.current = true;
-      void mint().then((minted) => {
-        mintingRef.current = false;
-        if (!current) return;
-        // Falling back to one made here keeps the chat working when the deployment cannot be
-        // asked; it is simply a thread nothing can later attribute.
-        const next = minted ?? newId();
-        if (minted) remember(agentId, minted);
-        setThreadId(next);
-        setHistory("ready");
-      });
-    };
+    const threadId = remembered(agentId);
+    // Nothing remembered means nothing the check could protect.
+    if (threadId === null) return;
 
-    const existing = remembered(agentId);
-    if (!existing) {
-      // Nothing remembered means nothing the check could protect — minting straight away is both
-      // faster and exactly as safe as asking Intelligence about an id that was never assigned.
-      adoptFresh();
-    } else {
-      void checkKnown(existing).then((outcome) => {
-        // `startedNewRef` as well as `current`: the agent may have changed (which `current` catches),
-        // or the person may have pressed New chat while this check was in flight, and a check about
-        // the thread they just left must not put it back.
-        if (!current || startedNewRef.current) return;
-        const decision = threadToUse({
-          remembered: existing,
-          known: outcome.known,
-        });
-        if (decision === "remembered") {
-          setThreadId(existing);
-          setHistory(outcome.unavailable ? "unavailable" : "ready");
-        } else {
-          adoptFresh();
+    void checkKnown(threadId).then(async (outcome) => {
+      // The agent may have changed, or this screen may have unmounted, while the check was in
+      // flight; an answer about a Bot nobody is looking at any more must not adopt anything.
+      if (!current) return;
+      if (!shouldAdopt({ remembered: threadId, known: outcome.known })) return;
+
+      try {
+        await adoptThread({ agentId, threadId });
+      } catch (error) {
+        if (!isAdoptConflict(error)) {
+          // Any other failure — offline, a 500, the tab closing mid-request — keeps the key: it is
+          // the only remaining pointer to this transcript, so the next visit has to be able to try
+          // again. See `ADOPT_CONFLICT_MESSAGE` for why a 409 does not take this branch.
+          return;
         }
-      });
-    }
+        // A 409: somebody already has this thread — this same adoption racing from another tab, or
+        // this same person having soft-deleted the row adoption would have created (see
+        // `ADOPT_CONFLICT_MESSAGE`). Either way the outcome adoption wanted has already happened, so
+        // this falls through to `forget` exactly as a successful `await` above would have.
+      }
+
+      if (!current) return;
+      forget(agentId);
+    });
 
     return () => {
       current = false;
-      mountedRef.current = false;
     };
-  }, [agentId]);
-
-  const startNew = useCallback(() => {
-    if (mintingRef.current) return;
-    mintingRef.current = true;
-    void mint().then((minted) => {
-      mintingRef.current = false;
-      if (!mountedRef.current) return;
-      // Leaving the current thread alone here matters: a person pressing "New chat" should never
-      // end up worse off — mid-conversation and suddenly unable to send — than before they pressed
-      // it.
-      if (!minted) return;
-      /*
-       * Latched here rather than at the press, and the difference is a blank screen.
-       *
-       * Set on the press, a mint that then fails leaves the mount-time check disarmed with nothing
-       * having replaced the thread: `bot.tsx` renders the chat only when there is one, so the person
-       * is left looking at an empty pane with no message and no way back but a reload. Set here, a
-       * failed mint disarms nothing and the remembered thread is still restored.
-       *
-       * This is not a weaker guard. Assignment and the check below both run to completion on one
-       * thread, so a `checkKnown` that resolves after this sees it, and one that resolves before it
-       * has already restored a thread that this line is about to replace — which is what the person
-       * asked for.
-       */
-      startedNewRef.current = true;
-      remember(agentId, minted);
-      setThreadId(minted);
-      setHistory("ready");
-    });
-  }, [agentId]);
-
-  return { threadId, history, startNew };
+  }, [agentId, adoptThread]);
 }

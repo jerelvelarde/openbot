@@ -1,10 +1,15 @@
 import { describe, expect, test } from "bun:test";
-import { botThreadKey, threadToUse } from "../src/lib/copilot/bot-thread";
+import {
+  botThreadKey,
+  shouldAdopt,
+  threadToUse,
+} from "../src/lib/copilot/bot-thread";
 
 /**
- * The two decisions `useBotThread` makes that do not need a browser to test: which localStorage
- * key belongs to which Bot, and whether a remembered thread id is still safe to use once
- * Intelligence has said whether it knows about it.
+ * The decisions `useLegacyThreadAdoption` makes that do not need a browser to test: which
+ * localStorage key belongs to which Bot, whether a remembered thread id is still safe to use once
+ * Intelligence has said whether it knows about it, and — built on that same answer — whether it is
+ * worth adopting into a `bot_chats` row at all.
  */
 
 describe("botThreadKey", () => {
@@ -47,5 +52,29 @@ describe("threadToUse", () => {
     expect(threadToUse({ remembered: null, known: true })).toBe("fresh");
     expect(threadToUse({ remembered: null, known: false })).toBe("fresh");
     expect(threadToUse({ remembered: null, known: undefined })).toBe("fresh");
+  });
+});
+
+describe("shouldAdopt", () => {
+  test("adopts a remembered thread Intelligence still has", () => {
+    expect(shouldAdopt({ remembered: "thread-1", known: true })).toBe(true);
+  });
+
+  test("does not adopt a thread Intelligence has never heard of", () => {
+    // Adopting a forgotten thread manufactures a roster row with no history behind it: a
+    // conversation that looks recoverable and is empty when opened.
+    expect(shouldAdopt({ remembered: "thread-1", known: false })).toBe(false);
+  });
+
+  test("does not adopt when the check could not get an answer", () => {
+    // `undefined` is the check failing, not the thread being gone. Creating a row on the strength of
+    // a network blip is the worse mistake, and the key survives for the next attempt.
+    expect(shouldAdopt({ remembered: "thread-1", known: undefined })).toBe(
+      false,
+    );
+  });
+
+  test("has nothing to adopt when nothing was remembered", () => {
+    expect(shouldAdopt({ remembered: null, known: true })).toBe(false);
   });
 });
