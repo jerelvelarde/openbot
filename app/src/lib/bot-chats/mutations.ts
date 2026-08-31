@@ -153,10 +153,7 @@ export function markBotChatReadMutationOptions(queryClient: QueryClient) {
  */
 export function setBotChatArchivedMutationOptions(queryClient: QueryClient) {
   return mutationOptions({
-    mutationFn: async (variables: {
-      botChatId: string;
-      archived: boolean;
-    }) => {
+    mutationFn: async (variables: { botChatId: string; archived: boolean }) => {
       await client(`/api/bot-chats/${variables.botChatId}/archive`, {
         method: "PUT",
         body: { archived: variables.archived },
