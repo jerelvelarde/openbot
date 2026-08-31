@@ -25,6 +25,13 @@
 - Comments in this repo explain *why*, at length, and often name the bug they prevent. Match that register. Do not add comments that restate the code.
 - Formatter and linter: `bun run format` and `bun run lint` (Biome, `--error-on-warnings`).
 
+## A note on the test counts in this plan
+
+Where a step says "Expected: PASS, N tests", treat N as approximate and count `test(` yourself —
+**each `test.each` row is a separate test**, and two of this plan's stated counts were wrong for
+exactly that reason (Task 5 said 20 and yields 22; Task 6 said 24 and yields 28). Report the number
+you actually observe. Never adjust a test to make a stated count come out right.
+
 ## Commands
 
 | Purpose | Command |
@@ -2725,7 +2732,8 @@ function botChatDto(botChat: BotChat) {
 - [ ] **Step 4: Run the test**
 
 Run: `bun test server/tests/bot-chat-routes.test.ts`
-Expected: PASS, 24 tests.
+Expected: PASS. Count `test(` and remember that each `test.each` ROW is its own test — the block
+above yields 28, not the 24 a quick read suggests. Report the real number rather than the expected one.
 
 - [ ] **Step 5: Mount it in `app.ts`**
 
