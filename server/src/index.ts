@@ -50,6 +50,7 @@ import { createPeopleStore } from "./people/store";
 import { redirectUriFor } from "./plugins/oauth";
 import { createPluginStore } from "./plugins/store";
 import { grantedSkills, grantedTools } from "./plugins/tools";
+import { createRosterStore } from "./roster/query";
 import { createIntentRouter } from "./routing/classify";
 import { createModelCompleter } from "./routing/model";
 import {
@@ -151,6 +152,10 @@ const botChatStore = createBotChatStore(
   agentProfileStore,
   threadIdentity,
 );
+// One paged read over channels and bot chats together, for the sidebar. It reads the same
+// tables channelStore and botChatStore write, so it needs nothing from either beyond the
+// database connection.
+const rosterStore = createRosterStore(database);
 const channelEvents = createChannelEventHub();
 /**
  * Which components each Bot may answer with.
@@ -567,6 +572,8 @@ const app = createApp(
   createPageFrameStore(database),
   // A person's own direct conversations with one Bot, outside any channel.
   botChatStore,
+  // One paged read over channels and bot chats together, for the sidebar.
+  rosterStore,
 );
 
 /**

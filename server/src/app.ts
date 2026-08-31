@@ -42,6 +42,8 @@ import type { PeopleStore } from "./people/store";
 import { createPluginRoutes } from "./plugins/routes";
 import type { PluginStore } from "./plugins/store";
 import { REFUSAL_MARKER } from "./plugins/tools";
+import type { RosterStore } from "./roster/query";
+import { createRosterRoutes } from "./roster/routes";
 import type { IntentRouter } from "./routing/classify";
 import { createRoutingRoutes } from "./routing/routes";
 import type { PackageStatusReader } from "./tenant-package";
@@ -178,6 +180,17 @@ export function createApp(
    * Absent leaves the routes unmounted.
    */
   botChatStore?: BotChatStore,
+  /**
+   * One paged read over channels and bot chats together, for the sidebar to draw from a single
+   * query instead of stitching two.
+   *
+   * Appended last on purpose: these are positional, so inserting one anywhere else silently
+   * shifts every existing call site's arguments by one.
+   *
+   * Absent leaves the route unmounted. `GET /api/channels` and `/api/bot-chats` keep answering
+   * either way — this is an additional read, not a replacement for either.
+   */
+  rosterStore?: RosterStore,
 ) {
   const app = new Hono<{ Variables: AppVariables }>();
 
@@ -719,6 +732,10 @@ export function createApp(
 
   if (botChatStore) {
     app.route("/api/bot-chats", createBotChatRoutes(botChatStore, requireUser));
+  }
+
+  if (rosterStore) {
+    app.route("/api/roster", createRosterRoutes(rosterStore, requireUser));
   }
 
   if (componentStore) {
