@@ -187,8 +187,11 @@ export function createApp(
    * Appended last on purpose: these are positional, so inserting one anywhere else silently
    * shifts every existing call site's arguments by one.
    *
-   * Absent leaves the route unmounted. `GET /api/channels` and `/api/bot-chats` keep answering
-   * either way — this is an additional read, not a replacement for either.
+   * Absent leaves `GET /api/roster` answering 503 with a reason, the way every other absent
+   * dependency here does, rather than the 404 an unmounted route would give: "this deployment cannot
+   * tell you" and "you have no conversations" are different answers and the sidebar has to say which
+   * one it got. `GET /api/channels` and `/api/bot-chats` keep answering either way — this is an
+   * additional read, not a replacement for either.
    */
   rosterStore?: RosterStore,
 ) {
@@ -736,6 +739,20 @@ export function createApp(
 
   if (rosterStore) {
     app.route("/api/roster", createRosterRoutes(rosterStore, requireUser));
+  } else {
+    /*
+     * Unmounted answers 503 with a reason, not Hono's bare `notFound()`.
+     *
+     * Every other absent dependency in this file does the same — `peopleStore`, `credentialService`,
+     * `identityProviders`, `packageStatusReader` — and for a reason the sidebar makes sharper than any
+     * of them: `client()` in the browser reads `body.error` off a failed response and falls back to
+     * its own sentence when the body is not JSON, so a 404 with Hono's text body reaches somebody as
+     * "Could not load your conversations" with nothing about why. This is the one read the sidebar
+     * has, so that sentence is the whole screen.
+     */
+    app.get("/api/roster", requireUser, (context) =>
+      context.json({ error: "The roster is not available." }, 503),
+    );
   }
 
   if (componentStore) {

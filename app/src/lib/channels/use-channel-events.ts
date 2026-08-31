@@ -14,6 +14,14 @@ import {
  * list to recover events missed while disconnected.
  */
 
+/**
+ * What arrives on the socket, which is narrower than what the server holds.
+ *
+ * The server's `RosterActivityEvent` also carries `memberIds`, the list its hub routes by, and
+ * `deliver` strips it before sending: a member has no use for every other member's internal user id
+ * and this file has never declared the field. So nothing is missing here — the wire shape is the
+ * server's `DeliveredRosterEvent`, and these two are the two halves of it.
+ */
 export type RosterActivityEvent = {
   kind: "channel" | "bot_chat";
   /** The row's id. Globally unique across kinds, so nothing looks a row up by anything else. */
@@ -276,9 +284,10 @@ export function useRosterEvents() {
 /**
  * Most recent first, where starting a conversation counts as activity.
  *
- * Deliberately the same rule the roster query uses, `coalesce(last_message_at, created_at) desc` in
- * channels/routes.ts. If these two disagree the list reorders itself the moment an event arrives,
- * which looks like rows jumping for no reason.
+ * Deliberately the same rule the roster reads use, `coalesce(last_message_at, created_at) desc`,
+ * which server/src/roster/order.ts owns and names this function as one of its two browser mirrors.
+ * If these two disagree the list reorders itself the moment an event arrives, which looks like rows
+ * jumping for no reason.
  */
 function byRecency(left: RosterItem, right: RosterItem) {
   const at = (item: RosterItem) => item.lastMessageAt ?? item.createdAt;

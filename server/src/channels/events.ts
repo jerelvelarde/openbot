@@ -38,15 +38,21 @@ export type RosterActivityEvent = {
    *
    * @deprecated Carried alongside `id` for exactly one release, then removed.
    *
-   * WHY IT IS STILL HERE. A rolling deploy runs new and old replicas at once. The old ones LISTEN on
-   * this topic and read `channelId`; a straight rename would have them deliver malformed events to
-   * every client they hold, and renaming the topic instead would drop events for the length of the
-   * rollout. So this release is additive and the field goes in the next one, once no replica predates
-   * `id`. `accounts.issuer` in core.ts ships nullable for the same reason.
+   * WHY IT IS STILL HERE. For browser tabs still running the PREVIOUS bundle, which find a row by
+   * `channelId` and know nothing of `id`. A deploy replaces replicas, not the page somebody left
+   * open, so the far end of a socket can be a bundle that predates `id` long after every replica
+   * carries it. The field goes in the next release, once no such tab can still be holding one.
    *
-   * A bot chat event has no `channelId`, so an old replica delivers one with the field undefined. Its
-   * clients read the channels list, find no such row, and refetch — which is the same harmless path a
-   * stale roster already takes.
+   * NOT for old replicas, though it reads as if it might be. An old replica does LISTEN on this
+   * topic, but it routes by `memberIds` and hands its own clients the payload it parsed, so it never
+   * reads `channelId` on the way past: keeping the field here changes nothing it does. The direction
+   * that genuinely cannot be helped is the other one — an old replica emits `{channelId, ...}` with
+   * no `id` at all, a shape no new bundle can read whatever this release sends.
+   * `app/src/lib/channels/use-channel-events.ts` states this reasoning authoritatively; this is its
+   * server half. `accounts.issuer` in core.ts ships nullable for the same class of reason.
+   *
+   * A bot chat event has no `channelId` to carry, so a previous bundle hearing one finds no such row
+   * in the channels list and refetches — the same harmless path a stale roster already takes.
    */
   channelId?: string;
   /** Who may receive it. Resolved by the writer, which already had to check who that is. */
@@ -73,8 +79,16 @@ export type RosterActivityEvent = {
   archived?: boolean;
 };
 
-/** @deprecated Use {@link RosterActivityEvent}. Kept so existing imports keep compiling. */
-export type ChannelActivityEvent = RosterActivityEvent;
+/**
+ * What a browser is actually sent: the event without the list the hub routed it by.
+ *
+ * `memberIds` is an instruction to `deliver` and nobody's business on the far end. Sent, it would
+ * hand every member the internal user id of every other member of the conversation, on every message,
+ * archive and delete, for no purpose — the browser's mirror of this type in
+ * `app/src/lib/channels/use-channel-events.ts` has never declared the field and nothing there reads
+ * it. So this is the shape that goes out, and `RosterActivityEvent` is the shape that goes in.
+ */
+export type DeliveredRosterEvent = Omit<RosterActivityEvent, "memberIds">;
 
 type Send = (payload: string) => void;
 
@@ -106,10 +120,26 @@ export function createChannelEventHub(): ChannelEventHub {
     },
 
     deliver(event) {
-      for (const userId of event.memberIds) {
+      // Serialised once for the whole fan-out, and without `memberIds`: see `DeliveredRosterEvent`
+      // for why the routing list stops here.
+      const { memberIds, ...delivered } = event;
+      const payload = JSON.stringify(delivered);
+
+      /*
+       * Once per connection, not once per entry in `memberIds`.
+       *
+       * The writers build that list from a query — `select user_id from channel_memberships where
+       * channel_id = ...` — so a name appearing in it twice is one join away, and delivering twice to
+       * one socket is not a harmless duplicate: an archive event makes each tab that hears it refetch
+       * the whole roster.
+       */
+      const sent = new Set<Send>();
+      for (const userId of memberIds) {
         for (const send of connections.get(userId) ?? []) {
+          if (sent.has(send)) continue;
+          sent.add(send);
           try {
-            send(JSON.stringify(event));
+            send(payload);
           } catch {
             // A connection that cannot be written to is one that is closing. Its own close handler
             // detaches it; failing here would deny the event to everybody after it in the set.
@@ -141,9 +171,30 @@ export async function startChannelActivityListener(
   await connection.listen(CHANNEL_ACTIVITY_TOPIC, (payload) => {
     try {
       hub.deliver(JSON.parse(payload) as RosterActivityEvent);
-    } catch {
-      // A payload we cannot read is not a reason to tear down the subscription: the roster query is
-      // still correct, and the next refetch shows whatever this event would have.
+    } catch (error) {
+      /*
+       * Swallowed, and said out loud.
+       *
+       * Swallowed because a payload we cannot read is not a reason to tear down the subscription:
+       * the roster query is still correct, the next refetch shows whatever this event would have,
+       * and every later event still needs delivering.
+       *
+       * Said out loud because nothing else can tell. Anything that reaches here — a malformed
+       * payload, a shape one replica writes and another cannot read mid-rollout, a throw from
+       * `deliver` outside its own per-send guard — leaves every client this instance holds silently
+       * without live updates until something unrelated makes them refetch, which is a bug report of
+       * "the sidebar stops moving" with nothing in the log under it. The payload goes in truncated,
+       * because its first 200 characters name the kind and the id and that is what tells those cases
+       * apart.
+       */
+      console.error(
+        JSON.stringify({
+          type: "channel-activity-delivery-failed",
+          payload: payload.slice(0, 200),
+          error: String(error),
+          note: "This instance heard a roster announcement it could not deliver. The clients it holds will not see that change until they refetch.",
+        }),
+      );
     }
   });
 

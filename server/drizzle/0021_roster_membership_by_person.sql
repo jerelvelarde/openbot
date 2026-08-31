@@ -1,0 +1,1 @@
+CREATE INDEX "channel_memberships_user_idx" ON "channel_memberships" USING btree ("user_id");

@@ -1,12 +1,14 @@
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { createAgentProfileStore } from "../src/agents/profile-store";
 import type { AgentActor } from "../src/agents/profile-types";
 import {
-  type ChannelActivityEvent,
+  CHANNEL_ACTIVITY_TOPIC,
   type ChannelEventHub,
   createChannelEventHub,
+  type DeliveredRosterEvent,
+  type RosterActivityEvent,
   startChannelActivityListener,
 } from "../src/channels/events";
 import {
@@ -27,7 +29,7 @@ import {
   users,
 } from "../src/db/schema";
 
-function event(overrides: Partial<ChannelActivityEvent> = {}) {
+function event(overrides: Partial<RosterActivityEvent> = {}) {
   return {
     kind: "channel",
     id: "channel_1",
@@ -37,7 +39,7 @@ function event(overrides: Partial<ChannelActivityEvent> = {}) {
     lastMessageAt: "2026-08-15T10:00:00.000Z",
     lastMessageAgentId: null,
     ...overrides,
-  } satisfies ChannelActivityEvent;
+  } satisfies RosterActivityEvent;
 }
 
 describe("channel event hub", () => {
@@ -80,6 +82,46 @@ describe("channel event hub", () => {
     // Dropped rather than left as an empty set, so a long-lived process does not grow one per
     // person who has ever connected.
     expect(hub.connectionCount("user-1")).toBe(0);
+  });
+
+  test("sends the event without the list it was routed by", () => {
+    const hub = createChannelEventHub();
+    const received: string[] = [];
+    hub.register("user-1", (payload) => received.push(payload));
+
+    hub.deliver(event({ memberIds: ["user-1", "user-2", "user-3"] }));
+
+    /*
+     * `memberIds` is an instruction to the hub, and a shared channel's copy of it is a list of
+     * everybody else's internal user id. Delivered, every member learns the whole roster on every
+     * message, archive and delete — and the browser's own type has never declared the field, so
+     * nothing was even reading it.
+     */
+    const [payload] = received;
+    expect(Object.keys(JSON.parse(payload as string))).not.toContain(
+      "memberIds",
+    );
+    // Everything the browser does read is still there.
+    expect(JSON.parse(payload as string)).toMatchObject({
+      kind: "channel",
+      id: "channel_1",
+      lastMessage: "Said something.",
+    });
+  });
+
+  test("sends once per connection, whatever the routing list repeats", () => {
+    const hub = createChannelEventHub();
+    const received: string[] = [];
+    hub.register("user-1", (payload) => received.push(payload));
+
+    /*
+     * The writers build that list with a query over `channel_memberships`, so one join away is a
+     * version of it that names a member twice. Delivering per entry rather than per connection makes
+     * that a duplicate event, and a duplicated archive is a second whole-roster refetch in that tab.
+     */
+    hub.deliver(event({ memberIds: ["user-1", "user-1"] }));
+
+    expect(received).toHaveLength(1);
   });
 
   test("one failing connection does not deny the event to the rest", () => {
@@ -168,7 +210,7 @@ describe("channel activity delivery", () => {
     createdChannelIds.push(channel.id);
 
     const hub = createChannelEventHub();
-    const delivered: ChannelActivityEvent[] = [];
+    const delivered: DeliveredRosterEvent[] = [];
     const arrived = new Promise<void>((resolve) => {
       hub.register(owner.id, (payload) => {
         delivered.push(JSON.parse(payload));
@@ -198,8 +240,110 @@ describe("channel activity delivery", () => {
       channelId: channel.id,
       lastMessage: "Categorized three expenses.",
       lastMessageAgentId: profile.id,
-      memberIds: [owner.id],
     });
+    /*
+     * The routing list travelled over NOTIFY and stopped at the hub.
+     *
+     * This assertion replaces one that read `memberIds: [owner.id]` off the delivered event, back
+     * when the hub re-serialised the payload whole. That the right person heard it is what the
+     * delivery itself proves; the list that decided so is the hub's business.
+     */
+    expect(Object.keys(delivered[0] ?? {})).not.toContain("memberIds");
+  });
+});
+
+/**
+ * A payload the listener cannot deliver.
+ *
+ * Two ways it happens: a payload that will not parse, and one that parses into a shape this instance
+ * cannot route — the risk a rolling deploy carries, since the writer may be a replica of a different
+ * version. Either leaves every client this instance holds without live updates, and both used to do
+ * it behind an empty `catch`, so what is asserted is the log line as much as the survival.
+ */
+describe("the activity listener", () => {
+  function announce(payload: string) {
+    return database.execute(
+      sql`select pg_notify(${CHANNEL_ACTIVITY_TOPIC}, ${payload})`,
+    );
+  }
+
+  /** Run with `console.error` collected, and hand back this module's own structured lines. */
+  async function loggedDuring(run: () => Promise<void>) {
+    const lines: Record<string, unknown>[] = [];
+    const wasConsoleError = console.error;
+    console.error = (line: unknown) => {
+      try {
+        lines.push(JSON.parse(String(line)) as Record<string, unknown>);
+      } catch {
+        // Something else in the process logging prose rather than a structured line. Not ours.
+      }
+    };
+    try {
+      await run();
+    } finally {
+      console.error = wasConsoleError;
+    }
+    return lines.filter(
+      (line) => line.type === "channel-activity-delivery-failed",
+    );
+  }
+
+  test("says so when a payload will not parse, and keeps delivering", async () => {
+    const hub = createChannelEventHub();
+    const received: string[] = [];
+    const arrived = new Promise<void>((resolve) => {
+      hub.register("user-1", (payload) => {
+        received.push(payload);
+        resolve();
+      });
+    });
+    const listener = await startChannelActivityListener(databaseUrl, hub);
+    // Long enough to prove the line truncates it. NOTIFY carries up to 8000 bytes and a log line is
+    // not the place to put all of them.
+    const malformed = `{ not json ${"x".repeat(400)}`;
+
+    const logged = await loggedDuring(async () => {
+      try {
+        await announce(malformed);
+        await announce(JSON.stringify(event()));
+        await within5s(arrived);
+      } finally {
+        await listener.stop();
+      }
+    });
+
+    // Swallowing is right: the subscription is still live and the next event arrives.
+    expect(received).toHaveLength(1);
+    // Silence was not. The payload goes in the line, because which of the two failures this was is
+    // not knowable from the exception alone.
+    expect(logged).toHaveLength(1);
+    expect(logged[0]?.payload).toBe(malformed.slice(0, 200));
+  });
+
+  test("says so when a payload parses and cannot be routed", async () => {
+    const hub = createChannelEventHub();
+    hub.register("user-1", () => {});
+    const listener = await startChannelActivityListener(databaseUrl, hub);
+    // No `memberIds`, which is what a replica older or newer than this one might announce. `deliver`
+    // throws on it, outside the per-send guard that covers a closing socket.
+    const shapeWeCannotRoute = JSON.stringify({
+      kind: "channel",
+      id: "channel_1",
+    });
+
+    const logged = await loggedDuring(async () => {
+      try {
+        await announce(shapeWeCannotRoute);
+        // Nothing arrives, so there is nothing to wait for; the window is what makes the assertion
+        // mean something.
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      } finally {
+        await listener.stop();
+      }
+    });
+
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toMatchObject({ payload: shapeWeCannotRoute });
   });
 });
 
@@ -242,7 +386,7 @@ async function createSharedChannel(owner: AgentActor, other: AgentActor) {
 
 /** Collect what each person's connection hears, and a promise that settles when one of them does. */
 function watch(hub: ChannelEventHub, userIds: string[]) {
-  const heard = new Map<string, ChannelActivityEvent[]>();
+  const heard = new Map<string, DeliveredRosterEvent[]>();
   let announce = () => {};
   const anything = new Promise<void>((resolve) => {
     announce = resolve;
@@ -298,9 +442,17 @@ describe("channel change delivery", () => {
       channelId: channel.id,
       deleted: true,
     });
-    expect(watched.of(owner.id)[0]?.memberIds?.sort()).toEqual(
-      [owner.id, other.id].sort(),
-    );
+    /*
+     * That the announcement named both members is what the two arrivals above already say, since one
+     * NOTIFY reached both connections through one `deliver`. What is asserted here instead is that
+     * neither of them was told who the other is: this is a shared channel, so a payload carrying the
+     * routing list would hand each member the other's internal user id.
+     */
+    for (const userId of [owner.id, other.id]) {
+      expect(Object.keys(watched.of(userId)[0] ?? {})).not.toContain(
+        "memberIds",
+      );
+    }
   });
 
   test("announces nothing for a delete the deployment package refuses", async () => {
@@ -367,7 +519,6 @@ describe("channel change delivery", () => {
     expect(watched.of(owner.id)[0]).toMatchObject({
       channelId: channel.id,
       pinned: true,
-      memberIds: [owner.id],
     });
     /*
      * The half worth having a test for. A pin lives on one membership row, and the hub delivers by

@@ -252,8 +252,8 @@ export const channels = pgTable(
      * The last thing said in this channel, denormalised so a roster is one indexed read.
      *
      * Channel grain, not per-member: what was said last is a property of the conversation, and a copy
-     * per member is the same fact stored N times, drifting. Per-member state, what somebody has read
-     *, belongs on the membership instead.
+     * per member is the same fact stored N times, drifting. Per-member state, what somebody has
+     * read, belongs on the membership instead.
      *
      * Written by whoever ran the agent, from the client that already received the reply, so it is a
      * cache of what a client observed rather than an authoritative mirror of the thread.
@@ -280,9 +280,14 @@ export const channels = pgTable(
      * channel. Per-member hiding would be a membership fact instead, and would enter the roster's
      * sort key, which this grain deliberately avoids.
      *
-     * Archived is hidden, not frozen. Reads and writes stay open — `setPinned`, `markRead` and
-     * `recordActivity` do not consult this — and saying something clears it. The roster query is the
-     * only read path that filters on it.
+     * Archived is hidden, not frozen. Nothing refuses a write because of this column: `setPinned` and
+     * `markRead` never look at it, and `recordActivity` reads it only to clear it and to say in the
+     * event it announces that the conversation came back — saying something is how it does.
+     *
+     * Hiding is the job of the reads that draw a list, and of those alone: the roster query the
+     * sidebar draws from, and `GET /api/channels`. A read of one channel by id deliberately does not
+     * filter on it, which is what leaves an archived conversation's URL working and archiving
+     * therefore reversible rather than a deletion wearing a gentler name.
      */
     archivedAt: timestamp("archived_at", { withTimezone: true }),
     createdAt: createdAt(),
@@ -290,11 +295,24 @@ export const channels = pgTable(
   },
   (table) => [
     /**
-     * The order the channel list is drawn in.
+     * Channel recency, ordered.
      *
-     * On the expression, not on the column, because the list sorts by the last thing said and falls
-     * back to when the channel was made. An index on `last_message_at` alone does not serve that
-     * ordering, so the sort would fall back to a scan on exactly the query drawn on every page.
+     * On the expression, not on the column, because recency is the last thing said falling back to
+     * when the channel was made, and an index on `last_message_at` alone describes a different
+     * ordering than anything asks for. What this can serve, then, is exactly one thing: a read whose
+     * whole sort key is channel recency.
+     *
+     * WHAT IT DOES NOT SERVE, since an earlier version of this comment implied it served the sidebar:
+     * the roster's channel branch and `ChannelStore.list` lead their sort key with the member's pin,
+     * which lives on `channel_memberships`, so both sort their rows whatever is declared here. A wider
+     * index cannot close that — no index on this table can order by a column in another one — and only
+     * moving the pin onto the channel could, which is the grain `archivedAt` above says this schema
+     * deliberately does not adopt. What those two reads needed was `channel_memberships_user_idx`,
+     * which finds one person's memberships at all.
+     *
+     * So no read here has this index's shape today, and `recordActivity` maintains it on every message
+     * said in any channel. Whether that trade still pays is a fair question and a separate one; this
+     * change only stops the comment claiming a benefit the sort cannot take.
      *
      * Declared here rather than only in a migration. An index that exists in the database and not in
      * the schema is invisible to `generate`, so the next generated migration proposes a schema
@@ -327,7 +345,29 @@ export const channelMemberships = pgTable(
     lastReadAt: timestamp("last_read_at", { withTimezone: true }),
     createdAt: createdAt(),
   },
-  (table) => [primaryKey({ columns: [table.channelId, table.userId] })],
+  (table) => [
+    primaryKey({ columns: [table.channelId, table.userId] }),
+    /**
+     * One person's memberships, which is where every roster read starts.
+     *
+     * The primary key leads with `channel_id`, so the only access path into this table was by channel
+     * and there was none at all by person. The roster's channel branch and `ChannelStore.list` both
+     * start from `user_id = actor`, and with nothing to start from the planner has to walk a whole
+     * deployment-sized table to reach one person's handful of rows — every membership, or every
+     * channel probing the primary key — on a read the sidebar now makes on every draw, the roster
+     * being its only read path.
+     *
+     * `user_id` alone. A wider `(user_id, pinned_at)` cannot help the ordering — see
+     * `channels_recent_activity_idx` for why the roster's sort is not an index read either way — and
+     * a covering `(user_id, channel_id, pinned_at)` would buy the roster's first phase an index-only
+     * scan while its second visits the same rows regardless for `last_read_at`. Neither earns a wider
+     * index on the write path without a profile that asks for one.
+     *
+     * Declared here rather than only in a migration, for the reason the channels index above gives:
+     * an index the schema does not know about is dropped by the next generated migration.
+     */
+    index("channel_memberships_user_idx").on(table.userId),
+  ],
 );
 
 export const channelAgents = pgTable(

@@ -132,8 +132,17 @@ export const botChats = pgTable(
     pinnedAt: timestamp("pinned_at", { withTimezone: true }),
     lastReadAt: timestamp("last_read_at", { withTimezone: true }),
     /**
-     * When this was archived, or null. Hidden, not frozen: the conversation stays live and saying
-     * something in it clears this. Only the roster query reads it.
+     * When this was archived, or null.
+     *
+     * Hidden, not frozen, the same way `channels.archived_at` is: nothing refuses a write because of
+     * it, and `recordActivity` clears it, because saying something in a conversation is how it comes
+     * back. `get` deliberately does not filter on it either, which is what leaves an archived
+     * conversation's URL working.
+     *
+     * Two reads do filter on it, and an earlier version of this line said only one did: the roster's
+     * list, and `mostRecent`, which is what the `?agent=` resolver lands on — handing back a
+     * conversation somebody put away would restore it by navigation. Every row this table hands out
+     * carries the state as `archived`, so a row's menu can offer Archive or Restore.
      */
     archivedAt: timestamp("archived_at", { withTimezone: true }),
     /** When this was deleted, or null. Soft, like a channel's, and every read path filters on it. */
@@ -151,11 +160,25 @@ export const botChats = pgTable(
      */
     uniqueIndex("bot_chats_thread_idx").on(table.threadId),
     /**
-     * The roster's own read, per person.
+     * One person's conversations, most recent first.
      *
-     * On the expression, not the column, for the reason `channels_recent_activity_idx` gives: the
-     * list sorts by the last thing said and falls back to when the conversation was made, so an
-     * index on `last_message_at` alone does not serve that ordering.
+     * The leading `user_id` is most of what this buys. The reads that are not by id — `mostRecent`,
+     * and the roster's bot chat branch — start from the owner and nothing else, and without it they
+     * walk everybody's conversations to find one person's.
+     *
+     * The trailing expression rather than the column, because recency is the last thing said falling
+     * back to when the conversation was made; it orders that person's rows inside the index, which is
+     * what makes `mostRecent` a walk that stops at the first row passing its filters instead of a
+     * sort of everything the person has.
+     *
+     * The roster's branch is NOT that read, though its shape looks the same: its sort key leads with
+     * the pin, and `pinned_at` is not in this index, so that branch sorts. `roster/query.ts` says the
+     * same thing from the query's side. A wider index could serve it — unlike a channel's, every part
+     * of a bot chat's sort key is on this one table, so `(user_id, pin rank desc, recency desc, id
+     * desc)` would answer that branch's own top-N from the index. It is not declared because what the
+     * branch sorts is already one person's conversations under a per-branch limit: the wider index
+     * would be earned by a profile of a deployment where that is a great many conversations, not by
+     * this paragraph.
      *
      * Declared here rather than only in the migration. An index that exists in the database and not
      * in the schema is invisible to `generate`, so the next generated migration proposes a schema

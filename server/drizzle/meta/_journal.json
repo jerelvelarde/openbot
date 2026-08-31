@@ -148,6 +148,13 @@
       "when": 1788202643633,
       "tag": "0020_archive_channels_and_bot_chats",
       "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1788213563865,
+      "tag": "0021_roster_membership_by_person",
+      "breakpoints": true
     }
   ]
 }
