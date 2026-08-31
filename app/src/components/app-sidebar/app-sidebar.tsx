@@ -53,6 +53,7 @@ import {
 import { useChannelEvents } from "@/lib/channels/use-channel-events";
 import { appConfig } from "@/lib/generated/application-config";
 import { EASE_OUT, ENTRANCE_SECONDS } from "@/lib/motion";
+import type { RosterStatus } from "@/lib/roster/queries";
 import { Button } from "../ui/button";
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "../ui/empty";
 import { Channel } from "./channel";
@@ -150,6 +151,55 @@ export function isUnread(
   openChannelId: string | undefined,
 ): boolean {
   return channel.id !== openChannelId && hasUnseenActivity(channel);
+}
+
+/**
+ * Which nothing to say, of four.
+ *
+ * FOUR DIFFERENT NOTHINGS, AND SAYING THE WRONG ONE IS ALARMING. A roster nobody has used yet needs
+ * telling how to start. A roster that simply does not match what is in the box has to say so and
+ * quote it back — told "you don't have conversations yet" while holding a typo, a person reads their
+ * conversations as gone. An empty archive is not an empty account. And `All` being empty is the only
+ * one of the four that really does mean there is nothing anywhere.
+ *
+ * The search wording wins over the status wording, because a search that matched nothing is a fact
+ * about the search whichever list it ran against.
+ */
+export function emptyStateFor(input: {
+  status: RosterStatus;
+  searching: boolean;
+  total: number;
+  search: string;
+}): { title: string; description: string } | null {
+  if (input.total > 0) return null;
+
+  if (input.searching) {
+    return {
+      title: "No conversations match your search",
+      description: `Nothing here is named “${input.search.trim()}”, and nobody has said it recently either.`,
+    };
+  }
+
+  if (input.status === "archived") {
+    return {
+      title: "Nothing archived",
+      description:
+        "Archiving a conversation takes it out of this list without deleting anything. You can bring it back at any time.",
+    };
+  }
+
+  if (input.status === "active") {
+    return {
+      title: "No conversations yet",
+      description:
+        "Start one with a coworker, or open a Bot chat. Anything you archive will still be here under Archived.",
+    };
+  }
+
+  return {
+    title: "No conversations at all",
+    description: "Nothing here, archived or otherwise. Start one to get going.",
+  };
 }
 
 /**
