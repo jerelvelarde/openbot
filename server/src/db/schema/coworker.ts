@@ -147,7 +147,7 @@ export const botChats = pgTable(
      * `get` deliberately does not filter on it either, which is what leaves an archived
      * conversation's URL working.
      *
-     * ONE READ FILTERS ON IT TODAY: the roster's list. `BotChatStore.mostRecent` also filters, and an
+     * ONE ROUTE-REACHABLE READ FILTERS ON IT TODAY: the roster's list. `mostRecent` filters too, and an
      * earlier version of this line called it "what the `?agent=` resolver lands on" — it is not. No
      * route mounts that method; the browser resolves `?agent=` over `/api/roster`'s active list with
      * its own rule (`mostRecentBotChat` in `app/src/routes/_authed/_app/bot.tsx`). Its filter is the

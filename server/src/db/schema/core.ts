@@ -281,8 +281,15 @@ export const channels = pgTable(
      * sort key, which this grain deliberately avoids.
      *
      * Archived is hidden, not frozen. Nothing refuses a write because of this column: `setPinned` and
-     * `markRead` never look at it, and `recordActivity` reads it only to clear it and to say in the
-     * event it announces that the conversation came back — saying something is how it does.
+     * `markRead` never look at it, and `recordActivity` clears it when a PERSON speaks, because that
+     * is how a conversation comes back. A Bot's reply does not clear it — it moves the preview and
+     * the recency and leaves the row archived, so the answer to a question asked before the archive
+     * cannot undo the archive. The locked read of it is also what decides whether the announced event
+     * says the conversation came back.
+     *
+     * `bot_chats.archived_at` says the same thing, and has to: the two kinds are read by one roster,
+     * so a rule that held for only one of them would be this feature implemented twice with two
+     * answers. This half of the pair was left behind once already when the Bot-reply guard landed.
      *
      * Hiding is the job of the reads that draw a list, and of those alone: the roster query the
      * sidebar draws from, and `GET /api/channels`. A read of one channel by id deliberately does not
