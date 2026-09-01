@@ -2557,6 +2557,25 @@ describe("advertised tools a write list does not name", () => {
   test("a server nobody reviewed is not reconciled here either", () => {
     expect(unlistedAdvertisedTools(null, ["anything"])).toEqual([]);
   });
+
+  /*
+   * The third branch: an entry that names its reads files nothing here.
+   *
+   * A behaviour test, and worth saying which. Typefully's `readTools` is WHY this is right — an
+   * advertised tool it does not list is already a write, so there is no under-inclusion to surface —
+   * but the empty `writeTools` that the read-list invariant requires produces the same empty answer
+   * on its own. Deleting the `readTools` guard from `unlistedAdvertisedTools` leaves this test, and
+   * the whole file, green; that was verified, not assumed. What is pinned here is the answer this
+   * function must give for an inverted entry, whichever guard delivers it — not the guard.
+   */
+  test("a vendor that names its reads is not reconciled here", () => {
+    expect(
+      unlistedAdvertisedTools(catalogueEntry("typefully"), [
+        "made_up_tool",
+        "another_made_up_tool",
+      ]),
+    ).toEqual([]);
+  });
 });
 
 /**

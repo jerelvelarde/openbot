@@ -311,7 +311,9 @@ export function refFromToolName(toolName: string): string | null {
  * — Notion, whose access is per-page on a consent screen and whose `scopes` are therefore empty.
  *
  * A server with no catalogue entry is not reconciled either, and for the opposite reason: nothing
- * reviewed says any tool of theirs only reads, so all of them are already writes.
+ * reviewed says any tool of theirs only reads, so all of them are already writes. An entry that
+ * names its READS is excluded for that same opposite reason: an advertised tool it does not list is
+ * already a write, so there is no silent under-inclusion left for a row to surface.
  *
  * Sorted, so two readings of the same listing produce the same row.
  */
@@ -319,7 +321,24 @@ export function unlistedAdvertisedTools(
   entry: CatalogueEntry | null,
   advertised: readonly string[],
 ): string[] {
-  if (!entry || entry.writeTools.length === 0) return [];
+  if (!entry) return [];
+  /*
+   * An inverted entry files nothing. This line is defence in depth, not the reason why.
+   *
+   * The reason is the invariant: an entry naming its reads leaves `writeTools` empty, so the guard
+   * immediately below returns the same empty list for any conforming entry. That makes this line
+   * unreachable in effect, and NO test can distinguish its presence — deleting it leaves the whole
+   * suite green. That was checked rather than assumed, and it is stated here because a comment
+   * claiming otherwise would promise a protection CI cannot give.
+   *
+   * It stays for two reasons. The guards below are true of Typefully for the WRONG reasons — an
+   * empty `writeTools` and a non-empty `scopes` — so a reader tracing why no row appeared would land
+   * on "this vendor has a scope, so something is behind the list", the opposite of true, since
+   * `full_access` is behind nothing. And an entry that violates the invariant fails closed here
+   * rather than filing rows that read as a gap in a list it does not use.
+   */
+  if (entry.readTools !== undefined) return [];
+  if (entry.writeTools.length === 0) return [];
   if (entry.auth.kind !== "user-oauth" || entry.auth.scopes.length > 0) {
     return [];
   }
@@ -2053,6 +2072,8 @@ export function createPluginStore(options: PluginStoreOptions) {
          * {@link unlistedAdvertisedTools} for why only that shape of vendor is named here: an
          * advertised tool absent from `writeTools` classifies as a READ, so an under-inclusive list
          * is silent, and for a vendor with no scope strings there is nothing else standing behind it.
+         * A vendor whose entry names its READS instead is not named here at all — an unlisted tool
+         * of theirs is already a write, so there is nothing silent to report.
          *
          * `configuration.changed` rather than a type of its own, the same as the stranded grants
          * above and for the same reason: nothing was denied and the refresh succeeded. What changed

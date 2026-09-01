@@ -118,8 +118,38 @@ export type CatalogueEntry = {
    * one that matters for this list: a tool the server DOES advertise but that is missing from here
    * classifies as a read, so an incomplete list is the failure mode, not a safe default — this list
    * has to lean over-inclusive.
+   *
+   * An entry that cannot afford that failure at all does not use this field: it names its reads in
+   * {@link CatalogueEntry.readTools} instead and leaves this one empty. So an empty `writeTools` is
+   * two different statements depending on the entry — "this vendor writes nothing" for Drive's
+   * arrangement, and "look at `readTools`, it governs here" for the inverted one.
    */
   writeTools: readonly string[];
+  /**
+   * The tools this vendor's server exposes that only read — and, when present, the ONLY ones.
+   *
+   * The other way round from {@link CatalogueEntry.writeTools}, and it exists because that field's
+   * failure mode is not survivable for every vendor. `writeTools` is a denylist: a tool the server
+   * advertises that nobody remembered to name reads as a read, so the cost of an incomplete list is
+   * a write the policy waves through. For Notion that is an edited page. For a vendor whose writes
+   * publish irreversibly and in public under somebody's own name, it is a post on their timeline,
+   * and no amount of leaning over-inclusive makes a hand-written denylist safe against a vendor
+   * renaming a tool.
+   *
+   * So an entry may invert the question. When this field is present it is the authority and
+   * {@link classifyTool} consults it INSTEAD of `writeTools`: a tool named here reads, and anything
+   * else the server advertises is a write. Unknown means write, which is the direction a connector
+   * like this has to fail in.
+   *
+   * Empty is therefore meaningful rather than missing: it says nobody has yet verified that any of
+   * this vendor's tools only read, so every one of them is treated as a write until somebody
+   * reconciles the live tool list and adds names here. That is the honest state for a vendor whose
+   * server will not advertise its tools without a credential.
+   *
+   * An entry setting this leaves `writeTools` empty, so there is exactly one list per entry and no
+   * reader has to work out which of two governs. `plugin-catalogue.test.ts` holds that.
+   */
+  readTools?: readonly string[];
   /**
    * Which protocol reaches this vendor. Absent means MCP, which is what every entry was.
    *
@@ -288,6 +318,90 @@ export const CATALOGUE: readonly CatalogueEntry[] = Object.freeze([
     ]),
     docsUrl: "https://github.com/CopilotKit/OpenBot/blob/main/docs/routines.md",
   },
+  {
+    key: "typefully",
+    title: "Typefully",
+    vendor: "Typefully",
+    summary: "Drafts, queue and analytics of whoever is asking.",
+    /*
+     * The hosted MCP server Typefully runs, on the default MCP transport — the same shape as
+     * Notion, and reached for the same reason: it is the server the vendor themselves maintains.
+     *
+     * Typefully also publishes an ordinary REST API at `api.typefully.com/v2`, and a REST adapter
+     * against it would work. It is not what this entry does. Drive's adapter exists because Drive's
+     * MCP server is preview-gated and unreachable; nothing is gated here, so writing an adapter
+     * would be taking on this vendor's request shapes, pagination and per-route trailing slashes
+     * for no availability gained.
+     */
+    host: "https://mcp.typefully.com",
+    path: "/mcp",
+    auth: {
+      kind: "user-oauth",
+      /*
+       * From https://mcp.typefully.com/.well-known/oauth-authorization-server, verified live.
+       *
+       * These sit on `api.typefully.com` while the MCP endpoint above is on `mcp.typefully.com`. It
+       * is what the vendor's metadata says and not a transcription slip: the MCP host's
+       * protected-resource document names `https://api.typefully.com` as its authorization server.
+       *
+       * Precedented rather than novel, which is the reassuring half. Google Drive already splits
+       * three ways — `googleapis.com` for the API, `accounts.google.com` to authorize,
+       * `oauth2.googleapis.com` to exchange — so the flow has never assumed a vendor's auth lives on
+       * its own host, and each URL here is pinned and used as written. Notion is the entry that
+       * happens to keep everything on one host, not the rule.
+       */
+      authorizationUrl: "https://api.typefully.com/oauth2/authorize",
+      tokenUrl: "https://api.typefully.com/oauth2/token",
+      // A real, separate revocation endpoint, unlike Notion's, whose revocation endpoint IS its
+      // token endpoint.
+      revokeUrl: "https://api.typefully.com/oauth2/revoke",
+      /*
+       * The one scope Typefully has, and it grants everything.
+       *
+       * `scopes_supported` is exactly `["full_access"]`, and the 401 challenge from the MCP endpoint
+       * names it in its `WWW-Authenticate` header, so it is sent rather than omitted — this is not
+       * Notion, where the consent screen is the scoping and a scope string would assert a control
+       * that does not exist. But naming it buys no narrowing: there is no read-only scope to ask for
+       * instead, so consenting at all consents to publishing. `readTools` below and the action
+       * policy are the entire write barrier, with nothing at the vendor behind them.
+       */
+      scopes: Object.freeze(["full_access"]),
+      clientRegistration: "dynamic",
+      registrationUrl: "https://api.typefully.com/oauth2/register",
+    },
+    /*
+     * Empty, because `readTools` governs this entry. One list per entry — see `readTools`.
+     */
+    writeTools: Object.freeze([]),
+    /*
+     * Empty on purpose, which for this field means "every tool this server advertises is a write".
+     *
+     * WHY THIS ENTRY IS THE INVERTED ONE. A write here is not an edited document. It schedules and
+     * publishes to X, LinkedIn, Threads, Bluesky, Mastodon and Substack, under the account holder's
+     * own name, in public, with no undo. A denylist that has to be complete to be safe is the wrong
+     * instrument for that: `writeTools` reads an advertised tool nobody named as a READ, so one
+     * rename at the vendor turns a post on somebody's timeline into a call the policy passes
+     * through as harmless.
+     *
+     * WHY IT IS EMPTY RATHER THAN SEEDED. Typefully's server refuses `tools/list` without a
+     * credential — a 401 pointing at its OAuth metadata — so the tool names cannot be read here at
+     * review time, and there is no published list of them: the vendor documents the server by
+     * capability rather than by tool, and every list circulating elsewhere belongs to a community
+     * server built on the v1 API that Typefully switched off in June 2026. Seeding this from those
+     * would be pinning names that never existed on this server while asserting they had been
+     * checked.
+     *
+     * So the entry ships classifying everything as a write, which is correct and useful — the
+     * connector works, the action policy simply sees every call as the write it might be — and the
+     * first `Refresh tools` is what makes it precise. Moving a name in here is the reviewed act of
+     * saying "this tool only reads", done against a live list rather than against a guess. Getting
+     * that wrong is now the loud direction: a read misfiled as a write costs a policy exception,
+     * where under the other arrangement a write misfiled as a read costs somebody a public post.
+     */
+    readTools: Object.freeze([]),
+    docsUrl:
+      "https://support.typefully.com/en/articles/13128440-typefully-mcp-server",
+  },
 ]);
 
 const BY_KEY = new Map(CATALOGUE.map((entry) => [entry.key, entry]));
@@ -369,6 +483,13 @@ export function resolveServerUrl(
  * Only a tool the server itself listed AND that is absent from the write list is treated as a read.
  * That is the one case where both sources agree, and it is the only one where guessing permissively
  * is recoverable.
+ *
+ * Unless the entry inverted the question. An entry carrying {@link CatalogueEntry.readTools} is read
+ * from the other end: a tool named there reads, and every other advertised tool is a write. The two
+ * branches are not a preference between equivalent spellings — a denylist is recoverable when a
+ * missed write edits a document and is not when it publishes one, so the vendor's entry chooses
+ * which failure it can afford, and this function does what the entry says rather than what is
+ * shortest.
  */
 export function classifyTool(
   entry: CatalogueEntry | null,
@@ -379,6 +500,12 @@ export function classifyTool(
   // can say a tool of theirs only reads. Everything it offers is a write.
   if (!entry) return "write";
   if (!advertised) return "write";
+  // Present, including empty, means this entry named its reads and nothing else is one. Checked for
+  // existence rather than for length, because an empty list is a statement ("no tool of theirs is
+  // known to only read") and treating it as absent would turn the safest entry into the loosest.
+  if (entry.readTools !== undefined) {
+    return entry.readTools.includes(toolName) ? "read" : "write";
+  }
   return entry.writeTools.includes(toolName) ? "write" : "read";
 }
 

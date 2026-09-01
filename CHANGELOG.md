@@ -8,6 +8,33 @@ Newest first. `Unreleased` is what is on `main` and not yet tagged.
 
 ## Unreleased
 
+### Typefully is a connector, and every one of its tools counts as a write
+
+A Bot can reach Typefully as the person asking, through the hosted MCP server Typefully runs at
+`mcp.typefully.com`. An administrator enables it at `/admin/plugins/typefully` and each person
+consents for themselves at `/settings/connected-accounts`, the same two halves as Notion. There is no
+client to register and no secret to paste: the deployment introduces itself to Typefully on first
+connect, so the only prerequisite is a public URL the redirect URI can be derived from. Typefully's
+API is a paid tier, so somebody whose plan excludes it can consent successfully and still be refused
+at the vendor.
+
+Typefully's writes are not edits to a document. They schedule and publish to X, LinkedIn, Threads,
+Bluesky, Mastodon and Substack, under the account holder's own name, in public, with no undo. Its one
+OAuth scope, `full_access`, grants everything and there is no read-only scope to ask for instead, so
+the action policy is the entire barrier with nothing at the vendor behind it.
+
+So this connector classifies tools the opposite way from every other one. Notion names its writes and
+anything unnamed is a read; Typefully names its **reads** and anything unnamed is a write. It ships
+with no reads named, which means a fresh deployment treats every Typefully tool as a write — including
+ones that plainly only read. That is not a setup step left undone: Typefully's server will not
+advertise its tools without a credential and documents itself by capability rather than by tool, so
+naming its reads is a reviewed code change made against a live tool list rather than a guess in
+advance. Until one is made, a rule written about `mcp.effect == "write"` governs everything this
+connector does, which is the side to be wrong on.
+
+Existing connectors are unchanged: Drive, Notion and Routines still name their writes and are
+classified exactly as before.
+
 ### A Bot's shell can no longer reach the embedded database without a password
 
 In the all-in-one image the cluster was `trust`-auth on loopback, and the Bot's shell runs in the

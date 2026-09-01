@@ -50,8 +50,11 @@ export const Route = createFileRoute("/_authed/admin/plugins/")({
  * A vendor's own mark where there is one, and a plug where there is not.
  *
  * The fallback covers a server an administrator added by URL, which has no catalogue entry and so no
- * mark of its own — and it would cover a catalogue vendor Tabler ships no brand for. Only Drive is in
- * the catalogue today, and Tabler has it.
+ * mark of its own — and a catalogue entry Tabler ships no brand for, which Routines and Typefully
+ * both are. That second case is no longer hypothetical, so it is worth saying what NOT to do about
+ * it: an entry without a mark of its own gets the plug, not a nearby brand's glyph. A row is a
+ * statement about which company holds somebody's credential, and wearing another company's mark is
+ * the one kind of wrong it must never be.
  */
 const MARKS: Record<string, React.ComponentType<{ className?: string }>> = {
   "google-drive": IconBrandGoogleDrive,
