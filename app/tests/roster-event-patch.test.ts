@@ -99,6 +99,63 @@ describe("an ordinary activity event", () => {
     ]);
   });
 
+  test("breaks a tie on the id, descending, which is the server's third sort term", () => {
+    /*
+     * `server/src/roster/order.ts` orders `[pinned desc, recency desc, id desc]`, and answering `0`
+     * on a tie is not the same as agreeing with that: `sort` is stable, so tied rows keep whatever
+     * order the page already held until the next refetch reorders them — rows jumping for no reason,
+     * which is the one symptom `byRecency` exists to prevent.
+     *
+     * The tie is the ordinary case here rather than a contrived one. `server/src/tenant-package.ts`
+     * inserts every channel a package defines inside one transaction, so `created_at` is
+     * byte-identical across them, and `lastMessageAt` is null until somebody speaks — so recency is
+     * that one shared timestamp. These are the ids the shipped `examples/fintech/channels.yaml`
+     * produces.
+     */
+    const insertedTogether = "2026-02-01T00:00:00.000Z";
+    const data = cache([
+      item("general-assistant", { createdAt: insertedTogether }),
+      item("risk-and-compliance", { createdAt: insertedTogether }),
+    ]);
+
+    const patched = applyRosterEvent(
+      data,
+      event({ id: "general-assistant", lastMessage: "First words" }),
+    );
+
+    expect(patched).not.toBe("unknown");
+    expect(patched).not.toBe("refetch");
+    if (patched === "unknown" || patched === "refetch") return;
+    expect(patched.pages[0]?.items.map((row) => row.id)).toEqual([
+      "risk-and-compliance",
+      "general-assistant",
+    ]);
+  });
+
+  test("answers that tie the same way whichever order the page held", () => {
+    // The comparator has to be antisymmetric, or the answer depends on where `sort` happened to
+    // start comparing — which is how a tie-break that looks fixed still leaves two tabs holding two
+    // different lists.
+    const insertedTogether = "2026-02-01T00:00:00.000Z";
+    const data = cache([
+      item("risk-and-compliance", { createdAt: insertedTogether }),
+      item("general-assistant", { createdAt: insertedTogether }),
+    ]);
+
+    const patched = applyRosterEvent(
+      data,
+      event({ id: "general-assistant", lastMessage: "First words" }),
+    );
+
+    expect(patched).not.toBe("unknown");
+    expect(patched).not.toBe("refetch");
+    if (patched === "unknown" || patched === "refetch") return;
+    expect(patched.pages[0]?.items.map((row) => row.id)).toEqual([
+      "risk-and-compliance",
+      "general-assistant",
+    ]);
+  });
+
   test("is unknown when no page in this list holds the row", () => {
     // Reported, not decided: three lists mean a row is legitimately absent from two of them, so what
     // the caller does about it is `applyRosterEventToCaches`'s business, tested below.
@@ -373,6 +430,82 @@ describe("the fields copied onto a patched row", () => {
 });
 
 /**
+ * The cache handed in, after the function has answered.
+ *
+ * `applyRosterEvent` builds a new cache and never edits the one it was given, which is what leaves
+ * React Query's previous data still the previous data and lets `RosterRow`'s memo tell a changed row
+ * from an unchanged one. Three `data.pages.slice()` copies and two `page.items.slice()` copies are
+ * the whole of that enforcement, and before these tests every one of them could be deleted with the
+ * suite green.
+ *
+ * The assertion that looks like it covers them cannot. `expect(patched.pages[1]).toBe(data.pages[1])`
+ * up in the delete tests reads as a copy check, but with the copy gone `patched.pages` IS
+ * `data.pages`, so page one is trivially itself — the check passes exactly when it should fail. Only
+ * looking at the INPUT after the call can see it, so that is what these three do: one per branch that
+ * writes, each holding the references it expects to find still in place, plus a clone of the whole
+ * cache taken beforehand for anything the pointed assertions would miss.
+ */
+describe("the cache handed in", () => {
+  test("is untouched by a delete", () => {
+    const data = cache([item("a"), item("b")], [item("c")]);
+    const before = structuredClone(data);
+    const firstPage = data.pages[0] as RosterPage;
+    const firstItems = firstPage.items;
+
+    applyRosterEvent(data, event({ id: "b", deleted: true }));
+
+    // Without `data.pages.slice()` the assignment lands on the cached array and page one becomes the
+    // filtered page: the roster has lost a row with nothing about the cache object having changed.
+    expect(data.pages[0]).toBe(firstPage);
+    expect(firstPage.items).toBe(firstItems);
+    expect(data).toEqual(before);
+  });
+
+  test("is untouched by a pin", () => {
+    const data = cache([item("a"), item("b")]);
+    const before = structuredClone(data);
+    const firstPage = data.pages[0] as RosterPage;
+    const pinnedRow = firstPage.items[0] as RosterItem;
+
+    applyRosterEvent(data, event({ id: "a", pinned: true }));
+
+    // Two copies to lose on this path: `page.items.slice()`, without which the row object at index 0
+    // is replaced inside the cached array, and `data.pages.slice()`, without which the page is.
+    expect(data.pages[0]).toBe(firstPage);
+    expect(firstPage.items[0]).toBe(pinnedRow);
+    expect(data).toEqual(before);
+  });
+
+  test("is untouched by an activity patch, the re-sort included", () => {
+    const data = cache([
+      item("a", { lastMessageAt: "2026-03-01T00:00:00.000Z" }),
+      item("b", { lastMessageAt: "2026-01-01T00:00:00.000Z" }),
+    ]);
+    const before = structuredClone(data);
+    const firstPage = data.pages[0] as RosterPage;
+    const items = firstPage.items;
+    const untouchedRow = items[0] as RosterItem;
+
+    applyRosterEvent(
+      data,
+      event({
+        id: "b",
+        lastMessage: "Newest",
+        lastMessageAt: "2026-04-01T00:00:00.000Z",
+      }),
+    );
+
+    // This branch writes an index AND sorts, so a missing `page.items.slice()` reorders the cached
+    // array in place — the one mutation that changes what the sidebar renders while every object
+    // identity React looks at stays exactly as it was.
+    expect(data.pages[0]).toBe(firstPage);
+    expect(items.map((row) => row.id)).toEqual(["a", "b"]);
+    expect(items[0]).toBe(untouchedRow);
+    expect(data).toEqual(before);
+  });
+});
+
+/**
  * The loop over the three cached lists, which is where the interesting mistake lived.
  *
  * `applyRosterEvent` is pure and covered above. What was not covered was the caller that turns three
@@ -463,6 +596,84 @@ describe("applyRosterEventToCaches", () => {
     // One, not three: all three lists report the move, and one invalidation on the shared prefix
     // reaches every one of them.
     expect(invalidated).toEqual([{ queryKey: rosterKeys.all }]);
+  });
+
+  /**
+   * A client with React Query's structural sharing turned off.
+   *
+   * Because that is the mechanism this file's own comments say was supplying the identity guarantee
+   * by accident. With sharing on, `setQueryData` merges the updater's answer against what was there
+   * and hands back the old references wherever the contents match — so an updater that rebuilt every
+   * page from scratch would still store the old page objects, and every identity assertion here
+   * would pass without this file contributing anything to them. Off, what is stored is exactly what
+   * `applyRosterEvent` returned.
+   */
+  function sharingOffQueryClient() {
+    return new QueryClient({
+      defaultOptions: { queries: { structuralSharing: false } },
+    });
+  }
+
+  test("the premise: this client really does not merge what it is given", () => {
+    // Checked rather than assumed, because an option that silently did not apply would leave the two
+    // tests below passing for the reason they are written to rule out.
+    const queryClient = sharingOffQueryClient();
+    const first = cache([item("channel_1")]);
+    const equal = structuredClone(first);
+
+    queryClient.setQueryData(rosterKeys.list("active"), first);
+    queryClient.setQueryData(rosterKeys.list("active"), equal);
+
+    expect(queryClient.getQueryData(rosterKeys.list("active"))).toBe(equal);
+  });
+
+  test("stores the very cache it was given when a duplicate event changed nothing", () => {
+    const queryClient = sharingOffQueryClient();
+    const data = cache([
+      item("channel_1", {
+        lastMessage: "Said something.",
+        lastMessageAt: "2026-08-31T10:00:00.000Z",
+        lastMessageAgentId: "agent-1",
+      }),
+    ]);
+    queryClient.setQueryData(rosterKeys.list("active"), data);
+
+    applyRosterEventToCaches(
+      queryClient,
+      event({
+        id: "channel_1",
+        lastMessage: "Said something.",
+        lastMessageAt: "2026-08-31T10:00:00.000Z",
+        lastMessageAgentId: "agent-1",
+      }),
+    );
+
+    // `RosterRow` is memoized, so "nothing changed" has to mean the same objects and not merely
+    // equal ones — and this is that, through the real cache write rather than in a return value.
+    expect(queryClient.getQueryData(rosterKeys.list("active"))).toBe(data);
+  });
+
+  test("keeps the pages it did not patch, through the cache write", () => {
+    const queryClient = sharingOffQueryClient();
+    const data = cache([item("channel_1")], [item("channel_2")]);
+    queryClient.setQueryData(rosterKeys.list("active"), data);
+
+    applyRosterEventToCaches(
+      queryClient,
+      event({
+        id: "channel_1",
+        lastMessage: "Newest",
+        lastMessageAt: "2026-08-31T10:00:00.000Z",
+      }),
+    );
+
+    const stored = queryClient.getQueryData<RosterCache>(
+      rosterKeys.list("active"),
+    );
+    // A patch is one page's business. Rebuilding the others would re-render every row on the roster
+    // for one row's new message, which is the cost this whole file exists to avoid.
+    expect(stored).not.toBe(data);
+    expect(stored?.pages[1]).toBe(data.pages[1]);
   });
 
   test("removes a deleted row from every list that held it, without a refetch", () => {

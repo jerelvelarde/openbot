@@ -11,8 +11,9 @@ import {
 /**
  * Keep the roster live.
  *
- * The query remains the source of truth; socket events only patch its cache. Reconnects refetch the
- * list to recover events missed while disconnected.
+ * The query remains the source of truth; socket events only patch its cache. A reconnection that
+ * holds refetches the list to recover events missed while disconnected — `ESTABLISHED_AFTER_MS`
+ * carries why holding, rather than merely opening, is the condition.
  */
 
 /**
@@ -206,6 +207,30 @@ export function applyRosterEvent(
 const FIRST_RETRY_MS = 500;
 const MAX_RETRY_MS = 30_000;
 
+/**
+ * How long a socket has to hold open before this tab believes in it.
+ *
+ * THE SIGNAL `onopen` IS NOT. A server that completes the upgrade and then closes without saying
+ * anything — a proxy that mangles WebSockets, a replica shutting down, an authorization check that
+ * fails after the handshake — fires `onopen` every single time. So a backoff reset there never
+ * engages, and a roster refetch there runs on every attempt: the loop sat at this file's first retry
+ * delay indefinitely, refetching three lists twice a second, each refetch discarded by the next.
+ *
+ * WHY NOT "DELIVERED A FRAME" ALONE, which is the other signal available and the one the reset below
+ * also reads. A frame proves the connection works; no frame proves nothing. A quiet roster says
+ * nothing for hours, so judging a connection by frames alone would let an idle proxy timeout climb
+ * the backoff to its 30-second ceiling on a network that is working perfectly, and skip the recovery
+ * refetch that is the entire point of reconnecting. The two are read together instead — a frame, or
+ * having held this long, either one.
+ *
+ * ITS OWN NUMBER, not `FIRST_RETRY_MS` reused, though the two were within a factor of two of each
+ * other when this was written and will be tempting to fold together. This one is "long enough that a
+ * socket the server accepts and drops cannot reach it, short enough that the recovery refetch is not
+ * visibly late"; that is not the same question as how soon to retry, and the two answers stopped
+ * agreeing the moment either was tuned.
+ */
+const ESTABLISHED_AFTER_MS = 1_000;
+
 function socketUrl() {
   const url = new URL("/api/channels/events", window.location.href);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
@@ -319,44 +344,204 @@ export function applyRosterEventToCaches(
   }
 }
 
+/**
+ * The part of a `WebSocket` this loop drives.
+ *
+ * Declared, and the loop below takes a factory for it, for the reason `applyRosterEvent` is exported:
+ * the connect-retry-teardown rules are the other half of what a socket event does to the screen, and
+ * they should be provable without a socket. The two defects this shape was written for are both
+ * lifecycle bugs — a backoff that never engaged, a handler that outlived its screen — and neither is
+ * a fact about any expression, so neither could be asserted while the whole loop lived inside an
+ * effect closure.
+ *
+ * The event types are the DOM's rather than something narrower this file would prefer, so that a real
+ * `WebSocket` satisfies this by construction: with `strictFunctionTypes` a handler declared to take
+ * less than a `MessageEvent` is not something a `WebSocket` can be assigned to, so narrowing here
+ * would mean a cast at the one place that matters.
+ */
+export type RosterSocket = {
+  onopen: ((event: Event) => void) | null;
+  onmessage: ((event: MessageEvent) => void) | null;
+  onclose: ((event: CloseEvent) => void) | null;
+  onerror: ((event: Event) => void) | null;
+  close: () => void;
+};
+
+/** Everything the loop needs from outside itself: a socket, a clock, and what to do with an event. */
+export type RosterSocketHooks = {
+  connect: () => RosterSocket;
+  schedule: (run: () => void, delayMs: number) => number;
+  cancel: (handle: number) => void;
+  /** One readable event, already parsed. */
+  onEvent: (activity: RosterActivityEvent) => void;
+  /** Bring the roster up to date after a gap the socket could not cover. */
+  recoverMissedEvents: () => void;
+};
+
+/**
+ * Keep one socket connected, reconnect it when it drops, and stop cleanly. Returns the teardown.
+ *
+ * Two rules live here and nowhere else, both of which used to be wrong in ways no test could reach.
+ * WHAT COUNTS AS A CONNECTION, which is what the backoff and the recovery refetch both hang off —
+ * see `ESTABLISHED_AFTER_MS`. And WHAT TEARDOWN DETACHES: every handler, because a frame that
+ * arrives after the screen is gone still runs whatever is still attached.
+ *
+ * Takes its socket, its clock and its two callbacks rather than reaching for `WebSocket`,
+ * `window.setTimeout` and a `QueryClient`, so the rules above are assertable in a plain test:
+ * `app/tests/roster-socket.test.ts` drives the whole loop with a fake socket and timers as values.
+ * That is the same argument `applyRosterEvent` above makes for being pure and exported.
+ */
+export function startRosterSocket(hooks: RosterSocketHooks): () => void {
+  let socket: RosterSocket | undefined;
+  let retryTimer: number | undefined;
+  /** Pending while a socket is open and has not yet held long enough to count as a connection. */
+  let establishedTimer: number | undefined;
+  let retryDelay = FIRST_RETRY_MS;
+  let stopped = false;
+
+  /** A connection worked, so the delay the failures before it earned is no longer owed. */
+  const established = () => {
+    retryDelay = FIRST_RETRY_MS;
+  };
+
+  const connect = () => {
+    if (stopped) return;
+    const live = hooks.connect();
+    socket = live;
+
+    live.onopen = () => {
+      /*
+       * The recovery refetch waits for the socket to prove it can hold.
+       *
+       * It used to run here, on the open itself, and that is what turned a server that accepts and
+       * drops into a three-list roster refetch twice a second. A socket that closes before this
+       * timer fires never reaches it, so that loop now costs the reconnects and nothing else.
+       */
+      establishedTimer = hooks.schedule(() => {
+        establishedTimer = undefined;
+        established();
+        // Recover events missed while the socket was disconnected.
+        hooks.recoverMissedEvents();
+      }, ESTABLISHED_AFTER_MS);
+
+      /*
+       * Except at the ceiling, where the attempt is the only clock this tab has left.
+       *
+       * A tab whose sockets never hold has no other route back to a fresh roster: this deployment
+       * turns `refetchOnWindowFocus` off, the sidebar outlives navigation so its query does not
+       * remount, and this socket is the only thing that invalidates it. Dropping the refetch
+       * entirely for that tab would trade a storm for a roster frozen at whatever the mount fetched,
+       * which is the worse of the two. Once the backoff has bottomed out the attempts are 30 seconds
+       * apart, and one refetch per attempt at that spacing is a poll rather than a storm — so this
+       * reads the delay rather than counting failures, because the delay is the thing that bounds
+       * the rate.
+       */
+      if (retryDelay >= MAX_RETRY_MS) hooks.recoverMissedEvents();
+    };
+
+    live.onmessage = (message) => {
+      // A frame is proof the connection works and does not wait for the timer above to agree. Read
+      // before the frame is parsed, deliberately: an unreadable frame is a bug in what was sent, not
+      // evidence against the socket that carried it.
+      established();
+
+      const activity = readRosterEvent(message.data);
+      if (!activity) return;
+      hooks.onEvent(activity);
+    };
+
+    /*
+     * Nothing to recover here, and that is why it needs saying.
+     *
+     * An error is always followed by a close, and `onclose` below is what schedules the reconnect,
+     * so there is no handling to do. Without this the failure is invisible: the spec deliberately
+     * withholds the reason from the event, so the browser's own console line names neither the
+     * socket nor the application, and the only other symptom is the sidebar going quiet. One line
+     * saying which socket broke is the difference between that and a reproducible report.
+     */
+    live.onerror = () => {
+      console.error(
+        JSON.stringify({
+          type: "roster-socket-error",
+          note: "The roster event socket failed. A reconnect follows; live sidebar updates pause until it succeeds.",
+        }),
+      );
+    };
+
+    // WebSocket needs explicit reconnect handling.
+    live.onclose = () => {
+      // Whatever this socket was going to prove, it is not going to prove it now. Cancelled before
+      // the `stopped` check below, because a timer must not outlive the socket it was measuring
+      // whatever the reason the socket went away.
+      if (establishedTimer !== undefined) {
+        hooks.cancel(establishedTimer);
+        establishedTimer = undefined;
+      }
+      if (stopped) return;
+      retryTimer = hooks.schedule(connect, retryDelay);
+      retryDelay = Math.min(retryDelay * 2, MAX_RETRY_MS);
+    };
+  };
+
+  connect();
+
+  return () => {
+    stopped = true;
+    if (retryTimer !== undefined) hooks.cancel(retryTimer);
+    if (establishedTimer !== undefined) hooks.cancel(establishedTimer);
+    /*
+     * Cleared first: the close below must not schedule a reconnect for a screen that is gone, and
+     * a socket torn down mid-connect must not log an error about a screen nobody is looking at.
+     *
+     * EVERY HANDLER, not the two this used to name. `onmessage` was left attached, so a frame
+     * already queued behind this cleanup still ran the whole handler — patching caches for a tree
+     * that has unmounted and, on a `deleted` frame, navigating a router the screen no longer has.
+     * `onopen` was left attached for the same reason and is the same shape of hazard: it now
+     * schedules a timer, and one scheduled after this point is one nobody cancels.
+     *
+     * Detached rather than gated on `stopped`, because detaching is what this teardown already does
+     * about a handler outliving its screen — one mechanism, and the `stopped` checks stay about
+     * whether to reconnect rather than becoming a second liveness rule about whether to deliver.
+     */
+    if (socket) {
+      socket.onopen = null;
+      socket.onmessage = null;
+      socket.onclose = null;
+      socket.onerror = null;
+    }
+    socket?.close();
+  };
+}
+
 export function useRosterEvents() {
   const queryClient = useQueryClient();
   const router = useRouter();
 
-  useEffect(() => {
-    let socket: WebSocket | undefined;
-    let retryTimer: number | undefined;
-    let retryDelay = FIRST_RETRY_MS;
-    let stopped = false;
+  useEffect(
+    () =>
+      startRosterSocket({
+        connect: () => new WebSocket(socketUrl()),
+        schedule: (run, delayMs) => window.setTimeout(run, delayMs),
+        cancel: (handle) => window.clearTimeout(handle),
+        recoverMissedEvents: () => {
+          void queryClient.invalidateQueries({ queryKey: rosterKeys.all });
+        },
+        onEvent: (activity) => {
+          applyRosterEventToCaches(queryClient, activity);
 
-    const connect = () => {
-      if (stopped) return;
-      socket = new WebSocket(socketUrl());
-
-      socket.onopen = () => {
-        retryDelay = FIRST_RETRY_MS;
-        // Recover events missed while the socket was disconnected.
-        void queryClient.invalidateQueries({ queryKey: rosterKeys.all });
-      };
-
-      socket.onmessage = (message) => {
-        const activity = readRosterEvent(message.data);
-        if (!activity) return;
-
-        applyRosterEventToCaches(queryClient, activity);
-
-        /*
-         * A tab looking at the channel somebody just deleted in another tab.
-         *
-         * The tab that issued the delete moves itself once the request returns. Every other tab only
-         * ever hears about it here, and dropping the row without moving leaves that tab on a route
-         * whose channel no longer resolves: an error, or an empty conversation, depending on which
-         * query answers first.
-         *
-         * Read off the router at event time rather than through `useParams`, so the effect does not
-         * have to be torn down and reconnected on every navigation just to keep this value fresh.
-         */
-        if (activity.deleted) {
+          /*
+           * A tab looking at the channel somebody just deleted in another tab.
+           *
+           * The tab that issued the delete moves itself once the request returns. Every other tab
+           * only ever hears about it here, and dropping the row without moving leaves that tab on a
+           * route whose channel no longer resolves: an error, or an empty conversation, depending on
+           * which query answers first.
+           *
+           * Read off the router at event time rather than through `useParams`, so the effect does
+           * not have to be torn down and reconnected on every navigation just to keep this value
+           * fresh.
+           */
+          if (!activity.deleted) return;
           const { pathname } = router.state.location;
           const path =
             activity.kind === "bot_chat"
@@ -365,49 +550,10 @@ export function useRosterEvents() {
           if (pathname === path) {
             void router.navigate({ to: "/" });
           }
-        }
-      };
-
-      /*
-       * Nothing to recover here, and that is why it needs saying.
-       *
-       * An error is always followed by a close, and `onclose` below is what schedules the reconnect,
-       * so there is no handling to do. Without this the failure is invisible: the spec deliberately
-       * withholds the reason from the event, so the browser's own console line names neither the
-       * socket nor the application, and the only other symptom is the sidebar going quiet. One line
-       * saying which socket broke is the difference between that and a reproducible report.
-       */
-      socket.onerror = () => {
-        console.error(
-          JSON.stringify({
-            type: "roster-socket-error",
-            note: "The roster event socket failed. A reconnect follows; live sidebar updates pause until it succeeds.",
-          }),
-        );
-      };
-
-      // WebSocket needs explicit reconnect handling.
-      socket.onclose = () => {
-        if (stopped) return;
-        retryTimer = window.setTimeout(connect, retryDelay);
-        retryDelay = Math.min(retryDelay * 2, MAX_RETRY_MS);
-      };
-    };
-
-    connect();
-
-    return () => {
-      stopped = true;
-      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
-      // Cleared first: the close below must not schedule a reconnect for a screen that is gone, and
-      // a socket torn down mid-connect must not log an error about a screen nobody is looking at.
-      if (socket) {
-        socket.onclose = null;
-        socket.onerror = null;
-      }
-      socket?.close();
-    };
-  }, [queryClient, router]);
+        },
+      }),
+    [queryClient, router],
+  );
 }
 
 /**
@@ -423,10 +569,33 @@ export function useRosterEvents() {
  * for this: it answers in the reader's locale and disagrees with a plain comparison on non-canonical
  * ISO forms. Every timestamp on the wire is `toISOString()` today, so the two agreed in practice —
  * which is exactly the kind of agreement that stops holding without anybody noticing.
+ *
+ * TIES GO TO THE GREATER ID, because `rosterOrder` there is `[pinned desc, recency desc, id desc]`
+ * and this has to mirror the whole key, not the middle term of it. Returning `0` instead — which this
+ * did — is not neutrality: `Array.prototype.sort` is stable, so tied rows kept whatever order the
+ * page already held, the next refetch put them in the server's order, and the rows moved for no
+ * reason a reader could see. That is the symptom the paragraph above is about, arriving through the
+ * one term that was missing rather than through disagreement about the terms that were there.
+ *
+ * The tie is ordinary, not hypothetical. `server/src/tenant-package.ts` inserts every channel a
+ * package defines in one transaction, so `created_at` — and with it the recency of a channel nobody
+ * has spoken in — is byte-identical across all of them; `roster/order.ts` has its own paragraph on
+ * what that same fact did to the cursor.
+ *
+ * COMPARED AS STRINGS, with the caveat worth writing down rather than discovering. `mostRecentBotChat`
+ * can argue this exactly: bot chat ids are one fixed length of lowercase hex, so a code-unit
+ * comparison and Postgres's `desc` cannot disagree. Channel ids are weaker — a package supplies its
+ * own, unprefixed and arbitrary (`general-assistant`), so a database collation that ignores
+ * punctuation could order two of those differently from this. The cost of that residual disagreement
+ * is one page of one list drawn in a different order from the next refetch's, for rows that share a
+ * timestamp; the alternative is shipping a collation-aware comparator to the browser to sort at most
+ * a page, which buys less than it costs. What matters here is that the order is TOTAL and stable
+ * across tabs, and code-unit order is both.
  */
 function byRecency(left: RosterItem, right: RosterItem) {
   const at = (item: RosterItem) => item.lastMessageAt ?? item.createdAt;
   const [first, second] = [at(left), at(right)];
-  if (first === second) return 0;
-  return first > second ? -1 : 1;
+  if (first !== second) return first > second ? -1 : 1;
+  if (left.id === right.id) return 0;
+  return left.id > right.id ? -1 : 1;
 }
