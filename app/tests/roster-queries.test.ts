@@ -162,3 +162,29 @@ describe("rosterListQueryOptions' queryFn", () => {
     ).rejects.toThrow("Could not load your conversations");
   });
 });
+
+/**
+ * A 200 THAT IS NOT JSON, which this list is the worst place in the app to meet.
+ *
+ * A proxy error page, a captive portal, or a dev server answering the wrong route all reply 200 with
+ * HTML. The page was parsed here, outside the guard that holds the `fallback`, so what reached the
+ * screen was `SyntaxError: Unexpected token '<', "<html>"… is not valid JSON` — rendered by the
+ * sidebar as its empty-state title, under `role="alert"`, directly above the words "Nothing has
+ * been lost." The parse is inside `client` now, so the sentence is the endpoint's own.
+ */
+test("says the endpoint's own sentence when a 200 carries something else", async () => {
+  globalThis.fetch = (async () =>
+    new Response("<html><body>502 Bad Gateway</body></html>", {
+      status: 200,
+      headers: { "content-type": "text/html" },
+    })) as unknown as typeof fetch;
+
+  const caught = await fetchPage(rosterListQueryOptions("active"), "").catch(
+    (error: unknown) => error,
+  );
+
+  expect((caught as Error).message).toBe("Could not load your conversations");
+  // The parser's complaint is not thrown away — a console still has it, which is where the difference
+  // between "the server broke" and "something in front of it did" is read.
+  expect((caught as Error).cause).toBeInstanceOf(SyntaxError);
+});

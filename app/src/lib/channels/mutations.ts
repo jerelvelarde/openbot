@@ -2,7 +2,7 @@ import { mutationOptions, type QueryClient } from "@tanstack/react-query";
 import { client } from "@/lib/client";
 import { patchRosterRead } from "@/lib/roster/read-marker";
 import { rosterKeys } from "@/lib/roster/queries";
-import { type AgentChannel, channelKeys } from "./queries";
+import { type AgentChannel, channelKeys, channelPath } from "./queries";
 
 /**
  * Start a new channel with one or more coworkers.
@@ -11,14 +11,20 @@ import { type AgentChannel, channelKeys } from "./queries";
  */
 export function createChannelMutationOptions(queryClient: QueryClient) {
   return mutationOptions({
-    mutationFn: async (agentIds: string[]): Promise<AgentChannel> => {
-      const response = await client("/api/channels", {
+    /*
+     * Through `client`'s envelope key rather than parsing the response here, which is what this used
+     * to do — and what `useStartChannel` (lib/channels/start.ts) then reads `.id` and `.threadId` off
+     * the moment it resolves. Parsed out here, outside the guard that holds the `fallback`, a 200
+     * carrying a proxy's HTML error page threw a raw `SyntaxError` and an envelope that had drifted
+     * resolved `undefined` typed as `AgentChannel` — a mutation that SUCCEEDED, so no screen had an
+     * error to render, followed by a `TypeError` on the first field read. See `unwrap` in lib/client.ts.
+     */
+    mutationFn: (agentIds: string[]): Promise<AgentChannel> =>
+      client<AgentChannel>("/api/channels", "channel", {
         method: "POST",
         body: { agentIds },
         fallback: "Could not start a channel",
-      });
-      return ((await response.json()) as { channel: AgentChannel }).channel;
-    },
+      }),
     /*
      * channelKeys.all is a prefix of channelKeys.detail, which channelQueryOptions reads;
      * rosterKeys.all is what actually gets the new row into the sidebar.
@@ -102,7 +108,7 @@ export function recordChannelActivityMutationOptions() {
       agentId: string | null;
       at: string;
     }) => {
-      await client(`/api/channels/${variables.channelId}/activity`, {
+      await client(`${channelPath(variables.channelId)}/activity`, {
         method: "POST",
         body: {
           agentId: variables.agentId,
@@ -129,7 +135,7 @@ export function recordChannelActivityMutationOptions() {
 export function setChannelPinnedMutationOptions(queryClient: QueryClient) {
   return mutationOptions({
     mutationFn: async (variables: { channelId: string; pinned: boolean }) => {
-      await client(`/api/channels/${variables.channelId}/pin`, {
+      await client(`${channelPath(variables.channelId)}/pin`, {
         method: "PUT",
         body: { pinned: variables.pinned },
         fallback: "Could not pin this channel",
@@ -157,7 +163,7 @@ export function setChannelPinnedMutationOptions(queryClient: QueryClient) {
 export function markChannelReadMutationOptions(queryClient: QueryClient) {
   return mutationOptions({
     mutationFn: async (channelId: string) => {
-      await client(`/api/channels/${channelId}/read`, {
+      await client(`${channelPath(channelId)}/read`, {
         method: "PUT",
         fallback: "Could not mark this channel read",
       });
@@ -172,17 +178,36 @@ export function markChannelReadMutationOptions(queryClient: QueryClient) {
 export function deleteChannelMutationOptions(queryClient: QueryClient) {
   return mutationOptions({
     mutationFn: async (channelId: string) => {
-      await client(`/api/channels/${channelId}`, {
+      await client(channelPath(channelId), {
         method: "DELETE",
         fallback: "Could not delete this channel",
       });
     },
-    // Not the detail query: the open channel's detail query would refetch into the fresh 404 and
-    // flash an error before the navigate-home lands; left alone, it keeps its cache and the
-    // navigation happens with nothing to complain about. rosterKeys.all is what removes the row from
-    // the sidebar, which is the only reader of the channel list.
-    onSuccess: () =>
-      queryClient.invalidateQueries({ queryKey: rosterKeys.all }),
+    /*
+     * REMOVED rather than invalidated, which are opposites, and this wanted both of the properties
+     * only removal has.
+     *
+     * Not invalidated, for the reason this comment has always given: the open channel's detail query
+     * would refetch into the fresh 404 and flash an error before the navigate-home lands. But left
+     * alone it kept its cache, and that is the half the argument stopped short of. `confirmDelete`
+     * (app-sidebar/roster-row.tsx) navigates home BEFORE it deletes, deliberately and for a reason of
+     * its own, so by the time this runs the cached row is sitting out the client's default
+     * five-minute `gcTime` with nobody watching it — and pressing Back inside that window rendered
+     * the deleted conversation from cache, complete with a working composer, until the refetch
+     * behind it came back 404.
+     *
+     * `removeQueries` is what gets both: the entry stops existing, and because nothing observes it
+     * any more there is no refetch for the 404 to answer. The one key and not the `channelKeys.all`
+     * prefix — every other channel's cached detail is still true.
+     *
+     * rosterKeys.all is what removes the row from the sidebar, which is the only reader of the
+     * channel list. Returned, and so awaited by query-core, because `deleteConversation.isPending`
+     * is what keeps the menu's button reading "Deleting…" until the row has actually gone.
+     */
+    onSuccess: (_data, channelId) => {
+      queryClient.removeQueries({ queryKey: channelKeys.detail(channelId) });
+      return queryClient.invalidateQueries({ queryKey: rosterKeys.all });
+    },
   });
 }
 
@@ -205,7 +230,7 @@ export function deleteChannelMutationOptions(queryClient: QueryClient) {
 export function setChannelArchivedMutationOptions(queryClient: QueryClient) {
   return mutationOptions({
     mutationFn: async (variables: { channelId: string; archived: boolean }) => {
-      await client(`/api/channels/${variables.channelId}/archive`, {
+      await client(`${channelPath(variables.channelId)}/archive`, {
         method: "PUT",
         body: { archived: variables.archived },
         fallback: variables.archived

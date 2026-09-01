@@ -1,9 +1,9 @@
 import { mutationOptions, type QueryClient } from "@tanstack/react-query";
 import { boundedActivityText } from "@/lib/channels/mutations";
-import { client, tryClient } from "@/lib/client";
+import { client, serverMessage, tryClient, unwrap } from "@/lib/client";
 import { patchRosterRead } from "@/lib/roster/read-marker";
 import { rosterKeys } from "@/lib/roster/queries";
-import { botChatKeys, type BotChat } from "./queries";
+import { botChatKeys, botChatPath, type BotChat } from "./queries";
 
 /**
  * Start a new direct conversation with a Bot.
@@ -68,15 +68,24 @@ export function adoptBotChatMutationOptions(queryClient: QueryClient) {
       });
 
       if (response.ok) {
-        return ((await response.json()) as { botChat: BotChat }).botChat;
+        /*
+         * Through `unwrap` rather than parsed here, which is the cost of reading a status yourself
+         * and was being paid twice over. A 200 is not a promise of JSON — a proxy error page or a
+         * captive portal answers one with HTML — so a raw `SyntaxError` used to reach the caller,
+         * which cannot tell that from a refusal; and an envelope without its key resolved
+         * `undefined` typed as a `BotChat`, which `useLegacyThreadAdoption` treats as an adoption
+         * that WORKED, forgetting the remembered thread it was there to rescue.
+         */
+        return unwrap<BotChat>(
+          response,
+          "botChat",
+          "Could not open this conversation",
+        );
       }
 
-      // Same extraction `client` does: the server's own message names the reason, which is worth
-      // surfacing over a generic fallback when it sent one.
-      const message = await response
-        .json()
-        .then((body: { error?: string }) => body.error)
-        .catch(() => undefined);
+      // `client`'s own extraction, shared rather than restated: the server's message names the
+      // reason, which is worth surfacing over a generic fallback when it sent one.
+      const message = await serverMessage(response);
 
       if (response.status === 409) {
         throw new AdoptConflictError(
@@ -148,7 +157,7 @@ export function recordBotChatActivityMutationOptions(
        */
       derivesTitle: boolean;
     }) => {
-      await client(`/api/bot-chats/${variables.botChatId}/activity`, {
+      await client(`${botChatPath(variables.botChatId)}/activity`, {
         method: "POST",
         body: {
           agentId: variables.agentId,
@@ -227,7 +236,7 @@ export function recordBotChatActivityMutationOptions(
 export function setBotChatPinnedMutationOptions(queryClient: QueryClient) {
   return mutationOptions({
     mutationFn: async (variables: { botChatId: string; pinned: boolean }) => {
-      await client(`/api/bot-chats/${variables.botChatId}/pin`, {
+      await client(`${botChatPath(variables.botChatId)}/pin`, {
         method: "PUT",
         body: { pinned: variables.pinned },
         fallback: "Could not pin this conversation",
@@ -246,13 +255,19 @@ export function setBotChatPinnedMutationOptions(queryClient: QueryClient) {
  * not land is a dot that returns on the next refetch, which is the truth reasserting itself, and a
  * refetch here would race the socket's own patches for nothing.
  *
- * Patches all three status lists: unlike a channel, which has one cache to patch, a bot chat's row can
- * be sitting in Active, Archived, or All, and the read has to clear wherever it is.
+ * Patches all three status lists, via `patchRosterRead`: a row can be sitting in Active or Archived
+ * and is in All either way, so the read has to clear wherever it is.
+ *
+ * The same three, by the same shared loop, as a channel's mark-read. This used to claim the channel
+ * "has one cache to patch", drawing a distinction between the two kinds that has never existed:
+ * `patchRosterRead` (lib/roster/read-marker.ts) walks `ROSTER_STATUSES` for whatever id it is given,
+ * and the sidebar reads both kinds out of the same three lists. Left standing, that sentence is an
+ * invitation to give one of the two an optimisation the other cannot have.
  */
 export function markBotChatReadMutationOptions(queryClient: QueryClient) {
   return mutationOptions({
     mutationFn: async (botChatId: string) => {
-      await client(`/api/bot-chats/${botChatId}/read`, {
+      await client(`${botChatPath(botChatId)}/read`, {
         method: "PUT",
         fallback: "Could not mark this conversation read",
       });
@@ -282,7 +297,7 @@ export function markBotChatReadMutationOptions(queryClient: QueryClient) {
 export function setBotChatArchivedMutationOptions(queryClient: QueryClient) {
   return mutationOptions({
     mutationFn: async (variables: { botChatId: string; archived: boolean }) => {
-      await client(`/api/bot-chats/${variables.botChatId}/archive`, {
+      await client(`${botChatPath(variables.botChatId)}/archive`, {
         method: "PUT",
         body: { archived: variables.archived },
         fallback: variables.archived
@@ -299,17 +314,37 @@ export function setBotChatArchivedMutationOptions(queryClient: QueryClient) {
 export function deleteBotChatMutationOptions(queryClient: QueryClient) {
   return mutationOptions({
     mutationFn: async (botChatId: string) => {
-      await client(`/api/bot-chats/${botChatId}`, {
+      await client(botChatPath(botChatId), {
         method: "DELETE",
         fallback: "Could not delete this conversation",
       });
     },
-    // The roster only, and deliberately not the detail query — which archive above does not
-    // invalidate either, but for a different reason worth keeping straight. Archive leaves the row
-    // exactly where it was and simply has no reader for the refetch to serve; this one has no row
-    // left at all. The open chat's detail query would refetch into the fresh 404 and flash an error
-    // before the navigate-home lands, so even gaining a reader would not make this one safe.
-    onSuccess: () =>
-      queryClient.invalidateQueries({ queryKey: rosterKeys.all }),
+    /*
+     * The roster invalidated, and the detail query REMOVED — which is not the same as invalidating it
+     * and is not the same as leaving it alone either, and the difference is the whole of this comment.
+     *
+     * NOT INVALIDATED, and archive above is not either, but for a different reason worth keeping
+     * straight. Archive leaves the row exactly where it was and simply has no reader for the refetch
+     * to serve; this one has no row left at all. The open chat's detail query would refetch into the
+     * fresh 404 and flash an error before the navigate-home lands, so even gaining a reader would not
+     * make an invalidation here safe.
+     *
+     * NOR LEFT ALONE, which is what this used to do, and the half the argument stopped short of.
+     * `confirmDelete` (app-sidebar/roster-row.tsx) navigates home BEFORE it deletes, deliberately, so
+     * by the time this runs the cached row is unobserved and sitting out the client's default
+     * five-minute `gcTime` — and pressing Back inside that window rendered the deleted conversation
+     * from cache, composer and all, until the refetch behind it came back 404. `removeQueries` gets
+     * both properties at once: the entry stops existing, and with nothing observing it there is no
+     * refetch for the 404 to answer. The one key rather than the `botChatKeys.all` prefix, because
+     * every other conversation's cached detail is still true.
+     *
+     * The roster invalidation is returned, and so awaited by query-core, because
+     * `deleteConversation.isPending` is what keeps the menu's button reading "Deleting…" until the
+     * row has actually gone.
+     */
+    onSuccess: (_data, botChatId) => {
+      queryClient.removeQueries({ queryKey: botChatKeys.detail(botChatId) });
+      return queryClient.invalidateQueries({ queryKey: rosterKeys.all });
+    },
   });
 }

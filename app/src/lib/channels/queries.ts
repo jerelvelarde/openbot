@@ -41,11 +41,34 @@ export const channelKeys = {
   detail: (channelId: string) => ["channels", "detail", channelId] as const,
 };
 
+/**
+ * The one place a channel id becomes a request path, id encoded.
+ *
+ * ENCODED, WHICH IT WAS NOT. Every site here and in `mutations.ts` interpolated the id into a
+ * template of its own, and the failure that produces is not the usual "unsafe input" one — it is
+ * quieter and worse. An id carrying `%3F` reaches the server as `/api/channels/x?y`, which reads the
+ * id as `x` and answers about a DIFFERENT conversation: a pin, an archive, a read stamp or a DELETE
+ * aimed at one channel landing on another. `%2F` splits the path instead, so the route stops matching
+ * and the answer is a 404 the screen reports as "not here any more".
+ *
+ * A FUNCTION AND NOT SIX `encodeURIComponent` CALLS, because six of those is six chances to write the
+ * seventh without one — which is exactly how this happened: `checkKnown` (lib/copilot/bot-thread.ts)
+ * encoded, inline, where none of its siblings could see it. The base path does not appear at a call
+ * site any more, so the unencoded form is no longer something a sibling can be written in. Same shape
+ * and same reason as `componentPath` in lib/components/mutations.ts, which this follows.
+ *
+ * Lives here rather than in `mutations.ts` only because both files need it and mutations already
+ * imports from queries.
+ */
+export function channelPath(channelId: string): string {
+  return `/api/channels/${encodeURIComponent(channelId)}`;
+}
+
 export function channelQueryOptions(channelId: string) {
   return queryOptions({
     queryKey: channelKeys.detail(channelId),
     queryFn: async (): Promise<AgentChannel> => {
-      return client(`/api/channels/${channelId}`, "channel", {
+      return client(channelPath(channelId), "channel", {
         fallback: "Could not load this channel",
       });
     },

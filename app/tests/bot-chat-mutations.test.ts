@@ -13,6 +13,7 @@ import {
   markBotChatReadMutationOptions,
   recordBotChatActivityMutationOptions,
   setBotChatArchivedMutationOptions,
+  setBotChatPinnedMutationOptions,
 } from "../src/lib/bot-chats/mutations";
 import {
   BotChatMissingError,
@@ -89,12 +90,19 @@ function capturingFetch(status: number, body: unknown) {
 
 function invalidationRecorder() {
   const invalidated: unknown[] = [];
+  // Recorded apart from the invalidations, because they are opposites: an invalidation asks for a
+  // refetch, a removal asks for the cache entry to stop existing. Delete does one of each, to two
+  // different keys, so the assertions have to be able to tell them apart.
+  const removed: unknown[] = [];
   const queryClient = {
     invalidateQueries: async (filter: unknown) => {
       invalidated.push(filter);
     },
+    removeQueries: (filter: unknown) => {
+      removed.push(filter);
+    },
   } as unknown as QueryClient;
-  return { queryClient, invalidated };
+  return { queryClient, invalidated, removed };
 }
 
 /**
@@ -229,11 +237,14 @@ test("restoring says so in its own words when the server sends none", async () =
   ).rejects.toThrow("Could not restore this conversation");
 });
 
-test("deleting invalidates the roster and deliberately NOT the detail query", async () => {
+test("deleting invalidates the roster and deliberately does NOT refetch the detail query", async () => {
   /*
    * The asymmetry with archive, which is documented as deliberate and was pinned by nothing: a
    * well-meaning "make these two consistent" edit would have passed. The open chat's detail query
    * would refetch into the fresh 404 and flash an error before the navigate-home lands.
+   *
+   * Refetching is the thing refused here, not caring about the entry: the detail cache is REMOVED,
+   * which is asserted two tests from the end of this file, and removing is not invalidating.
    */
   const seen = capturingFetch(204, undefined);
   const { queryClient, invalidated } = invalidationRecorder();
@@ -789,4 +800,196 @@ test("the title is read after the refetch it asked for, not beside it", async ()
   ).toBe("Tuesday flights");
   // ...and because it was read after that, nothing asks for the title a second time.
   expect(stillMissing).toEqual([]);
+});
+
+/**
+ * THE ID IN THE PATH, raw at every one of these sites until now.
+ *
+ * Not the ordinary "unsafe input" failure but a quieter and worse one: an id carrying `%3F` reaches
+ * the server as `/api/bot-chats/x?y`, which reads the id as `x` and answers about a DIFFERENT
+ * conversation — an archive, a read stamp or a DELETE aimed at one landing on another. `botChatPath`
+ * is the only way to build one of these now, which is what stops the next sibling being written
+ * without it: `checkKnown` (lib/copilot/bot-thread.ts) already encoded, inline, where none of its
+ * siblings could see that it did.
+ */
+
+test("every write against a bot chat encodes the id into its path", async () => {
+  const seen = capturingFetch(204, undefined);
+  const { queryClient } = invalidationRecorder();
+  // A slash and a question mark: the two that change which route, and which row, the server reads.
+  const id = "botchat/1?other=1";
+
+  await setBotChatPinnedMutationOptions(queryClient).mutationFn?.({
+    botChatId: id,
+    pinned: true,
+  });
+  await setBotChatArchivedMutationOptions(queryClient).mutationFn?.({
+    archived: true,
+    botChatId: id,
+  });
+  await markBotChatReadMutationOptions(queryClient).mutationFn?.(id);
+  await deleteBotChatMutationOptions(queryClient).mutationFn?.(id);
+  await recordBotChatActivityMutationOptions(queryClient).mutationFn?.({
+    agentId: null,
+    at: "2026-08-25T12:00:00.000Z",
+    botChatId: id,
+    derivesTitle: false,
+    text: "Ship it",
+  });
+
+  const encoded = encodeURIComponent(id);
+  expect(seen.map((request) => request.url)).toEqual([
+    `/api/bot-chats/${encoded}/pin`,
+    `/api/bot-chats/${encoded}/archive`,
+    `/api/bot-chats/${encoded}/read`,
+    `/api/bot-chats/${encoded}`,
+    `/api/bot-chats/${encoded}/activity`,
+  ]);
+  // The whole point of it: no site sent a path the server would read as a different id.
+  for (const request of seen) {
+    expect(request.url).not.toContain("?other=");
+  }
+});
+
+test("reading one bot chat encodes the id too", async () => {
+  const seen = capturingFetch(200, { botChat: { id: "botchat-1" } });
+  const id = "botchat/1?other=1";
+
+  await botChatQueryOptions(id).queryFn?.(undefined as never);
+
+  expect(seen[0]?.url).toBe(`/api/bot-chats/${encodeURIComponent(id)}`);
+});
+
+/**
+ * A 200 CARRYING SOMETHING THAT IS NOT JSON, and an ENVELOPE THAT HAS DRIFTED.
+ *
+ * Both of these paths parse their own success — they are on `tryClient`, because each needs a status
+ * the `client` wrapper does not surface — and both parsed it outside any guard that held a sentence.
+ * A proxy error page or a captive portal answering 200 with HTML threw a raw `SyntaxError` at the
+ * screen; an envelope without its key resolved `undefined` typed as a `BotChat`, which the caller
+ * then reads `.id` off. `unwrap` (lib/client.ts) owns both, so the sentence is the endpoint's own.
+ */
+
+test("an adopt answered with something that is not JSON says the endpoint's sentence", async () => {
+  globalThis.fetch = (async () =>
+    new Response("<html>502</html>", {
+      headers: { "content-type": "text/html" },
+      status: 200,
+    })) as unknown as typeof fetch;
+  const { queryClient } = invalidationRecorder();
+
+  // Caught rather than read off a rejected promise, the same way "a 500 is NOT reported as a
+  // conversation that is gone" does above: the assertion is about which TYPE was thrown.
+  let caught: unknown;
+  try {
+    await adoptBotChatMutationOptions(queryClient).mutationFn?.({
+      agentId: "agent-1",
+      threadId: "thread-1",
+    });
+  } catch (error) {
+    caught = error;
+  }
+
+  expect((caught as Error).message).toBe("Could not open this conversation");
+  // And NOT the one status this caller treats as a success: a body it could not read is not a
+  // conversation somebody else already has.
+  expect(caught).not.toBeInstanceOf(AdoptConflictError);
+});
+
+test("an adopt whose envelope carries no botChat fails instead of resolving nothing", async () => {
+  capturingFetch(200, { botchat: { id: "botchat-1" } });
+  const { queryClient } = invalidationRecorder();
+
+  await expect(
+    adoptBotChatMutationOptions(queryClient).mutationFn?.({
+      agentId: "agent-1",
+      threadId: "thread-1",
+    }),
+  ).rejects.toThrow("Could not open this conversation");
+});
+
+test("a read answered with something that is not JSON is not reported as a deletion", async () => {
+  globalThis.fetch = (async () =>
+    new Response("<html>502</html>", {
+      headers: { "content-type": "text/html" },
+      status: 200,
+    })) as unknown as typeof fetch;
+
+  let caught: unknown;
+  try {
+    await botChatQueryOptions("botchat-1").queryFn?.(undefined as never);
+  } catch (error) {
+    caught = error;
+  }
+
+  // The screen writes "Could not load this conversation" itself and puts this underneath, so the
+  // sentence is the detail line — and it must not be `BotChatMissingError`, which is the one that
+  // tells somebody their conversation is gone.
+  expect(caught).not.toBeInstanceOf(BotChatMissingError);
+  expect((caught as Error).message).toBe(
+    "The server's reply could not be read.",
+  );
+});
+
+test("a read whose envelope carries no botChat fails instead of resolving nothing", async () => {
+  capturingFetch(200, { botchat: { id: "botchat-1" } });
+
+  await expect(
+    botChatQueryOptions("botchat-1").queryFn?.(undefined as never),
+  ).rejects.toThrow("The server's reply could not be read.");
+});
+
+/**
+ * WHAT DELETING LEAVES BEHIND, which for five minutes was a working copy of the conversation.
+ *
+ * `confirmDelete` (app-sidebar/roster-row.tsx) navigates home BEFORE it deletes, deliberately. So the
+ * detail query is unobserved by the time `onSuccess` runs — an invalidation would have refetched
+ * nothing, and doing nothing left the cached row to sit out the client's default five-minute
+ * `gcTime`. Back inside that window rendered the deleted conversation from cache, composer and all,
+ * until the refetch behind it came back 404.
+ */
+
+test("deleting removes the deleted bot chat's detail cache", async () => {
+  capturingFetch(204, undefined);
+  const queryClient = new QueryClient();
+  queryClient.setQueryData(botChatKeys.detail("botchat-1"), {
+    active: true,
+    agentId: "agent-1",
+    archived: false,
+    id: "botchat-1",
+    threadId: "thread-1",
+    title: "Ship it",
+  });
+  const options = deleteBotChatMutationOptions(queryClient);
+
+  await options.mutationFn?.("botchat-1");
+  await options.onSuccess?.(
+    undefined as never,
+    "botchat-1",
+    undefined as never,
+    undefined as never,
+  );
+
+  expect(
+    queryClient.getQueryData(botChatKeys.detail("botchat-1")),
+  ).toBeUndefined();
+});
+
+test("deleting removes only the deleted conversation's detail, and invalidates the roster", async () => {
+  capturingFetch(204, undefined);
+  const { queryClient, invalidated, removed } = invalidationRecorder();
+  const options = deleteBotChatMutationOptions(queryClient);
+
+  await options.mutationFn?.("botchat-1");
+  await options.onSuccess?.(
+    undefined as never,
+    "botchat-1",
+    undefined as never,
+    undefined as never,
+  );
+
+  // The one key and not the `botChatKeys.all` prefix: every other conversation's cached detail is
+  // still true, and archive above still leaves its own detail entirely alone.
+  expect(removed).toEqual([{ queryKey: botChatKeys.detail("botchat-1") }]);
+  expect(invalidated).toEqual([{ queryKey: rosterKeys.all }]);
 });

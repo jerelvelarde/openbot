@@ -14,7 +14,7 @@ import {
   setChannelArchivedMutationOptions,
   setChannelPinnedMutationOptions,
 } from "../src/lib/channels/mutations";
-import { channelKeys } from "../src/lib/channels/queries";
+import { channelKeys, channelQueryOptions } from "../src/lib/channels/queries";
 import {
   rosterKeys,
   type RosterItem,
@@ -85,12 +85,19 @@ function capturingFetch(status: number, body: unknown) {
 
 function invalidationRecorder() {
   const invalidated: unknown[] = [];
+  // Recorded separately from the invalidations, because they are opposites: an invalidation asks for
+  // a refetch, and a removal asks for the cache entry to stop existing. Delete does both, to two
+  // different keys, and the assertions have to be able to tell them apart.
+  const removed: unknown[] = [];
   const queryClient = {
     invalidateQueries: async (filter: unknown) => {
       invalidated.push(filter);
     },
+    removeQueries: (filter: unknown) => {
+      removed.push(filter);
+    },
   } as unknown as QueryClient;
-  return { queryClient, invalidated };
+  return { queryClient, invalidated, removed };
 }
 
 test("pinning PUTs the flag to the channel's pin route and invalidates the roster", async () => {
@@ -504,4 +511,169 @@ test("marking read returns the identical cache for a list that does not hold the
   // And the patch itself still happened, in both lists that hold the row.
   expect(after.active?.pages[1]?.items[0]?.lastReadAt).not.toBeNull();
   expect(after.all?.pages[0]?.items[0]?.lastReadAt).not.toBeNull();
+});
+
+/**
+ * THE ID IN THE PATH, which was interpolated raw at every one of these sites.
+ *
+ * Not merely unsafe — silently wrong, and wrong in the worst available direction. An id carrying
+ * `%3F` arrives at the server as `/api/channels/x?y`, which reads the id as `x` and answers about a
+ * DIFFERENT conversation: a pin, an archive or a delete aimed at one channel landing on another.
+ * `channelPath` is the only way to build one of these now, so the unencoded form is not a thing a
+ * sibling can be written in.
+ */
+
+test("every write against a channel encodes the id into its path", async () => {
+  const seen = capturingFetch(204, undefined);
+  const { queryClient } = invalidationRecorder();
+  // A slash and a question mark: the two that change which route, and which row, the server reads.
+  const id = "channel/1?other=1";
+
+  await setChannelPinnedMutationOptions(queryClient).mutationFn?.({
+    channelId: id,
+    pinned: true,
+  });
+  await setChannelArchivedMutationOptions(queryClient).mutationFn?.({
+    archived: true,
+    channelId: id,
+  });
+  await markChannelReadMutationOptions(queryClient).mutationFn?.(id);
+  await deleteChannelMutationOptions(queryClient).mutationFn?.(id);
+  await recordChannelActivityMutationOptions().mutationFn?.({
+    agentId: null,
+    at: "2026-08-25T12:00:00.000Z",
+    channelId: id,
+    text: "Ship it",
+  });
+
+  const encoded = encodeURIComponent(id);
+  expect(seen.map((request) => request.url)).toEqual([
+    `/api/channels/${encoded}/pin`,
+    `/api/channels/${encoded}/archive`,
+    `/api/channels/${encoded}/read`,
+    `/api/channels/${encoded}`,
+    `/api/channels/${encoded}/activity`,
+  ]);
+  // And the whole point of the encoding: no site sent a path the server would read as another id.
+  for (const request of seen) {
+    expect(request.url).not.toContain("?other=");
+  }
+});
+
+test("reading one channel encodes the id too", async () => {
+  const seen = capturingFetch(200, { channel: { id: "channel-1" } });
+  const id = "channel/1?other=1";
+
+  await channelQueryOptions(id).queryFn?.(undefined as never);
+
+  expect(seen[0]?.url).toBe(`/api/channels/${encodeURIComponent(id)}`);
+});
+
+/**
+ * WHAT CREATING A CHANNEL HANDS BACK, which the caller reads `.threadId` and `.id` off immediately
+ * (`useStartChannel` in lib/channels/start.ts seeds, stashes and navigates on all three fields).
+ *
+ * The envelope used to be unwrapped here, outside `client` and outside every guard: a 200 carrying a
+ * proxy's HTML error page threw a raw `SyntaxError`, and a 200 whose envelope had drifted resolved
+ * `undefined` typed as `AgentChannel` — a success, with no error for any screen to render, followed by
+ * a `TypeError` on the first field read.
+ */
+
+test("creating a channel returns the channel out of its envelope", async () => {
+  capturingFetch(200, {
+    channel: {
+      active: true,
+      agentIds: ["agent-1"],
+      archived: false,
+      id: "channel-1",
+      name: "Assistant channel",
+      threadId: "thread-1",
+    },
+  });
+  const { queryClient } = invalidationRecorder();
+
+  const created = await createChannelMutationOptions(queryClient).mutationFn?.([
+    "agent-1",
+  ]);
+
+  expect(created?.id).toBe("channel-1");
+  expect(created?.threadId).toBe("thread-1");
+});
+
+test("a create whose envelope carries no channel fails instead of resolving nothing", async () => {
+  capturingFetch(200, { chanel: { id: "channel-1" } });
+  const { queryClient } = invalidationRecorder();
+
+  await expect(
+    createChannelMutationOptions(queryClient).mutationFn?.(["agent-1"]),
+  ).rejects.toThrow("Could not start a channel");
+});
+
+test("a create answered with something that is not JSON says the endpoint's sentence", async () => {
+  globalThis.fetch = (async () =>
+    new Response("<html>502</html>", {
+      headers: { "content-type": "text/html" },
+      status: 200,
+    })) as unknown as typeof fetch;
+  const { queryClient } = invalidationRecorder();
+
+  await expect(
+    createChannelMutationOptions(queryClient).mutationFn?.(["agent-1"]),
+  ).rejects.toThrow("Could not start a channel");
+});
+
+/**
+ * WHAT DELETING LEAVES BEHIND, which for five minutes was a working copy of the conversation.
+ *
+ * `confirmDelete` (app-sidebar/roster-row.tsx) navigates home BEFORE it deletes, deliberately and for
+ * a good reason of its own. The consequence is that the detail query is unobserved by the time this
+ * `onSuccess` runs — so an invalidation would have refetched nothing, and doing nothing left the
+ * cached row to sit out the client's default five-minute `gcTime`. Pressing Back inside that window
+ * rendered the deleted conversation from cache, complete with a working composer, until the refetch
+ * behind it came back 404.
+ */
+
+test("deleting removes the deleted channel's detail cache", async () => {
+  capturingFetch(204, undefined);
+  const queryClient = new QueryClient();
+  queryClient.setQueryData(channelKeys.detail("channel-1"), {
+    active: true,
+    agentIds: ["agent-1"],
+    archived: false,
+    id: "channel-1",
+    name: "Assistant channel",
+    threadId: "thread-1",
+  });
+  const options = deleteChannelMutationOptions(queryClient);
+
+  await options.mutationFn?.("channel-1");
+  await options.onSuccess?.(
+    undefined as never,
+    "channel-1",
+    undefined as never,
+    undefined as never,
+  );
+
+  expect(
+    queryClient.getQueryData(channelKeys.detail("channel-1")),
+  ).toBeUndefined();
+});
+
+test("deleting removes only the deleted channel, and leaves the others alone", async () => {
+  capturingFetch(204, undefined);
+  const { queryClient, invalidated, removed } = invalidationRecorder();
+  const options = deleteChannelMutationOptions(queryClient);
+
+  await options.mutationFn?.("channel-1");
+  await options.onSuccess?.(
+    undefined as never,
+    "channel-1",
+    undefined as never,
+    undefined as never,
+  );
+
+  // The one key, not the `channelKeys.all` prefix: another channel's cached detail is still true, and
+  // the sidebar is still the only reader of the list, which is what the roster invalidation serves.
+  expect(removed).toEqual([{ queryKey: channelKeys.detail("channel-1") }]);
+  expect(invalidated).toEqual([{ queryKey: rosterKeys.all }]);
 });

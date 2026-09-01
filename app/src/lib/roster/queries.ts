@@ -68,10 +68,20 @@ export function rosterListQueryOptions(status: RosterStatus) {
     queryFn: async ({ pageParam }): Promise<RosterPage> => {
       const parameters = new URLSearchParams({ status });
       if (pageParam) parameters.set("cursor", pageParam as string);
-      const response = await client(`/api/roster?${parameters.toString()}`, {
+      /*
+       * `null` for the envelope key, because this endpoint's body IS the page — `items` and
+       * `nextCursor` together, with nothing wrapped around them to unwrap.
+       *
+       * What passing a key at all buys is the parse happening inside `client`, where the `fallback`
+       * lives. Read back out here, a 200 carrying a proxy's HTML error page arrived on screen as
+       * `SyntaxError: Unexpected token '<', "<html>"… is not valid JSON`, rendered by the sidebar as
+       * its empty-state title under `role="alert"` and above the words "Nothing has been lost" —
+       * which is the one place in this app a void is most likely to be read as
+       * "my conversations are gone".
+       */
+      return client<RosterPage>(`/api/roster?${parameters.toString()}`, null, {
         fallback: "Could not load your conversations",
       });
-      return (await response.json()) as RosterPage;
     },
     getNextPageParam: (page: RosterPage) => page.nextCursor ?? undefined,
     select: (data): RosterItem[] => data.pages.flatMap((page) => page.items),
