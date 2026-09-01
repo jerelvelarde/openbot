@@ -94,6 +94,99 @@ describe("audit payload redaction", () => {
     });
   });
 
+  /*
+   * Redaction is not destruction, asserted one shape at a time.
+   *
+   * `Object.entries` is empty for all four of these, so the pass rebuilt each of them as `{}` and the
+   * row said a field had been there and nothing about what it held. That is worse than dropping the
+   * key: a reader is shown a fact that is missing and cannot tell whether the payload was empty or the
+   * trail ate it, on the surface whose whole argument is that it gets read to rule things out.
+   *
+   * Each case asserts the value survives AND that a sensitive key inside it is still redacted, because
+   * the cheap way to make these pass is to hand the value back untouched.
+   */
+  test("keeps a Date as the instant it names", () => {
+    expect(
+      redactAuditPayload({ at: new Date("2026-08-31T12:00:00.123Z") }),
+    ).toEqual({ at: "2026-08-31T12:00:00.123Z" });
+  });
+
+  test("keeps an unreadable Date as the null JSON would have written", () => {
+    // `toISOString()` throws on one, and `JSON.stringify(new Date(NaN))` is `null`, so this is the
+    // answer the payload would have carried had redaction never looked at it.
+    expect(redactAuditPayload({ at: new Date(Number.NaN) })).toEqual({
+      at: null,
+    });
+  });
+
+  test("keeps a Map's entries, redacting the sensitive ones", () => {
+    expect(
+      redactAuditPayload({
+        headers: new Map([
+          ["authorization", "Bearer secret"],
+          ["content-type", "application/json"],
+        ]),
+      }),
+    ).toEqual({
+      headers: {
+        authorization: "[REDACTED]",
+        "content-type": "application/json",
+      },
+    });
+  });
+
+  test("keeps a Set's members, redacting inside them", () => {
+    expect(
+      redactAuditPayload({
+        attempts: new Set([{ tool: "search", token: "secret" }, "plain"]),
+      }),
+    ).toEqual({
+      attempts: [{ tool: "search", token: "[REDACTED]" }, "plain"],
+    });
+  });
+
+  test("keeps what an Error says, and what provoked it", () => {
+    const cause = new Error("password rejected");
+    expect(
+      redactAuditPayload({ error: new TypeError("bad bound", { cause }) }),
+    ).toEqual({
+      error: {
+        name: "TypeError",
+        message: "bad bound",
+        cause: { name: "Error", message: "password rejected" },
+      },
+    });
+  });
+
+  test("describes an object whose state no key would have shown", () => {
+    /*
+     * The general case behind the four above, rather than a fifth special case. Anything holding its
+     * state somewhere other than its own enumerable keys came back as `{}`, and `Date`, `Map`, `Set`
+     * and `Error` are the four of those that turn up in a payload often enough to be worth a shape of
+     * their own. A `RegExp` is not, and being told what it was still beats being told nothing.
+     */
+    expect(redactAuditPayload({ pattern: /^bot_/i })).toEqual({
+      pattern: "/^bot_/i",
+    });
+  });
+
+  test("survives a payload that contains itself", () => {
+    /*
+     * Not a hypothetical shape. `createAuditRecorder` catches a failed write, but `recordAuditEvent`
+     * redacts BEFORE the store is reached and several callers reach it directly, so a stack overflow
+     * here is thrown out of the route that had already done the thing it was auditing.
+     */
+    const payload: Record<string, unknown> = { tool: "search" };
+    payload.self = payload;
+    payload.token = "secret";
+
+    expect(redactAuditPayload(payload)).toEqual({
+      tool: "search",
+      self: "[CIRCULAR]",
+      token: "[REDACTED]",
+    });
+  });
+
   test("writes only the redacted payload to the audit store", async () => {
     const writes: unknown[] = [];
 
@@ -122,7 +215,122 @@ describe("audit payload redaction", () => {
   });
 });
 
+/**
+ * The two triggers that carry the append-only guarantee, and what each has to be firing on.
+ *
+ * One trigger per operation because a row-level trigger cannot fire on TRUNCATE — 0012 has the
+ * argument. Both fire the same function, so the refusal is written once, and both are named here so a
+ * chain that installs one and loses the other fails on the half that went missing.
+ */
+const GUARD_TRIGGERS = [
+  {
+    trigger: "audit_events_append_only",
+    // Once per row, because UPDATE and DELETE are operations on rows.
+    definition: "BEFORE UPDATE OR DELETE ON audit_events FOR EACH ROW",
+  },
+  {
+    trigger: "audit_events_no_truncate",
+    // Once per statement, because TRUNCATE takes the whole table and has no rows to be given.
+    definition: "BEFORE TRUNCATE ON audit_events FOR EACH STATEMENT",
+  },
+];
+
+/**
+ * Every statement in the chain that installs or removes one named trigger, in chain order.
+ *
+ * A GUARD ON A LITERAL SQL STRING IS NOT A GUARD, which is what this function exists to stop being
+ * true here. The check used to be `not.toContain("DROP TRIGGER audit_events_append_only")`, and the
+ * repo's own house style walks straight past it: 0012 writes `DROP TRIGGER IF EXISTS
+ * audit_events_no_truncate ON audit_events;`, so the two words the assertion looks for never appear
+ * adjacent. Verified rather than reasoned about — a probe migration dropping both triggers in that
+ * style passed the old assertions. So the trigger is matched by NAME, through a pattern that survives
+ * `IF EXISTS`, the `ON <table>` clause, a quoted identifier, any whitespace including a newline mid-
+ * statement, and either case.
+ *
+ * BOTH KINDS, because "does the chain contain a drop" is the wrong question. 0012 legitimately drops
+ * `audit_events_no_truncate` and creates it again in the next statement, which is how an idempotent
+ * re-install is written and must not be a failure. What has to hold is that the LAST thing the chain
+ * says about each trigger is that it exists, so the assertion is about order rather than presence.
+ * `CREATE OR REPLACE TRIGGER` is matched as well as plain `CREATE TRIGGER`: nothing in the chain uses
+ * it today, and a guard that only recognises the spelling currently in use is the defect above again.
+ */
+function guardTriggerStatements(
+  chain: string,
+  trigger: string,
+): { verb: "create" | "drop"; statement: string }[] {
+  const pattern = new RegExp(
+    String.raw`\b(drop|create)\s+(?:or\s+replace\s+)?trigger\s+(?:if\s+(?:not\s+)?exists\s+)?"?${trigger}"?\b`,
+    "gi",
+  );
+  return [...chain.matchAll(pattern)].map((match) => {
+    const end = chain.indexOf(";", match.index);
+    return {
+      verb: match[1]?.toLowerCase() === "drop" ? "drop" : "create",
+      statement: chain
+        .slice(match.index, end === -1 ? undefined : end)
+        .replaceAll(/\s+/g, " "),
+    };
+  });
+}
+
 describe("audit event immutability", () => {
+  /*
+   * The matcher above, against chains this file writes, so its teeth do not depend on the migrations.
+   *
+   * The assertion below can only fail when somebody writes the migration that breaks it, which is
+   * exactly when nobody is reading this file. These cases fail the moment the pattern stops
+   * recognising a spelling — including the four the old literal missed, each named here so a later
+   * simplification of the regex cannot quietly drop one.
+   */
+  test.each([
+    ["CREATE TRIGGER audit_events_append_only\nBEFORE UPDATE ON x", ["create"]],
+    ["DROP TRIGGER audit_events_append_only;", ["drop"]],
+    // The house style, which is the spelling that defeated the literal assertion.
+    [
+      "DROP TRIGGER IF EXISTS audit_events_append_only ON audit_events;",
+      ["drop"],
+    ],
+    ["drop trigger if exists audit_events_append_only;", ["drop"]],
+    ['DROP TRIGGER IF EXISTS "audit_events_append_only";', ["drop"]],
+    ["DROP  TRIGGER\n  IF EXISTS\n  audit_events_append_only", ["drop"]],
+    ["CREATE OR REPLACE TRIGGER audit_events_append_only", ["create"]],
+    // A drop and a re-install is one statement about the trigger followed by another, in that order.
+    [
+      "DROP TRIGGER IF EXISTS audit_events_append_only ON audit_events;\nCREATE TRIGGER audit_events_append_only BEFORE UPDATE ON audit_events",
+      ["drop", "create"],
+    ],
+    // A different trigger with the same prefix is not this trigger.
+    ["DROP TRIGGER audit_events_append_only_v2 ON audit_events;", []],
+    ["-- audit_events_append_only is installed by 0000", []],
+  ])("reads %p as %p", (chain: string, expected: string[]) => {
+    expect(
+      guardTriggerStatements(chain, "audit_events_append_only").map(
+        (statement) => statement.verb,
+      ),
+    ).toEqual(expected);
+  });
+
+  /*
+   * The statement is captured, not only counted, because the assertion below reads it.
+   *
+   * Whitespace-collapsed on the way out so a definition broken across lines — which is how every one
+   * in this chain is written — can be compared against the single-line clause it is expected to carry.
+   */
+  test("captures the definition a trigger was installed with", () => {
+    expect(
+      guardTriggerStatements(
+        "CREATE TRIGGER audit_events_append_only\nBEFORE UPDATE OR DELETE ON audit_events\nFOR EACH ROW EXECUTE FUNCTION prevent_audit_event_mutation();\n",
+        "audit_events_append_only",
+      ),
+    ).toEqual([
+      {
+        verb: "create",
+        statement:
+          "CREATE TRIGGER audit_events_append_only BEFORE UPDATE OR DELETE ON audit_events FOR EACH ROW EXECUTE FUNCTION prevent_audit_event_mutation()",
+      },
+    ]);
+  });
+
   /*
    * What the guard DOES is proved against a real database in
    * audit-retention.integration.test.ts. This asserts only that it is still installed by some
@@ -146,13 +354,47 @@ describe("audit event immutability", () => {
       )
     ).join("\n");
 
-    expect(chain).toContain("FUNCTION prevent_audit_event_mutation");
-    expect(chain).toContain("BEFORE UPDATE OR DELETE ON audit_events");
-    expect(chain).toContain("BEFORE TRUNCATE ON audit_events");
+    /*
+     * The refusal itself, which is the one thing here a whole-chain search can honestly assert.
+     *
+     * `CREATE OR REPLACE FUNCTION` means the function has one name and the newest definition wins, so
+     * "this text is somewhere in the chain" is a weak claim about it either way — 0007 and 0012 both
+     * defined it and both spellings are still in the files. It stays because losing the phrase
+     * entirely would mean nothing raises, and that is worth a line.
+     */
     expect(chain).toContain("Audit events are append-only");
-    // A later migration removing either trigger would otherwise satisfy every line above.
-    expect(chain).not.toContain("DROP TRIGGER audit_events_append_only");
-    expect(chain).not.toContain("DROP TRIGGER audit_events_no_truncate");
+
+    /*
+     * A later migration removing either trigger would otherwise satisfy every line above.
+     *
+     * Said as "the chain ends with each trigger installed, firing on what it has to fire on" rather
+     * than "the chain contains no drop", which was both too weak and too strong: it missed the house
+     * style entirely, and had it not, it would have failed on 0012's own legitimate drop-and-recreate.
+     *
+     * THE DEFINITION IS READ FROM THE LAST INSTALL, not looked for anywhere in the chain, and that is
+     * the other half of the same defect. A migration chain only grows, so `toContain` over the join
+     * can never fail once a string has been written once: `expect(chain).toContain("BEFORE UPDATE OR
+     * DELETE ON audit_events")` was satisfied by 0000 for good, and would have gone on passing while a
+     * later migration re-created the trigger `BEFORE INSERT`. An assertion that cannot fail is not
+     * weaker than the one it replaced, it is the same tautology the drop check was.
+     *
+     * Compared as one string per trigger so a failure says which trigger and what it ended up firing
+     * on, rather than that two arrays of booleans differ.
+     */
+    expect(
+      GUARD_TRIGGERS.map(({ trigger }) => {
+        const last = guardTriggerStatements(chain, trigger).at(-1);
+        if (!last || last.verb === "drop") {
+          return `${trigger}: ${last ? "dropped" : "never installed"}`;
+        }
+        return `${trigger}: ${last.statement}`;
+      }),
+    ).toEqual(
+      GUARD_TRIGGERS.map(
+        ({ trigger, definition }) =>
+          `${trigger}: CREATE TRIGGER ${trigger} ${definition} EXECUTE FUNCTION prevent_audit_event_mutation()`,
+      ),
+    );
   });
 });
 
@@ -388,7 +630,16 @@ describe("paging the audit trail", () => {
     for (const [index, stamp] of PAGED_STAMPS.entries()) {
       await seedEvent(PAGING, stamp, index);
     }
-    await seedEvent(RANGE, "2020-05-06T07:08:09.000000Z", 0);
+    /*
+     * The newer of the two carries microseconds, and that is the whole point of it.
+     *
+     * Both used to sit on a whole millisecond, which is the one case where a millisecond-precision
+     * bound and the column agree exactly — so the test below asserted both ends and could only ever
+     * have caught an end that was exclusive, never an end that was truncating. `.000456` is what an
+     * ordinary row looks like: `created_at` defaults from `now()`, so every row written by the
+     * product has a remainder, and a whole millisecond is the unrepresentative case.
+     */
+    await seedEvent(RANGE, "2020-05-06T07:08:09.000456Z", 0);
     await seedEvent(RANGE, "2020-05-06T07:08:08.000000Z", 1);
   });
 
@@ -436,6 +687,40 @@ describe("paging the audit trail", () => {
       `${RANGE}-0`,
       `${RANGE}-1`,
     ]);
+  });
+
+  /*
+   * The bound as a reader can actually name it, rather than as a literal this file chose.
+   *
+   * The test above hard-codes the millisecond, which is right for pinning the rule and leaves the
+   * story that produces the bug untold: nobody types `.000Z`, they copy a timestamp off the trail and
+   * paste it into the other end of the filter. `createdAt` is millisecond-precision by construction —
+   * `row.createdAt.toISOString()`, and a `Date` holds no more — so the value on the screen is the
+   * column floored, and a floor only ever cuts downward. That is the asymmetry: it lands a `from`
+   * below its own row and a `to` below it too, which includes the row at one end and drops it at the
+   * other.
+   *
+   * Asserted through the reader's own output so it cannot drift from the format the screen is given.
+   */
+  test("includes the row a bound was copied from, at either end", async () => {
+    const reader = createAuditReader(database);
+    const page = await reader.list({ limit: 10, targetType: RANGE });
+    const newest = page.events.find(
+      (event) => event.targetId === `${RANGE}-0`,
+    ) as { createdAt: string };
+
+    expect(newest.createdAt).toBe("2020-05-06T07:08:09.000Z");
+
+    for (const bound of ["from", "to"] as const) {
+      const filtered = await reader.list({
+        limit: 10,
+        targetType: RANGE,
+        [bound]: newest.createdAt,
+      });
+      expect(filtered.events.map((event) => event.targetId)).toContain(
+        `${RANGE}-0`,
+      );
+    }
   });
 
   test("refuses a malformed cursor with a message rather than a 500", async () => {

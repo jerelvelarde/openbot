@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, inArray, lte, sql } from "drizzle-orm";
+import { type SQL, and, desc, eq, gte, inArray, sql } from "drizzle-orm";
 import { HTTPException } from "hono/http-exception";
 import type { Database } from "./db/client";
 import { auditEvents } from "./db/schema";
@@ -429,10 +429,27 @@ export type AuditEventQuery = {
    * most likely to reach for one: a `from` naming the instant a row was written excluded that row, so
    * a date taken off the screen and used as a bound dropped the row it was taken from.
    *
-   * As precise as the string given and no more: a `to` naming a millisecond still ends before a row
-   * 456 microseconds into it, because that is what asking for that instant means. `auditQueryFromUrl`
-   * refuses anything it cannot read as an instant at all, and anything naming a year outside the
-   * range `timestamptz` can be given.
+   * SWAPPING THE COMPARATOR FIXED ONLY THE LOWER END, and the reason is the precision the two ends
+   * are read at. A bound is a string, so it becomes a `Date`, so it carries milliseconds;
+   * `created_at` defaults from `now()` and carries microseconds. Flooring a boundary to the
+   * millisecond moves it downward, which is inside the window at the bottom and outside it at the
+   * top — so `gte` kept the row it named and `lte` went on dropping it, on the same screen, from the
+   * same pasted timestamp. It is the same defect this docblock was written about, surviving in the
+   * half the fix did not touch.
+   *
+   * SO A MILLISECOND MEANS THE WHOLE MILLISECOND at the top end: `to` ends after the last microsecond
+   * of the millisecond it names. That is what the value means to whoever typed it, because a
+   * millisecond is the finest thing anything outside the read can say — `createdAt` on the wire is
+   * `toISOString()`, and the screen prints what it is given. `interval '1 millisecond'` in SQL was
+   * rejected: it would have Postgres parse the bound, and a zone-less bound is read in whatever zone
+   * the session is set to rather than the one `new Date` uses, which is a live question on this
+   * parser and not one to answer accidentally here.
+   *
+   * Both ends therefore round outward, and that is the direction to err on a trail whose argument for
+   * existing is that it gets read to rule things out: a window slightly wider than asked for shows a
+   * row somebody has to dismiss, and a window narrower than asked for is a row they conclude does not
+   * exist. `auditQueryFromUrl` refuses anything it cannot read as an instant at all, and anything
+   * naming a year outside the range `timestamptz` can be given.
    */
   from?: string;
   to?: string;
@@ -518,6 +535,33 @@ function readsAsCursorTimestamp(value: string): boolean {
 }
 
 /**
+ * The `to` bound as the column has to be asked about it: the last microsecond of the millisecond named.
+ *
+ * `AuditEventQuery.to` has the argument for why the whole millisecond is what the value means. This is
+ * the mechanics, and they are deliberately the cursor's mechanics: the boundary is rendered to
+ * microseconds as text and cast in the predicate, exactly as `AuditCursor` describes, rather than
+ * handed to drizzle's timestamp mapper as a `Date` that cannot hold the digits being asked about.
+ *
+ * `new Date(...)` still does the parsing, because that is what accepts the several shapes a bound
+ * arrives in — a plain `2026-08-31` and a full ISO instant are both honest answers to "when" and
+ * `auditQueryFromUrl` says so. What changes is only how the parsed instant is spelled on the way to
+ * Postgres.
+ *
+ * `.999` RATHER THAN A MILLISECOND ADDED TO THE `Date`. Adding one would push a `to` of
+ * `9999-12-31T23:59:59.999Z` — a year `auditQueryFromUrl` accepts — into year 10000, where
+ * `toISOString` switches to the `±YYYYYY` form Postgres reads as a zone displacement and fails on
+ * from inside the read. Widening the fraction cannot leave the second it started in.
+ *
+ * An unparseable `to` throws here, from `toISOString`, as it previously threw from drizzle's mapper on
+ * the same value: `auditQueryFromUrl` is where that is refused with the parameter's name on it, and a
+ * caller reaching `list` directly with an Invalid Date is as wrong as it was before.
+ */
+function inclusiveUpperBound(to: string): SQL {
+  const millisecond = new Date(to).toISOString();
+  return sql`${auditEvents.createdAt} <= ${`${millisecond.slice(0, -1)}999Z`}::timestamptz`;
+}
+
+/**
  * A refusal an administrator can act on, rather than a 500 that says nothing.
  *
  * `app.ts` registers no `onError`, so an ordinary `Error` thrown anywhere under these routes becomes
@@ -562,21 +606,145 @@ function isSensitiveKey(key: string) {
   );
 }
 
-export function redactAuditPayload(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map(redactAuditPayload);
+/**
+ * The four shapes whose whole state lives somewhere other than their own enumerable keys.
+ *
+ * `Object.entries` is empty for every one of them, so the entries pass rebuilt each as `{}` and the
+ * row recorded that a field had been there and nothing whatever about what it held. REDACTION IS NOT
+ * DESTRUCTION, and the difference matters here for the reason `mcp.call_failed` gives at length: a
+ * `[REDACTED]` tells a reader something was withheld, and an empty object tells them the payload was
+ * empty. One is a trail with a gap in it and the other is a trail that is confidently wrong, which is
+ * the shape this file goes out of its way to avoid.
+ *
+ * Each rendering is the one JSON would have written if it could, because that is the form the column
+ * is going to hold and the form the screen already knows how to print. A `Date` is its instant, which
+ * is exactly what `JSON.stringify` does with one via `toJSON` — including `null` for an unreadable
+ * one, where `toISOString()` throws and this function may not. A `Set` is its members written down,
+ * which is an array. A `Map` is its entries, which is an object; the keys go through
+ * `isSensitiveKey` like any other keys, because a Map of headers is the likeliest one to arrive and
+ * `authorization` is in that set. An `Error` is what it says, `name` and `message`, plus whatever
+ * provoked it — `refuseAuditQuery` keeps `cause` for the same reason, and the failed-write line in
+ * `createAuditRecorder` already logs errors as `String(error)`, so name-and-message is the form this
+ * module already reads them in.
+ *
+ * NOT THE STACK. It is the one part of an error that names paths inside the deployment, it is long
+ * enough to bury the fields around it, and nothing that reads this trail asks for it.
+ */
+function redactStructuredValue(
+  value: object,
+  redact: (nested: unknown) => unknown,
+): { rendered: unknown } | undefined {
+  if (value instanceof Date) {
+    return {
+      rendered: Number.isNaN(value.getTime()) ? null : value.toISOString(),
+    };
   }
 
+  if (value instanceof Map) {
+    return {
+      rendered: Object.fromEntries(
+        [...value.entries()].map(([key, nested]) => {
+          // Stringified because a Map key need not be one, and an object column key has to be.
+          const name = String(key);
+          return [name, isSensitiveKey(name) ? "[REDACTED]" : redact(nested)];
+        }),
+      ),
+    };
+  }
+
+  if (value instanceof Set) {
+    return { rendered: [...value].map(redact) };
+  }
+
+  if (value instanceof Error) {
+    return {
+      rendered: {
+        name: value.name,
+        message: value.message,
+        ...(value.cause === undefined ? {} : { cause: redact(value.cause) }),
+      },
+    };
+  }
+
+  return undefined;
+}
+
+/**
+ * Anything the entries pass would have rebuilt as `{}`, described rather than erased.
+ *
+ * The general case behind the four above, and the reason they are four cases rather than a list that
+ * grows: `Date`, `Map`, `Set` and `Error` are the ones that turn up in a payload often enough to earn
+ * a rendering of their own, and the hole they were falling into belongs to every object that keeps its
+ * state off its own keys. A `RegExp`, a `URL`, a `URLSearchParams` all did the same thing and none of
+ * them is worth a branch, so the last resort is to say what the value was.
+ *
+ * ONLY WHEN THE ENTRIES PASS FOUND NOTHING, so an ordinary object is never described instead of
+ * walked, and only when the prototype is not `Object.prototype` — an empty `{}` in a payload means an
+ * empty object and has to stay one.
+ *
+ * `String(value)` is not redacted, and that is the same trade every string in a payload already makes:
+ * redaction is decided by the key a value sits under, and this value's key was checked before it got
+ * here. It is wrapped because a hostile or exotic `toString` may throw, and this function is the one
+ * that may not — the string is a courtesy, and losing it is not worth taking a route down with it.
+ */
+function describeOpaqueValue(value: object): unknown {
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype === Object.prototype || prototype === null) return {};
+  try {
+    return String(value);
+  } catch {
+    return "[UNPRINTABLE]";
+  }
+}
+
+/**
+ * The payload as the trail may hold it: sensitive values withheld, everything else still legible.
+ *
+ * TOTAL AND NON-THROWING, because of where it sits. `recordAuditEvent` redacts BEFORE the store is
+ * reached, so a throw here is not a failed audit write — `createAuditRecorder` catches those and says
+ * so — it is an exception raised inside a route that has already archived the channel, already told
+ * the caller it did, and is now only writing down that it happened. A payload is assembled from
+ * whatever a caller had to hand, so "exotic input" is not a hypothetical.
+ *
+ * A CYCLE IS THE CASE THAT USED TO THROW. `payload.self = payload` recursed until the stack ran out,
+ * and a `RangeError` from here reaches the route as an ordinary `Error`, which `app.ts` answers with
+ * Hono's bare plain-text 500. The seen set is per top-level call and holds only the objects on the
+ * current path — released on the way back out — so a value that legitimately appears twice in a
+ * payload is still rendered twice, and only a value that contains itself is cut.
+ */
+export function redactAuditPayload(value: unknown): unknown {
+  return redactValue(value, new Set<object>());
+}
+
+function redactValue(value: unknown, seen: Set<object>): unknown {
   if (!value || typeof value !== "object") {
     return value;
   }
 
-  return Object.fromEntries(
-    Object.entries(value).map(([key, nestedValue]) => [
-      key,
-      isSensitiveKey(key) ? "[REDACTED]" : redactAuditPayload(nestedValue),
-    ]),
-  );
+  if (seen.has(value)) return "[CIRCULAR]";
+  seen.add(value);
+  try {
+    const redact = (nested: unknown) => redactValue(nested, seen);
+
+    if (Array.isArray(value)) {
+      return value.map(redact);
+    }
+
+    const structured = redactStructuredValue(value, redact);
+    if (structured) return structured.rendered;
+
+    const entries = Object.entries(value);
+    if (entries.length === 0) return describeOpaqueValue(value);
+
+    return Object.fromEntries(
+      entries.map(([key, nestedValue]) => [
+        key,
+        isSensitiveKey(key) ? "[REDACTED]" : redact(nestedValue),
+      ]),
+    );
+  } finally {
+    seen.delete(value);
+  }
 }
 
 export async function recordAuditEvent(
@@ -739,7 +907,7 @@ export function createAuditReader(database: Database): AuditReader {
         query.from
           ? gte(auditEvents.createdAt, new Date(query.from))
           : undefined,
-        query.to ? lte(auditEvents.createdAt, new Date(query.to)) : undefined,
+        query.to ? inclusiveUpperBound(query.to) : undefined,
       ];
       const cursor = query.cursor ? decodeCursor(query.cursor) : undefined;
 
