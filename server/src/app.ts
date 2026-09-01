@@ -652,12 +652,11 @@ export function createApp(
    * The CopilotKit runtime, behind the same session guard as every other API route.
    *
    * This used to say it was "mounted last so its own routing cannot shadow an OpenBot route
-   * declared above". It is not mounted last — `/api/agents`, `/api/route`, `/api/channels`,
-   * `/api/bot-chats`, `/api/roster`, `/api/components`, `/api/plugins`, `/api/agent-tools/call`,
-   * `/api/sandboxed` and `/api/threads` all follow. Nothing is shadowed, because the handler
-   * carries its own `/api/copilotkit` basePath and matches nothing outside it, which is the real
-   * reason order does not matter here — and the reason worth writing down, since the ordering the
-   * old sentence relied on had already stopped being true.
+   * declared above". It is not mounted last, and a replacement sentence that listed what follows was
+   * incomplete within the same review — which is the point: an enumeration of mounts is a thing that
+   * rots, and naming one is how this comment was wrong twice. Nothing is shadowed for a reason that
+   * cannot go stale: the handler carries its own `/api/copilotkit` basePath and matches nothing
+   * outside it, so where it sits in the file does not matter.
    */
   if (copilotHandler) {
     // Mounted at the ROOT with the handler carrying its own basePath. Mounting it at
