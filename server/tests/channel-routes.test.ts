@@ -4,6 +4,7 @@ import {
   beforeEach,
   describe,
   expect,
+  spyOn,
   test,
 } from "bun:test";
 import { randomUUID } from "node:crypto";
@@ -33,7 +34,6 @@ import {
 import { createThreadIdentity } from "../src/channels/thread-identity";
 import { loadConfig } from "../src/config";
 import { createDatabase } from "../src/db/client";
-import { TEST_POOL } from "./support/database";
 import {
   agentProfiles,
   agents,
@@ -44,6 +44,7 @@ import {
   intelligenceChannelMappings,
   users,
 } from "../src/db/schema";
+import { TEST_POOL } from "./support/database";
 import { testEnvironment } from "./support/environment";
 
 const actor = {
@@ -297,6 +298,31 @@ describe("activity input parser", () => {
     },
   );
 
+  test("refuses a year `timestamptz` has no room for", () => {
+    /*
+     * `0000-01-01T00:00:00Z` is the whole of what got this far: it matches the shape above, `Date`
+     * holds it and round-trips it perfectly, and `timestamptz` has no year between 1 BC and AD 1. The
+     * extended `±YYYYYY` forms that break the other way are already refused by the shape.
+     *
+     * Neither existing bound catches it. The clamp only holds the ceiling and this is in the past, and
+     * the store's moves-forwards-only guard does not save it either — `activity.at` is bound in that
+     * guard's `WHERE` as well as in the `SET`, so Postgres parses it to decide whether to write rather
+     * than because it is writing. So `date/time field value out of range` came out of the middle of
+     * the store's transaction, where the parameter no longer has a name, as a 500 for a request that
+     * is simply malformed.
+     */
+    expect(
+      parseActivityInput({
+        text: "One more thing",
+        agentId: null,
+        at: "0000-01-01T00:00:00Z",
+      }),
+    ).toEqual({
+      ok: false,
+      error: "Timestamp must name a year between 0001 and 9999.",
+    });
+  });
+
   test.each([
     ["a minute behind this server", -60_000],
     ["half the allowance ahead of it", MAX_ACTIVITY_CLOCK_SKEW_MS / 2],
@@ -476,29 +502,65 @@ describe("channel routes", () => {
     },
   );
 
-  test("rethrows unexpected errors to the outer Hono error handler", async () => {
+  test("answers an unexpected error as JSON itself, without reaching an outer handler", async () => {
+    /*
+     * THIS TEST USED TO ASSERT THE OPPOSITE, and the seam it pinned was closed deliberately.
+     *
+     * It registered an `onError` answering 418 and proved that an error `mapStoreError` could not
+     * classify reached it. That seam was theoretical: nothing in this server registers an `onError`
+     * (`app.ts` does not), so in production the rethrow reached Hono's default handler and became a
+     * `text/plain "Internal Server Error"` — and `client()` in the browser reads `body.error` and
+     * falls back to its own sentence when the body is not JSON. `roster/routes.ts` was fixed for
+     * exactly that, so while these routes still rethrew, one unreachable database made `GET
+     * /api/roster` readable and `PUT /api/channels/:id/archive` unreadable: a roster whose rows behave
+     * differently depending on which kind they are, which `bot-chats/routes.ts`'s header calls the
+     * failure its shape exists to prevent.
+     *
+     * Not fixed with an app-level `onError`, which is why that was not the alternative: the audit
+     * reader answers its 400s as `HTTPException`s that work only because Hono's DEFAULT handler calls
+     * `err.getResponse()`, and registering one would have turned those into 500s.
+     *
+     * The `onError` below stays, inverted into a guard. It is what makes "this route answered for
+     * itself" an assertion rather than an inference from a status code that a passing rethrow could
+     * also produce.
+     */
     const store = fakeStore({
       create: async () => {
         throw new Error("database disconnected");
       },
     });
     const app = appFor(store);
-    // A status no channel route can produce, so the response can only have come from the handler
-    // below. 418 rather than the 599 that was here: Hono types the statuses it will serialise, and
-    // 599 is not one of them, which is a type error the suite cannot see because it does not compile
-    // its own tests.
+    // Reached only by a rethrow. 418 because no channel route can produce it — and because Hono types
+    // the statuses it will serialise, so the 599 that was here first was a type error the suite cannot
+    // see, not compiling its own tests.
     app.onError((error, context) =>
       context.json({ sentinel: error.message }, 418),
     );
+    const consoleError = spyOn(console, "error").mockImplementation(() => {});
 
-    const response = await app.request("http://openbot.test/", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ agentIds: ["agent-1"] }),
-    });
+    try {
+      const response = await app.request("http://openbot.test/", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ agentIds: ["agent-1"] }),
+      });
 
-    expect(response.status).toBe(418);
-    expect(await json(response)).toEqual({ sentinel: "database disconnected" });
+      expect(response.status).toBe(500);
+      expect(response.headers.get("content-type")).toContain(
+        "application/json",
+      );
+      expect(await json(response)).toEqual({
+        error: "The server could not complete that request.",
+      });
+      // What was thrown may name a host or carry a connection string, so the browser gets none of it
+      // and the log gets all of it. A 500 with no log line is an outage nobody can tell from a typo.
+      expect(consoleError).toHaveBeenCalledTimes(1);
+      expect(String(consoleError.mock.calls[0]?.[0])).toContain(
+        "database disconnected",
+      );
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 
   test.each([

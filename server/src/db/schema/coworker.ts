@@ -141,14 +141,21 @@ export const botChats = pgTable(
      * When this was archived, or null.
      *
      * Hidden, not frozen, the same way `channels.archived_at` is: nothing refuses a write because of
-     * it, and `recordActivity` clears it, because saying something in a conversation is how it comes
-     * back. `get` deliberately does not filter on it either, which is what leaves an archived
+     * it, and `recordActivity` clears it when a PERSON speaks, because that is how a conversation
+     * comes back. A Bot's reply does not clear it — it moves the preview and the recency and leaves
+     * the row archived, so the answer to a question asked before the archive cannot undo the archive.
+     * `get` deliberately does not filter on it either, which is what leaves an archived
      * conversation's URL working.
      *
-     * Two reads do filter on it, and an earlier version of this line said only one did: the roster's
-     * list, and `mostRecent`, which is what the `?agent=` resolver lands on — handing back a
-     * conversation somebody put away would restore it by navigation. Every row this table hands out
-     * carries the state as `archived`, so a row's menu can offer Archive or Restore.
+     * ONE READ FILTERS ON IT TODAY: the roster's list. `BotChatStore.mostRecent` also filters, and an
+     * earlier version of this line called it "what the `?agent=` resolver lands on" — it is not. No
+     * route mounts that method; the browser resolves `?agent=` over `/api/roster`'s active list with
+     * its own rule (`mostRecentBotChat` in `app/src/routes/_authed/_app/bot.tsx`). Its filter is the
+     * belt for a server-side resolver nobody has written, and this line pointed anybody changing
+     * these semantics at a method nothing calls.
+     *
+     * Every row this table hands out carries the state as `archived`, so a row's menu can offer
+     * Archive or Restore.
      */
     archivedAt: timestamp("archived_at", { withTimezone: true }),
     /** When this was deleted, or null. Soft, like a channel's, and every read path filters on it. */
@@ -173,11 +180,15 @@ export const botChats = pgTable(
      * walk everybody's conversations to find one person's.
      *
      * The trailing expression rather than the column, because recency is the last thing said falling
-     * back to when the conversation was made; it orders that person's rows inside the index, which is
-     * what makes `mostRecent` a walk that stops at the first row passing its filters instead of a
-     * sort of everything the person has.
+     * back to when the conversation was made; it orders that person's rows inside the index, so
+     * `mostRecent` reads them already in recency order instead of sorting everything the person has.
+     * NOT "a walk that stops at the first row", which is what this line used to say: `mostRecent`
+     * orders by `RECENCY desc, id desc` and `id` is not in this index, so the plan is `Limit →
+     * Incremental Sort → Index Scan`. The sort is real. What the index buys is that it is incremental
+     * — rows arrive grouped by equal recency, and under `limit 1` only the first such group is ever
+     * sorted.
      *
-     * The roster's branch is NOT that read, though its shape looks the same: its sort key leads with
+     * The roster's branch is NOT that read either, though its shape looks the same: its sort key leads with
      * the pin, and `pinned_at` is not in this index, so that branch sorts. `roster/query.ts` says the
      * same thing from the query's side. A wider index could serve it — unlike a channel's, every part
      * of a bot chat's sort key is on this one table, so `(user_id, pin rank desc, recency desc, id

@@ -154,19 +154,44 @@ describe("the roster", () => {
     return ids;
   }
 
-  /** Every conversation the cursor reaches, in the order the pages hand them over. */
+  /**
+   * How many pages a walk may take before it gives up and says the cursor is stuck.
+   *
+   * Far more than any test here needs — the longest walk below pages six conversations two at a time
+   * — so reaching it means the cursor stopped advancing rather than that a test outgrew the bound.
+   */
+  const MAX_WALK_PAGES = 20;
+
+  /**
+   * Every conversation the cursor reaches, in the order the pages hand them over.
+   *
+   * BOUNDED, and it throws at the bound. Six tests below page through this and several exist
+   * specifically to prove the cursor advances; as an unbounded `do/while`, a cursor that stopped
+   * advancing did not fail on the answer — it spun until the suite's timeout killed the whole file,
+   * which says nothing about which claim broke. Both sibling walkers in this change are bounded for
+   * exactly this reason: `channel-activity.integration.test.ts`'s, and the one in
+   * `channel-routes.test.ts` whose bound is "one more turn than there are visible channels, so a
+   * cursor that never advances fails as a wrong answer rather than as a hung test".
+   *
+   * Thrown rather than broken out of. Returning a truncated list would fail the caller's own
+   * `toEqual` with a diff of ids and send whoever reads it hunting for a missing-rows bug, which is
+   * the opposite of what happened.
+   */
   async function walk(actor: AgentActor, limit: number) {
     const seen: string[] = [];
     let cursor: string | undefined;
-    do {
-      const page = await rosterStore.list(actor, {
+    for (let page = 0; page < MAX_WALK_PAGES; page += 1) {
+      const answer = await rosterStore.list(actor, {
         limit,
         ...(cursor ? { cursor } : {}),
       });
-      seen.push(...page.items.map((item) => item.id));
-      cursor = page.nextCursor ?? undefined;
-    } while (cursor);
-    return seen;
+      seen.push(...answer.items.map((item) => item.id));
+      if (!answer.nextCursor) return seen;
+      cursor = answer.nextCursor;
+    }
+    throw new Error(
+      `The roster cursor did not reach the end of the list in ${MAX_WALK_PAGES} pages, so it is not advancing.`,
+    );
   }
 
   test("holds both kinds in one list", async () => {
@@ -340,6 +365,99 @@ describe("the roster", () => {
     expect(active.items.map((item) => item.id)).toEqual([botChat.id]);
     expect(archived.items.map((item) => item.id)).toEqual([channel.id]);
     expect(all.items).toHaveLength(2);
+  });
+
+  /*
+   * The Bot's reply to a question asked BEFORE the archive, on both kinds at once.
+   *
+   * This belongs here rather than beside either store's own tests because it is a claim about the
+   * roster: the two kinds are read by one query and drawn as one list, so a rule that held for a
+   * channel and not for a bot chat is the archive implemented twice with two answers — which is what
+   * `bot-chats/store.ts`'s header says its shape exists to prevent.
+   *
+   * The defect this covers: both `recordActivity` implementations cleared `archived_at` for any report
+   * that beat the stored `last_message_at`, with no reference to who spoke. A person's message and the
+   * Bot's reply are reported separately, so send, archive, and a second later the reply lands and the
+   * row is back in the sidebar with every tab refetching. Nobody did that.
+   */
+  test("keeps both kinds archived when the Bot answers after the archive", async () => {
+    const userId = await seedUser();
+    const actor = actorFor(userId);
+    const agentId = await seedProfile();
+
+    const channel = await channelStore.create(actor, [agentId]);
+    const botChat = await botChatStore.create(actor, agentId);
+    createdChannelIds.push(channel.id);
+    createdBotChatIds.push(botChat.id);
+
+    // The question, then the tidying gesture, then the answer — in the order they actually happen.
+    const asked = new Date();
+    await channelStore.recordActivity(actor, channel.id, {
+      text: "What is our refund policy?",
+      agentId: null,
+      at: asked,
+    });
+    await botChatStore.recordActivity(actor, botChat.id, {
+      text: "What is our refund policy?",
+      agentId: null,
+      at: asked,
+    });
+    await channelStore.setArchived(actor, channel.id, true);
+    await botChatStore.setArchived(actor, botChat.id, true);
+
+    const answered = new Date(asked.getTime() + 1000);
+    const channelReply = await channelStore.recordActivity(actor, channel.id, {
+      text: "Thirty days, unopened.",
+      agentId,
+      at: answered,
+    });
+    const botChatReply = await botChatStore.recordActivity(actor, botChat.id, {
+      text: "Thirty days, unopened.",
+      agentId,
+      at: answered,
+    });
+
+    // Nothing was restored, so no event carries `archived: false` and neither route writes an
+    // `unarchived` row for an unarchiving that did not happen.
+    expect(channelReply).toEqual({ restored: false });
+    expect(botChatReply).toEqual({ restored: false });
+
+    const active = await rosterStore.list(actor, { status: "active" });
+    const archived = await rosterStore.list(actor, { status: "archived" });
+    expect(active.items).toEqual([]);
+    // Hidden, not frozen: both rows are still archived, and the preview a person finds under
+    // Archived is the reply rather than the question it answered.
+    expect(
+      archived.items.map((item) => [item.id, item.lastMessage]).sort(),
+    ).toEqual(
+      [
+        [channel.id, "Thirty days, unopened."],
+        [botChat.id, "Thirty days, unopened."],
+      ].sort(),
+    );
+    expect(archived.items.map((item) => item.lastMessageAgentId)).toEqual([
+      agentId,
+      agentId,
+    ]);
+
+    // And the person can still bring either back by speaking in it, which is what "sending
+    // unarchives" was always about.
+    await channelStore.recordActivity(actor, channel.id, {
+      text: "Thanks",
+      agentId: null,
+      at: new Date(answered.getTime() + 1000),
+    });
+    await botChatStore.recordActivity(actor, botChat.id, {
+      text: "Thanks",
+      agentId: null,
+      at: new Date(answered.getTime() + 1000),
+    });
+    expect(
+      (await rosterStore.list(actor, { status: "archived" })).items,
+    ).toEqual([]);
+    expect(
+      (await rosterStore.list(actor, { status: "active" })).items.length,
+    ).toBe(2);
   });
 
   test("keeps deleted rows out of every status", async () => {

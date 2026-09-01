@@ -97,7 +97,39 @@ export type ChannelEventHub = {
   register(userId: string, send: Send): () => void;
   /** Fan one event out to this instance's own connections. */
   deliver(event: RosterActivityEvent): void;
+  /**
+   * Tell every connection this instance holds to re-read the roster. Returns how many were told.
+   *
+   * For the one case a live announcement cannot cover: this instance was not listening when
+   * something was announced. See `startChannelActivityListener`, its only caller, for when that is
+   * and why a push is the repair rather than a re-read on the server.
+   */
+  resyncAll(): number;
   connectionCount(userId: string): number;
+};
+
+/**
+ * What a resync is sent as: an event naming a row that does not exist.
+ *
+ * There is no "refetch" frame on this wire and this server cannot add one, because the far end of a
+ * socket is a browser bundle already deployed. What that bundle does with an event whose `id` no
+ * cached list holds is documented and deliberate — `applyRosterEventToCaches` in
+ * `app/src/lib/channels/use-channel-events.ts` invalidates the whole roster, calling it "the
+ * stale-roster recovery", and does nothing at all when no roster is on screen. A gap in this
+ * server's subscription IS a stale roster, so this uses that path rather than inventing one.
+ *
+ * Every field that would make the browser do something else is absent: no `deleted`, which navigates
+ * a tab away from the conversation it names; no `pinned` or `archived`, which patch or move a row;
+ * and an `id` that cannot collide with a real row, because real ids are prefixed `channel_` and
+ * `botchat_`. `kind` is required by the wire shape and is read only when a row is rendered, which
+ * this one never is.
+ */
+const RESYNC_EVENT: DeliveredRosterEvent = {
+  kind: "channel",
+  id: "roster-resync",
+  lastMessage: null,
+  lastMessageAt: null,
+  lastMessageAgentId: null,
 };
 
 export function createChannelEventHub(): ChannelEventHub {
@@ -148,6 +180,26 @@ export function createChannelEventHub(): ChannelEventHub {
       }
     },
 
+    resyncAll() {
+      const payload = JSON.stringify(RESYNC_EVENT);
+      let told = 0;
+      // Every connection of every person, because the gap this repairs is one in the subscription
+      // itself: nothing says which announcements were missed, so nothing says whose they were.
+      for (const sends of connections.values()) {
+        for (const send of sends) {
+          try {
+            send(payload);
+            told += 1;
+          } catch {
+            // A connection that cannot be written to is one that is closing; its own close handler
+            // detaches it. Not counted, because the count is what the log line reports as told, and
+            // failing here would deny the resync to everybody after it.
+          }
+        }
+      }
+      return told;
+    },
+
     connectionCount(userId) {
       return connections.get(userId)?.size ?? 0;
     },
@@ -168,35 +220,86 @@ export async function startChannelActivityListener(
 ): Promise<ChannelActivityListener> {
   const connection = postgres(databaseUrl, { max: 1 });
 
-  await connection.listen(CHANNEL_ACTIVITY_TOPIC, (payload) => {
-    try {
-      hub.deliver(JSON.parse(payload) as RosterActivityEvent);
-    } catch (error) {
-      /*
-       * Swallowed, and said out loud.
-       *
-       * Swallowed because a payload we cannot read is not a reason to tear down the subscription:
-       * the roster query is still correct, the next refetch shows whatever this event would have,
-       * and every later event still needs delivering.
-       *
-       * Said out loud because nothing else can tell. Anything that reaches here — a malformed
-       * payload, a shape one replica writes and another cannot read mid-rollout, a throw from
-       * `deliver` outside its own per-send guard — leaves every client this instance holds silently
-       * without live updates until something unrelated makes them refetch, which is a bug report of
-       * "the sidebar stops moving" with nothing in the log under it. The payload goes in truncated,
-       * because its first 200 characters name the kind and the id and that is what tells those cases
-       * apart.
-       */
-      console.error(
-        JSON.stringify({
-          type: "channel-activity-delivery-failed",
-          payload: payload.slice(0, 200),
-          error: String(error),
-          note: "This instance heard a roster announcement it could not deliver. The clients it holds will not see that change until they refetch.",
-        }),
-      );
+  /*
+   * RE-ESTABLISHED, which is the case a live notification cannot cover.
+   *
+   * A NOTIFY reaches whoever is listening at the time. An instance whose connection had dropped is
+   * not: postgres.js re-establishes the subscription on reconnect, but everything announced during
+   * the gap is gone. `computer/policy-listener.ts` passes `onlisten` for exactly this reason, and its
+   * docblock names it — "That is the original bug wearing a smaller hat, and it is worse for being
+   * intermittent."
+   *
+   * WHY THE CLIENTS' OWN RECOVERY DOES NOT COVER IT. A browser refetches the roster on its socket's
+   * `onopen` (`use-channel-events.ts`), and that socket stays open across a database reconnect on
+   * this side — nothing closes it. So the browser never learns it missed anything, and archives,
+   * deletes and other members' messages simply stop arriving until an unrelated refocus.
+   *
+   * A PUSH, NOT A RE-READ, which is where this differs from the policy listener. That one owns a
+   * cache and can refresh it; this one owns nothing — the roster query is authoritative and its cache
+   * lives in the browser. So the repair is to tell the attached clients to re-read, which is what
+   * `RESYNC_EVENT` is for.
+   *
+   * NOT ON THE FIRST SUBSCRIPTION, and the flag is what tells the two apart. `onlisten` fires when the
+   * subscription is established as well as when it is re-established, and on the first there is no gap
+   * to repair: `index.ts` builds the hub and starts this listener during module initialisation, before
+   * `Bun.serve` can accept the socket that would attach a connection to it. Resyncing there would send
+   * a refetch to whoever happened to be attached — in the tests below, everybody — for a subscription
+   * that had missed nothing.
+   *
+   * Said out loud, because a reconnect is otherwise invisible from this side and the symptom it
+   * produces, "the sidebar stopped moving for a while", is unreportable without it. Only on the
+   * reconnect: a line on every listener start would print in every test that starts one, for a
+   * non-event.
+   */
+  let subscribed = false;
+  const onListen = () => {
+    if (!subscribed) {
+      subscribed = true;
+      return;
     }
-  });
+    const resynced = hub.resyncAll();
+    console.error(
+      JSON.stringify({
+        type: "channel-activity-listener-reattached",
+        resynced,
+        note: "This instance's roster subscription dropped and came back. Anything announced while it was gone was missed, so the clients it holds were told to re-read the roster.",
+      }),
+    );
+  };
+
+  await connection.listen(
+    CHANNEL_ACTIVITY_TOPIC,
+    (payload) => {
+      try {
+        hub.deliver(JSON.parse(payload) as RosterActivityEvent);
+      } catch (error) {
+        /*
+         * Swallowed, and said out loud.
+         *
+         * Swallowed because a payload we cannot read is not a reason to tear down the subscription:
+         * the roster query is still correct, the next refetch shows whatever this event would have,
+         * and every later event still needs delivering.
+         *
+         * Said out loud because nothing else can tell. Anything that reaches here — a malformed
+         * payload, a shape one replica writes and another cannot read mid-rollout, a throw from
+         * `deliver` outside its own per-send guard — leaves every client this instance holds silently
+         * without live updates until something unrelated makes them refetch, which is a bug report of
+         * "the sidebar stops moving" with nothing in the log under it. The payload goes in truncated,
+         * because its first 200 characters name the kind and the id and that is what tells those cases
+         * apart.
+         */
+        console.error(
+          JSON.stringify({
+            type: "channel-activity-delivery-failed",
+            payload: payload.slice(0, 200),
+            error: String(error),
+            note: "This instance heard a roster announcement it could not deliver. The clients it holds will not see that change until they refetch.",
+          }),
+        );
+      }
+    },
+    onListen,
+  );
 
   return {
     stop: async () => {

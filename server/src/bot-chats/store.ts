@@ -71,7 +71,11 @@ export type BotChatStore = {
    * it is written from the person's first message whenever that message arrives, because which
    * message names a conversation has nothing to do with which one arrived last.
    *
-   * `restored` is for the route above, which writes the trail: saying something in an archived
+   * Only a PERSON's message clears the archive. A Bot's reply moves the preview and the recency and
+   * leaves an archived conversation archived, so the reply to a question asked before the archive
+   * cannot undo it; the implementation argues this at length.
+   *
+   * `restored` is for the route above, which writes the trail: a person speaking in an archived
    * conversation clears the archive, and that is a restore nobody performed as such.
    */
   recordActivity(
@@ -84,8 +88,8 @@ export type BotChatStore = {
   /** Stamp the caller's chat as read now. Throws `BotChatNotFoundError` as above. */
   markRead(actor: AgentActor, id: string): Promise<void>;
   /**
-   * Archive or restore. Hidden, not frozen: the conversation stays live and `recordActivity` clears
-   * the archive on its own.
+   * Archive or restore. Hidden, not frozen: the conversation stays live, and a person's message
+   * through `recordActivity` clears the archive on its own.
    *
    * Returns whether anything actually changed, matching `ChannelStore.setArchived` — the two are one
    * idea applied twice, and letting only one of them report change is exactly how they would drift.
@@ -163,9 +167,15 @@ const chatProjection = {
  * sort is exactly what lets the two kinds of conversation drift apart, and then the module left the
  * expression un-exported and the spellings accumulated anyway. It is exported now.
  *
- * `bot_chats_recent_activity_idx` is declared on this expression, so `mostRecent`'s ordering — which
- * leads with recency and nothing else — is an index read rather than a sort. That is not true of the
- * roster's bot-chat branch, whose key leads with the pin; see `roster/query.ts`.
+ * `bot_chats_recent_activity_idx` is declared on this expression, so it is the leading part of
+ * `mostRecent`'s ordering that comes out of the index in order. NOT THE WHOLE ORDERING, and an
+ * earlier version of this comment said "an index read rather than a sort": `mostRecent` orders by
+ * `RECENCY desc, id desc` and the index carries no `id`, so the plan is `Limit → Incremental Sort →
+ * Index Scan` — the sort is real, and what makes it cheap is that the index delivers groups of equal
+ * recency already in place, so only one such group is ever sorted under the `limit 1`.
+ *
+ * `roster/query.ts` retracts the same claim for the union's two branches, whose sort key leads with
+ * the pin — which is in neither index. The retraction did not reach this line the first time.
  */
 const RECENCY = recencyOf(botChats.lastMessageAt, botChats.createdAt);
 
@@ -399,8 +409,8 @@ export function createBotChatStore(
       const [row] = await database
         .select(chatProjection)
         .from(botChats)
-        // Loosely, for the reason `get` gives: this read decides which conversation opening a Bot
-        // lands on, and it must not skip one the roster is showing.
+        // Loosely, for the reason `get` gives: a read that answers "which conversation with this Bot"
+        // must not skip one the roster is showing, whatever state the Bot's profile is in.
         .leftJoin(agentProfiles, eq(agentProfiles.agentId, botChats.agentId))
         .where(
           and(
@@ -410,10 +420,19 @@ export function createBotChatStore(
             /*
              * Archived rows are skipped here, and only here.
              *
-             * This is what the `?agent=` resolver uses to decide which conversation opening a Bot
-             * lands on. Handing back something the person put away would restore it by navigation:
-             * the next thing they said would clear `archived_at`, and the archive would have been
-             * undone by an act nobody meant as one. A fresh conversation is the honest answer.
+             * WOULD-BE, not is: no route mounts this method, and the browser resolves `?agent=` for
+             * itself over the roster it has already loaded — `mostRecentBotChat` in
+             * `app/src/routes/_authed/_app/bot.tsx`, which gets the same exclusion from reading the
+             * `active` list rather than from a filter of its own. The interface docblock above says
+             * the same thing; an earlier version of this comment said
+             * "this is what the `?agent=` resolver uses", which pointed anybody changing `archived_at`
+             * semantics at a method nothing calls.
+             *
+             * Kept, and the filter with it, because the day a route does mount this the answer has to
+             * be the browser's: handing back a conversation the person put away would restore it by
+             * navigation — the next thing they said would clear `archived_at` — and the archive would
+             * have been undone by an act nobody meant as one. A fresh conversation is the honest
+             * answer. Two definitions of one ordering is how these drifted the first time.
              */
             isNull(botChats.archivedAt),
           ),
@@ -450,8 +469,8 @@ export function createBotChatStore(
              * Unlocked, an archive committing between this statement and the update reads here as
              * "was not archived"; the update clears `archived_at` regardless, and the event goes out
              * without `archived: false`. The conversation is then restored in the database and still
-             * hidden in every tab until something unrelated makes them refetch — and saying something
-             * in an archived conversation is exactly how it is meant to come back, which
+             * hidden in every tab until something unrelated makes them refetch — and a person saying
+             * something in an archived conversation is exactly how it is meant to come back, which
              * `app/src/lib/channels/use-channel-events.ts` argues at length is the direction that must
              * not be lossy. The lock is what makes the pre-image this method announces from the same
              * one it writes over.
@@ -505,6 +524,26 @@ export function createBotChatStore(
           }
 
           const lastMessage = previewOf(activity.text);
+          /*
+           * A PERSON speaking is how an archived conversation comes back. The Bot answering is not.
+           *
+           * The rule is "hidden but live — sending unarchives", and the person sending is what that
+           * means. The two halves of one exchange are reported separately, so without this the
+           * ordinary sequence was: ask the Bot something, put the conversation away, and a second
+           * later the reply to the question asked BEFORE the archive lands, clears `archived_at`, and
+           * the row is back in the sidebar with every tab refetching. Nobody did that, and it is why
+           * the archive stopped feeling like it held.
+           *
+           * A reply that arrives after an archive therefore leaves the row archived and still moves
+           * the preview, `last_message_at` and `last_message_agent_id` below: hidden, not frozen, so
+           * the row found under Archived is the current one and sorts where its last message says. The
+           * person can still bring it back by speaking in it, or with Restore.
+           *
+           * `channels/routes.ts`'s `recordActivity` guards its own clear identically. This file's
+           * header is why: one roster reads both kinds, and a rule that held for only one of them is
+           * the archive implemented twice with two answers.
+           */
+          const saidByAPerson = activity.agentId === null;
           const applied = await transaction
             .update(botChats)
             .set({
@@ -512,12 +551,12 @@ export function createBotChatStore(
               lastMessageAt: activity.at,
               lastMessageAgentId: activity.agentId,
               /*
-               * Saying something in an archived conversation is how it comes back. Cleared
-               * unconditionally rather than only when set, because the guard below is what decides
-               * whether this write happens at all, and a second clear of an already-null column
-               * changes nothing.
+               * Cleared on this write rather than a separate one, so it rides the guard below: a
+               * report the store ignores as stale must not un-archive anything either. Cleared rather
+               * than cleared-only-when-set, because the guard is what decides whether this write
+               * happens at all and a second clear of an already-null column changes nothing.
                */
-              archivedAt: null,
+              ...(saidByAPerson ? { archivedAt: null } : {}),
               updatedAt: new Date(),
             })
             .where(
@@ -548,6 +587,18 @@ export function createBotChatStore(
           if (applied.length === 0) return { restored: false };
 
           /*
+           * One fact, used twice: the event carries it so the browser moves the row between lists, and
+           * the route writes `bot_chat.unarchived` from what this method returns, so the two cannot
+           * disagree about what happened.
+           *
+           * Both terms, because both are conditions of the clear above. A `restored` that dropped the
+           * second would announce `archived: false` for a row that is still archived and put a
+           * `bot_chat.unarchived` row on the trail for an unarchiving that never happened — a trail
+           * that is confidently wrong, which `audit.ts` argues is worse than a silent one.
+           */
+          const restored = saidByAPerson && row.archivedAt !== null;
+
+          /*
            * Announced through the channel side's `announce`, on this transaction, so it is delivered
            * on commit and a write that rolls back is never announced.
            *
@@ -573,13 +624,13 @@ export function createBotChatStore(
             lastMessageAgentId: activity.agentId,
             // Only when this write actually restored something, so an ordinary message does not
             // carry an archive state the receiver then has to decide to ignore.
-            ...(row.archivedAt !== null ? { archived: false } : {}),
+            ...(restored ? { archived: false } : {}),
           };
           await announce(transaction, event);
 
           // The same fact the event above carries, for the route, which writes it to the trail: this
           // write is how an archived conversation comes back, and nobody performed that as an act.
-          return { restored: row.archivedAt !== null };
+          return { restored };
         },
         { isolationLevel: "read committed" },
       );
@@ -632,10 +683,12 @@ export function createBotChatStore(
         .update(botChats)
         .set({
           /*
-           * The later of this clock and the conversation's own last-message stamp. last_message_at
-           * is written from the reporting browser's clock and is not bounded; a marker stamped
-           * plainly "now" by a server running behind it would leave the row reading as unseen,
-           * re-lighting the dot on every refetch until wall clock catches up.
+           * The later of this clock and the conversation's own last-message stamp. last_message_at is
+           * written from the reporting browser's clock, and although `parseActivityInput` now bounds
+           * how far ahead of this server that clock may be, the bound is not zero: a marker stamped
+           * plainly "now" by a server running behind would leave the row reading as unseen,
+           * re-lighting the dot on every refetch until wall clock catches up. The channel twin's
+           * `markRead` carries this same paragraph, and this copy had not been brought forward.
            */
           lastReadAt: sql`greatest(now(), coalesce(${botChats.lastMessageAt}, now()))`,
         })

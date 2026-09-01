@@ -3,7 +3,10 @@ import type { MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import type { AuditEventInput, AuditStore } from "../src/audit";
 import type { AppVariables, AuthenticatedActor } from "../src/auth/guards";
-import type { RosterActivityEvent } from "../src/channels/events";
+import {
+  createChannelEventHub,
+  type RosterActivityEvent,
+} from "../src/channels/events";
 import {
   type AgentChannel,
   announcementPayloads,
@@ -105,6 +108,11 @@ function recordingAuditStore() {
  * The tolerant audit recorder swallows a failed write and logs it, which is the whole of what makes
  * a silent trail detectable. Left unstubbed, that line printed into the suite's output on every run
  * and its shape was never checked — which is what `bot-chat-routes.test.ts` does for its own side.
+ *
+ * Two kinds of line come out of these routes and they are handed back separately, because each test
+ * asserts one list is exactly what it expects: `lines` is the audit recorder's, and `failures` is
+ * `mapStoreError`'s terminal branch, which logs whatever it could not translate into a status of its
+ * own before answering 500.
  */
 async function loggedDuring(run: () => Promise<Response>) {
   const lines: Record<string, unknown>[] = [];
@@ -121,6 +129,7 @@ async function loggedDuring(run: () => Promise<Response>) {
     return {
       response,
       lines: lines.filter((line) => line.type === "channel-audit-write-failed"),
+      failures: lines.filter((line) => line.type === "channel-request-failed"),
     };
   } finally {
     console.error = wasConsoleError;
@@ -288,6 +297,46 @@ describe("PUT /:channelId/archive", () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ archived: false });
     expect(audit.written).toEqual([]);
+  });
+
+  test("answers a failed store as JSON, not as Hono's bare 500", async () => {
+    /*
+     * `client()` in the browser takes its message from `body.error` and falls back to its own sentence
+     * when the body is not JSON — and nothing in this server registers an `onError`, so a rethrow from
+     * `mapStoreError` reached Hono's default `text/plain "Internal Server Error"`. `GET /api/roster`
+     * was fixed to answer `{ error }` with 500 and log a line; while these routes still rethrew, one
+     * database blip made the roster readable and the archive on the same row unreadable, which is the
+     * split `bot-chats/routes.ts`'s header calls a roster whose rows behave differently depending on
+     * which kind they are.
+     */
+    const store = fakeStore({
+      async setArchived() {
+        throw new Error("connect ECONNREFUSED 127.0.0.1:5432");
+      },
+    });
+    const logged = await loggedDuring(() =>
+      archive(appFor(store), { archived: true }),
+    );
+
+    expect(logged.response.status).toBe(500);
+    expect(logged.response.headers.get("content-type")).toContain(
+      "application/json",
+    );
+    expect(await logged.response.json()).toEqual({
+      error: "The server could not complete that request.",
+    });
+    // What was thrown may name a host or carry a connection string, so the browser gets none of it
+    // and the log gets all of it, along with which route it was. A 500 with no log line is an outage
+    // nobody can tell from a typo.
+    expect(logged.failures).toEqual([
+      {
+        type: "channel-request-failed",
+        method: "PUT",
+        path: "/channel_1/archive",
+        error: "Error: connect ECONNREFUSED 127.0.0.1:5432",
+        note: "A channel route could not be answered. Somebody was shown an error instead of their conversation.",
+      },
+    ]);
   });
 
   test("still answers when the trail is unavailable, and says so", async () => {
@@ -503,5 +552,64 @@ describe("ChannelPackageOwnedError", () => {
   test("still says deleted when nobody names an act", () => {
     // The existing delete route constructs it with one argument, and its message must not change.
     expect(new ChannelPackageOwnedError("channel_1").act).toBe("deleted");
+  });
+});
+
+/**
+ * What this instance sends when its own subscription comes back, and who gets it.
+ *
+ * `startChannelActivityListener` calls this from `onlisten`, because a NOTIFY published while this
+ * server's connection was down is simply gone and the browser cannot tell: its socket stays open
+ * across a database reconnect on this side, so its own `onopen` recovery never fires.
+ *
+ * Asserted without a database, because what matters is the shape rather than the round trip. The
+ * payload is what decides what every attached tab does, and the browser's rule for it lives in
+ * `applyRosterEventToCaches` (`app/src/lib/channels/use-channel-events.ts`): an event whose `id` no
+ * cached list holds is the stale-roster recovery and invalidates the roster, while `deleted` would
+ * navigate a tab away from the conversation it names and `pinned`/`archived` would patch or move a
+ * row. So the fields that must be absent are what this pins down.
+ */
+describe("the event hub's resync", () => {
+  test("tells every connection of every person, once, and says how many", () => {
+    const hub = createChannelEventHub();
+    const first: string[] = [];
+    const second: string[] = [];
+    const other: string[] = [];
+    hub.register("user-1", (payload) => first.push(payload));
+    // A second tab for the same person, because the reconnect gap is theirs too.
+    hub.register("user-1", (payload) => second.push(payload));
+    hub.register("user-2", (payload) => other.push(payload));
+
+    expect(hub.resyncAll()).toBe(3);
+
+    for (const heard of [first, second, other]) {
+      expect(heard).toHaveLength(1);
+      const event = JSON.parse(heard[0] as string) as RosterActivityEvent;
+      // An id no roster row can carry: real ones are prefixed `channel_` or `botchat_`, and this has
+      // to miss every cached list for the browser to treat it as a stale roster rather than a row.
+      expect(event.id).toBe("roster-resync");
+      expect(event.deleted).toBeUndefined();
+      expect(event.pinned).toBeUndefined();
+      expect(event.archived).toBeUndefined();
+    }
+  });
+
+  test("tells nobody, and says so, when nothing is attached", () => {
+    // The ordinary case at startup, where there is no gap to repair and no socket to repair it on.
+    expect(createChannelEventHub().resyncAll()).toBe(0);
+  });
+
+  test("does not let one closing connection deny the rest", () => {
+    const hub = createChannelEventHub();
+    const heard: string[] = [];
+    hub.register("user-1", () => {
+      throw new Error("socket is closing");
+    });
+    hub.register("user-2", (payload) => heard.push(payload));
+
+    // A connection that cannot be written to is one whose own close handler will detach it. Counted
+    // as not told, because the count is what the log line reports.
+    expect(hub.resyncAll()).toBe(1);
+    expect(heard).toHaveLength(1);
   });
 });

@@ -37,6 +37,7 @@ import {
   recencyCursorText,
   rosterCursorFilter,
   rosterOrder,
+  withinTimestamptzRange,
 } from "../roster/order";
 import {
   DEFAULT_ROSTER_PAGE,
@@ -152,10 +153,11 @@ export type ChannelStore = {
   softDelete(actor: AgentActor, channelId: string): Promise<void>;
   /**
    * Archive or restore the channel for every member. Hidden, not frozen: the conversation stays
-   * live, and `recordActivity` clears the archive on its own.
+   * live, and a person's message through `recordActivity` clears the archive on its own.
    *
    * Throws ChannelNotFoundError for a non-member, an unknown channel, or a deleted one, and
-   * ChannelPackageOwnedError for a channel the tenant package defines.
+   * ChannelPackageOwnedError for ARCHIVING a channel the tenant package defines. Restoring one is
+   * allowed, and the guard in the implementation says why the two directions differ.
    *
    * Returns whether anything actually changed.
    *
@@ -169,9 +171,11 @@ export type ChannelStore = {
     archived: boolean,
   ): Promise<boolean>;
   /**
-   * Record the last thing said, and bring the channel back if it was archived.
+   * Record the last thing said, and bring the channel back if a PERSON said it and it was archived.
    *
-   * Throws ChannelNotFoundError for a non-member, an unknown channel, or a deleted one.
+   * A Bot's reply moves the preview and the recency and leaves an archived channel archived; the
+   * implementation says why at length. Throws ChannelNotFoundError for a non-member, an unknown
+   * channel, or a deleted one.
    *
    * Reports whether it restored an archive, for the same reason `setArchived` reports whether it
    * changed anything: the route audits the act, and an unarchiving that happens here is as real as
@@ -889,15 +893,28 @@ export function createChannelStore(
           // Not a member, no such channel, or a deleted one: the same answer every way, matching
           // setPinned, markRead, get and recordActivity, so membership is not probeable.
           if (!row) throw new ChannelNotFoundError(channelId);
-          // Package channels are configuration; the sync that wrote them owns them. Archiving is
-          // channel grain, so one member archiving one hides configuration from everybody with
-          // nothing to put it back — no sync writes archived_at. That is a deletion wearing a
-          // reversible name.
-          if (row.packageId !== null) {
-            throw new ChannelPackageOwnedError(
-              channelId,
-              archived ? "archived" : "restored",
-            );
+          /*
+           * ARCHIVING a package channel is refused. RESTORING one is not.
+           *
+           * Package channels are configuration; the sync that wrote them owns them. Archiving is
+           * channel grain, so one member archiving one hides configuration from everybody — and no
+           * sync writes `archived_at`, so nothing puts it back. That is a deletion wearing a
+           * reversible name, and refusing it is what this guard is for.
+           *
+           * IT USED TO REFUSE BOTH DIRECTIONS, which turned that argument inside out: restoring is
+           * precisely the act that puts it back. The state is reachable — `tenant-package.ts` upserts
+           * `package_id` onto channel rows that already exist, the race `softDelete`'s docblock names
+           * — so a channel archived before a sync claimed it was hidden from every roster with the one
+           * deliberate remedy refused, permanently. The only way back left was `recordActivity`
+           * clearing `archived_at`, which needs somebody to hold the URL of a conversation no roster
+           * still shows.
+           *
+           * A restore hides nothing and invents nothing: the write below only ever clears a stamp
+           * some member's archive put there, so it cannot resurrect a channel the package deleted or
+           * disagree with anything the sync wrote.
+           */
+          if (archived && row.packageId !== null) {
+            throw new ChannelPackageOwnedError(channelId, "archived");
           }
 
           /*
@@ -996,8 +1013,8 @@ export function createChannelStore(
              * "not archived", the write clearing the flag anyway, and the event omitting
              * `archived: false`. `app/src/lib/channels/use-channel-events.ts` refetches only when
              * that field is present, so the conversation was restored in the database and stayed
-             * hidden on every viewer. Saying something in an archived conversation is how it comes
-             * back, which makes the restore direction the one that must not be lossy.
+             * hidden on every viewer. A person saying something in an archived conversation is how it
+             * comes back, which makes the restore direction the one that must not be lossy.
              *
              * `of channels` for the reason `setArchived` gives: the membership row is not what
              * changes here, and locking it would collide with the methods that do write it.
@@ -1023,6 +1040,27 @@ export function createChannelStore(
           // A person's message and the agent's reply are reported separately, so they can arrive out
           // of order. Only ever move forwards.
           const lastMessage = previewOf(activity.text);
+          /*
+           * A PERSON speaking is what brings an archived channel back. A Bot answering is not.
+           *
+           * The rule is "hidden but live — sending unarchives", and the person sending is what that
+           * means. Both halves of one exchange are reported separately, so without this the ordinary
+           * sequence was: somebody sends a message, tidies the channel away, and a second later the
+           * reply to the question they asked BEFORE archiving lands, clears `archived_at`, and puts
+           * the row back on every roster with every tab refetching. They archived it deliberately and
+           * it came back on its own, which is the whole of why the archive stopped feeling reliable.
+           *
+           * A reply that lands after an archive therefore leaves the row archived and still moves the
+           * preview and the recency below — the conversation is hidden, not frozen, so the row a
+           * person finds under Archived is the up-to-date one and sorts where its last message says.
+           * And nothing is stranded: the person can still bring it back by speaking in it, which is
+           * the same gesture the rule was always about, or by pressing Restore.
+           *
+           * `bot-chats/store.ts` guards its own clear the same way, from the same reasoning: the two
+           * kinds of conversation are read by one roster and a rule that held for only one of them
+           * would be this feature implemented twice with two answers.
+           */
+          const saidByAPerson = activity.agentId === null;
           const applied = await transaction
             .update(channels)
             .set({
@@ -1030,13 +1068,11 @@ export function createChannelStore(
               lastMessageAt: activity.at,
               lastMessageAgentId: activity.agentId,
               /*
-               * Saying something restores an archived channel.
-               *
-               * On this write rather than a separate one, so it lands under the same
+               * On this write rather than a separate one, so the clear lands under the same
                * moves-forwards-only guard below: a report the store ignores as stale must not
                * unarchive the conversation either. An ignored report is not news.
                */
-              archivedAt: null,
+              ...(saidByAPerson ? { archivedAt: null } : {}),
               updatedAt: new Date(),
             })
             .where(
@@ -1056,7 +1092,13 @@ export function createChannelStore(
           // One fact, used twice: whether this report is what cleared the archive. The event carries
           // it so the browser moves the row between lists, and the route writes `channel.unarchived`
           // from the answer this method returns, so the two cannot disagree about what happened.
-          const restored = membership.archivedAt !== null;
+          //
+          // Both terms, because both are conditions of the clear above: the channel has to have been
+          // archived, and a Bot's reply does not clear it. A `restored` that ignored the second would
+          // announce `archived: false` for a row still archived and lay down a `channel.unarchived`
+          // row for an unarchiving that did not happen — the trail confidently wrong, which is the
+          // failure `audit.ts` argues is worse than a silent one.
+          const restored = saidByAPerson && membership.archivedAt !== null;
 
           const members = await transaction
             .select({ userId: channelMemberships.userId })
@@ -1209,6 +1251,9 @@ const ISO_8601_WITH_ZONE =
  * more than `MAX_ACTIVITY_CLOCK_SKEW_MS` ahead of this server's clock. Between them a wrong clock can
  * lose a report; it cannot leave the row pinned to the top of every roster with every later report a
  * no-op and its archive no longer clearable by speaking in it.
+ *
+ * A year the column cannot hold is refused outright, because neither bound covers it: see the
+ * `withinTimestamptzRange` check below.
  */
 export function parseActivityInput(input: unknown): ActivityInputParseResult {
   if (!isChannelInputObject(input)) {
@@ -1259,6 +1304,30 @@ export function parseActivityInput(input: unknown): ActivityInputParseResult {
     return {
       ok: false,
       error: "Timestamp must be an ISO-8601 date and time with a time zone.",
+    };
+  }
+  /*
+   * A date this column has no room for, refused here rather than by letting Postgres try.
+   *
+   * `0000-01-01T00:00:00Z` is the whole of what reaches this line: it matches the shape above, `Date`
+   * holds it and round-trips it perfectly, and `timestamptz` has no year between 1 BC and AD 1, so it
+   * answers `date/time field value out of range`. The extended `±YYYYYY` forms that break the other
+   * way are already refused by `ISO_8601_WITH_ZONE`.
+   *
+   * The clamp below does not catch it — year 0 is in the past, and only the ceiling is clamped — and
+   * neither does the store's moves-forwards-only guard, which is the trap: `activity.at` is bound in
+   * that guard's `WHERE` as well as in the `SET`, so Postgres parses it to decide whether to write
+   * rather than because it is writing. The failure therefore came out of the middle of the store's
+   * transaction, where the parameter no longer has a name, as a 500 for what is a malformed request.
+   *
+   * `withinTimestamptzRange` rather than a fourth copy of `year < 1`: it lives in `roster/order.ts`
+   * with the range and the reasoning, and `audit.ts` borrows it for the same class of bug on its own
+   * query bounds.
+   */
+  if (!withinTimestamptzRange(reported)) {
+    return {
+      ok: false,
+      error: "Timestamp must name a year between 0001 and 9999.",
     };
   }
 
@@ -1409,9 +1478,11 @@ export function createChannelRoutes(
         /*
          * The other way a channel is unarchived, and the row it owes the trail.
          *
-         * Saying something in an archived channel restores it. That is a real unarchiving with a real
-         * actor, and the store cannot write it down — it holds no audit store — so this does, from
-         * what the store reports back. Without it the trail shows `channel.archived` and no matching
+         * A person saying something in an archived channel restores it (a Bot's reply does not; see
+         * the store). That is a real unarchiving with a real actor, and the store cannot write it
+         * down — it holds no audit store — so this does, from what the store reports back. `restored`
+         * is therefore the only thing this route may key on: it already carries who spoke. Without it
+         * the trail shows `channel.archived` and no matching
          * `channel.unarchived` for a channel that is live and on every roster, which is the shape of
          * audit bug `audit.ts` argues is worse than a silent trail: it is used to rule things out.
          *
@@ -1563,6 +1634,27 @@ function channelSummaryDto(channel: ChannelSummary) {
   };
 }
 
+/**
+ * Whatever the store threw, as the JSON shape every refusal on these routes uses.
+ *
+ * IT USED TO RETHROW whatever it did not recognise. Nothing in this server registers an `onError`, so
+ * Hono answered its own `text/plain "Internal Server Error"` — and `client()` in the browser reads
+ * `body.error` and falls back to its own sentence when the body is not JSON. `roster/routes.ts` was
+ * fixed to answer `{ error }` with 500 and log a line; leaving these two rethrowing meant a database
+ * blip made `GET /api/roster` readable and `PUT /api/channels/:id/archive` unreadable, which is
+ * exactly the split `bot-chats/routes.ts`'s header names: one roster whose rows behave differently
+ * depending on which kind they are.
+ *
+ * Fixed here rather than with an app-level `onError`, which would have caught the audit reader's
+ * `HTTPException` 400s too and answered them 500: those rely on Hono's default handler calling
+ * `err.getResponse()`.
+ *
+ * The sentence names the server as the side that failed and says nothing else. What was thrown may
+ * carry a connection string or an upstream host, so it goes to the log instead — unconditionally,
+ * because everything reaching this line is unexpected, including a bug in this file's own DTO, and a
+ * 500 with no log line is an outage indistinguishable from a typo. The method and path go with it
+ * because this file serves eight routes, so "which channel call broke" is not otherwise answerable.
+ */
 function mapStoreError(context: Context, error: unknown): Response {
   if (error instanceof AgentNotFoundError) {
     return context.json({ error: "Agent not found." }, 404);
@@ -1578,5 +1670,17 @@ function mapStoreError(context: Context, error: unknown): Response {
       409,
     );
   }
-  throw error;
+  console.error(
+    JSON.stringify({
+      type: "channel-request-failed",
+      method: context.req.method,
+      path: context.req.path,
+      error: String(error),
+      note: "A channel route could not be answered. Somebody was shown an error instead of their conversation.",
+    }),
+  );
+  return context.json(
+    { error: "The server could not complete that request." },
+    500,
+  );
 }

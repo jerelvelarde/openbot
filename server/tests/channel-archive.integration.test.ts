@@ -5,8 +5,8 @@ import { createAgentProfileStore } from "../src/agents/profile-store";
 import type { AgentActor } from "../src/agents/profile-types";
 import {
   createChannelEventHub,
-  startChannelActivityListener,
   type RosterActivityEvent,
+  startChannelActivityListener,
 } from "../src/channels/events";
 import {
   ChannelNotFoundError,
@@ -194,8 +194,25 @@ async function heldWrite(
 const REACHED_THE_WRITE = 250;
 
 /**
- * The other half of "hidden, not frozen": an archived channel is not a dead end, because saying
- * something in it is how it comes back.
+ * How long to keep listening after the events a test was waiting for have arrived.
+ *
+ * For every assertion about HOW MANY events there were rather than that there were enough. A promise
+ * that resolves on the expected count resolves as soon as that count is reached, and a listener
+ * stopped there cannot hear anything sent after it — so the assertion holds only for whatever had
+ * already arrived, which is not what it claims to be about.
+ *
+ * Whether a later notification has already arrived by then is the driver's business, not this test's:
+ * postgres.js dispatches every notification it finds in one socket read before any awaiting
+ * continuation runs, so on this machine a duplicate in a later chunk is counted with or without this
+ * window (verified by making the splitter repeat a member). The window is what stops that from being
+ * the reason the assertion works. `bot-chat-events.integration.test.ts` takes a `settleMs` for the
+ * same reason, and the two "announces nothing" tests below wait the same 500ms.
+ */
+const SETTLE_MS = 500;
+
+/**
+ * The other half of "hidden, not frozen": an archived channel is not a dead end, because a person
+ * saying something in it is how it comes back — and a Bot answering is not.
  */
 describe("activity in an archived channel", () => {
   test("brings it back", async () => {
@@ -221,6 +238,54 @@ describe("activity in an archived channel", () => {
     // Hidden, not frozen: the archive is a tidying gesture, and typing in it undoes it.
     expect(row?.archivedAt).toBeNull();
     expect(row?.lastMessage).toBe("One more thing");
+  });
+
+  /*
+   * And a Bot's reply does not, which is the other half of the rule.
+   *
+   * "Hidden but live — sending unarchives" is about the person sending. Both halves of an exchange are
+   * reported separately, so the ordinary sequence — ask, tidy the channel away, the reply lands a
+   * second later — cleared `archived_at` for a report nobody made: the row was back on every roster
+   * with every tab refetching, and the person who archived it deliberately watched it come back on its
+   * own.
+   */
+  test("leaves it archived when the Bot answers a question asked before the archive", async () => {
+    const owner = await createUser();
+    const agentId = await createAgent(owner);
+    const channel = await createChannel(owner, [agentId]);
+
+    const asked = new Date();
+    await store.recordActivity(owner, channel.id, {
+      text: "What is our refund policy?",
+      agentId: null,
+      at: asked,
+    });
+    await store.setArchived(owner, channel.id, true);
+
+    const outcome = await store.recordActivity(owner, channel.id, {
+      text: "Thirty days, unopened.",
+      agentId,
+      at: new Date(asked.getTime() + 1000),
+    });
+
+    // Nothing was restored, so the event carries no `archived: false` and the route writes no
+    // `channel.unarchived` row for an unarchiving that did not happen.
+    expect(outcome).toEqual({ restored: false });
+
+    const [row] = await database
+      .select({
+        archivedAt: channels.archivedAt,
+        lastMessage: channels.lastMessage,
+        lastMessageAgentId: channels.lastMessageAgentId,
+      })
+      .from(channels)
+      .where(eq(channels.id, channel.id));
+
+    expect(row?.archivedAt).not.toBeNull();
+    // Hidden, not frozen: the recency write is deliberately not guarded, so the row a person finds
+    // under Archived carries the reply and sorts where its last message says.
+    expect(row?.lastMessage).toBe("Thirty days, unopened.");
+    expect(row?.lastMessageAgentId).toBe(agentId);
   });
 
   test("leaves a channel that was not archived alone", async () => {
@@ -385,6 +450,76 @@ describe("archiving a channel, in the database", () => {
     await expect(
       store.setArchived(stranger, channel.id, true),
     ).rejects.toBeInstanceOf(ChannelNotFoundError);
+  });
+
+  test("refuses to archive a channel the package defines, and names archiving", async () => {
+    const owner = await createUser();
+    const agentId = await createAgent(owner);
+    const channel = await createChannel(owner, [agentId]);
+    const packageId = await createPackage();
+    // What a tenant-package sync writes onto a channel row that already exists.
+    await database
+      .update(channels)
+      .set({ packageId })
+      .where(eq(channels.id, channel.id));
+
+    const refused = await store.setArchived(owner, channel.id, true).then(
+      () => null,
+      (error: unknown) => error,
+    );
+
+    expect(refused).toBeInstanceOf(ChannelPackageOwnedError);
+    /*
+     * The act, because it is the word the route renders into the sentence a person reads.
+     *
+     * Asserted on the store's own throw, which is the gap. The route test constructs
+     * `ChannelPackageOwnedError` INSIDE its fake store, so it proves the route's mapping and nothing
+     * about which argument the real store passes — and `"restored"`, the other value the store used to
+     * pass, appeared in no test in the repo at all. Regressed to the one-argument constructor, every
+     * test stayed green while somebody who pressed Archive was told the channel "cannot be deleted
+     * here", sending them to look for a deletion nobody attempted.
+     */
+    expect((refused as ChannelPackageOwnedError).act).toBe("archived");
+  });
+
+  /*
+   * The other direction, which used to be refused too and must not be.
+   *
+   * The guard's own argument for refusing an archive is that one member archiving a package channel
+   * hides configuration from everybody "with nothing to put it back". Restoring is precisely the act
+   * that puts it back, so refusing it inverted the reasoning — and the state is reachable by the exact
+   * race `softDelete`'s docblock names: `tenant-package.ts` upserts `package_id` onto channel rows that
+   * already exist. A channel archived before a sync claimed it was then hidden from every roster with
+   * its one deliberate remedy refused, permanently. The only escape left was `recordActivity` clearing
+   * `archived_at`, which needs somebody still holding the URL of a conversation no roster shows.
+   */
+  test("restores a package channel that was archived before the package claimed it", async () => {
+    const owner = await createUser();
+    const agentId = await createAgent(owner);
+    const channel = await createChannel(owner, [agentId]);
+
+    await store.setArchived(owner, channel.id, true);
+    const packageId = await createPackage();
+    await database
+      .update(channels)
+      .set({ packageId })
+      .where(eq(channels.id, channel.id));
+
+    await expect(store.setArchived(owner, channel.id, false)).resolves.toBe(
+      true,
+    );
+
+    const [row] = await database
+      .select({
+        archivedAt: channels.archivedAt,
+        packageId: channels.packageId,
+      })
+      .from(channels)
+      .where(eq(channels.id, channel.id));
+    expect(row?.archivedAt).toBeNull();
+    // And the channel still belongs to the package. A restore clears a stamp some member's archive
+    // put there; it does not take the channel away from the sync that owns it.
+    expect(row?.packageId).toBe(packageId);
   });
 });
 
@@ -684,6 +819,16 @@ describe("announcing to a channel with many members", () => {
         at: new Date(),
       });
       await within5s(allHeard);
+      /*
+       * Still listening, because "once each" below is the assertion.
+       *
+       * `allHeard` resolves the moment the last DISTINCT member is heard from, and this announcement
+       * arrives as several NOTIFY chunks — so a duplicate carried in a chunk after that one is heard
+       * only if the listener is still attached. That duplicate is exactly the splitter bug this
+       * assertion exists to catch. See `SETTLE_MS` for what is and is not guaranteed about when the
+       * later chunks arrive, and why this window is here rather than the guarantee.
+       */
+      await new Promise((resolve) => setTimeout(resolve, SETTLE_MS));
     } finally {
       await listener.stop();
     }
@@ -774,7 +919,7 @@ describe("the archive announcement", () => {
       // The refusal rolls the transaction back, so there is nothing to wait for. A window long
       // enough for a notify that did happen to arrive is what makes the empty assertion mean
       // something.
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      await new Promise((resolve) => setTimeout(resolve, SETTLE_MS));
     } finally {
       await listener.stop();
     }
@@ -797,7 +942,7 @@ describe("the archive announcement", () => {
       await store.setArchived(owner, channel.id, true);
       // A no-op returns before it announces, so there is nothing to wait for; the window is what
       // makes the empty assertion mean something.
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      await new Promise((resolve) => setTimeout(resolve, SETTLE_MS));
     } finally {
       await listener.stop();
     }

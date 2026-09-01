@@ -346,5 +346,38 @@ function mapStoreError(context: Context, error: unknown): Response {
       409,
     );
   }
-  throw error;
+  /*
+   * Anything else, as JSON with a 500 — not rethrown.
+   *
+   * IT USED TO RETHROW. Nothing in this server registers an `onError`, so Hono answered its own
+   * `text/plain "Internal Server Error"`, and `client()` in the browser reads `body.error` and falls
+   * back to its own sentence when the body is not JSON. `roster/routes.ts` already answers `{ error }`
+   * with 500 and logs a line for the same class of failure, so a database blip made `GET /api/roster`
+   * readable and `PUT /api/bot-chats/:id/archive` unreadable — one roster whose rows behave
+   * differently depending on which kind they are, which is the thing this file's header says it exists
+   * to prevent. The channel twin's `mapStoreError` carries the same terminal branch and the same
+   * sentence.
+   *
+   * Fixed here and not with an app-level `onError`, which would also have swallowed the audit
+   * reader's `HTTPException` 400s — those depend on Hono's default handler calling
+   * `err.getResponse()`.
+   *
+   * The sentence names the server as the side that failed and says nothing else: what was thrown may
+   * carry a connection string or an upstream host, so it goes to the log. Unconditionally, because
+   * everything reaching this line is unexpected — a 500 with no log line is an outage nobody can tell
+   * from a typo.
+   */
+  console.error(
+    JSON.stringify({
+      type: "bot-chat-request-failed",
+      method: context.req.method,
+      path: context.req.path,
+      error: String(error),
+      note: "A bot chat route could not be answered. Somebody was shown an error instead of their conversation.",
+    }),
+  );
+  return context.json(
+    { error: "The server could not complete that request." },
+    500,
+  );
 }
