@@ -121,7 +121,31 @@ next refetch reorders them, which is the symptom its own docblock says it preven
 in this same branch *does* implement the tie-break. Ties are ordinary here: package channels are
 inserted in one transaction, so their `created_at` is byte-identical.
 
-### 1.11 Smaller, all verified
+### 1.11 The clock clamp has a ceiling and no floor ✅
+`server/src/channels/routes.ts` ~:1343
+
+`parseActivityInput` clamps only the ceiling, on the stated grounds that "an old stamp cannot pin a
+row or hide a later message". True, and not the whole harm: recency is
+`coalesce(last_message_at, created_at)`, so the **first** report on a conversation replaces
+`created_at` as its sort key. A report carrying `at: "1970-01-02T00:00:00Z"` passes the shape check,
+passes the range check, is in the past so is never clamped, and matches the store's
+`isNull(lastMessageAt)` guard — so it is written. Confirmed against the database: the conversation
+then sorts *below* one with no activity at all, and no API resets it. Route-reachable by any signed-in
+caller against their own conversations.
+
+This is also the other half of §1.1: the same missing floor is what makes a slow clock drop every
+report.
+
+### 1.12 An invisible message blanks a row's stored preview
+`server/src/bot-chats/store.ts` ~:526 · `server/src/channels/routes.ts` ~:1042
+
+`previewOf` returns `null` for a message of only format characters, and `lastMessage` is set to that
+`null` unconditionally — while the title write two lines earlier refuses the same write, with an
+argument for why. Route-reachable, because the parser rejects on `text.trim()` and
+`"\u200b".trim().length === 1`, so any caller can blank their own roster previews. The asymmetry with
+the title path is undocumented and looks unintended.
+
+### 1.13 Smaller, all verified
 - Conversation ids are interpolated into request paths **unencoded** at ~12 sites. `/bot/x%3Fy` →
   `/api/bot-chats/x?y` → the server reads id `x` and answers with a **different conversation**.
   `checkKnown` already encodes; its siblings do not.
@@ -141,6 +165,18 @@ inserted in one transaction, so their `created_at` is byte-identical.
   the app's primary navigation exposes no list semantics, count or position to assistive tech.
 - `MAX_ROSTER_PAGE` is still never exercised — three independent confirmations — and raising
   `DEFAULT_ROSTER_PAGE` from 50 to 10,000 leaves both roster test files green.
+- `applyRosterEvent`'s three defensive `.slice()` copies can each be deleted with the suite green,
+  and the assertion that looks like it covers them cannot: under aliasing `patched.pages` **is**
+  `data.pages`, so the identity check passes trivially. Same for `pinnedFirst`'s `[...channels]` —
+  and in the common case (empty search box) its input is React Query's own memoized array, so an
+  in-place sort reorders the cache behind React's back.
+- `app.ts`'s own handlers still throw into Hono's bare `text/plain` 500 — the exact defect the three
+  route files were changed to fix, with no log line either.
+- `redactAuditPayload` reduces a `Date`, `Map`, `Set` or `Error` to `{}` — destroyed, not redacted,
+  in the table whose argument is that it gets used to rule things out.
+- The forward-only guard drops a report whose `at` **equals** what is stored, and the skew clamp can
+  manufacture that equality: two reports from a client more than five minutes fast are both rewritten
+  to the same value.
 
 ---
 
@@ -179,9 +215,20 @@ restate the premise as needing a total order over ids rather than a prefix packa
   bits" when the value is returned by a GET the caller is authorised for.
 - **I misrouted two coordination messages**, sending each agent the other's instructions. One caught
   it and refused; the cursor fix went unapplied for a round.
-- **I framed three findings as instances instead of rules**, so each fix was applied to one of two
-  places that needed it: the archive clear (§1.1), the audit `to` bound, and the body limit (§1.7).
-  In every case the precedent was already in the file.
+- **I framed findings as instances instead of rules.** This is the single biggest pattern in the
+  round, and it is mine: five separate fixes were applied to one of the places that needed them,
+  with the precedent already sitting in the file.
+
+  | fixed | left | §  |
+  |---|---|---|
+  | title write moved out from under the recency guard | the archive clear left under it | 1.1 |
+  | skew clamp's ceiling | its floor | 1.11 |
+  | audit `from` bound | audit `to` bound | 1.13 |
+  | `bodyLimit` on the activity route | its seven siblings | 1.7 |
+  | `mapStoreError` in three route files | `app.ts`'s own handlers | 1.13 |
+
+  Each brief I wrote quoted the reviewer's specific instance. None asked "where else is this true?"
+  A brief that ends with that question would have caught all five.
 - **Two findings I recorded in earlier rounds never made it into a brief** — the page cap (§1.11) and
   the whitespace-title fallback.
 
