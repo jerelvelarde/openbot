@@ -73,6 +73,73 @@ function ComputerViewPanel({
 }
 
 /**
+ * The prompt the server is holding, as this screen has observed it.
+ *
+ * A prompt needs an identity of its own, because the only thing a dismissal may hide is the prompt
+ * that was dismissed. `useNeedsYou` reads `GET /api/computers/:id/control` and hands back a boolean,
+ * so the identity has to be built here out of the one thing that boolean does say: when a prompt
+ * arrives. `epoch` counts arrivals; `live` is what the last poll said, which is what tells an
+ * arrival from the same prompt reported again by the next poll.
+ *
+ * `epoch` starts at 0 and 0 is never a prompt — the first arrival is 1. That is what lets a
+ * dismissal recorded with nothing waiting, a settings panel closed on a channel where no prompt has
+ * ever existed, hold a value no prompt that later arrives can match.
+ */
+export type SeenPrompt = {
+  /** Which prompt. A count of arrivals, so 0 means none has been seen on this screen. */
+  epoch: number;
+  /** What the last poll said, so the next `true` reads as an arrival or as the same prompt. */
+  live: boolean;
+};
+
+/**
+ * Fold one `needsYou` reading into what this screen has seen.
+ *
+ * Only the edges say anything, and only one of them moves the identity: false → true is a new
+ * prompt, and true → false is the prompt going away — answered in the pane, or the Bot stopped
+ * waiting — which leaves `epoch` where it is, so a dismissal naming that prompt goes on naming it
+ * rather than sliding onto the next one. A reading equal to the last one is returned unchanged, and
+ * that is what makes it safe to call this on every run of the effect below: that effect also re-runs
+ * when the pane opens and closes, and those runs must not invent prompts.
+ *
+ * A poll that FAILED is a false reading here, because `readControl` fails closed to `null` and
+ * `useNeedsYou` maps that to false. A dropped round-trip mid-prompt therefore reads as the prompt
+ * going away and coming back, which retires a dismissal and lets the pane open again. Left as it is:
+ * the alternative is to read "the Bot's computer could not be reached" as "the prompt is still
+ * standing", which suppresses the pane over a prompt nobody has confirmed exists, and reopening a
+ * pane once on a lost poll is the cheaper wrong answer.
+ */
+export function observePrompt(seen: SeenPrompt, needsYou: boolean): SeenPrompt {
+  if (needsYou === seen.live) return seen;
+  return { epoch: needsYou ? seen.epoch + 1 : seen.epoch, live: needsYou };
+}
+
+/**
+ * What a person closing the pane has dismissed, named in both identities the pane opens for.
+ *
+ * One close, two auto-open paths, and they do not share an identity — which is the whole reason this
+ * is a record rather than a number. The browser-activity path is tab-local end to end: it opens for
+ * a run this tab reported, so a dismissal of it belongs to that run. The needs-you path is server
+ * state, true from any tab and across a reload, so a dismissal of it belongs to the prompt. One
+ * number for both meant a close of the settings panel — which has no run and no prompt behind it —
+ * stamped the run epoch's `null`, and `null !== null` is false, so every prompt for the rest of the
+ * mount was read as already dismissed.
+ *
+ * The ref holding this is `undefined` until something is dismissed, and that is not the same as
+ * either field being empty. `undefined` is "nothing has been dismissed on this screen"; `{ runEpoch:
+ * null, promptEpoch: 0 }` is "a close happened, with no run reported and no prompt on screen".
+ * Collapsing those two into one sentinel is the exact confusion that produced this bug, so they stay
+ * apart even though neither can match anything real — `reportComputerActivity` counts epochs from 1
+ * and so does `observePrompt`, which is what makes a close with nothing to dismiss suppress nothing.
+ */
+export type Dismissal = {
+  /** The browser run in progress at the close; `null` when this tab has reported none. */
+  runEpoch: number | null;
+  /** The prompt on screen at the close; 0 when there was none. */
+  promptEpoch: number;
+};
+
+/**
  * Whether a live needs-you prompt should open the screen pane on its own.
  *
  * Exported for the tests that pin the answers a person notices, because none of them read as a
@@ -83,53 +150,62 @@ function ComputerViewPanel({
  * somebody deliberately opened is not a way to explain that a Bot is stuck, and the amber dot on the
  * Watch button says the same thing without seizing anything.
  *
- * Past that, the only question is whether this prompt has already been dismissed, and
- * `dismissedEpoch` has THREE values rather than two:
+ * Past that, the only question is whether THIS prompt has been dismissed, and that is a question
+ * about the prompt rather than about anything this tab did. It used to compare the browser-run epoch
+ * a dismissal was stamped with against the current one, and those two inputs come from different
+ * places: `needsYou` is server state (`GET /api/computers/:id/control` via `useNeedsYou`), so it
+ * outlives a reload and is true from any tab, while `runEpoch` is only ever written by this tab's
+ * `onComputerActivity` subscription, whose only producer is a computer tool this tab ran. Reloading
+ * while a Bot is blocked, walking into the channel after it got stuck, a prompt raised by a tool that
+ * never touches the browser, a run driven from another tab — each of those is a live prompt with no
+ * run epoch at all, and the pane is the only place the prompt and its masked field are drawn. Keyed
+ * on the run, one dismissal covered every one of them and expired on none.
  *
- * - `undefined` — nothing has been dismissed on this screen, so the pane opens. This is what a fresh
- *   mount holds, and it must not read as a dismissal, because the two inputs come from different
- *   places: `needsYou` is server state (`GET /api/computers/:id/control` via `useNeedsYou`), so it
- *   outlives a reload and is true from any tab, while `runEpoch` is only ever written by this tab's
- *   `onComputerActivity` subscription, whose only producer is a computer tool this tab ran. Reloading
- *   while a Bot is blocked, walking into the channel after it got stuck, a prompt raised by a tool
- *   that never touches the browser, a run driven from another tab — each of those is a live prompt
- *   with no run epoch, and the pane is the only place the prompt and its masked field are drawn.
- * - `null` — a dismissal recorded before any browser action had been reported to this tab
- *   (`reportComputerActivity` counts from 1, so a real epoch is never null). It holds until one is
- *   reported: the same "until the next run" rule, with no run yet to compare against.
- * - a number — a dismissal recorded for that run. It covers that run and expires with it, because
- *   the next run arrives with an epoch nobody dismissed.
- *
- * `undefined` cannot mean anything else: the only write is `dismissedEpoch.current =
- * runEpoch.current`, and `runEpoch` is `number | null`. That is the whole reason for the sentinel —
- * with `null` standing for both, the pristine state was byte-identical to a dismissal and the pane
- * stayed shut on every reload and every arrival after the fact.
+ * The wrong key cut the other way too: a Bot that went on browsing while it waited moved the run
+ * epoch, so the dismissal a person had just made was retired by activity that had nothing to do with
+ * the prompt they closed, and the pane came back over them. Keyed on the prompt, a dismissal covers
+ * the prompt it was made about and expires when that prompt does, which is both halves at once.
  *
  * Some dismissal is needed, though, or closing the pane is inert while the prompt is live:
- * `show(null)` clears `watch`, `useNeedsYou` resumes polling, the prompt is still there, and the pane
- * reopens. `shouldRecordDismissal` decides when one is written; it is the same `dismissedEpoch` the
- * browser-activity path reads, so one close covers both auto-open paths.
+ * `show(null)` clears `watch`, the poll goes on reporting the prompt, and the pane reopens.
+ * `dismissalForClose` decides when one is written and what it says, and `Dismissal` carries both
+ * identities, so one close still covers both auto-open paths.
  */
 export function shouldOpenForNeedsYou(input: {
   needsYou: boolean;
   /** Either pane: settings and watch are one pane with two contents. */
   isPaneOpen: boolean;
-  /** `undefined` when nothing has been dismissed on this screen; see above. */
-  dismissedEpoch: number | null | undefined;
-  runEpoch: number | null;
+  /** `undefined` when nothing has been dismissed on this screen; see `Dismissal`. */
+  dismissed: Dismissal | undefined;
+  /** `SeenPrompt.epoch` for the prompt the poll is reporting now. */
+  promptEpoch: number;
 }): boolean {
   if (!input.needsYou || input.isPaneOpen) return false;
-  return input.dismissedEpoch !== input.runEpoch;
+  return input.dismissed?.promptEpoch !== input.promptEpoch;
 }
 
 /**
- * Whether moving the pane to `next` is a close, which is what records a dismissal.
+ * What moving the pane to `next` dismisses, or `undefined` when it is not a close at all.
  *
- * Settings and watch are one pane with two contents, and a close has to count from either of them.
- * This used to read `next !== "watch" && isWatching`, which recognised a close only from the screen:
- * a settings pane closed while a prompt was live recorded nothing, `shouldOpenForNeedsYou` read the
- * newly closed pane as a fresh chance to open, and the pane came straight back as watch. The person's
- * close was defeated and a second one was needed to make it stick.
+ * The predicate and the record are ONE function on purpose. They were two — `shouldRecordDismissal`
+ * answering whether to record, and the caller deciding what to write — and the bug lived precisely in
+ * the seam: the predicate was right about every close counting, the caller stamped the wrong
+ * identity, and no test of either half could see it, because neither half was wrong on its own.
+ * Anything that asks whether a close is a dismissal now gets the dismissal, so the two answers cannot
+ * drift apart again.
+ *
+ * WHEN. Settings and watch are one pane with two contents, and a close has to count from either of
+ * them. This used to read `next !== "watch" && isWatching`, which recognised a close only from the
+ * screen: a settings pane closed while a prompt was live recorded nothing, `shouldOpenForNeedsYou`
+ * read the newly closed pane as a fresh chance to open, and the pane came straight back as watch. The
+ * person's close was defeated and a second one was needed to make it stick.
+ *
+ * WHAT. Every close is therefore recorded, including a close of a pane with nothing waiting behind it,
+ * and that is safe only because of what the record says: the prompt on screen, which is 0 when there
+ * is none, and no prompt is ever 0. Counting every close while stamping the browser-run epoch — which
+ * is `null` until this tab runs a computer tool, and `null !== null` is false — is what suppressed the
+ * pane for the life of the mount. The repair belongs in the identity and not in narrowing the WHEN
+ * back to the screen, which would restore the defeated close above.
  *
  * Switching contents is not a close. The pane stays open, and `shouldOpenForNeedsYou` leaves an open
  * pane alone, so there is nothing for a dismissal to suppress.
@@ -137,12 +213,15 @@ export function shouldOpenForNeedsYou(input: {
  * A close made with the browser Back button does not come through here at all — see the effect that
  * calls `shouldOpenForNeedsYou` for what that costs and why it is left as it is.
  */
-export function shouldRecordDismissal(input: {
+export function dismissalForClose(input: {
   next: "settings" | "watch" | null;
   /** Either pane: settings and watch are one pane with two contents. */
   isPaneOpen: boolean;
-}): boolean {
-  return input.next === null && input.isPaneOpen;
+  runEpoch: number | null;
+  seenPrompt: SeenPrompt;
+}): Dismissal | undefined {
+  if (input.next !== null || !input.isPaneOpen) return undefined;
+  return { runEpoch: input.runEpoch, promptEpoch: input.seenPrompt.epoch };
 }
 
 /**
@@ -172,12 +251,40 @@ function RouteComponent() {
   const isPaneOpen = isSettingsOpen || isWatching;
   /**
    * The coworker the header acts on: the same one the body renders, by the same rule.
-   * `undefined` for a channel with none and for a channel with several, which is what disables the
-   * Watch and coworker buttons and stops needs-you polling for a Bot this screen will not show.
+   *
+   * `undefined` for THREE reasons and not two, which is worth saying because everything downstream
+   * collapses them: a channel with no coworker, a channel with several, and a channel whose detail
+   * query has not answered yet. All three disable the Watch and coworker buttons and stop needs-you
+   * polling, which is the right answer to each — there is no Bot to act on in any of them — and
+   * `channelBodyState` is where they are told apart, because the body is the one place that has to
+   * say something different about each. The header stays silent rather than guessing which it is;
+   * `ChannelBody`'s docblock argues that out.
    */
   const agentId = soleAgentId(channel.data?.agentIds);
-  /** Only polled while the screen is closed; the screen panel polls control itself. */
-  const needsYou = useNeedsYou(agentId, !isWatching);
+  /*
+   * Polled while the pane is open as well, which it was not: this read `useNeedsYou(agentId,
+   * !isWatching)`, on the grounds that the screen panel polls control itself.
+   *
+   * It does, but not for this. A dismissal has to know which prompt it is about, and this boolean is
+   * the only place this screen hears about one — so switching the poll off exactly while the pane is
+   * open blinded the screen for the whole window in which a person answers the prompt. Every prompt
+   * then looked like it arrived twice: the gate forced `needsYou` false on open, and the first poll
+   * after the close reported the standing prompt as a fresh arrival, retiring the dismissal that
+   * close had just made. It hid the ordinary ending too — the prompt answered in the pane — so a
+   * dismissal outlived the prompt it named and swallowed the next one.
+   *
+   * The cost is a second reader of `/control` while the screen pane is open, every 3s beside the
+   * screen card's own 1s poll of the same route: a third more reads of a route already being read,
+   * against an identity that cannot be built at all from a poller switched off when it matters.
+   */
+  const needsYou = useNeedsYou(agentId, true);
+  /*
+   * What the header says about the prompt, which is not the same as whether there is one: the amber
+   * dot and the "waiting for you" label exist to reach somebody whose pane is shut, and the pane
+   * itself draws the prompt and its masked field. Now that the poll runs while the pane is open, this
+   * is what keeps the Watch button from offering to "open its screen" over an open screen.
+   */
+  const promptOutsidePane = needsYou && !isWatching;
 
   const queryClient = useQueryClient();
   const markRead = useMutation(markChannelReadMutationOptions(queryClient));
@@ -226,15 +333,18 @@ function RouteComponent() {
   }, [channelId, unseen, markReadMutate]);
 
   /*
-   * Either auto-open path may open the screen once per run unless that run was dismissed.
+   * Either auto-open path may open the pane once, unless the thing it would open for was dismissed.
    *
-   * `undefined` means nothing has been dismissed, and it has to be a value no epoch can take:
-   * `runEpoch` is null until this tab reports a browser action, so a `null` default made the pristine
-   * state indistinguishable from a dismissal and the needs-you pane never opened on a fresh mount.
-   * `shouldOpenForNeedsYou` spells out the three values and where each comes from.
+   * Three refs, because the two paths do not share an identity and the bug was pretending they did.
+   * `runEpoch` is this tab's browser-run counter, written only by the subscription below; `seenPrompt`
+   * is what the poll has said about the server's prompt, folded by `observePrompt`. `dismissed` is
+   * `undefined` until a close happens, which is not the same as a close that had nothing to name —
+   * `Dismissal` spells out why those two must stay apart, and why neither empty field can match a run
+   * or a prompt that arrives later.
    */
-  const dismissedEpoch = useRef<number | null | undefined>(undefined);
+  const seenPrompt = useRef<SeenPrompt>({ epoch: 0, live: false });
   const runEpoch = useRef<number | null>(null);
+  const dismissed = useRef<Dismissal | undefined>(undefined);
 
   /*
    * Settings and watch share one pane; opening either clears the other URL flag.
@@ -247,18 +357,24 @@ function RouteComponent() {
    * dependency array that fires every render, written a longer way. `isPaneOpen` is the only
    * reactive value the body reads besides `navigate`, so `show` changes identity when the pane opens
    * or closes but not when it swaps contents. Neither of those re-runs opens anything: the open one
-   * finds a pane open, and a close made through here has just recorded a dismissal for the current
-   * run. A close made with the browser Back button does not come through here, and that re-run does
-   * reopen the pane — the effect below says why that is left alone.
+   * finds a pane open, and a close made through here has just recorded a dismissal naming the run in
+   * progress and the prompt on screen. A close made with the browser Back button does not come
+   * through here, and that re-run does reopen the pane — the effect below says why that is left
+   * alone.
    *
    * `replace` is for the callers that nobody asked for — the two auto-opens. A person's click on the
    * header buttons is a navigation they made and keeps its history entry.
    */
   const show = useCallback(
     (next: "settings" | "watch" | null, options?: { replace?: boolean }) => {
-      // Dismissal applies only to the current browser-activity run.
-      if (shouldRecordDismissal({ next, isPaneOpen }))
-        dismissedEpoch.current = runEpoch.current;
+      // A close dismisses the run in progress and the prompt on screen, and nothing after either.
+      const closing = dismissalForClose({
+        next,
+        isPaneOpen,
+        runEpoch: runEpoch.current,
+        seenPrompt: seenPrompt.current,
+      });
+      if (closing) dismissed.current = closing;
       return navigate({
         replace: options?.replace,
         search: (previous) => ({
@@ -276,7 +392,7 @@ function RouteComponent() {
     return onComputerActivity((activity) => {
       if (activity.botId !== agentId) return;
       runEpoch.current = activity.epoch;
-      if (dismissedEpoch.current === activity.epoch) return;
+      if (dismissed.current?.runEpoch === activity.epoch) return;
       navigate({
         // Nobody asked for this pane, so it is not a history step. Same rule as the effect below.
         replace: true,
@@ -302,9 +418,13 @@ function RouteComponent() {
    * which resets that hook's own state: a navigate-per-render held back by another file's behaviour
    * rather than by anything this effect said.
    *
-   * The two epochs are read out of refs, which do not re-render when they change, and that is
-   * enough. `onComputerActivity` above is what hears about a new run, and it opens the pane itself
-   * for an epoch nobody dismissed; this effect never has to notice the number moving.
+   * The prompt's identity is folded in here rather than kept in state, because it is a function of
+   * `needsYou` and of nothing else: `observePrompt` runs on every run of this effect, `needsYou` is a
+   * dependency, and a reading equal to the last one changes nothing — so the epoch cannot move
+   * without this effect running, and this effect running twice on one reading cannot invent a prompt.
+   * The refs it and the dismissal live in do not re-render when they change, and that is enough:
+   * `onComputerActivity` above is what hears about a new browser run, and it opens the pane itself
+   * for a run nobody dismissed; this effect never has to notice that number moving.
    *
    * `replace: true` because nobody asked for this pane: an auto-open that pushed a history entry made
    * Back a trap, since Back landed on the closed state this effect immediately reopened, pushing
@@ -315,12 +435,13 @@ function RouteComponent() {
    * close button and the Watch toggle are what record a dismissal.
    */
   useEffect(() => {
+    seenPrompt.current = observePrompt(seenPrompt.current, needsYou);
     if (
       !shouldOpenForNeedsYou({
         needsYou,
         isPaneOpen,
-        dismissedEpoch: dismissedEpoch.current,
-        runEpoch: runEpoch.current,
+        dismissed: dismissed.current,
+        promptEpoch: seenPrompt.current.epoch,
       })
     )
       return;
@@ -384,7 +505,7 @@ function RouteComponent() {
           <div className="flex flex-row gap-1.5">
             <Button
               aria-label={
-                needsYou
+                promptOutsidePane
                   ? "This Bot is waiting for you. Open its screen"
                   : "Watch this Bot's screen"
               }
@@ -397,7 +518,7 @@ function RouteComponent() {
             >
               <IconDeviceDesktop className="size-4.5" />
               {/* Mirrors needs-you state outside the hidden screen pane. */}
-              {needsYou ? (
+              {promptOutsidePane ? (
                 <span className="absolute right-1 top-1 size-2 rounded-full bg-amber-500" />
               ) : null}
             </Button>
