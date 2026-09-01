@@ -305,6 +305,62 @@ export function expandEnvironment(
   );
 }
 
+/*
+ * The id namespaces this deployment mints in, which an id out of a package file may not enter.
+ *
+ * The sidebar roster is one `UNION ALL` over `channels` and `bot_chats`, paged by a single keyset
+ * cursor whose sort key ends in `id` and carries no `kind` term. Everywhere that is relied on, the
+ * argument given is that ids are prefixed — `channel_<uuid>` minted in `channels/routes.ts`,
+ * `botchat_<uuid>` in `bot-chats/store.ts`, `agent_<uuid>` in `agents/profile-store.ts` — and so
+ * name one row across both tables. A package is the one place an id is chosen by hand rather than
+ * generated, which is exactly where that argument was hopeful rather than true: `id:` came out of
+ * `channels.yaml` as any non-empty string at all, and the shipped ids are words.
+ *
+ * A collision costs two missing rows, not a duplicate one. Two roster rows sharing a complete sort
+ * key are both excluded by the cursor's strict `<`, so neither is served on any page — the same
+ * silent loss as the millisecond-precision cursor bug, which is the reason this is a check and not a
+ * sentence in a design document. Package channels are also the rows most exposed to the id tie-break
+ * in the first place, because a sync inserts them in one transaction with byte-identical
+ * `created_at`.
+ *
+ * One flat set rather than one per field, applied to a channel id as well as an agent id even though
+ * a channel called `agent_x` collides with nothing today. The reason to keep these namespaces clean
+ * is the same reason in every case — an id nobody generated has to stay distinguishable from one
+ * somebody did — and a per-field list is one more thing to keep in step when a fourth namespace
+ * appears.
+ */
+const GENERATED_ID_NAMESPACES = ["agent_", "botchat_", "channel_"];
+
+/**
+ * Refuse an id a package chose that sits inside one of those namespaces.
+ *
+ * Named by file and by field, because this is a sentence somebody acts on by editing YAML and "is
+ * reserved" on its own is a hunt through six files. Refused rather than rewritten: what a package's
+ * channel is called is the package's to decide, and a deployment quietly renaming one would orphan
+ * every membership, mapping and link that already names it.
+ *
+ * Checked only where the file is read, and deliberately not a second time inside the transaction the
+ * way a reserved deployment-route name is. That one is checked twice because a Bot already holding
+ * the name is a hole in the computer router whatever the file now says. A channel row already
+ * carrying one of these ids costs nothing by itself — it costs pages only if a `bot_chats` row
+ * happens to hold that exact id — so refusing to boot over it would trade an unlikely and
+ * recoverable state for a deployment that will not start, with no guard being bypassed meanwhile.
+ */
+function refuseGeneratedIdNamespace(
+  id: string,
+  field: string,
+  filename: string,
+) {
+  const namespace = GENERATED_ID_NAMESPACES.find((candidate) =>
+    id.startsWith(candidate),
+  );
+  if (namespace) {
+    throw new Error(
+      `${filename} ${field} "${id}" is in the "${namespace}" id namespace this deployment generates; a package must choose an id nothing generates`,
+    );
+  }
+}
+
 export function validateTenantPackage(files: PackageFiles): TenantPackage {
   if (files.themeCss.trim()) {
     validateThemeCss(files.themeCss);
@@ -350,6 +406,7 @@ export function validateTenantPackage(files: PackageFiles): TenantPackage {
           `agent.id "${id}" is reserved for a deployment route and cannot name a Bot`,
         );
       }
+      refuseGeneratedIdNamespace(id, "agent.id", "agents.yaml");
       if (type === "remote_ag_ui") {
         const endpoint =
           typeof agent.endpoint === "string" ? agent.endpoint.trim() : "";
@@ -415,6 +472,8 @@ export function validateTenantPackage(files: PackageFiles): TenantPackage {
   const channels = asList(channelsYaml.channels, "channels.yaml channels").map(
     (value) => {
       const channel = asRecord(value, "channel");
+      const id = requiredString(channel.id, "channel.id");
+      refuseGeneratedIdNamespace(id, "channel.id", "channels.yaml");
       const permittedAgents = stringArray(
         channel.permitted_agents,
         "channel.permitted_agents",
@@ -425,7 +484,7 @@ export function validateTenantPackage(files: PackageFiles): TenantPackage {
         }
       }
       return {
-        id: requiredString(channel.id, "channel.id"),
+        id,
         name: requiredString(channel.name, "channel.name"),
         description: requiredString(channel.description, "channel.description"),
         permittedAgents,

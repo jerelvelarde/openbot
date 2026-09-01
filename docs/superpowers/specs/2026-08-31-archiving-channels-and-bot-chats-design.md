@@ -185,12 +185,32 @@ order by pinned_rank desc, coalesce(last_message_at, created_at) desc, id desc
 ### The cursor's shape is unchanged; its encoding was not fit to reuse
 
 `ChannelCursor` — `{pinned, recency, id}` — keeps working across both kinds, with no `kind` term,
-because ids are prefixed (`channel_…`, `botchat_…`) and therefore globally unique. `id` still breaks
-every tie on its own.
+because `id` still breaks every tie on its own. What that requires is a **total order over ids across
+the two tables**: no channel id may equal a bot-chat id. If two rows shared one, they would share a
+*complete* sort key and the cursor's strict `<` would exclude **both** — silent row loss, the same
+failure mode as the encoding defect below.
 
-This is worth stating because it is the single piece of luck in this design and everything downstream
-spends it: the cursor's encode, decode, stale-cursor rule, and the "a cursor that names a different
-ordering reads as the first page" behaviour all survive untouched.
+This is worth stating because everything downstream spends that order: the cursor's encode, decode,
+stale-cursor rule, and the "a cursor that names a different ordering reads as the first page"
+behaviour all survive untouched.
+
+**Amended after review: this section claimed the order as luck, and for package channels the claim
+was not even true.** What it said was that ids are prefixed (`channel_…`, `botchat_…`) and therefore
+globally unique, and it called that the single piece of luck in the design. Every *generated* id is
+prefixed — `channel_<uuid>` in `channels/routes.ts`, `botchat_<uuid>` in `bot-chats/store.ts` — but a
+package channel's id comes out of `channels.yaml` verbatim, validated as a non-empty string and
+nothing more, which is how the shipped fintech package gets `general-assistant`,
+`risk-and-compliance` and `company-knowledge`. Nothing stopped a package writing `botchat_<uuid>` as
+a channel id, and package channels are the rows *most* exposed to the id tie-break in the first
+place, because a sync inserts them in one transaction with byte-identical `created_at`.
+
+The premise is now enforced rather than hoped for. `validateTenantPackage` refuses a package agent or
+channel id beginning with `agent_`, `botchat_` or `channel_`, in a message naming the file and the id,
+and there are exactly two channel insert paths — the package's and `channels/routes.ts`'s. So every
+channel id is either generated under `channel_` or proven to sit in no generated namespace at all,
+every bot-chat id is generated under `botchat_`, and the two sets cannot meet. Read the prefix as
+evidence of the total order, not as the thing being relied on: the requirement is the order, and any
+future id a person gets to choose has to be checked against it the same way.
 
 **Amended after review, and this section is why the defect was missed.** The *shape* survived
 untouched, and this section said so approvingly enough that nobody looked inside the encoding. The
@@ -399,8 +419,9 @@ An archive or restore carries `archived: boolean`, the way a pin carries `pinned
 
 ### Client patching
 
-`applyChannelEvent` finds rows by `id` alone, which still works because ids are globally unique.
-`kind` is needed only for rendering.
+`applyChannelEvent` finds rows by `id` alone, which still works because of the same total order over
+ids the cursor needs: a channel id and a bot-chat id can never be equal, which for a package channel
+is enforced by `validateTenantPackage` rather than assumed. `kind` is needed only for rendering.
 
 `hasUnseenActivity` and `isUnread` in `app-sidebar.tsx` need no change either. Both read
 `last_message_agent_id`, `last_message_at`, and `last_read_at`, which both branches of the union

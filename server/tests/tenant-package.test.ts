@@ -358,6 +358,84 @@ describe("tenant YAML validation", () => {
     ).toThrow('references unknown agent "missing"');
   });
 
+  /*
+   * A package id may not enter a namespace this deployment mints ids in.
+   *
+   * The roster is one `UNION ALL` over `channels` and `bot_chats`, paged by a single keyset cursor
+   * whose sort key ends in `id` and carries no `kind` term. That works only because an id names one
+   * row across both tables, and the argument for it, everywhere it is relied on, is that ids are
+   * prefixed — `channel_<uuid>` and `botchat_<uuid>`. Package channels were the exception nobody
+   * wrote down: their ids come out of `channels.yaml` verbatim, so `botchat_<uuid>` as a channel id
+   * was a thing somebody could type. Two rows sharing a complete sort key are both excluded by the
+   * cursor's strict `<`, so a collision loses both from every page — and package channels are the
+   * rows most exposed to the id tie-break in the first place, being inserted in one transaction
+   * with byte-identical `created_at`.
+   *
+   * Refused at load, where the id is read, rather than checked in the roster query: that query runs
+   * on every sidebar fetch and could do nothing useful about a collision it found, while an
+   * operator reading a message that names the file and the id fixes the package in one edit.
+   */
+  for (const reserved of ["botchat_", "channel_", "agent_"]) {
+    test(`rejects a channel id in the generated "${reserved}" namespace`, () => {
+      expect(() =>
+        validateTenantPackage({
+          brand: "tenant: { id: fintech, product_name: Ledgerline }",
+          agents: "agents: []",
+          channels: `channels: [{ id: ${reserved}0f4b, name: Company, description: Test, permitted_agents: [], allowed_groups: [all] }]`,
+          model:
+            "model: { provider: openai, credential_secret_ref: openai-key, default_model: gpt-5.6-terra }",
+          knowledge: "sources: []",
+          themeCss: "",
+        }),
+      ).toThrow(
+        `channels.yaml channel.id "${reserved}0f4b" is in the "${reserved}" id namespace this deployment generates; a package must choose an id nothing generates`,
+      );
+    });
+
+    test(`rejects an agent id in the generated "${reserved}" namespace`, () => {
+      expect(() =>
+        validateTenantPackage({
+          brand: "tenant: { id: fintech, product_name: Ledgerline }",
+          agents: `agents: [{ id: ${reserved}0f4b, name: Knowledge, title: Company Knowledge, role_description: Answer company questions., type: built-in, system_prompt: Answer from knowledge. }]`,
+          channels: "channels: []",
+          model:
+            "model: { provider: openai, credential_secret_ref: openai-key, default_model: gpt-5.6-terra }",
+          knowledge: "sources: []",
+          themeCss: "",
+        }),
+      ).toThrow(
+        `agents.yaml agent.id "${reserved}0f4b" is in the "${reserved}" id namespace this deployment generates; a package must choose an id nothing generates`,
+      );
+    });
+  }
+
+  test("an id that merely contains a generated prefix is fine", () => {
+    /*
+     * The namespace is a prefix, not a substring: `channel_` anywhere but the front cannot collide
+     * with a generated id, and the shipped packages use hyphenated words that a stricter shape check
+     * would have to keep accepting anyway. Asserted so that tightening this into a general
+     * identifier rule is a deliberate decision rather than something that happens by accident.
+     */
+    const tenantPackage = validateTenantPackage({
+      brand: "tenant: { id: fintech, product_name: Ledgerline }",
+      agents:
+        "agents: [{ id: my-agent_desk, name: Desk, title: Desk, role_description: Answer desk questions., type: built-in, system_prompt: Answer from the desk. }]",
+      channels:
+        "channels: [{ id: the-channel_room, name: Room, description: Test, permitted_agents: [my-agent_desk], allowed_groups: [all] }]",
+      model:
+        "model: { provider: openai, credential_secret_ref: openai-key, default_model: gpt-5.6-terra }",
+      knowledge: "sources: []",
+      themeCss: "",
+    });
+
+    expect(tenantPackage.agents.map((agent) => agent.id)).toEqual([
+      "my-agent_desk",
+    ]);
+    expect(tenantPackage.channels.map((channel) => channel.id)).toEqual([
+      "the-channel_room",
+    ]);
+  });
+
   test("omits a remote coworker whose endpoint expanded to nothing", () => {
     const tenantPackage = validateTenantPackage({
       brand: "tenant: { id: fintech, product_name: Ledgerline }",
