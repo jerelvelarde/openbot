@@ -12,12 +12,13 @@
  */
 import type { Context, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
-import { bodyLimit } from "hono/body-limit";
 import { AgentNotFoundError } from "../agents/profile-store";
 import { type AuditStore, createAuditRecorder } from "../audit";
 import type { AppVariables } from "../auth/guards";
 import {
+  limitBody,
   MAX_ACTIVITY_BODY_BYTES,
+  MAX_SMALL_BODY_BYTES,
   parseActivityInput,
 } from "../channels/routes";
 import {
@@ -111,38 +112,59 @@ export function createBotChatRoutes(
     logIdKey: "botChatId",
   });
 
-  routes.post("/", requireUser, async (context) => {
-    const parsed = parseCreateInput(await context.req.json().catch(() => null));
-    if (!parsed.ok) return context.json({ error: parsed.error }, 400);
-
-    try {
-      const botChat = await store.create(
-        context.var.actor,
-        parsed.value.agentId,
+  routes.post(
+    "/",
+    requireUser,
+    // One agent id, so the small cap — and NOT the channel twin's create cap, which is the one place
+    // the two `POST /`s legitimately differ: a channel is opened with a list of Bots and this is
+    // opened with one, so `MAX_CHANNEL_CREATE_BODY_BYTES` is sized for something this route cannot be
+    // asked for.
+    limitBody("Bot chat", MAX_SMALL_BODY_BYTES),
+    async (context) => {
+      const parsed = parseCreateInput(
+        await context.req.json().catch(() => null),
       );
-      return context.json({ botChat: botChatDto(botChat) }, 201);
-    } catch (error) {
-      return mapStoreError(context, error);
-    }
-  });
+      if (!parsed.ok) return context.json({ error: parsed.error }, 400);
+
+      try {
+        const botChat = await store.create(
+          context.var.actor,
+          parsed.value.agentId,
+        );
+        return context.json({ botChat: botChatDto(botChat) }, 201);
+      } catch (error) {
+        return mapStoreError(context, error);
+      }
+    },
+  );
 
   // Before `/:id`, or "adopt" is read as an id. `channels/routes.ts` carries the same hazard above
   // its `/events` route.
-  routes.post("/adopt", requireUser, async (context) => {
-    const parsed = parseAdoptInput(await context.req.json().catch(() => null));
-    if (!parsed.ok) return context.json({ error: parsed.error }, 400);
-
-    try {
-      const botChat = await store.adopt(
-        context.var.actor,
-        parsed.value.agentId,
-        parsed.value.threadId,
+  routes.post(
+    "/adopt",
+    requireUser,
+    // An agent id and a thread id. `PLAUSIBLE_THREAD_ID` bounds the second of them to 36 characters
+    // and `parseAdoptInput` bounds neither's arrival: both run after `context.req.json()` has built
+    // an object out of whatever was sent, which is the half `MAX_SMALL_BODY_BYTES` covers.
+    limitBody("Adopt", MAX_SMALL_BODY_BYTES),
+    async (context) => {
+      const parsed = parseAdoptInput(
+        await context.req.json().catch(() => null),
       );
-      return context.json({ botChat: botChatDto(botChat) });
-    } catch (error) {
-      return mapStoreError(context, error);
-    }
-  });
+      if (!parsed.ok) return context.json({ error: parsed.error }, 400);
+
+      try {
+        const botChat = await store.adopt(
+          context.var.actor,
+          parsed.value.agentId,
+          parsed.value.threadId,
+        );
+        return context.json({ botChat: botChatDto(botChat) });
+      } catch (error) {
+        return mapStoreError(context, error);
+      }
+    },
+  );
 
   routes.get("/:id", requireUser, async (context) => {
     try {
@@ -163,8 +185,8 @@ export function createBotChatRoutes(
     "/:id/activity",
     requireUser,
     /*
-     * The same body limit the channel twin's activity route carries, taken from the same constant, and
-     * not a second spelling of it.
+     * The same body limit the channel twin's activity route carries, taken from the same constant and
+     * through the same function, and not a second spelling of either.
      *
      * Two caps, and they are not interchangeable. `parseActivityInput` bounds the message, which is
      * the semantic limit and the one that answers 400; it cannot bound the work in front of it,
@@ -172,16 +194,12 @@ export function createBotChatRoutes(
      * parser sees an object. Without this middleware a multi-megabyte body was read and `JSON.parse`d
      * in full and only then answered "Text is too long." — the parser's cap bounded the message and
      * nothing about the body carrying it.
+     *
+     * `limitBody` is where the 413's shape and wording now live, so the status and the sentence are
+     * the channel twin's by construction rather than by two copies agreeing: a roster's two kinds of
+     * row must not answer one oversized report differently.
      */
-    bodyLimit({
-      maxSize: MAX_ACTIVITY_BODY_BYTES,
-      // JSON, and named, because every other refusal on these routes is; the default is a plain-text
-      // "Payload Too Large" thrown as an exception, which a client parsing our error shape cannot
-      // read. The same status and the same message the channel twin answers with, so a roster's two
-      // kinds of row do not answer one oversized report differently.
-      onError: (context) =>
-        context.json({ error: "Activity body is too large." }, 413),
-    }),
+    limitBody("Activity", MAX_ACTIVITY_BODY_BYTES),
     async (context) => {
       const parsed = parseActivityInput(
         await context.req.json().catch(() => null),
@@ -215,23 +233,35 @@ export function createBotChatRoutes(
     },
   );
 
-  routes.put("/:id/pin", requireUser, async (context) => {
-    const body = await context.req.json().catch(() => null);
-    if (!isBotChatInputObject(body)) {
-      return context.json({ error: "Pin input must be a JSON object." }, 400);
-    }
-    const { pinned } = body as { pinned?: unknown };
-    if (typeof pinned !== "boolean") {
-      return context.json({ error: "Pinned must be true or false." }, 400);
-    }
+  routes.put(
+    "/:id/pin",
+    requireUser,
+    // One boolean, capped from the channel twin's constant through the channel twin's function, for
+    // the reason this file's header gives: a cap the two kinds of row do not share is a roster whose
+    // rows refuse the same body at two different sizes.
+    limitBody("Pin", MAX_SMALL_BODY_BYTES),
+    async (context) => {
+      const body = await context.req.json().catch(() => null);
+      if (!isBotChatInputObject(body)) {
+        return context.json({ error: "Pin input must be a JSON object." }, 400);
+      }
+      const { pinned } = body as { pinned?: unknown };
+      if (typeof pinned !== "boolean") {
+        return context.json({ error: "Pinned must be true or false." }, 400);
+      }
 
-    try {
-      await store.setPinned(context.var.actor, context.req.param("id"), pinned);
-      return context.json({ pinned });
-    } catch (error) {
-      return mapStoreError(context, error);
-    }
-  });
+      try {
+        await store.setPinned(
+          context.var.actor,
+          context.req.param("id"),
+          pinned,
+        );
+        return context.json({ pinned });
+      } catch (error) {
+        return mapStoreError(context, error);
+      }
+    },
+  );
 
   routes.put("/:id/read", requireUser, async (context) => {
     try {
@@ -242,48 +272,59 @@ export function createBotChatRoutes(
     }
   });
 
-  routes.put("/:id/archive", requireUser, async (context) => {
-    const body = await context.req.json().catch(() => null);
-    if (!isBotChatInputObject(body)) {
-      return context.json(
-        { error: "Archive input must be a JSON object." },
-        400,
-      );
-    }
-    const { archived } = body as { archived?: unknown };
-    if (typeof archived !== "boolean") {
-      return context.json({ error: "Archived must be true or false." }, 400);
-    }
-
-    const id = context.req.param("id");
-    try {
-      const changed = await store.setArchived(context.var.actor, id, archived);
-      /*
-       * Only when the store moved the flag. `setArchived` answers `false` for a repeat call on a chat
-       * already in the requested state, and pressing Archive twice must not lay down two rows for one
-       * archiving.
-       *
-       * The response below is unconditional either way — the caller asked for a state and that state
-       * now holds — so a 200 here can coincide with no trail write at all. Deliberate: the HTTP
-       * contract answers "is it archived now", not "did this call do the archiving".
-       */
-      if (changed) {
-        await record(
-          context.var.actor.id,
-          archived ? "bot_chat.archived" : "bot_chat.unarchived",
-          id,
-          // Named the way `bot_chat.deleted` names its mechanism, and for a sharper reason: the
-          // activity route writes `bot_chat.unarchived` too, when somebody speaking in an archived
-          // conversation brings it back. Without this a reader cannot tell a decision from a side
-          // effect.
-          { mechanism: "explicit" },
+  routes.put(
+    "/:id/archive",
+    requireUser,
+    // One boolean, from the same constant and the same function as the channel twin's archive route.
+    // Verified answering 2xx to an 8 MB body before this line existed, exactly as that route was.
+    limitBody("Archive", MAX_SMALL_BODY_BYTES),
+    async (context) => {
+      const body = await context.req.json().catch(() => null);
+      if (!isBotChatInputObject(body)) {
+        return context.json(
+          { error: "Archive input must be a JSON object." },
+          400,
         );
       }
-      return context.json({ archived });
-    } catch (error) {
-      return mapStoreError(context, error);
-    }
-  });
+      const { archived } = body as { archived?: unknown };
+      if (typeof archived !== "boolean") {
+        return context.json({ error: "Archived must be true or false." }, 400);
+      }
+
+      const id = context.req.param("id");
+      try {
+        const changed = await store.setArchived(
+          context.var.actor,
+          id,
+          archived,
+        );
+        /*
+         * Only when the store moved the flag. `setArchived` answers `false` for a repeat call on a chat
+         * already in the requested state, and pressing Archive twice must not lay down two rows for one
+         * archiving.
+         *
+         * The response below is unconditional either way — the caller asked for a state and that state
+         * now holds — so a 200 here can coincide with no trail write at all. Deliberate: the HTTP
+         * contract answers "is it archived now", not "did this call do the archiving".
+         */
+        if (changed) {
+          await record(
+            context.var.actor.id,
+            archived ? "bot_chat.archived" : "bot_chat.unarchived",
+            id,
+            // Named the way `bot_chat.deleted` names its mechanism, and for a sharper reason: the
+            // activity route writes `bot_chat.unarchived` too, when somebody speaking in an archived
+            // conversation brings it back. Without this a reader cannot tell a decision from a side
+            // effect.
+            { mechanism: "explicit" },
+          );
+        }
+        return context.json({ archived });
+      } catch (error) {
+        return mapStoreError(context, error);
+      }
+    },
+  );
 
   routes.delete("/:id", requireUser, async (context) => {
     const id = context.req.param("id");
@@ -349,18 +390,24 @@ function mapStoreError(context: Context, error: unknown): Response {
   /*
    * Anything else, as JSON with a 500 — not rethrown.
    *
-   * IT USED TO RETHROW. Nothing in this server registers an `onError`, so Hono answered its own
+   * IT USED TO RETHROW. Nothing in this server registered an `onError` then, so Hono answered its own
    * `text/plain "Internal Server Error"`, and `client()` in the browser reads `body.error` and falls
    * back to its own sentence when the body is not JSON. `roster/routes.ts` already answers `{ error }`
    * with 500 and logs a line for the same class of failure, so a database blip made `GET /api/roster`
    * readable and `PUT /api/bot-chats/:id/archive` unreadable — one roster whose rows behave
    * differently depending on which kind they are, which is the thing this file's header says it exists
    * to prevent. The channel twin's `mapStoreError` carries the same terminal branch and the same
-   * sentence.
+   * sentence. `app.ts` registers one now, and it changes nothing here: these routes are mounted as a
+   * sub-app with no `onError` of its own, so the app's handler only ever sees what this function did
+   * not expect.
    *
    * Fixed here and not with an app-level `onError`, which would also have swallowed the audit
    * reader's `HTTPException` 400s — those depend on Hono's default handler calling
-   * `err.getResponse()`.
+   * `err.getResponse()`. The handler `app.ts` now carries answers that objection instead of ignoring
+   * it, by delegating to `getResponse()` before anything else — duck-typed on the method rather than
+   * `instanceof HTTPException`, so the copilot runtime's own copy of hono is served too — and that is
+   * why the two co-exist rather than one replacing the other: the three translations above are this
+   * file's to make.
    *
    * The sentence names the server as the side that failed and says nothing else: what was thrown may
    * carry a connection string or an upstream host, so it goes to the log. Unconditionally, because

@@ -1316,6 +1316,71 @@ const MAX_ACTIVITY_TEXT_UNITS = 16_000;
 export const MAX_ACTIVITY_BODY_BYTES = 256 * 1024;
 
 /**
+ * How large a body that is not a message may be.
+ *
+ * Six of the nine body-taking routes across this file and `bot-chats/routes.ts` take a fixed handful
+ * of fields and nothing that grows: a boolean to pin or archive either kind of conversation, one
+ * agent id to start a conversation with a Bot, an agent id and a thread id to adopt one. None of them
+ * needs anything close to the room a reported message needs, and that is the whole reason there is
+ * more than one number here — a quarter of a megabyte read off the socket and `JSON.parse`d in full
+ * to find `{"archived":true}` somewhere in it is what one number for every route costs.
+ *
+ * Four kilobytes rather than the forty-odd bytes such a body actually is, because every one of these
+ * parsers reads the fields it wants and ignores the rest: a client that PUTs back the whole row it
+ * was handed — the object `channelDto` returns — is asking for something legal, and a cap trimmed to
+ * the shortest legal body would refuse it. Four kilobytes is an order of magnitude above anything a
+ * client of these routes sends and three below the megabytes this exists to turn away.
+ *
+ * Exported for `bot-chats/routes.ts`, whose four small-bodied routes take their cap from here rather
+ * than restating it, for the reason `MAX_ACTIVITY_BODY_BYTES` above is exported: a roster's two kinds
+ * of row must not refuse the same body at two different sizes.
+ */
+export const MAX_SMALL_BODY_BYTES = 4 * 1024;
+
+/**
+ * How large `POST /` may be — the one body on either file that grows with what is being asked for.
+ *
+ * `parseChannelInput` bounds every member of `agentIds` and says nothing about how many members there
+ * are, so this is the only thing between one request and a transaction that looks up a profile and
+ * inserts a `channel_agents` row per id. Sixteen kilobytes is a few hundred ids at any length this
+ * deployment mints them — more Bots than a roster holds — and small enough that the work behind an
+ * accepted request stays bounded.
+ *
+ * A CAP ON THE COUNT WOULD BE THE BETTER BOUND, and it does not belong here: it belongs in
+ * `parseChannelInput`, which could then answer 400 saying how many Bots one channel may name instead
+ * of 413 saying something about bytes. Until it has one, this number is the effective limit on the
+ * list — which is the one way this cap is unlike `MAX_ACTIVITY_BODY_BYTES`, whose parser has a cap of
+ * its own that always bites first.
+ */
+export const MAX_CHANNEL_CREATE_BODY_BYTES = 16 * 1024;
+
+/**
+ * A body cap, as the JSON refusal every other answer on these routes is.
+ *
+ * ONE FUNCTION FOR NINE ROUTES rather than nine `bodyLimit` calls differing in a number and a noun.
+ * The way this went wrong the first time is the argument for it: the middleware sat on the two
+ * activity routes and on none of the other seven, and a decision written out per route is a decision
+ * nobody can count.
+ *
+ * `subject` names what was too large in the words that route's own 400s use — "Pin body is too
+ * large." beside "Pin input must be a JSON object." — so a client told its body was refused can tell
+ * which call was refused. JSON, and named, because every other refusal on these routes is: the
+ * `bodyLimit` default is a plain-text "Payload Too Large" thrown as an exception, and `client()` in
+ * the browser reads `body.error` and falls back to its own sentence when the body is not JSON, so
+ * the default reaches a person as "the request failed" with none of the server's reason in it.
+ *
+ * Exported for `bot-chats/routes.ts`, whose five body-taking routes cap themselves with this same
+ * function, so the twins cannot come to refuse one oversized body in two different words.
+ */
+export function limitBody(subject: string, maxSize: number): MiddlewareHandler {
+  return bodyLimit({
+    maxSize,
+    onError: (context) =>
+      context.json({ error: `${subject} body is too large.` }, 413),
+  });
+}
+
+/**
  * How far from this server's clock, in either direction, a reported `at` may be.
  *
  * Not zero: the stamp comes from the machine that saw the message, and two clocks a few seconds
@@ -1535,22 +1600,30 @@ export function createChannelRoutes(
     );
   }
 
-  routes.post("/", requireUser, async (context) => {
-    const parsed = parseChannelInput(
-      await context.req.json().catch(() => null),
-    );
-    if (!parsed.ok) return context.json({ error: parsed.error }, 400);
-
-    try {
-      const channel = await store.create(
-        context.var.actor,
-        parsed.value.agentIds,
+  routes.post(
+    "/",
+    requireUser,
+    // The one body on this file that grows with the request: `MAX_CHANNEL_CREATE_BODY_BYTES` says why
+    // it gets a number of its own rather than the small one the flag routes below share, and what a
+    // cap on the number of Bots would have to look like instead.
+    limitBody("Channel", MAX_CHANNEL_CREATE_BODY_BYTES),
+    async (context) => {
+      const parsed = parseChannelInput(
+        await context.req.json().catch(() => null),
       );
-      return context.json({ channel: channelDto(channel) }, 201);
-    } catch (error) {
-      return mapStoreError(context, error);
-    }
-  });
+      if (!parsed.ok) return context.json({ error: parsed.error }, 400);
+
+      try {
+        const channel = await store.create(
+          context.var.actor,
+          parsed.value.agentIds,
+        );
+        return context.json({ channel: channelDto(channel) }, 201);
+      } catch (error) {
+        return mapStoreError(context, error);
+      }
+    },
+  );
 
   routes.get("/", requireUser, async (context) => {
     try {
@@ -1588,17 +1661,16 @@ export function createChannelRoutes(
      *
      * `parseActivityInput` bounds the message, which is the semantic limit and the one that answers
      * 400. It cannot bound the work that precedes it: `context.req.json()` below has already read and
-     * parsed the whole body by the time the parser sees an object. This is that half — the only place
-     * a multi-megabyte body can be turned away before it is parsed at all.
+     * parsed the whole body by the time the parser sees an object. This is that half — the place a
+     * multi-megabyte report is turned away before it is parsed at all.
+     *
+     * IT SAID "THE ONLY PLACE", and the sentence was true of a route rather than of the server: this
+     * middleware sat here and on the bot-chat twin's activity route and on none of the other seven
+     * body-taking routes across the two files, so an 8 MB `{"archived":true}` was read and parsed in
+     * full and answered 200. All nine carry a cap now, and this is the widest of the three numbers
+     * because a message is the only one of these bodies allowed to be long.
      */
-    bodyLimit({
-      maxSize: MAX_ACTIVITY_BODY_BYTES,
-      // JSON, and named, because every other refusal on these routes is. The default is a plain-text
-      // "Payload Too Large" thrown as an exception, which a client parsing our error shape cannot
-      // read.
-      onError: (context) =>
-        context.json({ error: "Activity body is too large." }, 413),
-    }),
+    limitBody("Activity", MAX_ACTIVITY_BODY_BYTES),
     async (context) => {
       const parsed = parseActivityInput(
         await context.req.json().catch(() => null),
@@ -1638,71 +1710,89 @@ export function createChannelRoutes(
     },
   );
 
-  routes.put("/:channelId/pin", requireUser, async (context) => {
-    const body = await context.req.json().catch(() => null);
-    if (!isChannelInputObject(body)) {
-      return context.json({ error: "Pin input must be a JSON object." }, 400);
-    }
-    const { pinned } = body as { pinned?: unknown };
-    if (typeof pinned !== "boolean") {
-      return context.json({ error: "Pinned must be true or false." }, 400);
-    }
+  routes.put(
+    "/:channelId/pin",
+    requireUser,
+    // One boolean, so the small cap: `MAX_SMALL_BODY_BYTES` argues the size. It is here rather than
+    // nowhere because the two checks below run on an object `context.req.json()` has already built out
+    // of however many bytes arrived, and "Pinned must be true or false." is not an answer that
+    // bounded anything.
+    limitBody("Pin", MAX_SMALL_BODY_BYTES),
+    async (context) => {
+      const body = await context.req.json().catch(() => null);
+      if (!isChannelInputObject(body)) {
+        return context.json({ error: "Pin input must be a JSON object." }, 400);
+      }
+      const { pinned } = body as { pinned?: unknown };
+      if (typeof pinned !== "boolean") {
+        return context.json({ error: "Pinned must be true or false." }, 400);
+      }
 
-    try {
-      await store.setPinned(
-        context.var.actor,
-        context.req.param("channelId"),
-        pinned,
-      );
-      return context.json({ pinned });
-    } catch (error) {
-      return mapStoreError(context, error);
-    }
-  });
+      try {
+        await store.setPinned(
+          context.var.actor,
+          context.req.param("channelId"),
+          pinned,
+        );
+        return context.json({ pinned });
+      } catch (error) {
+        return mapStoreError(context, error);
+      }
+    },
+  );
 
-  routes.put("/:channelId/archive", requireUser, async (context) => {
-    const body = await context.req.json().catch(() => null);
-    if (!isChannelInputObject(body)) {
-      return context.json(
-        { error: "Archive input must be a JSON object." },
-        400,
-      );
-    }
-    const { archived } = body as { archived?: unknown };
-    if (typeof archived !== "boolean") {
-      return context.json({ error: "Archived must be true or false." }, 400);
-    }
-
-    const channelId = context.req.param("channelId");
-    try {
-      const changed = await store.setArchived(
-        context.var.actor,
-        channelId,
-        archived,
-      );
-      // Reached only once the store has resolved, so a refused archive writes nothing. And only when
-      // the store actually moved the flag: `setArchived` returns `false` for a repeat call on a
-      // channel already in the requested state, and clicking Archive twice must not lay down two
-      // `channel.archived` rows for one archiving. The response below is unconditional either way —
-      // the caller asked for a state and that state now holds — so a 200 here can coincide with no
-      // trail write at all. That is deliberate, not a bug: the HTTP contract answers "is it archived
-      // now", not "did this call do the archiving".
-      if (changed) {
-        await record(
-          context.var.actor.id,
-          archived ? "channel.archived" : "channel.unarchived",
-          channelId,
-          // Named the way `channel.deleted` names its mechanism, and for a sharper reason: the
-          // activity route writes `channel.unarchived` too, when somebody typing in an archived
-          // channel brings it back. Without this a reader cannot tell a decision from a side effect.
-          { mechanism: "explicit" },
+  routes.put(
+    "/:channelId/archive",
+    requireUser,
+    // One boolean, like the pin route above, and capped from the same constant rather than a second
+    // number that means the same thing. This is the route the review actually caught: an 8 MB body
+    // was read off the socket, `JSON.parse`d whole, and answered 200 because `archived: true` was
+    // somewhere inside it.
+    limitBody("Archive", MAX_SMALL_BODY_BYTES),
+    async (context) => {
+      const body = await context.req.json().catch(() => null);
+      if (!isChannelInputObject(body)) {
+        return context.json(
+          { error: "Archive input must be a JSON object." },
+          400,
         );
       }
-      return context.json({ archived });
-    } catch (error) {
-      return mapStoreError(context, error);
-    }
-  });
+      const { archived } = body as { archived?: unknown };
+      if (typeof archived !== "boolean") {
+        return context.json({ error: "Archived must be true or false." }, 400);
+      }
+
+      const channelId = context.req.param("channelId");
+      try {
+        const changed = await store.setArchived(
+          context.var.actor,
+          channelId,
+          archived,
+        );
+        // Reached only once the store has resolved, so a refused archive writes nothing. And only when
+        // the store actually moved the flag: `setArchived` returns `false` for a repeat call on a
+        // channel already in the requested state, and clicking Archive twice must not lay down two
+        // `channel.archived` rows for one archiving. The response below is unconditional either way —
+        // the caller asked for a state and that state now holds — so a 200 here can coincide with no
+        // trail write at all. That is deliberate, not a bug: the HTTP contract answers "is it archived
+        // now", not "did this call do the archiving".
+        if (changed) {
+          await record(
+            context.var.actor.id,
+            archived ? "channel.archived" : "channel.unarchived",
+            channelId,
+            // Named the way `channel.deleted` names its mechanism, and for a sharper reason: the
+            // activity route writes `channel.unarchived` too, when somebody typing in an archived
+            // channel brings it back. Without this a reader cannot tell a decision from a side effect.
+            { mechanism: "explicit" },
+          );
+        }
+        return context.json({ archived });
+      } catch (error) {
+        return mapStoreError(context, error);
+      }
+    },
+  );
 
   routes.put("/:channelId/read", requireUser, async (context) => {
     try {
@@ -1774,17 +1864,23 @@ function channelSummaryDto(channel: ChannelSummary) {
 /**
  * Whatever the store threw, as the JSON shape every refusal on these routes uses.
  *
- * IT USED TO RETHROW whatever it did not recognise. Nothing in this server registers an `onError`, so
- * Hono answered its own `text/plain "Internal Server Error"` — and `client()` in the browser reads
- * `body.error` and falls back to its own sentence when the body is not JSON. `roster/routes.ts` was
- * fixed to answer `{ error }` with 500 and log a line; leaving these two rethrowing meant a database
- * blip made `GET /api/roster` readable and `PUT /api/channels/:id/archive` unreadable, which is
- * exactly the split `bot-chats/routes.ts`'s header names: one roster whose rows behave differently
- * depending on which kind they are.
+ * IT USED TO RETHROW whatever it did not recognise. Nothing in this server registered an `onError`
+ * then, so Hono answered its own `text/plain "Internal Server Error"` — and `client()` in the browser
+ * reads `body.error` and falls back to its own sentence when the body is not JSON. `roster/routes.ts`
+ * was fixed to answer `{ error }` with 500 and log a line; leaving these two rethrowing meant a
+ * database blip made `GET /api/roster` readable and `PUT /api/channels/:id/archive` unreadable, which
+ * is exactly the split `bot-chats/routes.ts`'s header names: one roster whose rows behave differently
+ * depending on which kind they are. `app.ts` registers one now, and this function still runs first: a
+ * mounted sub-app with no `onError` of its own falls through to the parent's, so that handler only
+ * ever sees what this file did not expect.
  *
  * Fixed here rather than with an app-level `onError`, which would have caught the audit reader's
  * `HTTPException` 400s too and answered them 500: those rely on Hono's default handler calling
- * `err.getResponse()`.
+ * `err.getResponse()`. That objection is answered rather than dropped in the handler `app.ts` now
+ * carries — it delegates to `getResponse()` first, duck-typed on the method rather than `instanceof
+ * HTTPException` so a sub-app with its own copy of hono is served too — which is why the two
+ * co-exist: the translations below are this file's to make, and a backstop that guessed at them would
+ * be a second, quieter copy of them.
  *
  * The sentence names the server as the side that failed and says nothing else. What was thrown may
  * carry a connection string or an upstream host, so it goes to the log instead — unconditionally,
