@@ -285,6 +285,127 @@ describe("Routines", () => {
   });
 });
 
+describe("Typefully", () => {
+  const entry = catalogueEntry("typefully");
+
+  test("is in the catalogue with the MCP transport", () => {
+    expect(entry).not.toBeNull();
+    // Omitted means MCP. Typefully publishes a REST API too and this entry deliberately does not
+    // use it — see the comment on the entry.
+    expect(entry?.transport).toBeUndefined();
+    expect(entry?.host).toBe("https://mcp.typefully.com");
+    expect(entry?.path).toBe("/mcp");
+  });
+
+  test("resolves to its pinned endpoint and refuses every other host", () => {
+    expect(resolveServerUrl("typefully")?.url).toBe(
+      "https://mcp.typefully.com/mcp",
+    );
+    if (!entry) throw new Error("no entry");
+    // The control that stops "add an MCP server" being a forgery primitive, asked of this vendor's
+    // own lookalikes. An instance host is offered too, because a caller can always supply one and a
+    // pinned-host entry must ignore it rather than prefer it.
+    expect(hostAdmissible(entry, "https://mcp.typefully.com")).toBe(true);
+    for (const host of [
+      "https://mcp.typefully.com.evil.test",
+      "https://typefully.com",
+      "https://api.typefully.com",
+      "http://mcp.typefully.com",
+      "https://MCP.TYPEFULLY.COM",
+    ]) {
+      expect(hostAdmissible(entry, host)).toBe(false);
+      expect(resolveServerUrl("typefully", host)?.url).toBe(
+        "https://mcp.typefully.com/mcp",
+      );
+    }
+  });
+
+  test("registers its client dynamically, with every endpoint pinned to https", () => {
+    if (entry?.auth.kind !== "user-oauth") throw new Error("wrong auth kind");
+    expect(entry.auth.clientRegistration).toBe("dynamic");
+    expect(entry.auth.registrationUrl?.startsWith("https://")).toBe(true);
+    expect(entry.auth.authorizationUrl.startsWith("https://")).toBe(true);
+    expect(entry.auth.tokenUrl.startsWith("https://")).toBe(true);
+    expect(entry.auth.revokeUrl.startsWith("https://")).toBe(true);
+    // The one scope Typefully has, sent rather than omitted because its 401 challenge names it.
+    // Pinned literally: this granting everything is the reason the entry classifies from the read
+    // side, so a change to it is a change to the whole write story and should fail here.
+    expect(entry.auth.scopes).toEqual(["full_access"]);
+  });
+
+  test("pins the OAuth endpoints to the host the vendor's metadata names", () => {
+    if (entry?.auth.kind !== "user-oauth") throw new Error("wrong auth kind");
+    // Deliberately NOT the MCP host. Verified against
+    // https://mcp.typefully.com/.well-known/oauth-protected-resource, which names
+    // https://api.typefully.com as this resource's authorization server. Asserted so that
+    // "tidying" the three URLs onto mcp.typefully.com to match the entry's host fails here rather
+    // than at somebody's first connect.
+    expect(entry.auth.authorizationUrl).toBe(
+      "https://api.typefully.com/oauth2/authorize",
+    );
+    expect(entry.auth.tokenUrl).toBe("https://api.typefully.com/oauth2/token");
+    expect(entry.auth.revokeUrl).toBe(
+      "https://api.typefully.com/oauth2/revoke",
+    );
+    expect(entry.auth.registrationUrl).toBe(
+      "https://api.typefully.com/oauth2/register",
+    );
+    expect(new URL(entry.auth.tokenUrl).hostname).not.toBe(
+      new URL(entry.host as string).hostname,
+    );
+  });
+
+  test("classifies from the read side, so an unnamed tool is a write", () => {
+    // The property this connector's safety rests on. Typefully's writes publish in public under
+    // somebody's own name, so a tool nobody has reviewed must be a write — the opposite of the
+    // arrangement Drive and Notion use, where an unnamed advertised tool is a read.
+    expect(entry?.readTools).toEqual([]);
+    expect(classifyTool(entry, "create_draft", true)).toBe("write");
+    expect(classifyTool(entry, "get_drafts", true)).toBe("write");
+    expect(classifyTool(entry, "anything_at_all", true)).toBe("write");
+    expect(classifyTool(entry, "brand-new-tool", false)).toBe("write");
+  });
+});
+
+describe("an entry that names its reads", () => {
+  test("names them instead of its writes, never as well", () => {
+    // One governing list per entry. Two would leave every reader of an entry — and of
+    // classifyTool — working out which of them decides, and the answer would be invisible at the
+    // call site. Enforced over the whole catalogue rather than over Typefully, so it holds for the
+    // next vendor that inverts.
+    for (const entry of CATALOGUE) {
+      if (entry.readTools === undefined) continue;
+      expect(entry.writeTools).toEqual([]);
+    }
+  });
+
+  test("a read list is the authority, not a hint layered over the write list", () => {
+    // Written against a literal rather than a catalogue entry, because what is being pinned is
+    // classifyTool's branch and not any vendor's current lists. A tool named in BOTH would be a
+    // read: readTools decides alone. The invariant above is what stops an entry being written that
+    // way in the first place; this is what says which answer the code gives if one ever is.
+    const inverted = {
+      key: "test-inverted",
+      title: "Inverted",
+      vendor: "Test",
+      summary: "",
+      host: "https://example.test",
+      path: "/mcp",
+      auth: { kind: "none" },
+      writeTools: ["overlap"],
+      readTools: ["reads_only", "overlap"],
+      docsUrl: "https://example.test/docs",
+    } as const satisfies CatalogueEntry;
+
+    expect(classifyTool(inverted, "reads_only", true)).toBe("read");
+    expect(classifyTool(inverted, "overlap", true)).toBe("read");
+    expect(classifyTool(inverted, "unnamed", true)).toBe("write");
+    // Not advertised is still a write, whichever way the entry classifies: the name came from a
+    // model rather than from the server.
+    expect(classifyTool(inverted, "reads_only", false)).toBe("write");
+  });
+});
+
 describe("what a tool does", () => {
   const drive = catalogueEntry("google-drive")!;
 
