@@ -4,7 +4,7 @@ import type { Database } from "./db/client";
 import { auditEvents } from "./db/schema";
 import { recencyCursorText, withinTimestamptzRange } from "./roster/order";
 import { parsePageLimit } from "./roster/query";
-import { timestampShape } from "./time";
+import { isCursorTimestamp, timestampShape } from "./time";
 
 const sensitiveKeys = new Set([
   "access_token",
@@ -499,15 +499,6 @@ type AuditCursor = {
 /** The boundary timestamp as the cursor carries it. See `AuditCursor`. */
 const CURSOR_CREATED_AT = recencyCursorText(sql`${auditEvents.createdAt}`);
 
-/**
- * A cursor timestamp, shaped as `recencyCursorText` writes it.
- *
- * One to six fractional digits, so a cursor minted before that function was used here is still
- * accepted: `Date.prototype.toISOString` wrote three, and a page somebody has open across the deploy
- * names a real position in an ordering that has not changed.
- */
-const CURSOR_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/;
-
 /** The canonical rendering of a `uuid`, which is the only form this column is ever read back as. */
 const CURSOR_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -530,7 +521,7 @@ const CURSOR_ID =
  * The fraction is not compared, because `Date` cannot hold it; the shape above is what constrains it.
  */
 function readsAsCursorTimestamp(value: string): boolean {
-  if (!CURSOR_TIMESTAMP.test(value)) return false;
+  if (!isCursorTimestamp(value)) return false;
   const at = new Date(value);
   return (
     withinTimestamptzRange(at) &&

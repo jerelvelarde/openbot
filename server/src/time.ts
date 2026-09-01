@@ -107,3 +107,72 @@ export function timestampShape(value: string): TimestampShape {
   if (DATE_TIME_WITHOUT_ZONE.test(value)) return "date-time-without-zone";
   return "not-iso-8601";
 }
+
+/*
+ * The cursor timestamp, which is a narrower shape than any of the three above and deliberately so.
+ *
+ * Not assembled from the pieces above, because it accepts less of each: a four-digit year and not the
+ * extended `±YYYYYY` form, seconds always present rather than optional, one to six fractional digits
+ * rather than any number of them, and a literal `Z` rather than any zone. That is not a stricter mood
+ * about the same subject — it is a different subject. The three shapes above describe what a person or
+ * a client may hand in; this one describes what `recencyCursorText` writes, which is the only thing a
+ * cursor is ever minted from.
+ *
+ * ONE TO SIX FRACTIONAL DIGITS, so a cursor minted before that function was used is still accepted:
+ * `Date.prototype.toISOString` wrote three, and a link or a page somebody has open across the deploy
+ * names a real position in an ordering that has not changed.
+ *
+ * The capture groups are what `cursorTimestampFields` hands back, and the reason this is one literal
+ * rather than a composition: the group positions are the interface.
+ */
+const CURSOR_TIMESTAMP =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,6})?Z$/;
+
+/** The fields of a cursor timestamp, as numbers, in the order the string spells them. */
+export type CursorTimestampFields = {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+};
+
+/**
+ * The fields of `value`, or `null` if it is not shaped as a cursor timestamp.
+ *
+ * TWO READERS AGAIN, AND THE SAME HISTORY. `readsAsTimestamp` in `roster/order.ts` and
+ * `readsAsCursorTimestamp` in `audit.ts` each held a copy of this pattern — character for character
+ * the same, docblocks included, one carrying capture groups. Two copies of a cursor's format is worse
+ * than two copies of most rules: the roster and the audit trail mint their cursors the same way, so a
+ * correction landing in one copy means one surface refuses a page the other would have served, and a
+ * keyset cursor refused is a 400 on a link somebody had open.
+ *
+ * WHAT IS NOT SHARED is how each reader then decides the fields are real, and that is not an oversight.
+ * `roster/order.ts` rebuilds the instant through `setUTCFullYear` and compares field by field, because
+ * `Date.UTC` maps years 0 through 99 onto 1900 through 1999 and would call the year 1 a rollover.
+ * `audit.ts` renders the parsed instant back and compares the first nineteen characters. Both catch
+ * `2026-02-30T00:00:00Z`, neither can see the year — which is `withinTimestamptzRange`'s question, and
+ * both ask it.
+ */
+export function cursorTimestampFields(
+  value: string,
+): CursorTimestampFields | null {
+  const parts = CURSOR_TIMESTAMP.exec(value);
+  if (!parts) return null;
+  const [year, month, day, hour, minute, second] = parts
+    .slice(1, 7)
+    .map(Number) as [number, number, number, number, number, number];
+  return { year, month, day, hour, minute, second };
+}
+
+/**
+ * Whether `value` is shaped as a cursor timestamp, for the reader that does not need the fields.
+ *
+ * `audit.ts` reads the instant with `new Date` and compares the rendering, so it wants the shape and
+ * nothing else. Spelled here rather than as `cursorTimestampFields(v) !== null` at the call site so
+ * that both readers name the rule the same way.
+ */
+export function isCursorTimestamp(value: string): boolean {
+  return CURSOR_TIMESTAMP.test(value);
+}

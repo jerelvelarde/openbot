@@ -1,6 +1,7 @@
 import { desc, type SQL, sql } from "drizzle-orm";
 import type { PgColumn } from "drizzle-orm/pg-core";
 import { channels } from "../db/schema";
+import { cursorTimestampFields } from "../time";
 
 /**
  * The order the roster is drawn in, and where a page stopped.
@@ -132,16 +133,6 @@ export function rosterCursorFilter(
 }
 
 /**
- * A cursor timestamp, shaped as `recencyCursorText` writes it.
- *
- * One to six fractional digits, so a cursor minted before that function existed is still accepted:
- * `Date.prototype.toISOString` wrote three, and a link somebody has open across the deploy names a
- * real position in an ordering that has not changed.
- */
-const CURSOR_RECENCY =
-  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,6})?Z$/;
-
-/**
  * The instants a `timestamptz` can be given, which is narrower than the instants a `Date` can hold.
  *
  * A `Date` runs from ISO year -271821 to AD 275760 and Postgres will take neither end of that, so a
@@ -187,14 +178,14 @@ export function withinTimestamptzRange(at: Date): boolean {
  * The year is asked of `withinTimestamptzRange` rather than of the round trip, because the round trip
  * cannot see it: year 0 rebuilds perfectly and Postgres has no such year. `readsAsCursorTimestamp` in
  * `audit.ts` asks the same function about the same thing, having once carried a copy of this check
- * that then went missing.
+ * that then went missing. The shape both of them test is `cursorTimestampFields` in `time.ts`, which
+ * they also each held a copy of; what stays separate is only how the fields are checked for being
+ * real, and that docblock says why.
  */
 function readsAsTimestamp(value: string): boolean {
-  const parts = CURSOR_RECENCY.exec(value);
-  if (!parts) return false;
-  const [year, month, day, hour, minute, second] = parts
-    .slice(1, 7)
-    .map(Number) as [number, number, number, number, number, number];
+  const fields = cursorTimestampFields(value);
+  if (!fields) return false;
+  const { year, month, day, hour, minute, second } = fields;
   const at = new Date(0);
   at.setUTCFullYear(year, month - 1, day);
   at.setUTCHours(hour, minute, second, 0);
