@@ -58,3 +58,27 @@ test("leaves an all-unpinned roster in its original order", () => {
 
   expect(pinnedFirst(channels).map((c) => c.id)).toEqual(["a", "b", "c"]);
 });
+
+test("leaves the array it was handed in the order it arrived", () => {
+  /*
+   * The copy inside `pinnedFirst`, which every assertion above passes without.
+   *
+   * `Array.prototype.sort` sorts in place, and the array this function is handed is not its own: with
+   * an empty search box `matchingItems` returns the caller's array unchanged, and the caller's array
+   * is the one React Query's `select` memoized for the sidebar's roster observer. So dropping the copy
+   * reorders the query's own data from inside a render — and no test above can notice, because they
+   * all read the return value and this is a fact about the argument.
+   *
+   * Asserted on ids rather than on identity: `expect(arrived).not.toBe(sorted)` is the same trivial
+   * pass under aliasing that the review found in `applyRosterEvent`'s copies, since an in-place sort
+   * returns the same array it mutated and a copy returns a different one either way. The order of the
+   * argument afterwards is the thing that is actually true or false.
+   *
+   * app/tests/roster-sidebar.test.ts is the other half: that the array reaching this function really
+   * is the query's, asserted through a rendered sidebar rather than claimed in this comment.
+   */
+  const arrived = [channel("a", false), channel("b", true)];
+
+  expect(pinnedFirst(arrived).map((c) => c.id)).toEqual(["b", "a"]);
+  expect(arrived.map((c) => c.id)).toEqual(["a", "b"]);
+});

@@ -196,10 +196,27 @@ export function rowMarkers(row: {
  * Elements, keyed here, rather than a component per marker: the three have nothing in common — a
  * dot, a word, an icon — so a shared wrapper would exist only to hold the key, and would add a gap
  * to the row for every marker it wrapped.
+ *
+ * TWO OF THE THREE ARE SHAPES, AND A SHAPE SAYS NOTHING OUT LOUD. Archived is a word, so it reaches
+ * anybody reading the row by any means. The unread dot and the pin were a coloured circle and an
+ * `<svg>` with no text anywhere in them — so the two facts this row is most often scanned for were
+ * visible only to somebody looking at it, and a screen reader was given three rows it could not tell
+ * apart. `role="img"` with `aria-label` is what names a graphic that carries meaning; the alternative,
+ * a visually hidden word inside each, would need a wrapper around the icon for the sole purpose of
+ * holding it — which is the wrapper the paragraph above declines.
+ *
+ * The labels join the row link's accessible name, beside the conversation's name and its preview,
+ * which is where they belong: they are facts about that conversation, and "Archived" has been read out
+ * from exactly there since the day it was added.
  */
 const MARKER_META: Record<RowMarker, ReactNode> = {
   unread: (
-    <span className="size-2 shrink-0 rounded-full bg-primary" key="unread" />
+    <span
+      aria-label="Unread"
+      className="size-2 shrink-0 rounded-full bg-primary"
+      key="unread"
+      role="img"
+    />
   ),
   archived: (
     <span
@@ -211,8 +228,10 @@ const MARKER_META: Record<RowMarker, ReactNode> = {
   ),
   pinned: (
     <IconPinFilled
+      aria-label="Pinned"
       className="size-3 shrink-0 text-muted-foreground/70"
       key="pinned"
+      role="img"
     />
   ),
 };

@@ -139,6 +139,25 @@ function matchingItems(
  * onto a loaded row without moving it, and re-sorts a page by recency alone — which is the same
  * reason `byRecency` in use-channel-events.ts mirrors the recency rule. A stable partition, so the
  * recency order inside each group is whatever arrived.
+ *
+ * ONE TERM OF THE THREE, DELIBERATELY. The server's key is `[pinned desc, recency desc, id desc]`
+ * (server/src/roster/order.ts) and this mirrors the first of them alone. It does not need the other
+ * two: `Array.prototype.sort` has been stable since ES2019, so partitioning on the pin leaves each
+ * group in the order it arrived in, and the order it arrives in is already the remaining two terms —
+ * the server sends a page that way, and `byRecency` re-sorts a patched page that way, its id
+ * tie-break included. Restating them here would be a second copy of a rule that has one home, and
+ * the second copy is the one that goes stale.
+ *
+ * WHAT IT DOES RELY ON is that the arriving order is TOTAL. A recency mirror that answered `0` on a
+ * tie would hand tied rows over in whatever order the last thing to touch them left, and a stable
+ * partition preserves that faithfully — the disagreement would surface as rows swapping places on
+ * the next refetch, which is the symptom this function is part of preventing.
+ *
+ * The array is copied because `sort` mutates, and the array handed in is not this function's: with
+ * an empty search box `matchingItems` returns its input untouched, so the caller's array is the one
+ * React Query's `select` memoized for the sidebar's observer. app/tests/channel-order.test.ts asserts
+ * the argument survives, and app/tests/roster-sidebar.test.ts asserts through a rendered sidebar that
+ * the array really is the query's.
  */
 export function pinnedFirst(channels: RosterItem[]): RosterItem[] {
   return [...channels].sort((a, b) => Number(b.pinned) - Number(a.pinned));
@@ -336,6 +355,15 @@ export function rosterAnimation(input: {
  * not one, because the row cap only has to stop the expensive movement — but `initial` and `exit`
  * are gated at all, rather than left unconditional beside a gated `layout`, because a row fading out
  * on a keystroke is thrashing whether or not the rows around it relayout too.
+ *
+ * A LIST ITEM AROUND THE ANIMATED ELEMENT, not instead of it. The roster is this application's
+ * primary navigation and it has to be a list — a row that is only a `motion.div` has no position and
+ * no count to announce, whatever the element above it claims to be. `SidebarMenuItem` is the `<li>`
+ * (see components/ui/sidebar.tsx), and the animation is unaffected by sitting inside it: motion
+ * measures this `div`'s own box against the viewport, and the box moves when the item holding it
+ * moves, so a reorder animates exactly as it did when the `div` was the whole row. The `<li>` takes no
+ * `exit` of its own and needs none — `AnimatePresence` holds a leaving child mounted until the motion
+ * components inside it report their exits complete, which is this `div`.
  */
 function Row({
   channel,
@@ -364,40 +392,42 @@ function Row({
     },
   });
   return (
-    <motion.div
-      animate={{ opacity: 1, transform: "translateY(0px)" }}
-      // `false` disables the mount animation outright; a row then paints at its `animate` values.
-      initial={
-        animateEntrance
-          ? {
-              opacity: 0,
-              transform: shouldReduceMotion ? "none" : "translateY(-8px)",
-            }
-          : false
-      }
-      // No `exit` definition means AnimatePresence has nothing to wait for and drops the row without
-      // animating it: `setActive("exit", …)` resolves with nothing to animate, so `onExitComplete`
-      // fires straight away (framer-motion 13.1.1, motion/features/animation/exit.mjs).
-      exit={animateEntrance ? { opacity: 0 } : undefined}
-      layout={animateOrder && !shouldReduceMotion ? "position" : false}
-      transition={{ duration: ENTRANCE_SECONDS, ease: EASE_OUT }}
-    >
-      <RosterRow
-        kind={channel.kind}
-        id={channel.id}
-        participantIds={channel.agentIds}
-        name={channel.name}
-        lastMessage={channel.lastMessage ?? undefined}
-        lastMessageAt={
-          channel.lastMessageAt
-            ? relativeTime(channel.lastMessageAt)
-            : undefined
+    <SidebarMenuItem>
+      <motion.div
+        animate={{ opacity: 1, transform: "translateY(0px)" }}
+        // `false` disables the mount animation outright; a row then paints at its `animate` values.
+        initial={
+          animateEntrance
+            ? {
+                opacity: 0,
+                transform: shouldReduceMotion ? "none" : "translateY(-8px)",
+              }
+            : false
         }
-        pinned={channel.pinned}
-        unread={unread}
-        archived={channel.archived}
-      />
-    </motion.div>
+        // No `exit` definition means AnimatePresence has nothing to wait for and drops the row without
+        // animating it: `setActive("exit", …)` resolves with nothing to animate, so `onExitComplete`
+        // fires straight away (framer-motion 13.1.1, motion/features/animation/exit.mjs).
+        exit={animateEntrance ? { opacity: 0 } : undefined}
+        layout={animateOrder && !shouldReduceMotion ? "position" : false}
+        transition={{ duration: ENTRANCE_SECONDS, ease: EASE_OUT }}
+      >
+        <RosterRow
+          kind={channel.kind}
+          id={channel.id}
+          participantIds={channel.agentIds}
+          name={channel.name}
+          lastMessage={channel.lastMessage ?? undefined}
+          lastMessageAt={
+            channel.lastMessageAt
+              ? relativeTime(channel.lastMessageAt)
+              : undefined
+          }
+          pinned={channel.pinned}
+          unread={unread}
+          archived={channel.archived}
+        />
+      </motion.div>
+    </SidebarMenuItem>
   );
 }
 
@@ -499,67 +529,90 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
         </SidebarMenu>
       </SidebarHeader>
       <SidebarContent className="scroll-fade-b">
-        <SidebarMenu>
-          <SidebarGroup className="gap-px">
-            <SidebarMenuItem>
-              <InputGroup className="bg-background text-sm rounded-lg h-9">
-                <InputGroupInput
-                  aria-label="Search conversations"
-                  onChange={(event) => setSearch(event.target.value)}
-                  placeholder="Search..."
-                  value={search}
-                />
-                <InputGroupAddon>
-                  <IconSearch />
-                </InputGroupAddon>
-              </InputGroup>
-            </SidebarMenuItem>
-            <SidebarMenuItem>
-              <StatusFilter onChange={setStatus} value={status} />
-            </SidebarMenuItem>
-            <div className="w-full h-2" />
-            {empty ? (
-              <div className="py-4">
-                <Empty className="border border-dashed min-h-[40dvh]">
-                  <EmptyHeader>
+        {/*
+         * THE GROUP IS THE COLUMN AND THE LIST IS INSIDE IT, which is the other way round from how
+         * this surface was built. `SidebarMenu` is a `<ul>` and `SidebarMenuItem` an `<li>` (see
+         * components/ui/sidebar.tsx), and `SidebarGroup` is the `<div>` that lays the column out —
+         * so a group nested inside a menu put a `<div>` between the list and its items, and an `<li>`
+         * is only a list item while it is a direct child of the list. The application's primary
+         * navigation therefore announced no list, no count and no position, while looking in the
+         * source as though it announced all three.
+         *
+         * The search box and the status filter are no longer list items, because they are not items
+         * of anything: they were wrapped for the column layout, which the group provides directly.
+         * Making the roster a real list and leaving those two inside a list of their own would be the
+         * same mistake in a smaller place — markup chosen for its layout and read out as meaning.
+         */}
+        <SidebarGroup className="gap-px">
+          <InputGroup className="bg-background text-sm rounded-lg h-9">
+            <InputGroupInput
+              aria-label="Search conversations"
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder="Search..."
+              value={search}
+            />
+            <InputGroupAddon>
+              <IconSearch />
+            </InputGroupAddon>
+          </InputGroup>
+          <StatusFilter onChange={setStatus} value={status} />
+          <div className="w-full h-2" />
+          {empty ? (
+            <div className="py-4">
+              <Empty className="border border-dashed min-h-[40dvh]">
+                <EmptyHeader>
+                  {/*
+                    Announced when it is a failure and not when it is an emptiness: an empty roster
+                    is the answer to something the person just did, while a failed one interrupts
+                    them with news they did not ask for and cannot see coming.
+                  */}
+                  <EmptyTitle role={empty.failed ? "alert" : undefined}>
+                    {empty.title}
+                  </EmptyTitle>
+                  <EmptyDescription className="text-pretty">
+                    {empty.description}
+                  </EmptyDescription>
+                </EmptyHeader>
+                {empty.failed ? (
+                  <EmptyContent>
                     {/*
-                      Announced when it is a failure and not when it is an emptiness: an empty roster
-                      is the answer to something the person just did, while a failed one interrupts
-                      them with news they did not ask for and cannot see coming.
+                      The one thing that tries again. `retry: 1` is spent by the time this renders
+                      and `refetchOnWindowFocus` is off, so without this button the only way out of
+                      a failed roster is reloading the page.
                     */}
-                    <EmptyTitle role={empty.failed ? "alert" : undefined}>
-                      {empty.title}
-                    </EmptyTitle>
-                    <EmptyDescription className="text-pretty">
-                      {empty.description}
-                    </EmptyDescription>
-                  </EmptyHeader>
-                  {empty.failed ? (
-                    <EmptyContent>
-                      {/*
-                        The one thing that tries again. `retry: 1` is spent by the time this renders
-                        and `refetchOnWindowFocus` is off, so without this button the only way out of
-                        a failed roster is reloading the page.
-                      */}
-                      <Button
-                        disabled={channels.isFetching}
-                        onClick={() => {
-                          void channels.refetch();
-                        }}
-                        size="sm"
-                        variant="secondary"
-                      >
-                        {channels.isFetching ? "Trying…" : "Try again"}
-                      </Button>
-                    </EmptyContent>
-                  ) : null}
-                </Empty>
-              </div>
-            ) : null}
+                    <Button
+                      disabled={channels.isFetching}
+                      onClick={() => {
+                        void channels.refetch();
+                      }}
+                      size="sm"
+                      variant="secondary"
+                    >
+                      {channels.isFetching ? "Trying…" : "Try again"}
+                    </Button>
+                  </EmptyContent>
+                ) : null}
+              </Empty>
+            </div>
+          ) : null}
+          {/*
+           * Named, because this sidebar renders three lists — the brand and its New button, the
+           * roster, the footer — and only one of them is a list of anything a person chose. Without a
+           * name it is announced as "list, 12 items" among two others, and there is no visible
+           * heading to hang it off: the group has no `SidebarGroupLabel`, deliberately, because the
+           * roster fills the sidebar and a label over it would be labelling the whole surface.
+           *
+           * `gap-px` moves here with the rows, from the group it used to be the direct children of.
+           */}
+          <SidebarMenu aria-label="Conversations" className="gap-px">
             {/*
              * `initial={false}` covers only the children this element has on its very first render,
              * which here is none — the roster is still loading — so the rows still fade in when they
              * first arrive. Every later suppression is the row's own `initial`, above.
+             *
+             * It renders no element of its own, so the rows' `<li>`s are still direct children of the
+             * list above: `AnimatePresence` returns its children and nothing around them, and holds a
+             * leaving one mounted rather than wrapping it.
              */}
             <AnimatePresence initial={false}>
               {visibleItems.map((channel) => (
@@ -571,8 +624,8 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
                 />
               ))}
             </AnimatePresence>
-          </SidebarGroup>
-        </SidebarMenu>
+          </SidebarMenu>
+        </SidebarGroup>
       </SidebarContent>
       <SidebarFooter>
         <SidebarMenu className="gap-px">

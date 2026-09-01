@@ -220,6 +220,50 @@ test("a per-call handler does fire on a lone refusal, so the control below means
   expect(problems).toEqual([REFUSAL]);
 });
 
+test("an onError the wrapped options already had still runs, and runs first", async () => {
+  /*
+   * `reportingRefusal`'s last paragraph, which nothing here proved.
+   *
+   * The wrapper's `onError` REPLACES the one it is wrapping — that is what spreading and then
+   * assigning does — so the line that calls the original is the whole of what keeps it. None of the
+   * four pin and archive options defines an `onError` today, and no other test passes one in, so that
+   * line can be deleted with this file green: the shape the review found five times over.
+   *
+   * Silent if it ever breaks, which is why it is worth a test rather than a comment. The row would
+   * still say the refusal, because the report is the half that stayed; whatever the wrapped handler
+   * was added for — a rollback, an audit line — would simply not happen, on the path nobody watches.
+   *
+   * Order is asserted as well as arrival, because "first" is what the docblock promises: a wrapped
+   * handler that runs after the sentence is already on screen is a different contract from the one
+   * written down.
+   */
+  refusingFetch();
+  const ran: string[] = [];
+  const queryClient = new QueryClient();
+  const observer = new MutationObserver(
+    queryClient,
+    reportingRefusal(
+      {
+        ...setChannelPinnedMutationOptions(queryClient),
+        onError: () => {
+          ran.push("wrapped");
+        },
+      },
+      () => {
+        ran.push("reported");
+      },
+    ),
+  );
+  const unsubscribe = observer.subscribe(() => {});
+
+  await observer
+    .mutate({ channelId: "channel_1", pinned: true })
+    .catch(() => undefined);
+  unsubscribe();
+
+  expect(ran).toEqual(["wrapped", "reported"]);
+});
+
 test("the same refusal handed to mutate per call is lost, which is why it is not", async () => {
   /*
    * THE CONTROL, and a canary for the day query-core changes. `MutationObserver.mutate` does
