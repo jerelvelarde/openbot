@@ -212,6 +212,14 @@ every bot-chat id is generated under `botchat_`, and the two sets cannot meet. R
 evidence of the total order, not as the thing being relied on: the requirement is the order, and any
 future id a person gets to choose has to be checked against it the same way.
 
+The same check carries one exact reservation, for the same reason. The roster's live wire announces a
+gap in the server's subscription by sending an event whose `id` names no conversation — the only
+thing an already-deployed browser bundle reads as "refetch the whole roster" — and that id,
+`roster-resync`, sits in no generated namespace at all. A package channel called it would take the
+patch meant for nobody and swallow the recovery for everybody whose roster holds it, so
+`validateTenantPackage` refuses it against the constant the sender uses. A Bot may still be called
+it: the sentinel names a roster row, and a Bot is not one.
+
 **Amended after review, and this section is why the defect was missed.** The *shape* survived
 untouched, and this section said so approvingly enough that nobody looked inside the encoding. The
 encoding was broken before this work and reusing it verbatim routed the whole roster through it: the

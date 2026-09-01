@@ -409,6 +409,50 @@ describe("tenant YAML validation", () => {
     });
   }
 
+  /*
+   * The roster resync event's id, which is not in any generated namespace and so needs its own rule.
+   *
+   * `resyncAll` announces a gap in this server's Postgres subscription by sending an event that names
+   * a row nobody has, which is the only thing the deployed browser bundle understands as "refetch the
+   * whole roster". A package could call a channel that, and then the event would land on a real row
+   * instead: the three null activity fields would patch it, and the recovery would not happen for
+   * anybody whose roster holds it. Reserved here, against the constant the sender uses, so the two
+   * cannot drift apart.
+   *
+   * A Bot may still be called it. The sentinel names a roster row and a Bot is not one, so refusing
+   * it there would be a rule with no failure behind it.
+   */
+  test("a channel may not take the roster resync event's id, though a Bot may", () => {
+    expect(() =>
+      validateTenantPackage({
+        brand: "tenant: { id: fintech, product_name: Ledgerline }",
+        agents: "agents: []",
+        channels:
+          "channels: [{ id: roster-resync, name: Company, description: Test, permitted_agents: [], allowed_groups: [all] }]",
+        model:
+          "model: { provider: openai, credential_secret_ref: openai-key, default_model: gpt-5.6-terra }",
+        knowledge: "sources: []",
+        themeCss: "",
+      }),
+    ).toThrow(
+      'channels.yaml channel.id "roster-resync" is reserved: the server sends it as the id of the roster resync event, which must name no conversation at all',
+    );
+
+    const tenantPackage = validateTenantPackage({
+      brand: "tenant: { id: fintech, product_name: Ledgerline }",
+      agents:
+        "agents: [{ id: roster-resync, name: Knowledge, title: Company Knowledge, role_description: Answer company questions., type: built-in, system_prompt: Answer from knowledge. }]",
+      channels: "channels: []",
+      model:
+        "model: { provider: openai, credential_secret_ref: openai-key, default_model: gpt-5.6-terra }",
+      knowledge: "sources: []",
+      themeCss: "",
+    });
+    expect(tenantPackage.agents.map((agent) => agent.id)).toEqual([
+      "roster-resync",
+    ]);
+  });
+
   test("an id that merely contains a generated prefix is fine", () => {
     /*
      * The namespace is a prefix, not a substring: `channel_` anywhere but the front cannot collide

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { and, desc, eq, inArray, isNull } from "drizzle-orm";
 import { parse } from "yaml";
 import { DEPLOYMENT_ROUTES } from "./computer/deployment-routes";
+import { RESYNC_ROSTER_ID } from "./channels/events";
 import type { Database } from "./db/client";
 import {
   agentProfiles,
@@ -361,6 +362,26 @@ function refuseGeneratedIdNamespace(
   }
 }
 
+/**
+ * Refuse the one exact id the roster wire spends on a conversation that does not exist.
+ *
+ * A different rule from the namespace above and deliberately kept separate: that one asks whether an
+ * id trespasses on a generator, this one whether it collides with a single literal something else
+ * already sends. The literal is imported rather than repeated, because the sentinel and the
+ * reservation are only worth anything while they are the same string, and two copies drift the moment
+ * one is renamed.
+ *
+ * Applied to a channel id and not to an agent id: the sentinel names a roster row, and a Bot is not
+ * one, so a Bot called `roster-resync` is an odd name and nothing worse.
+ */
+function refuseReservedRosterId(id: string, field: string, filename: string) {
+  if (id === RESYNC_ROSTER_ID) {
+    throw new Error(
+      `${filename} ${field} "${id}" is reserved: the server sends it as the id of the roster resync event, which must name no conversation at all`,
+    );
+  }
+}
+
 export function validateTenantPackage(files: PackageFiles): TenantPackage {
   if (files.themeCss.trim()) {
     validateThemeCss(files.themeCss);
@@ -474,6 +495,7 @@ export function validateTenantPackage(files: PackageFiles): TenantPackage {
       const channel = asRecord(value, "channel");
       const id = requiredString(channel.id, "channel.id");
       refuseGeneratedIdNamespace(id, "channel.id", "channels.yaml");
+      refuseReservedRosterId(id, "channel.id", "channels.yaml");
       const permittedAgents = stringArray(
         channel.permitted_agents,
         "channel.permitted_agents",

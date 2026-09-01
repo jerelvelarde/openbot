@@ -28,9 +28,10 @@ export type RosterActivityEvent = {
   /**
    * The row's id.
    *
-   * Globally unique across both kinds, because ids are prefixed (`channel_...`, `botchat_...`). That
-   * is what lets one cursor page a mixed list and one patch function find a row without being told
-   * its kind.
+   * Unique across both kinds: generated ids are prefixed (`channel_...`, `botchat_...`), and a
+   * package channel's chosen id is refused by `validateTenantPackage` if it enters one of those
+   * namespaces. That is what lets one cursor page a mixed list and one patch function find a row
+   * without being told its kind.
    */
   id: string;
   /**
@@ -109,6 +110,19 @@ export type ChannelEventHub = {
 };
 
 /**
+ * The id the resync event carries, and a name no conversation may take.
+ *
+ * Exported because two places have to agree on it and only one of them sends it: this event uses it
+ * to name no row at all, and `validateTenantPackage` refuses it as a package channel id. That second
+ * half is what makes the first half true — a `channels.yaml` chooses its ids by hand, so "no real row
+ * is called this" holds only while something enforces it, and the enforcement has to be able to name
+ * the same string this does. A channel that were called this would take the patch meant for nobody:
+ * the three null activity fields below would land on it, and the recovery this event exists to
+ * trigger would not happen for anybody whose roster holds that row.
+ */
+export const RESYNC_ROSTER_ID = "roster-resync";
+
+/**
  * What a resync is sent as: an event naming a row that does not exist.
  *
  * There is no "refetch" frame on this wire and this server cannot add one, because the far end of a
@@ -120,13 +134,13 @@ export type ChannelEventHub = {
  *
  * Every field that would make the browser do something else is absent: no `deleted`, which navigates
  * a tab away from the conversation it names; no `pinned` or `archived`, which patch or move a row;
- * and an `id` that cannot collide with a real row, because real ids are prefixed `channel_` and
- * `botchat_`. `kind` is required by the wire shape and is read only when a row is rendered, which
- * this one never is.
+ * and an `id` no real row can carry, because every generated id is prefixed `channel_` or `botchat_`
+ * and a package naming this one as a channel id is refused at load. `kind` is required by the wire
+ * shape and is read only when a row is rendered, which this one never is.
  */
 const RESYNC_EVENT: DeliveredRosterEvent = {
   kind: "channel",
-  id: "roster-resync",
+  id: RESYNC_ROSTER_ID,
   lastMessage: null,
   lastMessageAt: null,
   lastMessageAgentId: null,

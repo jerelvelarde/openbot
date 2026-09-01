@@ -18,10 +18,12 @@
  * and no aggregates, so it is a union of two identically-shaped narrow selects rather than of two
  * fully-hydrated ones — and each branch is ordered and limited before the union rather than after it.
  *
- * WHY ONE CURSOR IS ENOUGH. Ids are prefixed — `channel_...` and `botchat_...` — and therefore
- * globally unique, so `id` still breaks every tie and the cursor needs no `kind` term. That is the
- * one piece of luck in this design, and it is what lets the existing cursor codec serve a mixed list
- * unchanged.
+ * WHY ONE CURSOR IS ENOUGH. `id` breaks every tie on its own, so the cursor needs no `kind` term —
+ * which requires a total order over ids across the two tables, not merely uniqueness within each.
+ * Generated ids give it by construction (`channel_...`, `botchat_...`); a package channel chooses
+ * its id in `channels.yaml`, and `validateTenantPackage` refuses a chosen id inside a generated
+ * namespace, so the order is enforced rather than assumed. That is what lets the existing cursor
+ * codec serve a mixed list unchanged.
  */
 import {
   and,

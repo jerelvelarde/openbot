@@ -96,8 +96,11 @@ export function recencyCursorText(recency: SQL): SQL<string> {
  * `recency` is a string because it is Postgres' own rendering of the boundary, kept out of JS number
  * types on purpose. See `recencyCursorText`.
  *
- * No `kind`. Ids are prefixed (`channel_...`, `botchat_...`) and therefore globally unique, so `id`
- * still breaks every tie on its own. That is what lets one cursor page through a mixed list.
+ * No `kind`. What that needs is a total order over ids across the two tables: no channel id may
+ * equal a bot-chat id, or two rows share a complete sort key and the strict `<` excludes both.
+ * Generated ids carry it by construction (`channel_...`, `botchat_...`); a package channel's id is
+ * chosen in `channels.yaml`, so `validateTenantPackage` refuses one inside a generated namespace
+ * rather than leaving the order to hope. That is what lets one cursor page through a mixed list.
  */
 export type RosterCursor = { pinned: boolean; recency: string; id: string };
 
