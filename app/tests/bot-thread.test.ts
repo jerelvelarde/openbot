@@ -44,12 +44,21 @@ afterEach(() => {
  */
 function stubStorage(seed: Record<string, string> = {}): Map<string, string> {
   const store = new Map(Object.entries(seed));
-  const host = globalThis as { window?: Record<string, unknown> };
+  /*
+   * `object` rather than `Record<string, unknown>`, which claimed something untrue of the case this
+   * function most has to survive: when app/tests/bot-chat-resolver.test.ts has registered happy-dom,
+   * the value here is a real `Window`, and describing that as an index-signature bag invites reads and
+   * writes through it that a `Window` does not answer. Nothing below needs to see a single property —
+   * every access goes through `Object.defineProperty`, `Object.getOwnPropertyDescriptor` and
+   * `Reflect.deleteProperty`, which take any object — so `object` is the whole of what is required.
+   */
+  const host = globalThis as { window?: object };
   const created = host.window === undefined;
   host.window ??= {};
-  const previous = Object.getOwnPropertyDescriptor(host.window, "localStorage");
+  const target: object = host.window;
+  const previous = Object.getOwnPropertyDescriptor(target, "localStorage");
 
-  Object.defineProperty(host.window, "localStorage", {
+  Object.defineProperty(target, "localStorage", {
     configurable: true,
     value: {
       getItem: (key: string) => store.get(key) ?? null,
@@ -69,10 +78,10 @@ function stubStorage(seed: Record<string, string> = {}): Map<string, string> {
       return;
     }
     if (previous) {
-      Object.defineProperty(host.window as object, "localStorage", previous);
+      Object.defineProperty(target, "localStorage", previous);
       return;
     }
-    delete (host.window as Record<string, unknown>).localStorage;
+    Reflect.deleteProperty(target, "localStorage");
   };
 
   return store;
@@ -284,6 +293,42 @@ describe("attemptAdoption", () => {
       () => false,
     );
 
+    expect(outcome).toEqual({ adopted: null });
+    expect(store.get(botThreadKey(BOT))).toBe(THREAD);
+  });
+
+  test("an adopt that succeeded but arrived stale keeps the key, and says nothing about the row", async () => {
+    /*
+     * The other stale exit, and the one the test above cannot reach: there `isCurrent` was already
+     * false when the check answered, so the adopt never ran. Here the caller is current right up to
+     * the adopt and gone when it lands — the row is written, and this function reports
+     * `{ adopted: null }` for it, which is also what it reports for "nothing was remembered" and for
+     * "the check came back inconclusive".
+     *
+     * Both halves are pinned on purpose. The key surviving is `forget`'s deliberate discipline: the
+     * row exists but clearing the only local pointer to it on behalf of a screen nobody is looking at
+     * is the one act that cannot be undone, and a later unstale run finishes it through the 409 path.
+     * The outcome being indistinguishable is what cost a duplicate row: `BotResolver` read it as
+     * "nothing to adopt" and created a second, empty conversation alongside this one, which is why it
+     * now re-checks its own mount ref immediately before it creates.
+     */
+    const store = stubStorage({ [botThreadKey(BOT)]: THREAD });
+    answerCheck(200, { known: true });
+    let current = true;
+    let adoptCalls = 0;
+
+    const outcome = await attemptAdoption(
+      BOT,
+      async () => {
+        adoptCalls += 1;
+        // The screen goes while the adopt is with the server. The row is still written.
+        current = false;
+        return adopted;
+      },
+      () => current,
+    );
+
+    expect(adoptCalls).toBe(1);
     expect(outcome).toEqual({ adopted: null });
     expect(store.get(botThreadKey(BOT))).toBe(THREAD);
   });

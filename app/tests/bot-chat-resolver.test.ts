@@ -17,8 +17,9 @@ import {
   createRouter,
   RouterProvider,
 } from "@tanstack/react-router";
-import { cleanup, render, waitFor } from "@testing-library/react";
+import { cleanup, configure, render, waitFor } from "@testing-library/react";
 import { createElement, StrictMode } from "react";
+import { botThreadKey } from "../src/lib/copilot/bot-thread";
 import {
   type RosterItem,
   type RosterPage,
@@ -309,12 +310,28 @@ describe("resolverView", () => {
 let registeredHere = false;
 
 beforeAll(() => {
+  /*
+   * `@testing-library/react` waits one second by default, and every `waitFor` and `findBy*` below
+   * inherits it. That budget is not a fact about anything under test — nothing here is timing
+   * sensitive by design; a render either resolves and redirects or it does not — and it is small
+   * enough to be spent on load rather than on work: these tests have failed at 1003–1005 ms, the
+   * duration landing on the timeout itself rather than anywhere near it, which is what a starved
+   * event loop looks like rather than a stuck resolution. `bun run test` puts app, server and worker
+   * in one process, so CI is where that load actually lives. A longer budget costs nothing on the
+   * happy path: `waitFor` returns as soon as its assertion passes, so this only lengthens genuine
+   * failures.
+   */
+  configure({ asyncUtilTimeout: 5000 });
   if (GlobalRegistrator.isRegistered) return;
   GlobalRegistrator.register({ url: "http://localhost:3000/" });
   registeredHere = true;
 });
 
 afterAll(async () => {
+  // Put back, for the same reason the registration below is undone: `configure` writes to a
+  // module-level object shared by every file that imports the library, and this file is the only one
+  // that does today — which is exactly the assumption worth not leaving a landmine under.
+  configure({ asyncUtilTimeout: 1000 });
   if (!registeredHere) return;
   await GlobalRegistrator.unregister();
   registeredHere = false;
@@ -325,6 +342,14 @@ const AGENT = { id: "agent_1", name: "Bot", title: "Bot" };
 
 /** What the stubbed `POST /api/bot-chats` hands back. */
 const CREATED = "botchat_created";
+
+/**
+ * The conversation a browser upgrading into this feature is still holding, and the row adopting it
+ * produces. Distinct ids from `CREATED` on purpose: which of the two the resolver lands on is the
+ * whole difference between rescuing somebody's transcript and burying it under an empty chat.
+ */
+const LEGACY_THREAD = "thread_legacy_1";
+const ADOPTED = "botchat_adopted";
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -340,18 +365,28 @@ type Script = {
   roster?: () => Response;
   /** `POST /api/bot-chats`, deferrable so a test can hold a create in flight. */
   create?: () => Response | Promise<Response>;
+  /** `GET /api/threads/:threadId` — whether Intelligence still has a remembered thread. */
+  check?: () => Response;
+  /** `POST /api/bot-chats/adopt`, deferrable so a test can hold an adoption in flight. */
+  adopt?: () => Response | Promise<Response>;
 };
 
 let calls: Array<{ method: string; path: string }> = [];
 const realFetch = globalThis.fetch;
 
 /**
- * The server this screen talks to, as the four requests it can make.
+ * The server this screen talks to, as the requests it can make.
  *
  * `fetch` rather than a mocked module: `client` in app/src/lib/client.ts is the only thing between
  * this screen and the wire, and stubbing at the wire keeps the mutation options, the query options
  * and their invalidations — including the roster invalidation a successful create fires, which is
  * one of the dependency changes that used to strand the redirect — exactly as they are in the app.
+ *
+ * The two adoption routes are stubbed here even though most tests never reach them, because the
+ * unstubbed fall-through below answers 500 and `attemptAdoption` folds every failure into "adopted
+ * nothing": a missing stub on this path does not fail loudly, it quietly turns an adoption test into
+ * a create test. Nothing seeds the remembered key unless a test asks for it, so the defaults only
+ * decide what the tests that do seed it get.
  */
 function serve(script: Script = {}): void {
   calls = [];
@@ -360,6 +395,8 @@ function serve(script: Script = {}): void {
     roster:
       script.roster ?? (() => jsonResponse({ items: [], nextCursor: null })),
     create: script.create ?? (() => jsonResponse({ botChat: { id: CREATED } })),
+    check: script.check ?? (() => jsonResponse({ known: true })),
+    adopt: script.adopt ?? (() => jsonResponse({ botChat: { id: ADOPTED } })),
   };
   globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input);
@@ -367,6 +404,14 @@ function serve(script: Script = {}): void {
     calls.push({ method, path });
     if (path.startsWith("/api/agents")) return Promise.resolve(routes.agents());
     if (path.startsWith("/api/roster")) return Promise.resolve(routes.roster());
+    if (path.startsWith("/api/threads/")) {
+      return Promise.resolve(routes.check());
+    }
+    // Before the exact-match create below rather than after it, so that a path that merely starts
+    // the same way cannot be read as a create.
+    if (path === "/api/bot-chats/adopt" && method === "POST") {
+      return Promise.resolve(routes.adopt());
+    }
     if (path === "/api/bot-chats" && method === "POST") {
       return Promise.resolve(routes.create());
     }
@@ -380,6 +425,37 @@ function creates(): number {
   return calls.filter(
     (call) => call.method === "POST" && call.path === "/api/bot-chats",
   ).length;
+}
+
+function adopts(): number {
+  return calls.filter(
+    (call) => call.method === "POST" && call.path === "/api/bot-chats/adopt",
+  ).length;
+}
+
+/**
+ * Give a resolution that is already past its last `await` every chance to reach the request it must
+ * not make.
+ *
+ * `waitFor` is the right tool for an assertion that becomes true; this one is an absence, and the
+ * absence has no signal to poll. An unmounted resolver writes nothing by definition, and the roster
+ * invalidation a successful adopt fires reaches no observer once the screen is gone, so there is no
+ * later event to hang the assertion on. What separates the released adopt response from the create is
+ * microtasks — `client` issues its `fetch` synchronously inside the mutation function — and each turn
+ * of the macrotask queue below drains all of them. Two, so that a hop this comment did not anticipate
+ * does not turn a real regression into a passing test; without the mount check in `resolve` the create
+ * is in `calls` by the time the first one returns.
+ */
+async function settle(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/** The `GET /api/threads/:threadId` paths this screen asked for, in order. */
+function checked(): string[] {
+  return calls
+    .filter((call) => call.path.startsWith("/api/threads/"))
+    .map((call) => call.path);
 }
 
 /**
@@ -633,5 +709,76 @@ describe("the resolver on screen", () => {
       await view.findByText('This deployment has no Bot called "nope".'),
     ).toBeDefined();
     expect(creates()).toBe(0);
+  });
+
+  /*
+   * ADOPTION, ON SCREEN — the branch that had no test at all.
+   *
+   * Every assertion above passes with the entire `if (shouldAttemptAdoption(...)) { ... }` block
+   * deleted from `resolve()`: nothing here seeded `botThreadKey`, and `serve` had no stub for
+   * `POST /api/bot-chats/adopt` or `GET /api/threads/:id`, so the branch could not be entered. The
+   * predicate was tested as a pure function, which says what the decision is and nothing about
+   * whether the resolver makes it. That matters more than the usual coverage argument because the
+   * defect the branch exists for is deterministic on upgrade rather than a race — every upgrading
+   * browser, first visit, every time — so a regression would not be rare, it would be universal, and
+   * its symptom is a durable row rather than a crash.
+   */
+  test("a remembered thread is adopted, and no second conversation is created", async () => {
+    // The browser upgrading in: a real conversation behind a localStorage key, and no `bot_chats` row
+    // anywhere yet, which is the only state this branch can be reached from.
+    window.localStorage.setItem(botThreadKey(AGENT.id), LEGACY_THREAD);
+    const { router } = mount({ roster: [] });
+
+    await waitFor(() =>
+      expect(router.state.location.pathname).toBe(`/bot/${ADOPTED}`),
+    );
+    expect(checked()).toEqual([`/api/threads/${LEGACY_THREAD}`]);
+    expect(adopts()).toBe(1);
+    // The one that matters: the person lands in their own transcript, and there is no empty
+    // conversation sitting on top of it in the roster.
+    expect(creates()).toBe(0);
+    // Adopted, so the key has nothing left to protect — and `useLegacyThreadAdoption` runs on the
+    // screen this just redirected to, so a key left behind is the same question asked again forever.
+    expect(window.localStorage.getItem(botThreadKey(AGENT.id))).toBeNull();
+  });
+
+  /*
+   * The stale path, which is how the duplicate row came back after `shouldAttemptAdoption` closed the
+   * original one.
+   *
+   * `attemptAdoption` reports an unmount as `{ adopted: null }` — the same answer it gives for
+   * "nothing was remembered" — so a resolution whose adopt succeeded after this screen was gone used
+   * to read that as "nothing to adopt", fall through with `mostRecent` still `null`, and create. Two
+   * durable rows for one conversation, the empty one newer, so `mostRecentBotChat` resolves to the
+   * empty one — and adoption is never attempted again, because `mostRecent` is no longer `null`.
+   *
+   * The unmount window exists only on this path: on the ordinary path nothing is awaited between the
+   * decision and the create, which is why no test above could have caught this.
+   */
+  test("an unmount while the adopt is in flight creates nothing behind it", async () => {
+    window.localStorage.setItem(botThreadKey(AGENT.id), LEGACY_THREAD);
+    let release: (response: Response) => void = () => {};
+    const inFlight = new Promise<Response>((resolve) => {
+      release = resolve;
+    });
+    serve({ adopt: () => inFlight });
+    const { view } = mount({ roster: [] });
+
+    await waitFor(() => expect(adopts()).toBe(1));
+    // Navigating away, closing the tab, switching Bot — the resolver's own comment on `mounted` says
+    // unmount is the only thing a resolution is allowed to cancel on, and this is that.
+    view.unmount();
+    // The adoption succeeds anyway: the request was already with the server, so the row is written
+    // whatever this browser does next. That is the point — the answer is stale, not failed.
+    release(jsonResponse({ botChat: { id: ADOPTED } }));
+    await settle();
+
+    expect(creates()).toBe(0);
+    // Not forgotten, deliberately: `attemptAdoption` withholds `forget` from a stale answer, so the
+    // pointer survives for `useLegacyThreadAdoption` to finish from the chat screen, where finding the
+    // thread already adopted is the 409 it already handles.
+    expect(window.localStorage.getItem(botThreadKey(AGENT.id))).toBe(
+      LEGACY_THREAD,
+    );
   });
 });

@@ -147,7 +147,13 @@ export function mostRecentBotChat(
 }
 
 /**
- * Whether the resolver must try to adopt a remembered thread before it is allowed to create.
+ * Whether the resolver must run the adoption sequence before it decides whether to create.
+ *
+ * Deliberately not "before it is allowed to create", which this used to say and which reads as a
+ * promise this predicate cannot make: `attemptAdoption` answers an inconclusive check the same way it
+ * answers "nothing to adopt", so a `true` here means the sequence runs, not that a create is off the
+ * table. See `resolve` below, which is where that answer is acted on and where the residual case is
+ * written down.
  *
  * This is the fix for the duplicate-conversation defect at the release boundary: a browser upgrading
  * into this feature has no `bot_chats` rows yet (`mostRecent` reads `null`), and — unfixed — the
@@ -312,7 +318,7 @@ function BotResolver({ agentId }: { agentId: string }) {
     if (!shouldResolveBotChat({ data: roster.data, started: started.current }))
       return;
     started.current = true;
-    async function resolve(): Promise<string> {
+    async function resolve(): Promise<string | null> {
       /*
        * Adoption first, and fully awaited before any create decision is made — this is the fix for
        * the duplicate-conversation defect `shouldAttemptAdoption` documents: a browser upgrading
@@ -322,6 +328,20 @@ function BotResolver({ agentId }: { agentId: string }) {
        * way to tell the person had one already. Skipped whenever `mostRecent` is not `null`: a row
        * already exists, so there is nothing to gain from checking, and `useLegacyThreadAdoption` on
        * the chat screen is the belt for a stray key an earlier, incomplete adoption left behind.
+       *
+       * ONLY A PROVEN ADOPTION DIVERTS THIS, so the two-rows outcome is narrowed here rather than
+       * closed, and the difference is worth being exact about. `attemptAdoption` reports
+       * `{ adopted: null }` for an inconclusive check as well — a 500 from the thread reader, an
+       * offline blink — and deliberately keeps the remembered key, so this falls through and
+       * creates, and the belt hook rescues the thread into a second row from the chat screen on this
+       * visit or a later one. Chosen rather than overlooked, and the two orderings are not equally
+       * bad — both rows are minted with `created_at` defaulting to now and neither has a
+       * `last_message_at` yet, so whichever is written second is the one `mostRecentBotChat` picks.
+       * Adoption first and create second leaves the *empty* row newer, which is the defect below;
+       * create first and adoption second leaves the *rescued* row newer, so the next visit resolves
+       * to the transcript and what is left over is one empty conversation the person can see and
+       * archive. Refusing to open anything because an existence check for a thread that may not even
+       * exist any more came back inconclusive is the larger harm.
        */
       if (shouldAttemptAdoption({ mostRecent, remembered: legacyThreadId })) {
         /*
@@ -351,12 +371,39 @@ function BotResolver({ agentId }: { agentId: string }) {
         mostRecent,
       });
       if ("open" in resolution) return resolution.open;
+      /*
+       * The last look at `mounted` before this function writes anything durable, and the fix for the
+       * second way this resolver forked a duplicate row.
+       *
+       * `attemptAdoption` reports an unmount as `{ adopted: null }`, which is the same thing it says
+       * for "nothing to adopt" — so an adopt that succeeded and came back after this screen was gone
+       * fell through to here, `mostRecent` still `null` (it is the value this effect run closed
+       * over, and the adopted row cannot have reached it), and a second, empty conversation was
+       * written for nobody. Two durable rows for one conversation, the empty one newer, so
+       * `mostRecentBotChat` resolves to the empty one — and nothing here revisits that, because
+       * `mostRecent` is no longer `null` and adoption is never attempted again. The rescued
+       * transcript sits below it in the roster for the person to find by hand: the same
+       * duplicate-conversation defect `shouldAttemptAdoption` exists to prevent, re-entered through
+       * the stale path.
+       *
+       * Here rather than inside `attemptAdoption`, because this is the one statement in this function
+       * that writes a row: guarding it covers every await ahead of it — a check that answered late,
+       * an adopt that succeeded late, a 409 that arrived late — instead of only the one of the three
+       * that was reproduced. See the mount ref's own comment above for why `mounted.current` is false
+       * only after a real unmount, and so cannot fire on a dependency change and strand a resolution
+       * the way a per-run flag did.
+       *
+       * `null` rather than a throw: nothing failed, and the `.catch` below is the create's error
+       * path. An unmounted component renders nothing and runs no effects, so there is no frame in
+       * which this answer is on screen — `resolved` simply stays as it was.
+       */
+      if (!mounted.current) return null;
       const created = await createBotChatMutate(agentId);
       return created.id;
     }
     resolve()
       .then((id) => {
-        if (!mounted.current) return;
+        if (id === null || !mounted.current) return;
         setResolved(id);
       })
       .catch(() => {

@@ -147,6 +147,16 @@ export function shouldAdopt(input: {
  * a duplicate, which is exactly the 409 case below, already handled). Committing to `forget` on
  * behalf of a screen nobody is looking at any more is the one thing that cannot be undone, so it is
  * the one thing withheld until the answer is not stale.
+ *
+ * WHAT A CALLER CANNOT LEARN FROM THE RETURN VALUE, because it cost a duplicate row once. Every
+ * stale exit below reports `{ adopted: null }`, which is also what "nothing was remembered", "the
+ * check came back inconclusive" and "the adopt failed" say — so a successful-but-stale adopt is
+ * indistinguishable from an adoption that never happened, and a caller that reads
+ * `{ adopted: null }` as licence to write something durable writes it alongside the row this
+ * function just adopted. Widening the return type to name that case would move the decision in
+ * here; leaving it as it is keeps the decision with whoever is about to write, which is where the
+ * thing being protected lives. `BotResolver` therefore checks its own mount ref again immediately
+ * before it creates — see the comment on that check in app/src/routes/_authed/_app/bot.tsx.
  */
 export async function attemptAdoption(
   agentId: string,
