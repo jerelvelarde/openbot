@@ -55,6 +55,25 @@ describe("audit payload redaction", () => {
     );
   });
 
+  test("names both halves of the roster archive, and the removal", () => {
+    /*
+     * Named here rather than left to `arrayContaining` above, which asserts nothing about a type it
+     * does not mention: the five this change adds could all be deleted and every line above would
+     * still pass. A type removed from this list is an event the recorders below cannot be given —
+     * `AuditEventType` is this array — so a screen that still archives writes no row, which is the
+     * failure "where did that conversation go" is answered from.
+     */
+    expect(auditEventTypes).toEqual(
+      expect.arrayContaining([
+        "channel.archived",
+        "channel.unarchived",
+        "bot_chat.archived",
+        "bot_chat.unarchived",
+        "bot_chat.deleted",
+      ]),
+    );
+  });
+
   test("removes secret values and document content recursively", () => {
     expect(
       redactAuditPayload({
@@ -275,6 +294,18 @@ const databaseUrl =
   "postgres://openbot:openbot@localhost:5432/openbot";
 const database = createDatabase(databaseUrl, TEST_POOL);
 
+/*
+ * Handed back at the end, like every other file here that opens one.
+ *
+ * The suite runs in one process, so a pool this file opens is held for the whole run whether or not
+ * this file is still using it, and the totals add up rather than take turns — `TEST_POOL`'s docblock
+ * has the accounting. File-level rather than inside the describe below, because the URL tests further
+ * down read through this same database after that describe has finished.
+ */
+afterAll(async () => {
+  await database.$client.close();
+});
+
 /** Rows are found by their target, because the id is a uuid the test does not choose. */
 const PAGING = "audit-paging-test";
 const RANGE = "audit-range-test";
@@ -429,6 +460,20 @@ describe("paging the audit trail", () => {
         createdAt: "2020-02-30T05:06:07.501001Z",
         id: "6f27a2a6-d449-4b0f-abb7-6cb5f48d331b",
       }),
+      /*
+       * A year 0, which JS has and `timestamptz` does not.
+       *
+       * The one on this list the round trip cannot catch: `new Date("0000-01-01T00:00:00Z")` is a
+       * valid instant that renders back byte-for-byte, so this cursor used to reach the keyset
+       * comparison and fail there with `date/time field value out of range` — a `DrizzleQueryError`
+       * rather than the `HTTPException` a refusal mints, and therefore the bare plain-text 500 every
+       * other entry here exists to prevent, through a door the other entries do not open.
+       * `0001-01-01` below is the neighbour it must not be confused with.
+       */
+      cursorFor({
+        createdAt: "0000-01-01T00:00:00.000000Z",
+        id: "6f27a2a6-d449-4b0f-abb7-6cb5f48d331b",
+      }),
     ]) {
       const response = await app.request(
         `http://openbot.local/api/admin/audit-events?cursor=${encodeURIComponent(cursor)}`,
@@ -439,6 +484,35 @@ describe("paging the audit trail", () => {
         error: "cursor must be a valid audit page cursor",
       });
     }
+  });
+
+  test("accepts the year Postgres does have, next door to the one it does not", async () => {
+    /*
+     * `0001-01-01` against the real database, so the refusal above is proved to be about the year
+     * `timestamptz` has no room for and not about every small year. A rule that refused this one
+     * would turn an in-range cursor into a 400, which is the same defect pointing the other way.
+     *
+     * No rows come back because every seeded row is later than AD 1, and a 200 is the whole
+     * assertion: the boundary was bound, cast and compared rather than refused.
+     */
+    const app = createApp(
+      config,
+      adminAuth,
+      { rolesForUser: async () => ["admin"] },
+      createAuditReader(database),
+    );
+
+    const response = await app.request(
+      `http://openbot.local/api/admin/audit-events?cursor=${encodeURIComponent(
+        cursorFor({
+          createdAt: "0001-01-01T00:00:00.000000Z",
+          id: "6f27a2a6-d449-4b0f-abb7-6cb5f48d331b",
+        }),
+      )}&targetType=${PAGING}`,
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ events: [] });
   });
 
   test("still reads a cursor minted before the boundary carried microseconds", async () => {
@@ -522,6 +596,178 @@ describe("reading an audit query off the URL", () => {
     await expect(response.json()).resolves.toEqual({
       error: 'from must be a date, and "yesterday" is not one.',
     });
+  });
+
+  test.each([
+    ["0000-01-01", "a year 0, which JS has and `timestamptz` does not"],
+    [
+      "-271821-04-20T00:00:00Z",
+      "the earliest instant a `Date` holds, which Postgres reads as a zone",
+    ],
+    [
+      "+010000-01-02T00:00:00Z",
+      "a five-digit year, rendered back the same way",
+    ],
+  ])("refuses ?from=%p: %s", async (value: string) => {
+    /*
+     * A date `timestamptz` cannot be given, refused at the edge and named as such.
+     *
+     * Against the shipped reader rather than a stub, because the stub is what would hide the point: a
+     * `Date` spans ISO year -271821 to AD 275760 and the column does not, so each of these parses,
+     * reaches drizzle's timestamp mapper and fails inside the read — `date/time field value out of
+     * range` for the year 0, `time zone displacement out of range` for the two whose `toISOString()`
+     * renders an extended `±YYYYYY` year Postgres reads as a zone offset. No `onError` is registered
+     * in `app.ts`, so all three used to answer Hono's plain-text 500 with no parameter named.
+     *
+     * A separate message from "is not one", because these ARE dates and a reader can only act on
+     * being told which of the two things they got wrong.
+     */
+    const app = createApp(
+      config,
+      adminAuth,
+      { rolesForUser: async () => ["admin"] },
+      createAuditReader(database),
+    );
+
+    const response = await app.request(
+      `http://openbot.local/api/admin/audit-events?from=${encodeURIComponent(value)}`,
+    );
+
+    expect(response.status).toBe(400);
+    expect(response.headers.get("content-type")).toContain("application/json");
+    await expect(response.json()).resolves.toEqual({
+      error: `from must name a year between 0001 and 9999, and "${value}" does not.`,
+    });
+  });
+
+  test("reads an empty ?from= as absent, the way every other parameter reads", async () => {
+    /*
+     * A parameter that says nothing is not a parameter — `parsePageLimit`'s words for the rule the
+     * rest of this surface already followed. `""` is falsy, so an empty `?cursor=` or `?eventType=`
+     * always reached the read as no filter; `?from=` was the exception, because `new Date("")` is an
+     * Invalid Date, so a client clearing its date filter was answered
+     * `from must be a date, and "" is not one.` while clearing any other filter answered a page.
+     */
+    const queries: unknown[] = [];
+    const app = appWith(async (query) => {
+      queries.push(query);
+      return { events: [] };
+    });
+
+    const response = await app.request(
+      "http://openbot.local/api/admin/audit-events?from=&to=&cursor=&eventType=&actorUserId=&targetType=&targetId=",
+    );
+
+    expect(response.status).toBe(200);
+    expect(queries).toEqual([{ limit: 50 }]);
+  });
+
+  test.each([
+    [",", "a bare separator"],
+    [" , ", "separators and spaces"],
+    [",,", "nothing between two of them"],
+  ])("refuses ?eventType=%p: %s", async (value: string) => {
+    /*
+     * A filter request answered with the unfiltered trail is the failure this surface can least
+     * afford. Each of these is non-empty and names no type, and no types is exactly how the read
+     * spells "every row" — so an administrator narrowing the trail was handed all of it, with a 200
+     * on it and nothing to reveal the difference. The trail's argument for existing is that it gets
+     * used to rule things out.
+     */
+    const queries: unknown[] = [];
+    const app = appWith(async (query) => {
+      queries.push(query);
+      return { events: [] };
+    });
+
+    const response = await app.request(
+      `http://openbot.local/api/admin/audit-events?eventType=${encodeURIComponent(value)}`,
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      error: `eventType must name at least one event type, and "${value}" names none.`,
+    });
+    // And no page was read. A refusal that still served rows would be the same unfiltered answer
+    // with a status code on top of it.
+    expect(queries).toEqual([]);
+  });
+
+  test("passes several event types through as it was given them", async () => {
+    // The accepted side of the refusal above: a separator between two names still names two.
+    const queries: unknown[] = [];
+    const app = appWith(async (query) => {
+      queries.push(query);
+      return { events: [] };
+    });
+
+    const response = await app.request(
+      "http://openbot.local/api/admin/audit-events?eventType=channel.archived,channel.unarchived",
+    );
+
+    expect(response.status).toBe(200);
+    expect(queries).toEqual([
+      { limit: 50, eventType: "channel.archived,channel.unarchived" },
+    ]);
+  });
+
+  /*
+   * `?limit=`, on the surface `parsePageLimit` was hardest to get right on.
+   *
+   * `Number.parseInt` stopped at the first character it could not read and kept the digits in front
+   * of it, so `?limit=1e3` meant one row on the trail whose whole argument for existing is that it
+   * gets used to rule things out: a caller asking for a thousand rows was served one, with a 200 on
+   * it. Nothing in this file pinned the parser after it was fixed.
+   */
+  test.each([
+    ["1e3", "a thousand in exponent form, which parsed as 1"],
+    ["0x10", "sixteen in hex, which parsed as 0"],
+    ["50abc", "digits with a tail, which parsed as 50"],
+    ["-5", "negative, which the clamp below would have pulled up to 1"],
+    ["0", "no rows, which the clamp would have pulled up to 1"],
+    ["5.5", "not a whole number"],
+    ["+5", "signed"],
+    [" 5", "a space where a digit goes"],
+    ["lots", "not a number at all"],
+  ])("refuses ?limit=%p: %s", async (value: string) => {
+    const queries: unknown[] = [];
+    const app = appWith(async (query) => {
+      queries.push(query);
+      return { events: [] };
+    });
+
+    const response = await app.request(
+      `http://openbot.local/api/admin/audit-events?limit=${encodeURIComponent(value)}`,
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      error: "Limit must be a whole number of at least 1.",
+    });
+    expect(queries).toEqual([]);
+  });
+
+  test.each([
+    ["", 50, "absent, so the surface's own page size fires"],
+    ["007", 7, "a leading zero, which is a digit and not a refusal"],
+    ["10", 10, "what was asked for"],
+    ["1000", 100, "capped at a hundred rather than refused"],
+  ])("reads ?limit=%p as %p: %s", async (value: string, expected: number) => {
+    // A value this can read is capped rather than reinterpreted: the caller gets rows it asked for
+    // and a cursor saying there are more, which is a different thing from being told one row is a
+    // thousand.
+    const queries: unknown[] = [];
+    const app = appWith(async (query) => {
+      queries.push(query);
+      return { events: [] };
+    });
+
+    const response = await app.request(
+      `http://openbot.local/api/admin/audit-events?limit=${encodeURIComponent(value)}`,
+    );
+
+    expect(response.status).toBe(200);
+    expect(queries).toEqual([{ limit: expected }]);
   });
 
   test("passes a date it can read straight through", async () => {

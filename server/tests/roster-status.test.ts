@@ -2,11 +2,17 @@ import { describe, expect, test } from "bun:test";
 import { parseRosterStatus } from "../src/roster/query";
 
 describe("parseRosterStatus", () => {
+  /*
+   * `as const`, so the expectation stays a `RosterStatus` rather than widening to `string`.
+   *
+   * Widened, `toBe` had a `string` where it wants the narrower type and did not compile — a type
+   * error the suite cannot see, because `server/tsconfig.json` excludes `tests`.
+   */
   test.each([
     ["active", "active"],
     ["archived", "archived"],
     ["all", "all"],
-  ])("reads %p as %p", (input, expected) => {
+  ] as const)("reads %p as %p", (input, expected) => {
     expect(parseRosterStatus(input)).toBe(expected);
   });
 

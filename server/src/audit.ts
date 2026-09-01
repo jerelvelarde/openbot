@@ -2,7 +2,7 @@ import { and, desc, eq, gte, inArray, lte, sql } from "drizzle-orm";
 import { HTTPException } from "hono/http-exception";
 import type { Database } from "./db/client";
 import { auditEvents } from "./db/schema";
-import { recencyCursorText } from "./roster/order";
+import { recencyCursorText, withinTimestamptzRange } from "./roster/order";
 import { parsePageLimit } from "./roster/query";
 
 const sensitiveKeys = new Set([
@@ -414,6 +414,9 @@ export type AuditEventQuery = {
    * Several, because the questions people arrive with cut across the events that answer them: "was
    * anything blocked" is a computer action refused, a component refused AND an MCP call rejected,
    * and a filter that returns only the first quietly hides two thirds of the refusals.
+   *
+   * Absent means every type. A value that is present and names no type at all does not:
+   * `auditQueryFromUrl` refuses it rather than let a narrowing request answer with the whole trail.
    */
   eventType?: string;
   actorUserId?: string;
@@ -428,7 +431,8 @@ export type AuditEventQuery = {
    *
    * As precise as the string given and no more: a `to` naming a millisecond still ends before a row
    * 456 microseconds into it, because that is what asking for that instant means. `auditQueryFromUrl`
-   * refuses anything it cannot read as an instant at all.
+   * refuses anything it cannot read as an instant at all, and anything naming a year outside the
+   * range `timestamptz` can be given.
    */
   from?: string;
   to?: string;
@@ -493,8 +497,14 @@ const CURSOR_ID =
  * The shape alone is not enough: `2026-02-30T00:00:00Z` matches it and `timestamptz` answers
  * `date/time field value out of range`. So the parsed instant is rendered back and compared against
  * the seconds it came from, which is what catches a component that rolled over into the next month.
- * `readsAsTimestamp` in `roster/order.ts` makes the same check the other way round, by rebuilding the
- * fields it read.
+ *
+ * THE YEAR IS ASKED OF `withinTimestamptzRange`, not of the round trip, which cannot see it: JS has a
+ * year 0, so `0000-01-01T00:00:00Z` parses, renders back byte-for-byte and satisfies every line
+ * below, while `select '0000-01-01T00:00:00Z'::timestamptz` is out of range. Such a cursor therefore
+ * reached the keyset comparison and failed inside the read as a `DrizzleQueryError` rather than as the
+ * `HTTPException` `refuseAuditQuery` mints — a third door into the bare 500 `decodeCursor` exists to
+ * shut. `readsAsTimestamp` in `roster/order.ts` calls the same function for the same reason; this
+ * check once carried its own copy of that rule and lost it, which is why the rule now has one home.
  *
  * The fraction is not compared, because `Date` cannot hold it; the shape above is what constrains it.
  */
@@ -502,7 +512,7 @@ function readsAsCursorTimestamp(value: string): boolean {
   if (!CURSOR_TIMESTAMP.test(value)) return false;
   const at = new Date(value);
   return (
-    !Number.isNaN(at.getTime()) &&
+    withinTimestamptzRange(at) &&
     at.toISOString().startsWith(value.slice(0, 19))
   );
 }
@@ -524,6 +534,21 @@ function refuseAuditQuery(message: string, cause?: unknown): never {
     cause,
     res: Response.json({ error: message }, { status: 400 }),
   });
+}
+
+/**
+ * The event types an `eventType` parameter names, in the order it named them.
+ *
+ * ONE HOME FOR THE SPLIT, because the two places that need it disagreeing is the defect itself:
+ * `auditQueryFromUrl` refuses a value that names nothing and `createAuditReader` builds the filter
+ * from what it names, so a separator one treated as a name and the other did not would refuse a
+ * filter at the edge and drop it in the read, or the reverse.
+ */
+function requestedEventTypes(eventType: string | undefined): string[] {
+  return (eventType ?? "")
+    .split(",")
+    .map((type) => type.trim())
+    .filter(Boolean);
 }
 
 function normalizedKey(key: string) {
@@ -697,10 +722,7 @@ function decodeCursor(cursor: string): AuditCursor {
 export function createAuditReader(database: Database): AuditReader {
   return {
     list: async (query) => {
-      const requestedTypes = (query.eventType ?? "")
-        .split(",")
-        .map((type) => type.trim())
-        .filter(Boolean);
+      const requestedTypes = requestedEventTypes(query.eventType);
       const conditions = [
         requestedTypes.length === 1
           ? eq(auditEvents.eventType, requestedTypes[0] as string)
@@ -807,24 +829,72 @@ export function auditQueryFromUrl(url: URL): AuditEventQuery {
   const requested = parsePageLimit(url.searchParams.get("limit"));
   if (!requested.ok) refuseAuditQuery(requested.error);
   const limit = Math.min(Math.max(requested.limit ?? 50, 1), 100);
-  const optional = (name: string) => url.searchParams.get(name) ?? undefined;
+  /*
+   * A PARAMETER THAT SAYS NOTHING IS NOT A PARAMETER, resolved here rather than by each reader being
+   * separately falsy about emptiness.
+   *
+   * That is `parsePageLimit`'s rule, in its words — it applies it to `?limit=` deliberately, and the
+   * filters here followed it by accident: `""` is falsy, so an empty `?cursor=`, `?eventType=`,
+   * `?actorUserId=`, `?targetType=` or `?targetId=` reached the read as no filter at all. `?from=`
+   * and `?to=` were the exceptions, because
+   * `new Date("")` is an Invalid Date — so a client clearing its date filter, which is how a filter is
+   * cleared, was answered `from must be a date, and "" is not one.` while clearing any other filter
+   * on the same screen answered a page.
+   */
+  const optional = (name: string) => {
+    const value = url.searchParams.get(name);
+    return value === null || value === "" ? undefined : value;
+  };
   /*
    * Anything `Date` can read, which is deliberately more than one format: a bound typed by hand is
    * usually a plain `2026-08-31` and a bound copied off the screen is a full ISO instant, and both
-   * are honest answers to "when". What is refused is a string that names no instant at all.
+   * are honest answers to "when". What is refused is a string that names no instant at all, and a
+   * string that names one `timestamptz` cannot be given.
+   *
+   * TWO REFUSALS, because they are two different things to have got wrong and a reader can only act on
+   * being told which. `from=yesterday` is not a date. `from=0000-01-01` and
+   * `from=-271821-04-20T00:00:00Z` are dates, and are dates this column has no room for: both parse,
+   * both used to reach drizzle's timestamp mapper, and Postgres answers `date/time field value out of
+   * range` for the first and `time zone displacement out of range` for the second — from inside the
+   * read,
+   * where the parameter no longer has a name and, with no `onError` registered in `app.ts`, Hono
+   * answers its default plain-text 500. `withinTimestamptzRange` carries the range and the reasoning.
    */
   const instant = (name: string) => {
     const value = optional(name);
-    if (value !== undefined && Number.isNaN(new Date(value).getTime())) {
+    if (value === undefined) return undefined;
+    const at = new Date(value);
+    if (Number.isNaN(at.getTime())) {
       refuseAuditQuery(`${name} must be a date, and "${value}" is not one.`);
+    }
+    if (!withinTimestamptzRange(at)) {
+      refuseAuditQuery(
+        `${name} must name a year between 0001 and 9999, and "${value}" does not.`,
+      );
     }
     return value;
   };
+  /*
+   * A filter that names no event type is refused, not silently dropped.
+   *
+   * `?eventType=,` and `?eventType=%20,%20` are non-empty values that `requestedEventTypes` reduces to
+   * nothing, and nothing is how the read spells "no filter" — so an administrator who asked to narrow
+   * the trail was handed every row, with a 200 on it. On a surface whose whole argument is that it
+   * gets used to rule things out, an unfiltered answer to a filter request is the same class of
+   * failure as a wrong one. An absent or empty `?eventType=` is a different thing and still reads as
+   * absent: see `optional` above.
+   */
+  const eventType = optional("eventType");
+  if (eventType !== undefined && requestedEventTypes(eventType).length === 0) {
+    refuseAuditQuery(
+      `eventType must name at least one event type, and "${eventType}" names none.`,
+    );
+  }
 
   return {
     cursor: optional("cursor"),
     limit,
-    eventType: optional("eventType"),
+    eventType,
     actorUserId: optional("actorUserId"),
     targetType: optional("targetType"),
     targetId: optional("targetId"),

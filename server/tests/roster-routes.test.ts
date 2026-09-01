@@ -1,9 +1,8 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import type { MiddlewareHandler } from "hono";
 import { Hono } from "hono";
-import type { AgentActor } from "../src/agents/profile-types";
 import { createApp } from "../src/app";
-import type { AppVariables } from "../src/auth/guards";
+import type { AppVariables, AuthenticatedActor } from "../src/auth/guards";
 import { loadConfig } from "../src/config";
 import { createRosterRoutes } from "../src/roster/routes";
 import type {
@@ -14,7 +13,21 @@ import type {
 } from "../src/roster/query";
 import { testEnvironment } from "./support/environment";
 
-const actor: AgentActor = { id: "user-1", role: "user" };
+/**
+ * `AuthenticatedActor`, not `AgentActor`: this is set as the Hono context `actor`, which is the wider
+ * of the two, and it carries an email the narrower type has no field for. Annotated `AgentActor` it
+ * did not compile — `context.set("actor", …)` wants the wider type — and nothing said so, because
+ * `server/tsconfig.json` excludes `tests`. `RosterStore.list` takes the narrower type and receives
+ * this unchanged, which is what the assertions on `store.queries` below are about.
+ *
+ * The third of three fixtures in this change with the same defect; `channel-archive.test.ts` and
+ * `bot-chat-routes.test.ts` are the two that were already annotated this way.
+ */
+const actor: AuthenticatedActor = {
+  id: "user-1",
+  email: "member@openbot.test",
+  role: "user",
+};
 
 const requireUser: MiddlewareHandler<{ Variables: AppVariables }> = async (
   context,

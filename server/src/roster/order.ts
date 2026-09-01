@@ -139,6 +139,39 @@ const CURSOR_RECENCY =
   /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,6})?Z$/;
 
 /**
+ * The instants a `timestamptz` can be given, which is narrower than the instants a `Date` can hold.
+ *
+ * A `Date` runs from ISO year -271821 to AD 275760 and Postgres will take neither end of that, so a
+ * bound or a cursor timestamp that parses cleanly here can still fail inside the read — where nothing
+ * knows which parameter was at fault, and where an ordinary `Error` becomes a bare plain-text 500 as
+ * `app.ts` registers no `onError`. Every timestamp check in this file and in `audit.ts` exists so the
+ * value is judged before it is bound, and each of them needs this same rule, so there is one copy.
+ *
+ * AD 1 THROUGH 9999, which is a smaller window than Postgres' documented 4713 BC to AD 294276, and the
+ * difference is mostly the rendering rather than the calendar. Both ways a `Date` reaches the column
+ * go through a four-digit year: drizzle's timestamp mapper calls `toISOString()`, and a cursor carries
+ * `recencyCursorText`'s `YYYY`. Outside AD 1..9999 `toISOString` switches to ISO 8601's extended
+ * `±YYYYYY` form, and Postgres reads that leading sign as a zone rather than a year —
+ * `select '+010000-01-02T00:00:00.000Z'::timestamptz` answers `time zone displacement out of range`,
+ * and so does `-271821-04-20T00:00:00.000Z` at the other end. Year 0 fails differently and for the
+ * older reason: there is no year between 1 BC and AD 1 in the calendar `timestamptz` implements, so
+ * `select '0000-01-01T00:00:00Z'::timestamptz` is out of range even though a `Date` has that year and
+ * round-trips it perfectly.
+ *
+ * An Invalid Date is refused too, so a caller that has one has no separate `Number.isNaN` check to
+ * remember: `getUTCFullYear()` on one is `NaN`, and every comparison against `NaN` is false.
+ *
+ * IN THIS MODULE because this is where the cursor timestamp rules already live and `audit.ts` already
+ * borrows `recencyCursorText` from here rather than restating it. The same trade as that borrowing:
+ * one function reached across a module boundary, against two hand-copied spellings of a rule that has
+ * already been dropped once on the way past.
+ */
+export function withinTimestamptzRange(at: Date): boolean {
+  const year = at.getUTCFullYear();
+  return year >= 1 && year <= 9999;
+}
+
+/**
  * Whether Postgres will read this as a timestamp, decided here rather than by letting it try.
  *
  * The shape alone is not enough: `2026-02-30T00:00:00Z` matches it and `timestamptz` answers `date/
@@ -148,10 +181,10 @@ const CURSOR_RECENCY =
  * Built through `setUTCFullYear` rather than `Date.UTC`, which maps years 0 through 99 onto 1900
  * through 1999 and would therefore reject the year 1 as a rollover it is not.
  *
- * Year 0 is refused on its own line, because the round trip cannot catch it: a `Date` has a year 0
- * and rebuilds it perfectly, and Postgres does not — `select '0000-01-01T00:00:00Z'::timestamptz`
- * answers the same out-of-range error. There is no year between 1 BC and AD 1 in the calendar
- * `timestamptz` implements, so a cursor naming one is malformed however cleanly it parses here.
+ * The year is asked of `withinTimestamptzRange` rather than of the round trip, because the round trip
+ * cannot see it: year 0 rebuilds perfectly and Postgres has no such year. `readsAsCursorTimestamp` in
+ * `audit.ts` asks the same function about the same thing, having once carried a copy of this check
+ * that then went missing.
  */
 function readsAsTimestamp(value: string): boolean {
   const parts = CURSOR_RECENCY.exec(value);
@@ -159,11 +192,11 @@ function readsAsTimestamp(value: string): boolean {
   const [year, month, day, hour, minute, second] = parts
     .slice(1, 7)
     .map(Number) as [number, number, number, number, number, number];
-  if (year < 1) return false;
   const at = new Date(0);
   at.setUTCFullYear(year, month - 1, day);
   at.setUTCHours(hour, minute, second, 0);
   return (
+    withinTimestamptzRange(at) &&
     at.getUTCFullYear() === year &&
     at.getUTCMonth() === month - 1 &&
     at.getUTCDate() === day &&

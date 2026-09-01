@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { decodeRosterCursor, encodeRosterCursor } from "../src/roster/order";
+import {
+  decodeRosterCursor,
+  encodeRosterCursor,
+  withinTimestamptzRange,
+} from "../src/roster/order";
 
 describe("the roster cursor", () => {
   test("round-trips every part of the sort key", () => {
@@ -88,5 +92,59 @@ describe("the roster cursor", () => {
       id: "channel_1",
     });
     expect(decodeRosterCursor(cursor)).toBeUndefined();
+  });
+});
+
+/*
+ * The one rule two files and three parameters share.
+ *
+ * A JS `Date` runs from ISO year -271821 to AD 275760 and `timestamptz` will not be given either end
+ * of that, so a bound or a cursor timestamp that parses cleanly still fails inside the read — as an
+ * ordinary driver error, which with no `onError` registered in `app.ts` is Hono's bare plain-text
+ * 500. `decodeRosterCursor` above, `readsAsCursorTimestamp` in `audit.ts` and `auditQueryFromUrl`'s
+ * `from`/`to` each need this answer; the second of them once carried its own copy and lost the year-0
+ * line, which is why the rule is asserted here on its own rather than only through its callers.
+ *
+ * The window is AD 1 through 9999 and the reason is the rendering, not the calendar: both ways a
+ * `Date` reaches the column go through a four-digit year, and outside that window `toISOString()`
+ * switches to ISO 8601's extended `±YYYYYY` form, whose leading sign Postgres reads as a zone
+ * offset.
+ */
+describe("the range timestamptz can be given", () => {
+  const at = (iso: string) => new Date(iso);
+
+  test.each([
+    ["0001-01-01T00:00:00.000Z", "the first year in the window"],
+    ["2026-08-31T09:00:00.000Z", "an ordinary one"],
+    ["9999-12-31T23:59:59.999Z", "the last four-digit year"],
+  ])("holds %p: %s", (iso: string) => {
+    expect(withinTimestamptzRange(at(iso))).toBe(true);
+  });
+
+  test.each([
+    [
+      "0000-01-01T00:00:00.000Z",
+      "a year 0, which JS has and the calendar does not",
+    ],
+    [
+      "-000001-12-31T00:00:00.000Z",
+      "a negative ISO year, on the other side of it",
+    ],
+    ["-271821-04-20T00:00:00.000Z", "the earliest instant a `Date` holds"],
+    [
+      "+010000-01-02T00:00:00.000Z",
+      "a five-digit year, which renders with a sign",
+    ],
+    ["+275760-09-13T00:00:00.000Z", "the latest instant a `Date` holds"],
+  ])("does not hold %p: %s", (iso: string) => {
+    // Each of these is a perfectly good `Date`: the point is that being one is not enough.
+    expect(Number.isNaN(at(iso).getTime())).toBe(false);
+    expect(withinTimestamptzRange(at(iso))).toBe(false);
+  });
+
+  test("does not hold an Invalid Date either", () => {
+    // So a caller has no separate `Number.isNaN` check to remember: every comparison against the
+    // `NaN` year of an Invalid Date is false.
+    expect(withinTimestamptzRange(new Date("lol"))).toBe(false);
   });
 });
