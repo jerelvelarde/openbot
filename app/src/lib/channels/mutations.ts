@@ -1,5 +1,5 @@
 import { mutationOptions, type QueryClient } from "@tanstack/react-query";
-import { client, tryClient } from "@/lib/client";
+import { client } from "@/lib/client";
 import { patchRosterRead } from "@/lib/roster/read-marker";
 import { rosterKeys } from "@/lib/roster/queries";
 import { type AgentChannel, channelKeys } from "./queries";
@@ -19,8 +19,22 @@ export function createChannelMutationOptions(queryClient: QueryClient) {
       });
       return ((await response.json()) as { channel: AgentChannel }).channel;
     },
-    // channelKeys.all is a prefix of channelKeys.detail, which channelQueryOptions reads;
-    // rosterKeys.all is what actually gets the new row into the sidebar.
+    /*
+     * channelKeys.all is a prefix of channelKeys.detail, which channelQueryOptions reads;
+     * rosterKeys.all is what actually gets the new row into the sidebar.
+     *
+     * DROPPED RATHER THAN RETURNED, which every sibling below does the opposite of, and the
+     * difference is deliberate rather than an oversight. query-core awaits whatever `onSuccess`
+     * returns before the mutation settles, and `useStartChannel` (lib/channels/start.ts) awaits
+     * `mutateAsync` and then seeds, stashes and navigates — so returning these would hold the
+     * navigation, and the composer's `pending` with it, behind a roster refetch plus a refetch of
+     * whichever channel detail query is open, which is the channel being navigated away from.
+     * Neither result is read by anything in that sequence.
+     *
+     * A sibling has somewhere for the wait to show instead: `deleteConversation.isPending` is what
+     * keeps the menu's button reading "Deleting…" (app-sidebar/roster-row.tsx), and staying pending
+     * until the row has actually gone is the honest version of that.
+     */
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: channelKeys.all });
       void queryClient.invalidateQueries({ queryKey: rosterKeys.all });
@@ -29,12 +43,56 @@ export function createChannelMutationOptions(queryClient: QueryClient) {
 }
 
 /**
+ * How long a reported message may be, in UTF-16 units, before the route refuses it outright.
+ *
+ * This side's copy of `MAX_ACTIVITY_TEXT_UNITS` in server/src/channels/routes.ts — a copy because
+ * nothing under `app` imports from `server`, and here for the same reason the server keeps it in its
+ * own channels file: the bot chat activity route reads a body of this shape and turns away the same
+ * sizes, so `bot-chats/mutations.ts` imports this one rather than restating it and the two reporters
+ * cannot drift apart on this side either.
+ *
+ * If the two SIDES drift, the report comes back `400 "Text is too long."` — which the reporters now
+ * say out loud instead of dropping, so the drift is a console line rather than a silence.
+ */
+export const MAX_ACTIVITY_TEXT_UNITS = 16_000;
+
+/**
+ * The reported text, cut down to what the route will accept.
+ *
+ * A report is a PREVIEW, not the message: the server keeps 200 code points of it for the roster row
+ * and the first 80 for a bot chat's title, and the transcript is held by whoever owns it. So a
+ * message over the cap is worth reporting shortened, where sending it whole is worth nothing at all
+ * — the route refuses the whole request, and with it the timestamp, the preview, and the
+ * `archived_at` clear that is how saying something in an archived conversation brings it back.
+ *
+ * Cut in UTF-16 units and never through the middle of an astral character, the same rule and the
+ * same reason as `boundedInput` in server/src/roster/preview.ts: the server strips a lone surrogate
+ * to a space, so a cut that split a pair would render a space where a character used to be.
+ */
+export function boundedActivityText(text: string): string {
+  if (text.length <= MAX_ACTIVITY_TEXT_UNITS) return text;
+  const last = text.charCodeAt(MAX_ACTIVITY_TEXT_UNITS - 1);
+  const splitsAPair = last >= 0xd800 && last <= 0xdbff;
+  return text.slice(
+    0,
+    splitsAPair ? MAX_ACTIVITY_TEXT_UNITS - 1 : MAX_ACTIVITY_TEXT_UNITS,
+  );
+}
+
+/**
  * Report the last thing said in a channel.
  *
  * The client that ran the agent already has the message before platform replay can return it; the
  * runtime exposes no run-completion hook and its run endpoint returns before the reply exists.
  *
- * Fire-and-forget on purpose: a failed preview update is a stale roster line, not a lost message.
+ * Still fire-and-forget in the sense that matters: nothing waits on it, nothing retries, and a
+ * failed preview update is a stale roster line rather than a lost message. What it is no longer is
+ * SILENT. This went through `tryClient` with the response dropped unread, which made a 400 on a bad
+ * timestamp, a 413, a 401 on an expired session and any 500 byte-for-byte indistinguishable from the
+ * 204 that means it worked — and a rejection, which is what being offline actually produces, equally
+ * so. `client` turns all of those into one throw carrying whatever the server said, and `onError`
+ * writes the line: the shape `use-channel-events.ts` established for a failure nothing can recover
+ * from, which is exactly why it has to be said out loud.
  */
 export function recordChannelActivityMutationOptions() {
   return mutationOptions({
@@ -44,15 +102,25 @@ export function recordChannelActivityMutationOptions() {
       agentId: string | null;
       at: string;
     }) => {
-      /* Still fire-and-forget: `tryClient` does not throw, and the result is not read. */
-      await tryClient(`/api/channels/${variables.channelId}/activity`, {
+      await client(`/api/channels/${variables.channelId}/activity`, {
         method: "POST",
         body: {
           agentId: variables.agentId,
           at: variables.at,
-          text: variables.text,
+          text: boundedActivityText(variables.text),
         },
+        fallback: "Could not update this channel's roster line.",
       });
+    },
+    onError: (error, variables) => {
+      console.error(
+        JSON.stringify({
+          type: "channel-activity-not-recorded",
+          channelId: variables.channelId,
+          error: error.message,
+          note: "This tab could not tell the server what was just said in this channel. The message itself is unaffected; the channel's roster line keeps its previous preview and timestamp until something else moves it.",
+        }),
+      );
     },
   });
 }

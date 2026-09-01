@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import {
   MutationObserver,
   QueryClient,
+  QueryObserver,
   type InfiniteData,
 } from "@tanstack/react-query";
 import { hasUnseenActivity } from "../src/components/app-sidebar/app-sidebar";
@@ -25,10 +26,23 @@ import {
 } from "../src/lib/roster/queries";
 
 const realFetch = globalThis.fetch;
+const realConsoleError = console.error;
 
 afterEach(() => {
   globalThis.fetch = realFetch;
+  // Put back even when a test failed before it could: `bun test` runs every file in one process, so
+  // a swapped `console.error` left behind swallows the next file's output as well as this one's.
+  console.error = realConsoleError;
 });
+
+/** The console lines a failure writes, which is the only place a refused report is said. */
+function capturingConsoleError(): string[] {
+  const lines: string[] = [];
+  console.error = ((...args: unknown[]) => {
+    lines.push(args.map(String).join(" "));
+  }) as typeof console.error;
+  return lines;
+}
 
 function rosterItem(
   id: string,
@@ -456,6 +470,170 @@ test("a report that is not the conversation's first words refetches nothing", as
 });
 
 /**
+ * WHAT A REFUSED REPORT DOES, which for a while was nothing whatsoever.
+ *
+ * The report went through `tryClient` with the response discarded, so a 400, a 404, a 413, a 401 and
+ * a 500 were byte-for-byte indistinguishable from the 204 that means it worked. This route is the
+ * only thing that clears `archived_at`, so the feature's headline promise — saying something in an
+ * archived conversation is how it comes back — was being broken with no dot, no banner, no console
+ * line and no retry: the person spoke, the Bot answered normally, and the conversation stayed put
+ * away. Every case below is reachable from the composer today.
+ */
+
+/** A report and the watcher-facing answer to it, driven by query-core rather than by hand. */
+function reportingHarness(status: number, body: unknown) {
+  const seen = capturingFetch(status, body);
+  const logged = capturingConsoleError();
+  const { queryClient, invalidated } = spyingQueryClient();
+  /** The ids the mutation said were still untitled — what the hook re-arms its watcher on. */
+  const stillMissing: string[] = [];
+  const observer = new MutationObserver(
+    queryClient,
+    recordBotChatActivityMutationOptions(queryClient, (botChatId) => {
+      stillMissing.push(botChatId);
+    }),
+  );
+  return { invalidated, logged, observer, queryClient, seen, stillMissing };
+}
+
+test("a refused report is said out loud, and does not pass for one that landed", async () => {
+  // 400 "Text is too long." is the server's own words, and they are what a console line has to
+  // carry: "the report failed" is not something anybody can act on, and the status alone is not
+  // either.
+  const harness = reportingHarness(400, { error: "Text is too long." });
+  const unsubscribe = harness.observer.subscribe(() => {});
+
+  await expect(
+    harness.observer.mutate(report({ agentId: null, derivesTitle: true })),
+  ).rejects.toThrow("Text is too long.");
+  unsubscribe();
+
+  expect(harness.seen).toHaveLength(1);
+  expect(harness.logged).toHaveLength(1);
+  expect(JSON.parse(String(harness.logged[0]))).toMatchObject({
+    type: "bot-chat-activity-not-recorded",
+    botChatId: "botchat-1",
+    error: "Text is too long.",
+  });
+  // Nothing was written, so there is no title to go looking for — and the flag is armed again so the
+  // person's next message can be the one that names the conversation.
+  expect(harness.invalidated).toEqual([]);
+  expect(harness.stillMissing).toEqual(["botchat-1"]);
+});
+
+test("a report the browser could not send at all says the endpoint's sentence, not the browser's", async () => {
+  /*
+   * The failure this file's other offline tests already prove is a REJECTION rather than a status —
+   * and the one the old comment ("`tryClient` does not throw") denied existed. Nothing caught it, so
+   * `onSuccess` never ran and the title refetch was skipped in silence; now it is one throw like any
+   * other, carrying the sentence this endpoint supplied rather than Chrome's "Failed to fetch".
+   */
+  const harness = reportingHarness(204, undefined);
+  globalThis.fetch = (async () => {
+    throw new TypeError("Failed to fetch");
+  }) as unknown as typeof fetch;
+  const unsubscribe = harness.observer.subscribe(() => {});
+
+  let caught: unknown;
+  try {
+    await harness.observer.mutate(
+      report({ agentId: null, derivesTitle: true }),
+    );
+  } catch (error) {
+    caught = error;
+  }
+  unsubscribe();
+
+  expect((caught as Error).message).toBe(
+    "Could not update this conversation's roster line.",
+  );
+  // The browser's own wording is kept where a console can still reach it, and where anything that
+  // needs to tell a refusal from an unreachable server still can.
+  expect((caught as Error).cause).toBeInstanceOf(TypeError);
+  expect(JSON.parse(String(harness.logged[0]))).toMatchObject({
+    type: "bot-chat-activity-not-recorded",
+    error: "Could not update this conversation's roster line.",
+  });
+  expect(harness.stillMissing).toEqual(["botchat-1"]);
+});
+
+test("a message too long for the route is reported shortened rather than refused whole", async () => {
+  /*
+   * A report is a preview: the server keeps 200 code points of it and refuses anything over 16,000
+   * UTF-16 units outright. Sent whole, a long message lost the timestamp, the preview AND the
+   * un-archiving; sent cut, it keeps all three and the row shows the same 200 code points either way.
+   */
+  const harness = reportingHarness(204, undefined);
+  const unsubscribe = harness.observer.subscribe(() => {});
+
+  await harness.observer.mutate({
+    ...report({ agentId: null, derivesTitle: false }),
+    text: "x".repeat(20_000),
+  });
+  unsubscribe();
+
+  const body = JSON.parse(String(harness.seen[0]?.init?.body)) as {
+    text: string;
+  };
+  expect(body.text).toHaveLength(16_000);
+});
+
+/**
+ * WHICH REPORT LEAVES THE CONVERSATION NAMED, which a 204 does not answer.
+ *
+ * `derivesTitle` is this browser's guess, made with `.trim()`; the server decides with `flatten`,
+ * which strips `\p{Cc}\p{Cf}\p{Cs}` first. A first message of zero-width characters passes the one
+ * and not the other, so the report lands, the flag is spent, and no title is written — while the
+ * person's NEXT message does get titled server-side, the write being guarded on `WHERE title IS
+ * NULL`. Latched, that left a real title in the database and the Bot's name on the row for the rest
+ * of the session.
+ *
+ * The seeded detail cache stands in for what the awaited invalidation refetches: `spyingQueryClient`
+ * replaces `invalidateQueries`, so the cache holds whatever the refetch is being said to have found.
+ */
+
+function detailCache(queryClient: QueryClient, title: string | null) {
+  queryClient.setQueryData(botChatKeys.detail("botchat-1"), {
+    active: true,
+    agentId: "agent-1",
+    archived: false,
+    id: "botchat-1",
+    threadId: "thread-1",
+    title,
+  });
+}
+
+test("a report the server did not title from arms the next one", async () => {
+  const harness = reportingHarness(204, undefined);
+  detailCache(harness.queryClient, null);
+  const unsubscribe = harness.observer.subscribe(() => {});
+
+  await harness.observer.mutate(report({ agentId: null, derivesTitle: true }));
+  unsubscribe();
+
+  // The refetch happened — asked for before this was read, which is the only ordering that makes the
+  // answer mean anything — and came back with no name on the conversation.
+  expect(harness.invalidated).toEqual([
+    { queryKey: botChatKeys.detail("botchat-1") },
+    { queryKey: rosterKeys.all },
+  ]);
+  expect(harness.stillMissing).toEqual(["botchat-1"]);
+});
+
+test("a report the server DID title from does not ask again", async () => {
+  // The other half, and the one that keeps the throttle a throttle: a conversation that has just
+  // been named must not re-arm, or every message a person sends refetches the detail query.
+  const harness = reportingHarness(204, undefined);
+  detailCache(harness.queryClient, "Tuesday flights");
+  const unsubscribe = harness.observer.subscribe(() => {});
+
+  await harness.observer.mutate(report({ agentId: null, derivesTitle: true }));
+  unsubscribe();
+
+  expect(harness.stillMissing).toEqual([]);
+});
+
+/**
  * Reading one conversation, which lives here beside the writes because it shares their whole point:
  * the browser needs the STATUS, not just a sentence. `client` throws a plain `Error` built from the
  * body's message and drops the status, so this read goes through `tryClient` the way
@@ -542,4 +720,73 @@ test("being offline is not a deletion either", async () => {
 
   expect(caught).toBeInstanceOf(Error);
   expect(caught).not.toBeInstanceOf(BotChatMissingError);
+});
+
+test("the title is read after the refetch it asked for, not beside it", async () => {
+  /*
+   * The ordering the re-arm signal is built on, with a real `QueryClient` and a real refetch rather
+   * than a seeded stand-in for one: the detail invalidation is AWAITED, so what is read afterwards is
+   * what the server just sent. Read beside the refetch instead — `void`, as the invalidations here
+   * used to be — and the answer is always the value the report was trying to replace, so every
+   * conversation reads as still untitled, re-arms, and refetches again on the next message for as long
+   * as somebody keeps typing.
+   */
+  globalThis.fetch = (async (url: unknown) => {
+    if (String(url).endsWith("/activity")) {
+      return new Response(null, { status: 204 });
+    }
+    return new Response(
+      JSON.stringify({
+        botChat: {
+          active: true,
+          agentId: "agent-1",
+          archived: false,
+          id: "botchat-1",
+          threadId: "thread-1",
+          title: "Tuesday flights",
+        },
+      }),
+      { headers: { "content-type": "application/json" }, status: 200 },
+    );
+  }) as unknown as typeof fetch;
+  const queryClient = new QueryClient();
+  queryClient.setQueryData(botChatKeys.detail("botchat-1"), {
+    active: true,
+    agentId: "agent-1",
+    archived: false,
+    id: "botchat-1",
+    threadId: "thread-1",
+    title: null,
+  });
+  /*
+   * Observed, because `invalidateQueries` refetches ACTIVE queries and this stands in for the screen
+   * that is reading the conversation. `staleTime: Infinity` keeps the subscription itself from
+   * fetching, so the only fetch of the detail query in this test is the one the report asks for.
+   */
+  const detail = new QueryObserver(queryClient, {
+    ...botChatQueryOptions("botchat-1"),
+    staleTime: Number.POSITIVE_INFINITY,
+  });
+  const unobserve = detail.subscribe(() => {});
+  const stillMissing: string[] = [];
+  const observer = new MutationObserver(
+    queryClient,
+    recordBotChatActivityMutationOptions(queryClient, (botChatId) => {
+      stillMissing.push(botChatId);
+    }),
+  );
+  const unsubscribe = observer.subscribe(() => {});
+
+  await observer.mutate(report({ agentId: null, derivesTitle: true }));
+  unsubscribe();
+  unobserve();
+
+  // The refetch really happened, so the cache holds the title the report earned...
+  expect(
+    queryClient.getQueryData<{ title: string | null }>(
+      botChatKeys.detail("botchat-1"),
+    )?.title,
+  ).toBe("Tuesday flights");
+  // ...and because it was read after that, nothing asks for the title a second time.
+  expect(stillMissing).toEqual([]);
 });

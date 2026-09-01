@@ -256,6 +256,58 @@ describe("what a bot chat reports", () => {
     ).toBe(true);
   });
 
+  test("a report that left the conversation untitled arms the flag again", () => {
+    /*
+     * THE FLAG IS A THROTTLE, NOT A ONE-SHOT, and the difference is a conversation that keeps the
+     * Bot's name for the whole session.
+     *
+     * "This message has words" is decided twice on different rules: `.trim()` here, and `flatten` on
+     * the server, which strips `\p{Cc}\p{Cf}\p{Cs}` first. Zero-width characters are not whitespace
+     * to `trim`, so the message below is reported and spends the flag — and the server writes no
+     * title from it. The person's next message DOES get titled server-side, since that write is
+     * guarded on `WHERE title IS NULL`, so latching here left a real title in the database with the
+     * Bot's name still on the row and the header.
+     */
+    const watcher = botChatActivityWatcher(BOT);
+
+    expect(watcher.observed(typedHere("m1", "\u200b\u200d"))).toEqual({
+      agentId: null,
+      firstFromPerson: true,
+      text: "\u200b\u200d",
+    });
+    // Still one at a time: a burst while the refetch is in flight asks once, not once per message.
+    expect(watcher.observed(typedHere("m2", "Book it"))?.firstFromPerson).toBe(
+      false,
+    );
+
+    watcher.titleStillMissing();
+
+    expect(
+      watcher.observed(typedHere("m3", "Book the Tuesday flight"))
+        ?.firstFromPerson,
+    ).toBe(true);
+  });
+
+  test("arming the flag again arms nothing else", () => {
+    /*
+     * The blast radius, pinned. A watcher's other two pieces of memory are what keep a replayed
+     * history from being reported — and reporting a replay is what would un-archive a conversation
+     * by opening it. Neither is about titles, so neither may move when the title flag does.
+     */
+    const watcher = botChatActivityWatcher(BOT);
+
+    watcher.titleStillMissing();
+    // `spokenHere` is still closed, so a stored answer arriving first is still not reported.
+    expect(
+      watcher.observed(fromStream("h1", "assistant", "Stored answer")),
+    ).toBeNull();
+
+    watcher.observed(typedHere("m1", "Said once"));
+    watcher.titleStillMissing();
+    // And the reported-ids set is still intact, so the same message is still not reported twice.
+    expect(watcher.observed(typedHere("m1", "Said once"))).toBeNull();
+  });
+
   test("the reported text is trimmed, so a preview never starts with whitespace", () => {
     const watcher = botChatActivityWatcher(BOT);
 

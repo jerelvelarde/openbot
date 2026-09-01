@@ -1,7 +1,7 @@
 import type { Message } from "@ag-ui/core";
 import { useAgent } from "@copilotkit/react-core/v2";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { recordBotChatActivityMutationOptions } from "./mutations";
 import type { BotChat } from "./queries";
 
@@ -29,13 +29,18 @@ export type BotChatActivity = {
   agentId: string | null;
   text: string;
   /**
-   * True on the first words a person says in this conversation, and never again — false on every
-   * message the Bot says, and on a person's later ones.
+   * True on the first words a person says in this conversation — false on every message the Bot
+   * says, on a person's later ones, and on every message sent while a title is still being asked
+   * for.
    *
-   * The server derives the conversation's title from that one message, so this is what tells the
+   * The server may derive the conversation's title from that one message, so this is what tells the
    * hook which report is worth a refetch. A latch here rather than a test at the call site because
    * the call site cannot tell: it would have to ask whether the title has arrived yet, and the
    * answer is still "no" for every message sent while the refetch is in flight.
+   *
+   * A THROTTLE RATHER THAN A ONE-SHOT, which is the difference between this and what it used to be.
+   * `titleStillMissing` arms it again when a report ends without a title, so "never again" holds only
+   * for as long as asking again would be asking a question already in flight.
    */
   firstFromPerson: boolean;
 };
@@ -59,6 +64,15 @@ export type ObservedMessage = {
 /** Held so the hook below can keep one across re-subscribes. */
 export type BotChatActivityWatcher = {
   observed: (event: ObservedMessage) => BotChatActivity | null;
+  /**
+   * Arm `firstFromPerson` again: the last report that carried it did not leave the conversation
+   * titled.
+   *
+   * Called by the hook when the refetch behind a title-deriving report came back with `title` still
+   * null, or when that report never landed at all. Only the flag is armed — the `spokenHere` latch
+   * and the reported-ids set are untouched, because neither of them is about titles.
+   */
+  titleStillMissing: () => void;
 };
 
 /**
@@ -105,8 +119,8 @@ function spokenText(message: Readonly<Message>): string {
  *   - Nothing is reported twice, keyed on the message id: a resumed connect may re-deliver the tail
  *     of a thread this tab already reported, and one message must not move the roster twice.
  *
- * The latch is never cleared, unlike `awaitingReply` in `channel-chat.tsx`, which clears when the run
- * finishes. It cannot be: OpenBot registers every computer tool as a frontend tool, so an ordinary
+ * The `spokenHere` latch is never cleared, unlike `awaitingReply` in `channel-chat.tsx`, which
+ * clears when the run finishes. It cannot be: OpenBot registers every computer tool as a frontend tool, so an ordinary
  * browsing turn is several runs in a row and the answer worth previewing usually lands in a later
  * one. Left latched, every sentence the Bot says updates the preview and the newest one wins, which
  * is what a roster line is for. The cost is that a replay arriving after the person has already typed
@@ -119,10 +133,20 @@ export function botChatActivityWatcher(
   const reported = new Set<string>();
   /** Whether a person has sent something from this browser, in this conversation. */
   let spokenHere = false;
-  /** Whether a person's words have already been reported, which the title is derived from. */
+  /**
+   * Whether a person's words have already been reported for the title, and that report is either
+   * still being answered or produced one.
+   *
+   * Cleared by `titleStillMissing` when it did neither, so the next thing the person says asks again
+   * rather than the conversation keeping the Bot's name for the session.
+   */
   let reportedFromPerson = false;
 
   return {
+    titleStillMissing() {
+      reportedFromPerson = false;
+    },
+
     observed({ message, input }) {
       const addedHere = input === undefined;
 
@@ -148,8 +172,15 @@ export function botChatActivityWatcher(
       reported.add(message.id);
 
       const fromPerson = message.role === "user";
-      // Latched only on a message that is actually being reported: an attachment with no words never
-      // reaches here, and the title is derived from a message the server was told about.
+      /*
+       * Latched only on a message that is actually being reported: an attachment with no words never
+       * reaches here, so it does not spend the flag on a message the server is never told about.
+       *
+       * Being told about a message is not the same as the server titling from it, though, and this
+       * cannot tell which happened — the rules differ (`.trim()` here, `flatten` there) and only the
+       * answer says. So the latch is provisional: whoever reports calls `titleStillMissing` when the
+       * conversation came back untitled, and the next thing the person says carries the flag again.
+       */
       const firstFromPerson = fromPerson && !reportedFromPerson;
       if (fromPerson) reportedFromPerson = true;
 
@@ -187,7 +218,11 @@ export type HeldWatcher = {
  * The screen that calls the hook passes `key={botChat.id}`, which remounts the whole subtree on a
  * change and so happens to make this impossible from that one call site — but that key was the only
  * thing standing between a navigation and the failure above, which made a correct screen a
- * precondition for a correct hook. Now the hook holds either way.
+ * precondition for a correct hook. The hook now holds either way: it swaps the held watcher inside
+ * the effect that subscribes, so only a render React actually committed can change which watcher is
+ * held. (Called from the render body, as it was, a render React abandoned could swap it too — the
+ * failure direction was safe, a fresh watcher for the conversation being abandoned, but "the hook
+ * holds either way" was not true of the concurrent case.)
  *
  * Reused for the same id, deliberately, which is the reason a ref holds it at all: a re-subscribe
  * (a new agent instance, a re-run effect) must not lose the "already reported" set, or the tail of
@@ -207,54 +242,116 @@ export function watcherFor(
 /**
  * Report both directions of this conversation to the roster, for as long as the screen is mounted.
  *
- * Fire-and-forget, like the channel's: `recordBotChatActivityMutationOptions` goes through
- * `tryClient` and the result is not read, because a failed preview update is a stale roster line and
- * not a lost message. Nothing here waits on it, and nothing retries.
+ * Nothing here waits on a report and nothing retries — a failed preview update is a stale roster
+ * line, not a lost message. A refused one is no longer silent, though:
+ * `recordBotChatActivityMutationOptions` reads the answer, throws when the server said no or never
+ * answered at all, and writes a structured console line naming the conversation. There is no
+ * sentence on the screen for it today, deliberately: a turn reports several times over — every
+ * sentence the Bot says is one — so a blip would stack banners over a conversation whose messages
+ * all arrived.
  */
 export function useBotChatActivity(botChat: BotChat): void {
+  const { agentId, id } = botChat;
   /*
    * Bound by agent id and nothing else, which is what makes this the chat's own agent rather than a
    * second one: `useAgent({ agentId })` returns the shared registered instance, and the packaged
    * chat resolves the same instance from the same id (it writes the thread onto it separately). Ask
    * for a `threadId` here and the hook throws, by design — see the message it throws.
    */
-  const { agent } = useAgent({ agentId: botChat.agentId });
+  const { agent } = useAgent({ agentId });
   const queryClient = useQueryClient();
+
+  /** One watcher per conversation, so its "already reported" set survives a re-subscribe. */
+  const held = useRef<HeldWatcher | null>(null);
+
+  /*
+   * The answer to "that report left the conversation untitled", which the mutation is what knows.
+   *
+   * Checked against the held conversation before it is acted on, for the same reason `watcherFor`
+   * checks: a report settles after the write it describes, so one belonging to the conversation
+   * somebody has just moved away from can arrive once a different watcher is held — and arming THAT
+   * one's flag would let a conversation that has already asked for its title ask a second time, on
+   * an answer about a different conversation entirely. Only the screen's `key` makes that impossible
+   * today, and this hook is not allowed to need it. Stable identity, so the mutation options stay
+   * the only thing that changes per render.
+   */
+  const titleStillMissing = useCallback((botChatId: string) => {
+    const current = held.current;
+    if (current?.botChatId !== botChatId) return;
+    current.watcher.titleStillMissing();
+  }, []);
+
   const recordActivity = useMutation(
-    recordBotChatActivityMutationOptions(queryClient),
+    recordBotChatActivityMutationOptions(queryClient, titleStillMissing),
   );
   /* The mutation object's identity changes per render; `mutate` is stable, so only it is a dep. */
   const record = recordActivity.mutate;
 
-  /** One watcher per conversation, so its "already reported" set survives a re-subscribe. */
-  const held = useRef<HeldWatcher | null>(null);
-  held.current = watcherFor(held.current, botChat);
-  const watcher = held.current.watcher;
-
-  /** Read at report time rather than captured, so the effect does not re-subscribe when it changes. */
+  /**
+   * Read at report time rather than captured, so the effect does not re-subscribe when it changes.
+   *
+   * Written from an effect rather than in the render body: only a committed render has a `botChat`
+   * this hook should believe, and reports arrive from a subscription that a commit is what
+   * establishes, so an effect is never too late for one.
+   */
   const untitled = useRef(botChat.title === null);
-  untitled.current = botChat.title === null;
+  useEffect(() => {
+    untitled.current = botChat.title === null;
+  });
 
   useEffect(() => {
-    const subscription = agent.subscribe?.({
+    /*
+     * The held watcher is swapped here, in the effect, rather than in the render body — see
+     * `watcherFor`. This is also the only place it matters: the watcher exists to be handed to a
+     * subscription, and there is one of those per commit.
+     */
+    held.current = watcherFor(held.current, { agentId, id });
+    const watcher = held.current.watcher;
+
+    if (typeof agent.subscribe !== "function") {
+      /*
+       * NOT INFERRED SILENTLY, because the whole premise of this file is that the browser is the
+       * only thing that can report what was said here. No subscription means no reports at all for
+       * this conversation — no title, no preview, no timestamp, no unseen dot and no un-archiving —
+       * which looks exactly like somebody who opened a chat and never spoke, and would be diagnosed
+       * as a server problem for as long as it took somebody to read this file.
+       *
+       * A line rather than a throw: this is a reporter, and taking the conversation down with it
+       * would be the worse trade. The packaged `useAgent` documents `agent` as always fully
+       * constructed and `agent.subscribe(...)` as always safe (@copilotkit/react-core v2,
+       * `headless.d.mts`), so reaching this is a broken contract rather than a state to design for —
+       * which is exactly the kind of thing that has to be audible when it happens.
+       */
+      console.error(
+        JSON.stringify({
+          type: "bot-chat-activity-unsubscribable",
+          botChatId: id,
+          note: "This tab cannot subscribe to the Bot's messages, so nothing said in this conversation will reach the roster: no title, no preview, no unseen dot, and an archived conversation will not come back by being spoken in.",
+        }),
+      );
+      return;
+    }
+
+    const subscription = agent.subscribe({
       onNewMessage: (event) => {
         const activity = watcher.observed(event);
         if (!activity) return;
 
         /*
-         * ONE REFETCH PER CONVERSATION: the first thing a person says in one that has no title yet.
+         * ONE TITLE REFETCH AT A TIME: the first thing a person says in a conversation that has none
+         * yet, and again after an attempt that did not produce one.
          *
          * Both halves are needed and neither is enough. `firstFromPerson` is latched in the watcher,
-         * so this stays one refetch however fast somebody types — read on its own, `untitled` is
-         * still true for every message sent before the invalidated detail query comes back, so a
-         * burst into a new conversation used to ask for a title several times over. `untitled` is
-         * what keeps a conversation that already has one from refetching at all.
+         * so a burst of messages asks once rather than once each — read on its own, `untitled` is
+         * still true for every message sent before the invalidated detail query comes back.
+         * `untitled` is what keeps a conversation that already has a title from refetching at all.
          *
-         * What that costs: if the one refetch misses the title — the report was refused, or the read
-         * raced the write server-side — nothing here asks again, and the roster keeps showing the
-         * Bot's name for this conversation until something else loads it. That is the same
-         * fire-and-forget bargain the rest of this file makes, and the alternative is a refetch per
-         * message for the whole conversation.
+         * What it no longer costs: an attempt that ends with `title` still null — the report was
+         * refused, or the server declined to title a message this browser thought had words in it —
+         * arms the flag again through `titleStillMissing`, so the next thing the person says asks
+         * once more. Left latched, that one lost refetch meant the header and the sidebar row showed
+         * the Bot's name for the rest of the session while a title the person's next message had
+         * earned sat in the database.
          *
          * The refetch itself is in the mutation's own `onSuccess`, not passed per call — see
          * `recordBotChatActivityMutationOptions`, where a per-call callback was being cancelled by
@@ -263,12 +360,12 @@ export function useBotChatActivity(botChat: BotChat): void {
         record({
           agentId: activity.agentId,
           at: new Date().toISOString(),
-          botChatId: botChat.id,
+          botChatId: id,
           derivesTitle: activity.firstFromPerson && untitled.current,
           text: activity.text,
         });
       },
     });
-    return () => subscription?.unsubscribe();
-  }, [agent, botChat.id, record, watcher]);
+    return () => subscription.unsubscribe();
+  }, [agent, agentId, id, record]);
 }

@@ -1,4 +1,5 @@
 import { mutationOptions, type QueryClient } from "@tanstack/react-query";
+import { boundedActivityText } from "@/lib/channels/mutations";
 import { client, tryClient } from "@/lib/client";
 import { patchRosterRead } from "@/lib/roster/read-marker";
 import { rosterKeys } from "@/lib/roster/queries";
@@ -95,7 +96,17 @@ export function adoptBotChatMutationOptions(queryClient: QueryClient) {
  * The client that ran the agent already has the message before platform replay can return it; the
  * runtime exposes no run-completion hook and its run endpoint returns before the reply exists.
  *
- * Fire-and-forget on purpose: a failed preview update is a stale roster line, not a lost message.
+ * NOTHING WAITS ON IT AND NOTHING RETRIES — a failed preview update is a stale roster line, not a
+ * lost message — BUT A REFUSAL IS NOT ALLOWED TO BE INVISIBLE, and it used to be. This went through
+ * `tryClient` with the response dropped unread, so `400 "Text is too long."`, a 413 on an oversized
+ * body, a 400 on a bad timestamp, a 404 for a row deleted in another tab, a 401 on an expired
+ * session and any 500 were all byte-for-byte indistinguishable from the 204 that means it worked.
+ * What that costs is not cosmetic: this route is the only thing that clears `archived_at`, so the
+ * promise that saying something in an archived conversation brings it back was being broken in
+ * silence — the person spoke, the Bot answered, the conversation stayed archived, and there was no
+ * dot, no banner, no console line and no retry to tell them their model of the app was now wrong.
+ * `client` turns every one of those into a throw carrying whatever the server said, `onError` writes
+ * the line, and a caller that wants to put a sentence on the screen now has an error to hang it on.
  *
  * WHY THE TITLE REFETCH LIVES HERE, in the mutation's own `onSuccess`, driven by a flag in the
  * variables rather than by per-call callbacks at the call site. `useBotChatActivity` reports both
@@ -110,7 +121,19 @@ export function adoptBotChatMutationOptions(queryClient: QueryClient) {
  * `onSuccess` is invoked by the mutation (`mutation.js`: `await this.options.onSuccess?.(…)`), not
  * by the observer, so there is nothing for a later call to overwrite or detach.
  */
-export function recordBotChatActivityMutationOptions(queryClient: QueryClient) {
+export function recordBotChatActivityMutationOptions(
+  queryClient: QueryClient,
+  /**
+   * Told, with the conversation's id, that this report did not leave the conversation with a title.
+   *
+   * Either because the report never landed, or because it landed and the refetch behind it still
+   * found `title === null`. `useBotChatActivity` answers it by re-arming the watcher's
+   * `firstFromPerson` flag, so the next thing the person says asks again — see the flag's docblock
+   * in activity.ts for why one report was not enough. Optional because a caller that reports without
+   * ever setting `derivesTitle` has nothing to re-arm.
+   */
+  onTitleStillMissing?: (botChatId: string) => void,
+) {
   return mutationOptions({
     mutationFn: async (variables: {
       botChatId: string;
@@ -118,23 +141,29 @@ export function recordBotChatActivityMutationOptions(queryClient: QueryClient) {
       agentId: string | null;
       at: string;
       /**
-       * Whether this is the report the server derives the conversation's title from — a person's
+       * Whether this is the report the server may derive the conversation's title from — a person's
        * first words in a conversation that has none yet. Client-side intent only: the server decides
-       * the title for itself from the message, and the body below is unchanged by it.
+       * the title for itself from the message, and the body below is unchanged by it. "May" and not
+       * "does": `onSuccess` checks what actually came back rather than assuming.
        */
       derivesTitle: boolean;
     }) => {
-      /* Still fire-and-forget: `tryClient` does not throw, and the result is not read. */
-      await tryClient(`/api/bot-chats/${variables.botChatId}/activity`, {
+      await client(`/api/bot-chats/${variables.botChatId}/activity`, {
         method: "POST",
         body: {
           agentId: variables.agentId,
           at: variables.at,
-          text: variables.text,
+          /*
+           * Cut to the length the route accepts rather than sent whole and refused: this is a
+           * preview, and a report refused for its length loses the timestamp and the un-archiving
+           * with it. See `boundedActivityText`, which the channel's reporter shares.
+           */
+          text: boundedActivityText(variables.text),
         },
+        fallback: "Could not update this conversation's roster line.",
       });
     },
-    onSuccess: (_data, variables) => {
+    onSuccess: async (_data, variables) => {
       if (!variables.derivesTitle) return;
       /*
        * `title` is derived server-side from the message this report just delivered, and nothing else
@@ -143,14 +172,53 @@ export function recordBotChatActivityMutationOptions(queryClient: QueryClient) {
        * query is what the open screen's header reads; the roster is what the sidebar row reads.
        *
        * After the write rather than beside it, so the refetch reads the title instead of racing it.
-       * `tryClient` resolves for a refused write too, so this can fire with no title to find; that
-       * costs one refetch and changes nothing, which is the fire-and-forget bargain, not error
-       * handling.
        */
-      void queryClient.invalidateQueries({
+      await queryClient.invalidateQueries({
         queryKey: botChatKeys.detail(variables.botChatId),
       });
+      // Not awaited, unlike the detail query above: nothing here reads the roster back, the row it
+      // refreshes is drawn by the sidebar, and awaiting three infinite lists would hold this
+      // mutation pending for no reader.
       void queryClient.invalidateQueries({ queryKey: rosterKeys.all });
+
+      /*
+       * AND THEN LOOK, because a 204 means the server was TOLD about a message, not that it named
+       * the conversation from it. The two decisions are made by different code on different rules:
+       * this browser calls a message "words" with `.trim()`, and the server calls it words with
+       * `flatten`, which strips `\p{Cc}\p{Cf}\p{Cs}` first. A first message of nothing but
+       * zero-width characters passes the trim, is reported, spends the one refetch, and leaves
+       * `title` null — and the person's NEXT message does get titled server-side, since that write
+       * is guarded on `WHERE title IS NULL`, so a real title then sat in the database while the
+       * header and the sidebar row showed the Bot's name for the rest of the session.
+       *
+       * The invalidation above is awaited, so by here the cache holds what the refetch found and the
+       * signal costs nothing extra. Anything other than a string — including no cached row at all,
+       * which is what an inactive detail query leaves — re-arms rather than latches: an extra refetch
+       * on the next message is cheap, and a roster line stuck on the Bot's name is not.
+       */
+      const titled = queryClient.getQueryData<BotChat>(
+        botChatKeys.detail(variables.botChatId),
+      )?.title;
+      if (typeof titled !== "string") {
+        onTitleStillMissing?.(variables.botChatId);
+      }
+    },
+    onError: (error, variables) => {
+      /*
+       * The structured shape `use-channel-events.ts` uses for the same kind of failure: one nothing
+       * can recover from, which is exactly why it has to be said. The note is written for whoever
+       * reads it in a report from a person who says their conversation would not come back.
+       */
+      console.error(
+        JSON.stringify({
+          type: "bot-chat-activity-not-recorded",
+          botChatId: variables.botChatId,
+          error: error.message,
+          note: "This tab could not tell the server what was just said in this conversation. The message itself is unaffected, but the roster line keeps its previous preview and timestamp, and an archived conversation stays archived until something is said in it that does reach the server.",
+        }),
+      );
+      // The server never heard the message, so it cannot have titled the conversation from it.
+      if (variables.derivesTitle) onTitleStillMissing?.(variables.botChatId);
     },
   });
 }
