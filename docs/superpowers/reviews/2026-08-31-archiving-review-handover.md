@@ -1,236 +1,114 @@
 # Archiving branch — review handover
 
-Branch `jerel/channel-thread-archiving-b2f3f1`, 98 commits, nothing pushed.
+Branch `jerel/channel-thread-archiving-b2f3f1`, 117 commits, nothing pushed.
 
-**Gate as it stands:** 2204 pass / 10 skip / 0 fail across 160 files (`main` was 1871 across 158).
-`bun run typecheck`, `lint`, `format:check` and `build` all clean.
+**Gate:** 2361 pass / 10 skip / 0 fail across 165 files (`main` was 1871 across 158).
+`bun run typecheck`, `lint`, `format:check` and `build` all clean. Tree clean. Every commit verified
+as an ancestor of HEAD — see §4 for why that is a separate check from "the content is there".
 
-Four review rounds ran: roughly 45, 45, 25 and — this round — 30 mandatory findings. Three fix waves
-landed. Each round found real, verified defects; each wave introduced fewer than it fixed but never
-zero. I stopped the loop here rather than spend a fourth wave without you, because the remaining set
-is no longer small enough to call finishing.
-
----
-
-## 1. Fix before this merges
-
-Ranked by what a person actually experiences. Every one was reproduced or verified against the code
-by an agent, and the ones marked ✅ I re-verified myself.
-
-### 1.1 The archive can silently fail to lift, and can silently lift on its own ✅
-`server/src/bot-chats/store.ts` ~:546-599 · `server/src/channels/routes.ts` ~:1063-1101
-
-One root cause, two opposite symptoms: the archive clear is gated on recency against
-`last_message_at` and is **never compared against `archived_at` itself**.
-
-- A person's message *older* than the stored last message fails to un-archive. Reproduced for both
-  kinds — the row stays archived, `restored` is false so no audit row and no socket event, and the
-  POST answers 204. **The likeliest trigger is a slow clock**: `MAX_ACTIVITY_CLOCK_SKEW_MS` clamps
-  the ceiling and has no floor, so a browser running behind whatever last wrote `last_message_at`
-  has *every* report dropped and can never speak a conversation back into view.
-- A person's message that *predates the archive* (sent T1, archived T2, report commits T3) **does**
-  un-archive it and writes an `unarchived` row for a message sent before the archive existed.
-
-The store's comment describes the second failure for the Bot's reply — "it is why the archive stopped
-feeling like it held" — and wave 3's fix excluded only `agentId !== null`. The person's own late
-report walks the identical path.
-
-**Fix:** clear `archived_at` on its own statement, guarded on `archived_at IS NOT NULL` and on the
-report being newer than `archived_at`; derive `restored` from that statement's `returning`. This is
-the same shape as the title write, which was moved out from under the recency guard for exactly this
-reason — the precedent is already in the file.
-
-### 1.2 The audit append-only guard does not guard ✅
-`server/tests/audit.test.ts` ~:154
-
-Asserts the migration chain lacks `"DROP TRIGGER audit_events_append_only"`, but migration 0012
-already writes drops as `DROP TRIGGER IF EXISTS … ON audit_events;`. The repo's own house style walks
-past it — verified by adding a probe migration with both drops, which passed. Match the trigger
-**names** with a regex instead.
-
-### 1.3 `GET /api/roster` has no authentication or tenancy assertion ✅
-`server/tests/roster-routes.test.ts` ~:66
-
-Deleting `requireUser` from the route leaves all 19 tests green; so does passing a different actor.
-The same deletion fails 2 tests on channels and 5 on bot-chats. The fake is `async list(_actor, …)`,
-so no test observes who the roster is read as — on the sidebar's only read, whose entire
-authorization is "the store is scoped to the actor". Both sibling fixtures already record and assert
-the actor; copy them.
-
-### 1.4 The roster tests cannot tell phase 1 from phase 2
-`server/tests/roster-union.integration.test.ts` ~:463, ~:482
-
-Removing the ownership term from **phase 1** leaves all 22 tests green, because phase 2 filters
-again. A probe showed the real consequence: at `limit: 1`, a person's own page no longer contains
-their own conversation — the permanent slot-burning the module header describes. Assert that no
-`roster-rows-not-hydrated` line is logged during the ordinary reads, and add the positive
-counterpart that `channel-routes.test.ts` already has.
-
-### 1.5 `/api/capabilities` fails entirely when one optional read fails
-`server/src/app.ts` ~:238 — `((await identityProviders?.list()) ?? []).length > 0`, no `.catch`.
-That is the endpoint the sign-in screen reads to choose provider buttons, so a database blip on one
-boolean means nobody can sign in — and with no `onError` registered the client cannot read
-`body.error` either. `.catch(() => [])`, as every other optional read there does.
-
-### 1.6 A retired Bot's direct chat crashes the screen
-`app/src/lib/bot-chats/activity.ts` ~:261 (and `stopped-turn.ts`, which runs first)
-
-`useAgent({ agentId })` is called unconditionally, including when `botChat.active === false`, and it
-throws for an id the runtime does not hold. The server only registers "unavailable" tombstones
-through **channel** membership (`selectTombstoneAgents` joins `channelAgents` ⋈ `channelMemberships`
-and knows nothing about `bot_chats`), so somebody whose only history with a retired Bot is a direct
-chat gets no registration — the screen falls to the error boundary, taking down the "This Bot has
-been retired, the conversation stays readable" banner written for exactly that case.
-**Durable fix is server-side:** give `selectTombstoneAgents` a bot-chat arm.
-
-### 1.7 Seven of nine body-taking routes have no body limit ✅
-`bodyLimit` is on the two activity routes only, and there is no app-level limit. Verified: 8 MB
-bodies to `PUT /:id/archive`, `PUT /:id/pin` and `POST /` all answered 2xx. The file's own comment
-calls that middleware "the only place a multi-megabyte body can be turned away before it is parsed at
-all" — the argument was applied to one route in five.
-
-### 1.8 The needs-you pane can be permanently suppressed
-`app/src/routes/_authed/_app/channel/$channelId.tsx` — `shouldRecordDismissal`
-
-Wave 3 changed the rule to `next === null && isPaneOpen`, so **any** close of the shared pane records
-a dismissal — including a settings pane closed when no prompt has ever existed. Since `runEpoch` only
-moves when this tab runs a computer tool, the dismissal stamps `null`, and `null !== null` suppresses
-every later prompt for the life of the mount. The code it replaced only recorded a dismissal when the
-*screen* was closed. The dismissal is keyed on the wrong identity: `needsYou` is server state,
-`runEpoch` is tab-local.
-
-### 1.9 `client()`'s fallback is bypassed by every caller that parses JSON itself
-`app/src/lib/client.ts` ~:145, callers in `roster/queries.ts`, `channels/mutations.ts`,
-`bot-chats/mutations.ts`, `bot-chats/queries.ts`
-
-`client()` returns the raw `Response` when given no envelope key, and each caller then does
-`await response.json()` outside every guard. A 200 carrying HTML — proxy error page, captive portal —
-becomes a `SyntaxError` rendered as the sidebar's `role="alert"` headline:
-`Unexpected token '<', "<html>"… is not valid JSON`, under "Nothing has been lost."
-Related, same file: `client(path, key)` unwraps the envelope without checking the key exists, so
-drift yields `undefined` typed as `T` — the resolver then reads `created.id`, throws into an empty
-catch, and because the *mutation succeeded* there is no error to render. Permanently blank screen,
-no console output, after a row was written.
-
-### 1.10 `byRecency` is missing the server's third sort term
-`app/src/lib/channels/use-channel-events.ts` ~:427
-
-The server orders `[pinned desc, recency desc, id desc]`. `pinnedFirst` mirrors the first,
-`byRecency` mirrors the second and returns `0` on a tie — so tied rows hold their old order until the
-next refetch reorders them, which is the symptom its own docblock says it prevents. `mostRecentBotChat`
-in this same branch *does* implement the tie-break. Ties are ordinary here: package channels are
-inserted in one transaction, so their `created_at` is byte-identical.
-
-### 1.11 The clock clamp has a ceiling and no floor ✅
-`server/src/channels/routes.ts` ~:1343
-
-`parseActivityInput` clamps only the ceiling, on the stated grounds that "an old stamp cannot pin a
-row or hide a later message". True, and not the whole harm: recency is
-`coalesce(last_message_at, created_at)`, so the **first** report on a conversation replaces
-`created_at` as its sort key. A report carrying `at: "1970-01-02T00:00:00Z"` passes the shape check,
-passes the range check, is in the past so is never clamped, and matches the store's
-`isNull(lastMessageAt)` guard — so it is written. Confirmed against the database: the conversation
-then sorts *below* one with no activity at all, and no API resets it. Route-reachable by any signed-in
-caller against their own conversations.
-
-This is also the other half of §1.1: the same missing floor is what makes a slow clock drop every
-report.
-
-### 1.12 An invisible message blanks a row's stored preview
-`server/src/bot-chats/store.ts` ~:526 · `server/src/channels/routes.ts` ~:1042
-
-`previewOf` returns `null` for a message of only format characters, and `lastMessage` is set to that
-`null` unconditionally — while the title write two lines earlier refuses the same write, with an
-argument for why. Route-reachable, because the parser rejects on `text.trim()` and
-`"\u200b".trim().length === 1`, so any caller can blank their own roster previews. The asymmetry with
-the title path is undocumented and looks unintended.
-
-### 1.13 Smaller, all verified
-- Conversation ids are interpolated into request paths **unencoded** at ~12 sites. `/bot/x%3Fy` →
-  `/api/bot-chats/x?y` → the server reads id `x` and answers with a **different conversation**.
-  `checkKnown` already encodes; its siblings do not.
-- Deleting leaves the detail query cached for `gcTime`, and delete navigates home *before* deleting —
-  so Back within five minutes renders the deleted conversation with a working composer.
-  `removeQueries` gets both properties the comments want.
-- The audit `to=` bound still drops the row whose timestamp it names; `gt`→`gte` fixed `from` only.
-- `?from=`/`?to=` accept a zone-less date-time, read in the **server process's** local zone — two
-  replicas answer the same query 16 hours apart. `parseActivityInput` already refuses this shape.
-- An unguarded `decodeURIComponent` at the top of `serve.fetch`, outside any try and before the
-  upgrade check, so a malformed escape bypasses every error shape the server maintains.
-- The reconnect backoff never engages against a socket that opens and immediately closes, and each
-  `onopen` invalidates the whole roster — a full three-list refetch twice a second.
-- `socket.onmessage` survives teardown while `onclose`/`onerror` are nulled, so a queued `deleted`
-  frame can still navigate a screen that is gone.
-- The roster is inside invalid list markup (`<ul>` → `<div>` → `<li>`, rows as bare `motion.div`), so
-  the app's primary navigation exposes no list semantics, count or position to assistive tech.
-- `MAX_ROSTER_PAGE` is still never exercised — three independent confirmations — and raising
-  `DEFAULT_ROSTER_PAGE` from 50 to 10,000 leaves both roster test files green.
-- `applyRosterEvent`'s three defensive `.slice()` copies can each be deleted with the suite green,
-  and the assertion that looks like it covers them cannot: under aliasing `patched.pages` **is**
-  `data.pages`, so the identity check passes trivially. Same for `pinnedFirst`'s `[...channels]` —
-  and in the common case (empty search box) its input is React Query's own memoized array, so an
-  in-place sort reorders the cache behind React's back.
-- `app.ts`'s own handlers still throw into Hono's bare `text/plain` 500 — the exact defect the three
-  route files were changed to fix, with no log line either.
-- `redactAuditPayload` reduces a `Date`, `Map`, `Set` or `Error` to `{}` — destroyed, not redacted,
-  in the table whose argument is that it gets used to rule things out.
-- The forward-only guard drops a report whose `at` **equals** what is stored, and the skew clamp can
-  manufacture that equality: two reports from a client more than five minutes fast are both rewritten
-  to the same value.
+Four review rounds found the defects; five fix waves landed them. **§1 and §2 of the previous version
+of this document are done.** What is left is in §5, and none of it is in this PR's subject.
 
 ---
 
-## 2. A premise in the design doc that is false
+## 1. What the last wave fixed
 
-The spec calls it "the single piece of luck in this design": ids are prefixed (`channel_…`,
-`botchat_…`) and therefore globally unique, which is what lets one cursor page a mixed list with no
-`kind` term.
+Sixteen commits, one per subject. Every item was reproduced before the fix and had the fix reverted
+alone afterwards to prove the test fails without it.
 
-**Package channels are not prefixed.** `server/src/tenant-package.ts` ~:695 inserts `id: channel.id`
-verbatim from `channels.yaml`, validated at ~:428 as a non-empty string and nothing more. The shipped
-`examples/fintech/channels.yaml` produces `general-assistant`, `risk-and-compliance`,
-`company-knowledge`. ✅ verified.
+| what | commit |
+|---|---|
+| The archive clear rides its own statement, guarded on `archived_at` rather than on recency — so a late message no longer fails to un-archive, and one that predates the archive no longer lifts it | `59e357a` |
+| The clock clamp has a floor as well as a ceiling; the first report on a conversation can no longer sink it below one with no activity at all | `59e357a` |
+| An invisible message no longer blanks a row's stored preview — and drops `lastMessageAgentId` with it, because the pair is one fact | `59e357a` |
+| A retired Bot you only ever direct-messaged is registered as a tombstone, so its screen keeps its banner instead of falling to the error boundary | `0a0e093` |
+| `GET /api/roster` has tests that observe who it is read as; deleting `requireUser` now fails 8 | `59739f1` |
+| The roster tests can tell phase 1 from phase 2; removing phase 1's ownership term now fails 21 | `671c772` |
+| `MAX_ROSTER_PAGE` has a list behind it | `671c772` |
+| `/api/capabilities` no longer closes sign-in when one optional read fails, and `app.ts`'s own handlers answer JSON with a log line | `f7e2b92` |
+| A malformed percent-escape in the stream path no longer escapes `serve.fetch` into Bun's own HTML 500 | `f7e2b92` |
+| The audit append-only guard matches trigger names, not a literal the house style walks past | `3ba3dc8` |
+| The audit window ends after the millisecond it names; `redactAuditPayload` renders `Date`/`Map`/`Set`/`Error` instead of erasing them, and no longer throws on a cycle | `3ba3dc8` |
+| `client()` parses inside the guard that owns its sentence, and a missing envelope key is an error rather than `undefined` cast to `T` | `aab0ec5` |
+| Twelve conversation ids are encoded into request paths, via `channelPath()`/`botChatPath()` | `aab0ec5` |
+| Deleting removes the detail query instead of leaving it cached for `gcTime` | `aab0ec5` |
+| The needs-you dismissal is keyed on the prompt it was made about, not on a tab-local run counter | `c4b7330` |
+| `byRecency` mirrors the server's whole sort key; the socket believes a connection only once it holds; teardown detaches all four handlers | `d8a25d2` |
+| A package id inside a generated namespace (`agent_`, `botchat_`, `channel_`) is refused at load | `a15b13a` |
+| The resync event's sentinel id is reserved, so a package cannot name a channel it | `7918e4f` |
+| The roster is a real list; the unread dot and the pin are words as well as colours | `b5e92b4` |
+| Every one of the nine body-taking conversation routes has a cap, through one `limitBody` helper | `1186bba` |
+| The comments this branch's own fixes made false | `b33a59a` |
+| An audit bound that names no zone is refused, and the timestamp shape rule has one home in `server/src/time.ts` | `933d975` |
+| The cursor's format has one home too, in the same module | `5eb2ea5` |
 
-If a package id ever equalled a bot-chat id, both rows would share a complete sort key and the strict
-`<` would exclude **both** — silent row loss, the same failure mode as the cursor bug this review
-opened with, and package channels are the rows *most* exposed to the id tie-break because they are
-inserted in one transaction with identical recency. A collision needs somebody to write
-`botchat_<uuid>` as a channel id, so it is unlikely — but it is unenforced, and stated as settled fact
-in three places including the spec. Either enforce the namespace where package ids are read, or
-restate the premise as needing a total order over ids rather than a prefix packages do not carry.
+### The premise in the design doc is now enforced, not restated
+The spec called it "the single piece of luck in this design": ids are prefixed and therefore globally
+unique. **Package channels are not prefixed** — `tenant-package.ts` inserted `channels.yaml`'s id
+verbatim, and `examples/fintech` produces `general-assistant`, `risk-and-compliance`,
+`company-knowledge`. Rather than restate the premise, `validateTenantPackage` now refuses a chosen id
+inside a namespace this deployment mints, for package **agents** as well as channels. The claim was
+stated in **seven** places, not the three this document previously said; all seven now say the true
+thing, which is that the server keeps a total order over ids across the two tables.
+
+That fix also closed a hole nobody had looked for: the channel upsert has no `setWhere`, unlike the
+agent and skill upserts beside it, so a package id equal to a user-created `channel_<uuid>` would have
+silently adopted that channel — rewriting its name, description and allowed groups.
+
+---
+
+## 2. Three things worth knowing about the code that came out
+
+**The five-instance pattern from the last round did not recur.** Every brief in this wave ended with
+"where else is this true?", and that question is what found: the second toothless assertion in the
+audit test (a `toContain` over a migration chain that only grows, so it was permanently satisfied by
+migration 0000 and could never fail again); two `tryClient` callers where envelope drift would have
+read as an adoption that *worked*; five defensive `.slice()` copies where the review had named three;
+and seven unbounded routes where the review had counted them but not the helper.
+
+**Two fixes needed a restructure, not a patch.** The socket loop came out of its effect as an exported
+`startRosterSocket(hooks)`, because a backoff and a teardown are facts about *when* handlers run and
+nothing inside an effect closure can assert them. And `shouldRecordDismissal` became
+`dismissalForClose`, returning the record rather than a boolean: the predicate was right that every
+close counts, the caller stamped the wrong identity, and **neither half was wrong alone**, which is
+exactly why no test of either could see it.
+
+**One behaviour change to be aware of on review.** needs-you now polls while the pane is open. It has
+to: the old gate forced `needsYou` false exactly while somebody was answering the prompt, so the first
+poll after they closed the pane read the standing prompt as a fresh arrival and retired the dismissal
+they had just made. The cost is a second reader of `/control` at 3s beside the screen card's 1s poll,
+while the pane is open.
 
 ---
 
 ## 3. What I got wrong
 
-- **I shipped a no-op with a comment claiming it worked.** A finding said the unmounted-roster stub
-  answered a bare 404 on a trailing slash. I implemented the fix *and wrote the comment*, then
-  measured: identical output before and after. Reverted. Had I not measured, I would have added
-  exactly the defect class this review exists to remove.
-- **I filed a real test flake as "not reproducible."** Three green runs on an idle machine. It is
-  load-dependent — the library's 1000 ms default timeout — and CI runs app, server and worker in one
-  process, which is the worst case. "Couldn't reproduce" is not "doesn't happen."
-- **I downgraded two findings out of the mandatory bucket on stories I had not checked** — "no
-  motivating defect" when the defect was documented in the file above, and "unexploitable, ~74 random
-  bits" when the value is returned by a GET the caller is authorised for.
-- **I misrouted two coordination messages**, sending each agent the other's instructions. One caught
-  it and refused; the cursor fix went unapplied for a round.
-- **I framed findings as instances instead of rules.** This is the single biggest pattern in the
-  round, and it is mine: five separate fixes were applied to one of the places that needed them,
-  with the precedent already sitting in the file.
+The pattern from the previous round held: my write-ups were reliable about *what* was broken and
+repeatedly wrong about *why*.
 
-  | fixed | left | §  |
-  |---|---|---|
-  | title write moved out from under the recency guard | the archive clear left under it | 1.1 |
-  | skew clamp's ceiling | its floor | 1.11 |
-  | audit `from` bound | audit `to` bound | 1.13 |
-  | `bodyLimit` on the activity route | its seven siblings | 1.7 |
-  | `mapStoreError` in three route files | `app.ts`'s own handlers | 1.13 |
+- **§1.5's justification was invented.** "`.catch(() => [])`, as every other optional read there does"
+  — `/api/capabilities` has no other async read. And "with no `onError` registered the client cannot
+  read `body.error` either" was half wrong: Hono's default handler does `console.error(err)`, so there
+  was a line, just the raw error object with no method or path.
+- **§1.13's audit `to=` bound was not a `gt`→`gte` omission.** An earlier commit changed both ends.
+  The surviving defect was precision, and the direction matters: flooring a boundary to the
+  millisecond moves it *downward*, which is inside the window at the bottom and outside it at the top.
+- **§1.8's suggested fix would have reintroduced a defect.** Narrowing the rule back to "only the
+  screen" restores the wave-3 bug *and* leaves the mis-keying. The *when* rule was already right.
+- **§1.6 was not a two-sided fix.** `CopilotChat` calls `useAgent` itself and throws inside a `useMemo`
+  during render, and the route renders it unconditionally — so the client-side guard I asked for would
+  have lost the screen a beat later, banner included. It is unreachable after the server fix.
+- **I overstated `pinnedFirst`.** `select` flattens with `flatMap`, so the cached pages are never
+  aliased, and default structural sharing undoes an in-place sort on the next render. Latent, not live.
+- **I undercounted twice** — five `.slice()` copies, not three; seven statements of the id premise, not
+  three.
 
-  Each brief I wrote quoted the reviewer's specific instance. None asked "where else is this true?"
-  A brief that ends with that question would have caught all five.
-- **Two findings I recorded in earlier rounds never made it into a brief** — the page cap (§1.11) and
-  the whitespace-title fallback.
+Two agents corrected me on their own initiative and were right both times, and one declined an
+instruction of mine as out of its brief and was also right. The useful lesson is narrower than "verify
+everything": claims about a slot's **own** files were reliable throughout, and claims about a
+neighbour's file needed checking every time. I verified four cross-file claims myself this wave; three
+held, and the fourth (a route-collision hazard) was correctly classified as pre-existing only after I
+checked `main`.
 
 ---
 
@@ -238,26 +116,80 @@ restate the premise as needing a total order over ids rather than a prefix packa
 
 - **Ordering, paging and the cursor.** ~70,000 differential inputs against the preview flattener; 25
   randomised paging rounds with deliberate microsecond collisions across both kinds and all three
-  statuses; 40,000 candidates fuzzing the cursor validator against Postgres. Zero mismatches. The
-  per-branch `LIMIT` argument, the derived-table sort, and the boolean/integer pin-rank agreement were
-  each checked against generated SQL and `EXPLAIN`.
-- **The SSO admin gate is not bypassable.** ✅ Two agents disagreed; I settled it: rou3 gives no match
-  for a percent-encoded segment, better-call rejects a trailing-slash mismatch, and
-  `skipTrailingSlashes` is set neither in our source nor by better-auth.
+  statuses; 40,000 candidates fuzzing the cursor validator against Postgres. Zero mismatches.
+- **The microsecond class is swept.** It produced four problems on this branch (the roster cursor, the
+  audit cursor, the audit `to` bound, and one test flake), so every place a `timestamptz` boundary
+  passes through a JS `Date` was checked. Clean, with the reason each is safe: `archivedAt` is written
+  from a JS `Date`, so that guard is milliseconds on both sides; `lastMessageAt` only ever holds a
+  client-supplied millisecond stamp; `page-frames.purge` computes its cutoff in SQL; the work-queue
+  cutoffs are retention sweeps; and the audit `from` bound floors *outward* on a lower bound. One real
+  find, outside this PR's subject — see §5.
+- **The SSO admin gate is not bypassable.** rou3 gives no match for a percent-encoded segment,
+  better-call rejects a trailing-slash mismatch, and `skipTrailingSlashes` is set neither in our source
+  nor by better-auth.
 - **Migrations.** Snapshot chain intact, no drift, both new indexes declared so `generate` cannot drop
   them, rolling-deploy safe.
-- **The replay discrimination in the activity watcher**, re-verified against `@ag-ui/client` 0.0.57.
-- **`reportingRefusal`** survives query-core's observer detach, verified in the library source.
+- **Two rules that had two homes now have one**, in `server/src/time.ts`: the timestamp shape a reported
+  `at` and an audit bound must agree on, and the cursor format the roster and the audit trail both mint
+  through `recencyCursorText`. Each is known to be load-bearing for both of its readers by mutation —
+  narrowing the cursor pattern to three fractional digits fails 2 tests on the audit trail and 8 on the
+  roster. `server/src/time.ts` exports classifications and predicates rather than regexps, so a third
+  reader cannot arrive with the rule spelled slightly differently, which is how these came to disagree.
+- **Commit reachability.** One slot's `git add` swept another's staged files; the resulting amend and
+  reset left two orphaned commits and one slot's finished work uncommitted in the tree. Nothing was
+  lost, and it is committed as `3ba3dc8` — but "the content is present" and "the commit is reachable"
+  came apart, so all fourteen commits were checked with `git merge-base --is-ancestor`. Worth repeating
+  after any wave that runs agents concurrently.
 
 ---
 
-## 5. Follow-up PR (out of this PR's subject)
+## 5. Follow-up PR — real, and none of it this PR's subject
 
-Eight coherent subjects, each with its own shape: audit query surface; server-wide error handling
-(no app-level `onError` anywhere); the sidebar never paging; exposing the server-side bot-chat
-resolver; one uniqueness constraint spanning both thread columns; retiring `GET /api/channels`;
-index tuning (`channels_recent_activity_idx` has **no reader** and blocks HOT updates — measured
-0 of 5000 HOT with it, 3365 without); and test-harness consolidation.
+Ranked. The first is a silent-data-loss bug of the same class as the one this review opened with.
+
+1. **The People list cursor floors microseconds.** `server/src/people/store.ts` ~253 mints it as
+   `new Date(last.lastSignedInAt).toISOString()` and compares it with strict `<` against
+   `max(sessions.created_at)`, which is `timestamptz DEFAULT now()`. Page 2 asks for `max < floor(R)`,
+   so a person whose most recent session began in the same millisecond as the boundary row but earlier
+   than it is served **on no page at all**. No commits on that file, so it is pre-existing; the fix is
+   the helper this branch already built — select the boundary as text at Postgres precision, as
+   `recencyCursorText` does.
+2. **`active` ignores profile visibility.** A Bot flipped public→private stays `active: true` for
+   someone who still has history, while the runtime stops registering it and no tombstone applies —
+   error boundary, and no banner, because `active` is true. `main` already has this on the channel
+   path, so this branch added a second surface rather than the bug. Fix it once for both kinds.
+3. **No body limit anywhere else in the server.** 28 body reads across seven files with no cap, and
+   `computer/routes.ts` carries screenshot-sized payloads while checking `MAX_FRAME_BYTES` only *after*
+   the parse. `limitBody` and `MAX_SMALL_BODY_BYTES` are exported and reusable; they may want a home
+   less channel-specific than `channels/routes.ts`.
+4. **`client()`'s parse gap and path encoding, repo-wide.** 11 sites parse outside the guard, 16
+   interpolate an unencoded segment. `unwrap` and the `null` key form are exported and ready, and an
+   `agentPath`/`personPath` beside `channelPath` closes the two biggest clusters.
+5. **`/channel/new` shadows a package channel called `new`.** Static beats dynamic in the route tree,
+   so that row navigates to the create screen. The reserved name is a filename in the app's route tree,
+   so the fix is to export the reserved segments from a module beside the routes and have the server
+   import it — reserving it server-side would hardcode the other half of the system.
+6. **`live-screen.tsx`'s teardown detaches no handlers at all**, and its `closed` flag is only checked
+   inside `onmessage`'s async decode path.
+7. **A count cap on `agentIds` in `parseChannelInput`.** The 16 KiB body limit is standing in for it;
+   the constant's docblock says so.
+8. **The audit `eventType` filter accepts a value outside the taxonomy**, so a typo reads as "it never
+   happened". Needs a decision about whether the taxonomy is closed — historical rows keep retired type
+   strings — not a mechanical fix.
+9. **The UUID shape has five homes** — `audit.ts`, `bot-chats/routes.ts`, `channels/thread-identity.ts`,
+   `channels/thread-routes.ts`, `plugins/store.ts` — and `server/src/time.ts` is the precedent for what
+   to do about it. Four of the five files are outside this PR's subject.
+10. **Server collation vs client code-unit ordering.** The new `id desc` tie-break compares in JS code
+   units; the server compares under Postgres collation, and package ids are arbitrary strings.
+11. **A `bunfig.toml` preload registering happy-dom before module evaluation** would make motion-driven
+    assertions testable and remove the `beforeAll` dance the DOM test files carry.
+12. **The Base UI `nativeButton` warning** fires on every render wherever `Button` renders as `Link`
+    (~14 route files). `nativeButton={false}` is not the fix — it stamps `role="button"` on the anchor.
+13. Plus the eight subjects already listed before this wave: the audit query surface, server-wide error
+    handling, the sidebar never paging, exposing the server-side bot-chat resolver, one uniqueness
+    constraint spanning both thread columns, retiring `GET /api/channels`, index tuning
+    (`channels_recent_activity_idx` has no reader and blocks HOT updates — measured 0 of 5000 HOT with
+    it, 3365 without), and test-harness consolidation.
 
 **One trap for whoever takes the roster `staleTime` idea:** `setQueryData` sets `isInvalidated: false`,
 so `patchRosterRead` un-invalidates lists an archive marked stale but has not refetched. It is inert
@@ -265,11 +197,13 @@ only because `staleTime` is 0 today. Adding one turns it into a stale Archived t
 
 ---
 
-## 6. Next steps when you pick this up
+## 6. Next steps
 
-1. Fix §1 (or tell me which parts to take).
-2. Deferred-findings audit, then `copilotkit-internal:pre-push-quality`.
-3. `superpowers:finishing-a-development-branch` — its commit redo also repairs the scrambled
-   attribution from the build's first wave (`2d9ce1f` holds another task's files).
-4. PR **to the fork** (`jerelvelarde/openbot`). There is no push access to `CopilotKit/openbot`, and
+1. `copilotkit-internal:pre-push-quality`.
+2. `superpowers:finishing-a-development-branch` — its commit redo also repairs the scrambled
+   attribution from the build's first wave (`2d9ce1f` holds another task's files), and two message-level
+   slips this wave: `aab0ec5`'s body says "eleven" where the code encodes twelve, and the audit work's
+   reasoning had to be re-committed by hand after the index race in §4.
+3. PR **to the fork** (`jerelvelarde/openbot`). There is no push access to `CopilotKit/openbot`, and
    nothing is pushed until you say so.
+4. Spin off §5 — items 1 through 3 are worth their own PR each; the rest can travel together.
