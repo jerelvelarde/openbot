@@ -359,8 +359,9 @@ describe("the roster", () => {
 
     const seen = await walk(actor, 2);
 
-    // One cursor over two tables. Ids are prefixed and therefore globally unique, which is what lets
-    // `id` break every tie without the cursor carrying `kind`.
+    // One cursor over two tables. Channel and bot-chat ids cannot collide — generated ids are
+    // prefixed, and a package's chosen id is refused if it enters one of those namespaces — which is
+    // what lets `id` break every tie without the cursor carrying `kind`.
     expect(seen).toEqual(expected);
     expect(new Set(seen).size).toBe(expected.length);
   });

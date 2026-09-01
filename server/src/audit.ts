@@ -564,10 +564,11 @@ function inclusiveUpperBound(to: string): SQL {
 /**
  * A refusal an administrator can act on, rather than a 500 that says nothing.
  *
- * `app.ts` registers no `onError`, so an ordinary `Error` thrown anywhere under these routes becomes
- * Hono's default plain-text "Internal Server Error" and whatever the thrower had to say is discarded.
- * An `HTTPException` carrying its own response does not: the status is 400 and the body is the
- * `{ error }` shape every other refusal on these routes uses.
+ * `app.ts` registers an `onError` now, so an ordinary `Error` thrown anywhere under these routes no
+ * longer reaches Hono's plain-text default — but that handler answers one generic sentence for every
+ * failure it sees, so whatever the thrower had to say is still discarded. An `HTTPException` carrying
+ * its own response is what survives it: the app-level handler delegates to `getResponse()`, so the
+ * status is 400 and the body is the `{ error }` shape every other refusal on these routes uses.
  *
  * The message is on the exception as well as in the body, so a log of the throw says the same thing
  * the caller was told, and `cause` keeps the parse error that provoked it rather than dropping it.
@@ -983,8 +984,9 @@ export function createAuditReader(database: Database): AuditReader {
  * `limit` is clamped, because every number is either in range or nearest to one end of it. A date is
  * not: `from=yesterday` is an Invalid Date, drizzle's timestamp mapper calls `toISOString()` on it,
  * and that throws a `RangeError` from inside the read — where nothing knows which parameter was at
- * fault and, with no `onError` registered in `app.ts`, Hono answered its default plain-text 500. So
- * the refusal is made here, at the edge, where the offending parameter still has a name.
+ * fault, so it reached the caller as Hono's default plain-text 500 and now reaches them as `app.ts`'s
+ * one generic sentence, which names no parameter either. So the refusal is made here, at the edge,
+ * where the offending parameter still has a name.
  *
  * A cursor is refused by `decodeCursor` rather than here, because that is where it is read as
  * something other than text. Both refusals go through `refuseAuditQuery`, so the trail's two ways of
@@ -1024,9 +1026,8 @@ export function auditQueryFromUrl(url: URL): AuditEventQuery {
    * `from=-271821-04-20T00:00:00Z` are dates, and are dates this column has no room for: both parse,
    * both used to reach drizzle's timestamp mapper, and Postgres answers `date/time field value out of
    * range` for the first and `time zone displacement out of range` for the second — from inside the
-   * read,
-   * where the parameter no longer has a name and, with no `onError` registered in `app.ts`, Hono
-   * answers its default plain-text 500. `withinTimestamptzRange` carries the range and the reasoning.
+   * read, where the parameter no longer has a name, so the caller is told only that the server could
+   * not complete the request. `withinTimestamptzRange` carries the range and the reasoning.
    */
   const instant = (name: string) => {
     const value = optional(name);

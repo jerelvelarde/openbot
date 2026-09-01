@@ -5,6 +5,7 @@ import type { AuditEventInput, AuditStore } from "../src/audit";
 import type { AppVariables, AuthenticatedActor } from "../src/auth/guards";
 import {
   createChannelEventHub,
+  RESYNC_ROSTER_ID,
   type RosterActivityEvent,
 } from "../src/channels/events";
 import {
@@ -160,7 +161,11 @@ async function reportActivity(app: Hono<{ Variables: AppVariables }>) {
     body: JSON.stringify({
       text: "One more thing",
       agentId: null,
-      at: "2026-01-01T00:00:00.000Z",
+      // Stamped at call time, as a real client stamps it. A fixed literal here used to read as though
+      // the tests asserted something about that instant; they never did — this file asserts status
+      // and audit rows, never the stamp — and `parseActivityInput`'s floor would now rewrite it
+      // anyway, so the literal had become actively misleading.
+      at: new Date().toISOString(),
     }),
   });
 }
@@ -585,9 +590,11 @@ describe("the event hub's resync", () => {
     for (const heard of [first, second, other]) {
       expect(heard).toHaveLength(1);
       const event = JSON.parse(heard[0] as string) as RosterActivityEvent;
-      // An id no roster row can carry: real ones are prefixed `channel_` or `botchat_`, and this has
-      // to miss every cached list for the browser to treat it as a stale roster rather than a row.
-      expect(event.id).toBe("roster-resync");
+      // An id no roster row can carry: every generated id is prefixed `channel_` or `botchat_`, and
+      // `validateTenantPackage` refuses this one as a package channel id, against the same constant
+      // asserted here rather than a second copy of the string. It has to miss every cached list for
+      // the browser to treat it as a stale roster rather than a row.
+      expect(event.id).toBe(RESYNC_ROSTER_ID);
       expect(event.deleted).toBeUndefined();
       expect(event.pinned).toBeUndefined();
       expect(event.archived).toBeUndefined();

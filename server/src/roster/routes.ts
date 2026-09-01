@@ -87,13 +87,15 @@ function rosterItemDto(item: RosterItem) {
  * into a status code of its own, it has one obvious home instead of a change to the route body.
  *
  * IT USED TO RETHROW, which is what its `never` return type described. Nothing in this server
- * registered an `onError` to turn a throw into JSON, so Hono answered its own `text/plain "Internal
- * Server Error"`: `client()` in the browser reads `body.error` and falls back to its own sentence
+ * registered an `onError` to turn a throw into JSON at the time, so Hono answered its own
+ * `text/plain "Internal Server Error"`: `client()` in the browser reads `body.error` and falls back to its own sentence
  * when the body is not JSON, and `GET /api/roster` is the one read the sidebar has, so an unreachable
  * database reached a person as "Could not load your conversations" — the client's words, carrying
  * nothing of the server's reason, and the same for every other way this read can fail. `app.ts`
  * answers `{ error }` with 503 for the rarer case of no store being mounted at all, for exactly that
- * reason; the common case now says something of its own too.
+ * reason; the common case now says something of its own too. `app.ts` registers an `onError` as
+ * well now, so a throw from here would reach the caller as JSON rather than as plain text — but as
+ * one sentence for every failure in the server, which is what this function exists to improve on.
  *
  * The sentence names the server as the side that failed and says nothing else. What was thrown may
  * carry a connection string or an upstream host, so it goes to the log instead — unconditionally,

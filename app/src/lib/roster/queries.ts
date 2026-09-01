@@ -4,8 +4,9 @@ import { client } from "@/lib/client";
 /**
  * One roster over two kinds of conversation.
  *
- * `kind` is for rendering, not for finding a row: ids are prefixed on the server and therefore
- * globally unique, so everything that looks a row up does it by id alone.
+ * `kind` is for rendering, not for finding a row: the server keeps a total order over ids across
+ * both kinds — generated ids are prefixed, and a package channel's chosen id is refused if it enters
+ * a generated namespace — so everything that looks a row up does it by id alone.
  *
  * `archived` is carried on the row rather than inferred from which list it arrived in, because the
  * menu on the row has to offer Archive or Restore and a row can be sitting in the All list.

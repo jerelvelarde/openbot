@@ -257,6 +257,25 @@ export function createRosterStore(database: Database): RosterStore {
           ),
         })
         .from(channels)
+        /*
+         * ONE ROW PER CHANNEL ONLY WHILE ONE MEMBERSHIP ROW PER CHANNEL IS REACHABLE. The join is on
+         * `channel_id` + `user_id`, and `channels/routes.ts` is the only writer of this table and
+         * inserts the creator alone, so today the pair is unique and this branch emits one row per
+         * channel. The day channels gain members, a channel the actor shares with somebody else would
+         * emit one phase-1 row per membership: it would consume several page slots and appear several
+         * times in one page, and the drop log would stay SILENT about it, because that log fires on
+         * `chosen.length !== items.length` and these rows are all hydrated.
+         *
+         * Left as a join rather than pre-emptively rewritten as an `exists` — which is what the
+         * bot-chat branch and the tombstone query both use — because `pinnedAt` is read out of this
+         * table two lines above, so the row is genuinely needed here and an `exists` could not supply
+         * it. What the day needs is a term choosing one membership, not a different join shape.
+         *
+         * The ownership term is also stated twice on this branch: here, and again as the
+         * `intelligence_channel_mappings` `exists` below. The `exists` is the one under test — removing
+         * it fails a named test, removing this one fails nothing — and that asymmetry is why this
+         * comment says what this term is for.
+         */
         .innerJoin(
           channelMemberships,
           and(

@@ -71,8 +71,9 @@ export type RosterCache = { pages: RosterPage[]; pageParams: unknown[] };
  * legitimately absent from two of them. `applyRosterEventToCaches` is what turns the three answers
  * into a decision, and only a row that NO cached list holds is a stale roster worth refetching.
  *
- * Rows are found by `activity.id` alone: the server prefixes ids so they are globally unique across
- * kinds, and `kind` is needed only for rendering, never for locating a row.
+ * Rows are found by `activity.id` alone: the server keeps ids unique across kinds — generated ones
+ * are prefixed, and a package channel's chosen id is refused if it enters a generated namespace — and
+ * `kind` is needed only for rendering, never for locating a row.
  */
 export function applyRosterEvent(
   data: RosterCache,

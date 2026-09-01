@@ -146,8 +146,8 @@ const CURSOR_RECENCY =
  *
  * A `Date` runs from ISO year -271821 to AD 275760 and Postgres will take neither end of that, so a
  * bound or a cursor timestamp that parses cleanly here can still fail inside the read — where nothing
- * knows which parameter was at fault, and where an ordinary `Error` becomes a bare plain-text 500 as
- * `app.ts` registers no `onError`. Every timestamp check in this file and in `audit.ts` exists so the
+ * knows which parameter was at fault, and where an ordinary `Error` becomes the one generic sentence
+ * `app.ts`'s `onError` answers with. Every timestamp check in this file and in `audit.ts` exists so the
  * value is judged before it is bound, and each of them needs this same rule, so there is one copy.
  *
  * AD 1 THROUGH 9999, which is a smaller window than Postgres' documented 4713 BC to AD 294276, and the
