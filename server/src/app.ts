@@ -209,7 +209,90 @@ export function createApp(
 ) {
   const app = new Hono<{ Variables: AppVariables }>();
 
+  /*
+   * Whatever was thrown anywhere under this app, as the JSON shape every refusal here uses.
+   *
+   * REGISTERED AT THE APP RATHER THAN ADDED TO EACH HANDLER, which is the other half of the change
+   * `channels/routes.ts`, `bot-chats/routes.ts` and `roster/routes.ts` already made: their
+   * `mapStoreError` turns a store failure into `{ error }` with 500 because `client()` in the browser
+   * reads `body.error` and falls back to its own sentence when the body is not JSON, so Hono's
+   * default `text/plain "Internal Server Error"` reaches a person as the client's words carrying
+   * nothing of the server's reason. This file's own dozen handlers were left out of it. A try/catch
+   * on each would be twelve copies of one decision, and it still would not cover `requireUser`,
+   * which runs in front of every one of them and reads the role repository: an unreachable database
+   * throws there for `/api/me` as readily as inside a handler.
+   *
+   * `channels/routes.ts` argued against exactly this, on the grounds that it would answer the audit
+   * reader's `HTTPException` 400s with a 500 — those depend on Hono's default handler calling
+   * `getResponse()`. The objection is answered rather than dismissed: the first branch below does
+   * what that default did, so `refuseAuditQuery`'s `{ error }` 400 is still served as the 400 it
+   * minted. Duck-typed the way Hono's own default tests it (`"getResponse" in err`) rather than
+   * `instanceof HTTPException`, because the copilot runtime is mounted here as a sub-app and may
+   * carry its own copy of hono, and an `instanceof` against the wrong copy would turn its refusals
+   * into 500s.
+   *
+   * The route files keep their `mapStoreError` and this changes nothing about them: a mounted sub-app
+   * with no `onError` of its own runs the parent's, so this only ever sees what they did not expect.
+   * Their domain translations — `ChannelNotFoundError` to 404, `ChannelPackageOwnedError` to 409 —
+   * are theirs to make, and a backstop that guessed at them would be a second, quieter copy of those
+   * rules.
+   *
+   * The sentence names the server as the side that failed and says nothing else, in the words
+   * `channels/routes.ts` already uses. What was thrown may carry a connection string or an upstream
+   * host, so it goes to the log instead — with the method and path, because Hono's default logged the
+   * error object on its own and "which call broke" is the first thing anybody reading it needs.
+   */
+  app.onError((error, context) => {
+    const carried = error as { getResponse?: () => Response };
+    if (typeof carried.getResponse === "function") {
+      return carried.getResponse();
+    }
+
+    console.error(
+      JSON.stringify({
+        type: "request-failed",
+        method: context.req.method,
+        path: context.req.path,
+        error: String(error),
+        note: "A route could not be answered. Somebody was shown an error instead of what they asked for.",
+      }),
+    );
+    return context.json(
+      { error: "The server could not complete that request." },
+      500,
+    );
+  });
+
   app.get("/health", (context) => context.json({ status: "ok" }));
+  /**
+   * Whether any enterprise identity provider is registered — as a question that always answers.
+   *
+   * TOLERANT, and the only read on `/api/capabilities` that can fail: everything else there comes off
+   * `config`, which is in memory. That endpoint is what the sign-in screen reads to choose which
+   * provider buttons to draw, and it is reached before anybody has signed in, so letting one
+   * unavailable table take the whole response down means a database blip on one boolean is a
+   * deployment nobody can get into — the social buttons included, which need nothing from this.
+   *
+   * `false` is the honest degraded answer here, and it is not the same bet the grant stores make.
+   * They refuse rather than fall back, because guessing there would GRANT something nobody granted.
+   * This only hides the email box that routes by domain, and hiding one way in beats hiding all of
+   * them. Somebody with SSO registered is still stuck until the read works, which is why the failure
+   * is logged rather than swallowed: nothing else on this path would say so, and the screen looks
+   * ordinary.
+   */
+  const anySsoProviderRegistered = async () =>
+    (
+      (await identityProviders?.list().catch((error) => {
+        console.error(
+          JSON.stringify({
+            type: "sso-availability-read-failed",
+            error: String(error),
+            note: "The sign-in screen was told this deployment has no enterprise identity provider. If one is registered, nobody it vouches for can sign in until this read works.",
+          }),
+        );
+        return [];
+      })) ?? []
+    ).length > 0;
   // Projected, never the raw runtime. config.runtime carries the Intelligence contract, including
   // INTELLIGENCE_API_KEY and the licence token, and this endpoint is reachable by anyone. Returning
   // the object wholesale would serve deployment secrets to the browser. Add fields here explicitly.
@@ -234,8 +317,11 @@ export function createApp(
        * A count, not a list. The sign-in screen only needs to know whether to offer the email box
        * that routes by domain; naming the providers would tell anybody who loads the page which
        * companies use this deployment, which is not theirs to have before they sign in.
+       *
+       * Read through `anySsoProviderRegistered`, which carries why an unreadable table answers `false`
+       * here instead of taking the sign-in screen down with it.
        */
-      ssoConfigured: ((await identityProviders?.list()) ?? []).length > 0,
+      ssoConfigured: await anySsoProviderRegistered(),
     }),
   );
   /*

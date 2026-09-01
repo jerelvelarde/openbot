@@ -595,12 +595,36 @@ const toStreamUrl = (baseUrl: string, botId: string) =>
   `${baseUrl.replace(/^http/, "ws").replace(/\/$/, "")}/stream?bot=${encodeURIComponent(botId)}&token=${encodeURIComponent(config.computer?.token ?? "")}`;
 
 /**
+ * The Bot id as the path spells it, or the segment itself when it cannot be spelled out.
+ *
+ * GUARDED, because this is read in `serve.fetch` — outside Hono, ahead of the upgrade check, and
+ * therefore outside every error shape this server maintains. `decodeURIComponent("%E0%A4%A")` throws
+ * a `URIError`, and a malformed escape in a path is a request anybody can send: the throw escaped
+ * `fetch` and left Bun answering with its own page — `text/html` in development, `Something went
+ * wrong!` in production — which is the one response shape here that nothing in this deployment chose,
+ * and the failure app.ts's catch-all calls "the API returned HTML".
+ *
+ * THE RAW SEGMENT RATHER THAN `null`, which is what Hono's own `tryDecodeURIComponent` does with an
+ * escape it cannot read: keep the text and carry on. `null` would drop the request out of the stream
+ * branch altogether and answer Hono's 404 for a route that does exist. No Bot can be named by an
+ * undecodable segment, so the lookup below answers "There is no such Bot" instead — the proxy's own
+ * words, about the thing that was actually wrong.
+ */
+const decodeStreamSegment = (segment: string): string => {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+};
+
+/**
  * Which Bot's screen. The Bot is named in the path and its computer is located the same way every
  * other call locates it, so the live stream cannot point at a different Bot's browser.
  */
 const streamPathBotId = (pathname: string): string | null => {
   const match = pathname.match(/^\/api\/computers\/([^/]+)\/stream$/);
-  return match?.[1] ? decodeURIComponent(match[1]) : null;
+  return match?.[1] ? decodeStreamSegment(match[1]) : null;
 };
 
 /** What each proxied socket carries: where to connect inward, and the socket once opened. */
