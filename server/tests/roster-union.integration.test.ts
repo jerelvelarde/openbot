@@ -1,4 +1,11 @@
-import { afterAll, afterEach, describe, expect, test } from "bun:test";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  test,
+} from "bun:test";
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { createAgentProfileStore } from "../src/agents/profile-store";
@@ -17,7 +24,7 @@ import {
   users,
 } from "../src/db/schema";
 import { recencyCursorText } from "../src/roster/order";
-import { MAX_ROSTER_PAGE } from "../src/roster/preview";
+import { DEFAULT_ROSTER_PAGE, MAX_ROSTER_PAGE } from "../src/roster/preview";
 import { createRosterStore } from "../src/roster/query";
 import { TEST_POOL } from "./support/database";
 
@@ -41,6 +48,47 @@ const createdAgentIds: string[] = [];
 const createdChannelIds: string[] = [];
 const createdBotChatIds: string[] = [];
 
+/**
+ * EVERY DROPPED ROW THIS FILE'S READS LEAVE BEHIND, ASSERTED ON, TEST BY TEST.
+ *
+ * `list` writes a `roster-rows-not-hydrated` line when phase 1 chose a conversation phase 2 could not
+ * rebuild, and its docblock says what one means: expected once for a conversation deleted or archived
+ * between the two statements, and a disagreement between the phases for any other cause. A
+ * disagreement is invisible from the answers alone — the page is simply short, and the row keeps
+ * burning its slot on every read — which is how two earlier versions of that bug survived. The line is
+ * the only place it shows, so nothing in this file may write one that a test has not claimed.
+ *
+ * Collected for the whole file rather than around one read, because the check has to be a property of
+ * every ordinary read here rather than of the one test that remembered to look. Removing the ownership
+ * term from phase 1's bot chat branch left all twenty-two tests green before this existed: phase 2
+ * filters on ownership as well, so a stranger's conversation was chosen, dropped, and paid for out of
+ * somebody else's page — silently, and permanently.
+ *
+ * Swallowed rather than printed, and only these lines: anything else the process logs still reaches
+ * the suite's output, so this cannot hide a diagnostic that belongs to another test. A test that
+ * expects a line drains this with `splice(0)` and asserts on what it took, which is what leaves the
+ * check below meaning "unclaimed".
+ */
+const droppedRowLines: Record<string, unknown>[] = [];
+let wasConsoleError: typeof console.error | undefined;
+
+beforeAll(() => {
+  wasConsoleError = console.error;
+  console.error = (...arguments_: unknown[]) => {
+    let line: Record<string, unknown> | undefined;
+    try {
+      line = JSON.parse(String(arguments_[0])) as Record<string, unknown>;
+    } catch {
+      // Something else in the process logging prose rather than a structured line. Not ours.
+    }
+    if (line?.type === "roster-rows-not-hydrated") {
+      droppedRowLines.push(line);
+      return;
+    }
+    wasConsoleError?.(...arguments_);
+  };
+});
+
 afterEach(async () => {
   for (const botChatId of createdBotChatIds.splice(0)) {
     await database.delete(botChats).where(eq(botChats.id, botChatId));
@@ -60,9 +108,14 @@ afterEach(async () => {
   for (const userId of createdUserIds.splice(0)) {
     await database.delete(users).where(eq(users.id, userId));
   }
+
+  // Last, and after the cleanup above rather than before it: a failure here ends the hook, and rows
+  // left in the database would then follow this file into every later test that reads the same tables.
+  expect(droppedRowLines.splice(0)).toEqual([]);
 });
 
 afterAll(async () => {
+  if (wasConsoleError) console.error = wasConsoleError;
   await database.$client.close();
 });
 
@@ -492,6 +545,64 @@ describe("the roster", () => {
     expect((await rosterStore.list(actorFor(stranger))).items).toEqual([]);
   });
 
+  test("does not spend a page slot on somebody else's conversation", async () => {
+    /*
+     * The other half of the claim above, and the half that reads as an empty sidebar rather than as
+     * one row too many.
+     *
+     * "Shows nobody else's conversations" holds as long as ownership is decided ANYWHERE, and phase 2
+     * decides it too — so it held with the term missing from phase 1, and so did the whole file. What
+     * a missing phase-1 term does instead is let phase 1 choose a row phase 2 cannot rebuild: the row
+     * is dropped, its slot is spent, and it is spent again on every read for as long as the stranger's
+     * conversation stays newer. This is the permanent slot-burning the module header describes, from
+     * the outside: at `limit: 1`, a person's own page stops containing their own conversation.
+     *
+     * A page of one, because that is the smallest page where a wasted slot is the whole page. The
+     * stranger gets one of each kind, so the assertion covers both branches of the union rather than
+     * whichever one the mutation happened to be tried on.
+     */
+    const ownerId = await seedUser();
+    const owner = actorFor(ownerId);
+    const strangerId = await seedUser();
+    const stranger = actorFor(strangerId);
+    const agentId = await seedProfile();
+
+    const base = Date.now();
+    const mine = await botChatStore.create(owner, agentId);
+    createdBotChatIds.push(mine.id);
+    await botChatStore.recordActivity(owner, mine.id, {
+      text: "Mine",
+      agentId: null,
+      at: new Date(base - 10_000),
+    });
+
+    // Both newer than the owner's, so either one would take the single slot if phase 1 chose the page
+    // without asking whose conversation it is.
+    const theirChat = await botChatStore.create(stranger, agentId);
+    createdBotChatIds.push(theirChat.id);
+    await botChatStore.recordActivity(stranger, theirChat.id, {
+      text: "Theirs",
+      agentId: null,
+      at: new Date(base),
+    });
+    const theirChannel = await channelStore.create(stranger, [agentId]);
+    createdChannelIds.push(theirChannel.id);
+    await channelStore.recordActivity(stranger, theirChannel.id, {
+      text: "Theirs",
+      agentId: null,
+      at: new Date(base - 1000),
+    });
+
+    const page = await rosterStore.list(owner, { limit: 1 });
+
+    // Their conversation is not merely absent from the answer: it never took the slot. An empty page
+    // carrying a live cursor is what the defect looked like, and a client that stops at the first
+    // empty page shows a person no conversations at all.
+    expect(page.items.map((item) => item.id)).toEqual([mine.id]);
+    expect(page.nextCursor).toBeNull();
+    expect(await walk(owner, 1)).toEqual([mine.id]);
+  });
+
   test("keeps a channel whole when its agents outnumber the page", async () => {
     const userId = await seedUser();
     const actor = actorFor(userId);
@@ -510,19 +621,81 @@ describe("the roster", () => {
     expect(page.items[0]?.agentIds).toHaveLength(3);
   });
 
-  test("caps what a caller may ask for", async () => {
+  /**
+   * One more conversation than the ceiling this module declares — WRITTEN AS A LITERAL, deliberately.
+   *
+   * `MAX_ROSTER_PAGE + 1` was what stood here, and a fixture derived from the constant under test grows
+   * with it: raising the cap from 200 to 400 seeded 401 conversations, the read handed back 400, and
+   * the assertion passed. That is the same vacuous shape as the version before it, which seeded one row
+   * and asserted the page was no longer than the cap — it held for every value the constant could have
+   * had. A literal is what makes raising the cap a failure rather than a bigger page.
+   *
+   * The coupling that leaves behind is asserted below rather than left as a comment nobody reads: if
+   * the ceiling is ever raised past this number, that assertion says so and names this constant.
+   */
+  const SEEDED_CONVERSATIONS = 201;
+
+  /**
+   * More conversations than either page size, inserted rather than created.
+   *
+   * Two hundred and one rows through `botChatStore.create` is two hundred and one round trips and a
+   * thread id minted for each; one `insert ... values` is one. Nothing here needs a real creation —
+   * the claim is about how many rows a read hands back — so the columns are the four the store's reads
+   * actually require plus an explicit `last_message_at`, which is what makes the recency order
+   * deterministic rather than a tie broken by whichever `created_at` Postgres stamped first.
+   */
+  async function manyBotChats(userId: string, agentId: string, count: number) {
+    const base = Date.now();
+    const rows = Array.from({ length: count }, (_, index) => ({
+      id: `botchat_${testPrefix}-page-${randomUUID()}`,
+      userId,
+      agentId,
+      threadId: randomUUID(),
+      lastMessageAt: new Date(base - index * 1000),
+      lastMessage: `Conversation ${index}`,
+    }));
+    await database.insert(botChats).values(rows);
+    createdBotChatIds.push(...rows.map((row) => row.id));
+    return rows.map((row) => row.id);
+  }
+
+  test("caps what a caller may ask for, and pages by default", async () => {
+    /*
+     * ASKING FOR EVERYTHING MUST NOT BE A WAY TO READ EVERYTHING. The limit arrives over HTTP, so the
+     * ceiling is what makes paging a property of the endpoint rather than of the caller —
+     * `roster/routes.ts` deliberately passes `?limit=1000` through unchanged for the store to clamp,
+     * and this is the clamp.
+     *
+     * SEEDED PAST BOTH SIZES, because the earlier version of this test seeded one conversation and
+     * asserted the page was no longer than `MAX_ROSTER_PAGE`. One row is shorter than any cap, so that
+     * assertion held for every value the constant could have had — three review rounds noticed it, and
+     * raising `DEFAULT_ROSTER_PAGE` from 50 to 10,000 left both roster test files green. A cap is only
+     * tested by a list longer than it.
+     *
+     * Both sizes, in one seeded list: the ceiling is what a caller cannot talk its way past, and the
+     * default is what the sidebar gets when it names no limit at all. Neither is the other's evidence.
+     */
     const userId = await seedUser();
     const actor = actorFor(userId);
     const agentId = await seedProfile();
-    const chat = await botChatStore.create(actor, agentId);
-    createdBotChatIds.push(chat.id);
+    const ids = await manyBotChats(userId, agentId, SEEDED_CONVERSATIONS);
 
-    // Asking for everything must not be a way to read everything. The limit arrives over HTTP, so the
-    // ceiling is what makes paging a property of the endpoint rather than of the caller.
-    const page = await rosterStore.list(actor, { limit: 100_000 });
+    // The fixture is a literal and the ceiling is not, so this is where the two meeting says so. A
+    // list no longer than the cap cannot tell whether the cap was applied.
+    expect(MAX_ROSTER_PAGE).toBeLessThan(SEEDED_CONVERSATIONS);
 
-    expect(page.items.map((item) => item.id)).toEqual([chat.id]);
-    expect(page.items.length).toBeLessThanOrEqual(MAX_ROSTER_PAGE);
+    const capped = await rosterStore.list(actor, { limit: 100_000 });
+    expect(capped.items).toHaveLength(MAX_ROSTER_PAGE);
+    expect(capped.items.map((item) => item.id)).toEqual(
+      ids.slice(0, MAX_ROSTER_PAGE),
+    );
+    // Capped, not truncated: there is another page and the cursor says so, which is the difference
+    // between a ceiling and rows quietly going missing.
+    expect(capped.nextCursor).not.toBeNull();
+
+    const byDefault = await rosterStore.list(actor);
+    expect(byDefault.items).toHaveLength(DEFAULT_ROSTER_PAGE);
+    expect(byDefault.nextCursor).not.toBeNull();
   });
 
   test("reports a retired Bot as inactive on both kinds", async () => {
@@ -808,5 +981,106 @@ describe("the roster", () => {
     const page = await rosterStore.list(actor, { limit: 1 });
     expect(page.items.map((item) => item.id)).toEqual([other.id]);
     expect(await walk(actor, 1)).toEqual([other.id]);
+  });
+});
+
+/**
+ * `list`, with a delete committing between its two statements.
+ *
+ * The negative every other test in this file now carries — that no read leaves a
+ * `roster-rows-not-hydrated` line behind — is only worth something if the line is written when it
+ * should be. Delete the `console.error` from `list` and the guard is satisfied by silence, which is
+ * the state the module was in when the two phases last disagreed. So this is the case that produces
+ * one, and it is the case that is meant to: every join in the statement that rebuilds a page is
+ * matched by a term in the statement that chooses it, which leaves a concurrent write as the only way
+ * a chosen conversation can fail to be rebuilt.
+ *
+ * Its own `describe`, outside the guard's reach only in the sense that it drains the line it expects:
+ * the guard fails on lines no test claimed, and this test claims exactly one.
+ */
+describe("the roster, interleaved", () => {
+  /**
+   * A store whose `list` runs `between` after it has chosen the page and before it rebuilds it.
+   *
+   * `channel-routes.test.ts`'s hook, unchanged apart from which store it builds — a race between two
+   * connections is a test only if the interleaving is chosen rather than hoped for, and `list` takes no
+   * locks to time a write against. The database handed to the store hooks every query's `then`, which
+   * is what awaiting a drizzle query calls, and runs the write immediately before the second query it
+   * is asked to execute. The write therefore lands with phase 1's rows in hand and phase 2 not yet
+   * sent.
+   *
+   * Counted on execution rather than on `select`, because the two are not the same number here either:
+   * phase 1 builds both branches of the union and an `exists` subquery inside the channel branch, and
+   * a subquery is compiled into SQL rather than awaited. The page below is bot chats only, so phase 2
+   * is a single statement and the second execution is unambiguous.
+   */
+  function storeInterleavedWith(between: () => Promise<void>) {
+    let executed = 0;
+    const hooked = Object.create(database) as typeof database;
+    Object.defineProperty(hooked, "select", {
+      value: (...columns: unknown[]) => {
+        const builder = (
+          database.select as unknown as (
+            ...args: unknown[]
+          ) => Record<string, unknown>
+        )(...columns);
+        const from = (
+          builder.from as (...args: unknown[]) => Record<string, unknown>
+        ).bind(builder);
+        builder.from = (...tables: unknown[]) => {
+          const query = from(...tables);
+          const execute = (query.execute as () => Promise<unknown>).bind(query);
+          // Defined rather than assigned, because a drizzle query already is a thenable and this
+          // shadows the one it inherits. Awaiting it is what calls this.
+          // biome-ignore lint/suspicious/noThenProperty: the thenable is drizzle's, not this test's — shadowing `then` is the only hook the store's own `await` runs through.
+          Object.defineProperty(query, "then", {
+            value: (onFulfilled: never, onRejected: never) => {
+              executed += 1;
+              const before = executed === 2 ? between() : Promise.resolve();
+              return before.then(execute).then(onFulfilled, onRejected);
+            },
+          });
+          return query;
+        };
+        return builder;
+      },
+    });
+    return createRosterStore(hooked);
+  }
+
+  test("drops a conversation deleted before it could be rebuilt, and says which", async () => {
+    const userId = await seedUser();
+    const actor = actorFor(userId);
+    const agentId = await seedProfile();
+    const staying = await botChatStore.create(actor, agentId);
+    createdBotChatIds.push(staying.id);
+    // Made second, so it leads the page and the drop is not the last row falling off the end.
+    const vanishing = await botChatStore.create(actor, agentId);
+    createdBotChatIds.push(vanishing.id);
+
+    const store = storeInterleavedWith(async () => {
+      await database
+        .update(botChats)
+        .set({ deletedAt: new Date() })
+        .where(eq(botChats.id, vanishing.id));
+    });
+
+    const page = await store.list(actor);
+
+    // Dropping it is right — it is deleted, and phase 2 filters on that. The page being short is the
+    // part nothing used to say out loud.
+    expect(page.items.map((item) => item.id)).toEqual([staying.id]);
+    const dropped = droppedRowLines.splice(0);
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]).toMatchObject({
+      actorUserId: userId,
+      status: "active",
+      chosen: 2,
+      hydrated: 1,
+      ids: [vanishing.id],
+    });
+    // The note is what tells the next reader whether one of these lines is a race or a disagreement
+    // between the two phases, which is the only reason the line is worth writing.
+    expect(typeof dropped[0]?.note).toBe("string");
   });
 });
