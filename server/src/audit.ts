@@ -4,6 +4,7 @@ import type { Database } from "./db/client";
 import { auditEvents } from "./db/schema";
 import { recencyCursorText, withinTimestamptzRange } from "./roster/order";
 import { parsePageLimit } from "./roster/query";
+import { timestampShape } from "./time";
 
 const sensitiveKeys = new Set([
   "access_token",
@@ -442,14 +443,17 @@ export type AuditEventQuery = {
    * millisecond is the finest thing anything outside the read can say — `createdAt` on the wire is
    * `toISOString()`, and the screen prints what it is given. `interval '1 millisecond'` in SQL was
    * rejected: it would have Postgres parse the bound, and a zone-less bound is read in whatever zone
-   * the session is set to rather than the one `new Date` uses, which is a live question on this
-   * parser and not one to answer accidentally here.
+   * the session is set to rather than the one `new Date` uses, which was a live question on this
+   * parser and not one to answer accidentally here. It is no longer live — `auditQueryFromUrl` refuses
+   * a date and time that names no zone outright, so no bound reaching this predicate depends on
+   * anybody's zone — and the rejection stands on the precision argument above, which does not.
    *
    * Both ends therefore round outward, and that is the direction to err on a trail whose argument for
    * existing is that it gets read to rule things out: a window slightly wider than asked for shows a
    * row somebody has to dismiss, and a window narrower than asked for is a row they conclude does not
-   * exist. `auditQueryFromUrl` refuses anything it cannot read as an instant at all, and anything
-   * naming a year outside the range `timestamptz` can be given.
+   * exist. `auditQueryFromUrl` refuses anything it cannot read as an instant at all, anything naming a
+   * time of day without the zone that would fix which instant that is, and anything naming a year
+   * outside the range `timestamptz` can be given.
    */
   from?: string;
   to?: string;
@@ -542,10 +546,10 @@ function readsAsCursorTimestamp(value: string): boolean {
  * microseconds as text and cast in the predicate, exactly as `AuditCursor` describes, rather than
  * handed to drizzle's timestamp mapper as a `Date` that cannot hold the digits being asked about.
  *
- * `new Date(...)` still does the parsing, because that is what accepts the several shapes a bound
- * arrives in — a plain `2026-08-31` and a full ISO instant are both honest answers to "when" and
- * `auditQueryFromUrl` says so. What changes is only how the parsed instant is spelled on the way to
- * Postgres.
+ * `new Date(...)` still does the parsing, because that is what reads both shapes a bound arrives in —
+ * a plain `2026-08-31` and a full ISO instant are both honest answers to "when" and
+ * `auditQueryFromUrl` says so, having refused everything whose instant would depend on which replica
+ * did the parsing. What changes is only how the parsed instant is spelled on the way to Postgres.
  *
  * `.999` RATHER THAN A MILLISECOND ADDED TO THE `Date`. Adding one would push a `to` of
  * `9999-12-31T23:59:59.999Z` — a year `auditQueryFromUrl` accepts — into year 10000, where
@@ -1016,18 +1020,39 @@ export function auditQueryFromUrl(url: URL): AuditEventQuery {
     return value === null || value === "" ? undefined : value;
   };
   /*
-   * Anything `Date` can read, which is deliberately more than one format: a bound typed by hand is
-   * usually a plain `2026-08-31` and a bound copied off the screen is a full ISO instant, and both
-   * are honest answers to "when". What is refused is a string that names no instant at all, and a
-   * string that names one `timestamptz` cannot be given.
+   * TWO SHAPES, deliberately, because a bound typed by hand is usually a plain `2026-08-31` and a bound
+   * copied off the screen is a full ISO instant, and both are honest answers to "when". `time.ts`
+   * holds which two and the argument for why not a third: a date-only value is UTC by specification,
+   * so it names the same midnight on every replica, and a date and time with no offset is local, so it
+   * does not. What is refused is a string that names no instant at all, a string that names a
+   * different instant on each replica, and a string that names one `timestamptz` cannot be given.
    *
-   * TWO REFUSALS, because they are two different things to have got wrong and a reader can only act on
-   * being told which. `from=yesterday` is not a date. `from=0000-01-01` and
-   * `from=-271821-04-20T00:00:00Z` are dates, and are dates this column has no room for: both parse,
-   * both used to reach drizzle's timestamp mapper, and Postgres answers `date/time field value out of
-   * range` for the first and `time zone displacement out of range` for the second — from inside the
-   * read, where the parameter no longer has a name, so the caller is told only that the server could
-   * not complete the request. `withinTimestamptzRange` carries the range and the reasoning.
+   * FOUR REFUSALS, because they are four different things to have got wrong and a reader can only act
+   * on being told which.
+   *
+   * `from=yesterday` is not a date.
+   *
+   * `from=2026-08-31T12:00:00` is a date and time that names no zone — the shape `parseActivityInput`
+   * has refused on a reported stamp since before this parser existed, and the one this parser went on
+   * admitting. `new Date` reads it in the server process's own local zone, so two replicas on different
+   * `TZ` settings answered this same query as much as a day apart, each with a 200 on it. The refusal
+   * names the missing part and how to supply it, because the value is one character from correct.
+   *
+   * `from=12/25/2026` is a date only because `new Date` guesses at it, in the local zone, by rules the
+   * specification leaves to the implementation. Same ambiguity, different format, and refused by naming
+   * the two shapes that are accepted — "not a date" is not true of it and tells a client nothing.
+   *
+   * `from=0000-01-01` and `from=-271821-04-20T00:00:00Z` are dates, and are dates this column has no
+   * room for: both parse, both used to reach drizzle's timestamp mapper, and Postgres answers
+   * `date/time field value out of range` for the first and `time zone displacement out of range` for
+   * the second — from inside the read, where the parameter no longer has a name, so the caller is told
+   * only that the server could not complete the request. `withinTimestamptzRange` carries the range and
+   * the reasoning, and the shape check asks nothing about the year so that this refusal is the one that
+   * answers them.
+   *
+   * THE SHAPE IS ASKED AFTER `new Date`, so `from=2026-13-01T00:00:00Z` is still told it is not a date
+   * rather than told something about the zone it does name. The order is what keeps each of the four
+   * true of the value that provoked it.
    */
   const instant = (name: string) => {
     const value = optional(name);
@@ -1035,6 +1060,17 @@ export function auditQueryFromUrl(url: URL): AuditEventQuery {
     const at = new Date(value);
     if (Number.isNaN(at.getTime())) {
       refuseAuditQuery(`${name} must be a date, and "${value}" is not one.`);
+    }
+    const shape = timestampShape(value);
+    if (shape === "date-time-without-zone") {
+      refuseAuditQuery(
+        `${name} must name a time zone when it names a time of day, and "${value}" names none. Add "Z" for UTC, or an offset such as "+02:00".`,
+      );
+    }
+    if (shape === "not-iso-8601") {
+      refuseAuditQuery(
+        `${name} must be an ISO-8601 date, or a date and time with a time zone, and "${value}" is neither.`,
+      );
     }
     if (!withinTimestamptzRange(at)) {
       refuseAuditQuery(

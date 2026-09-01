@@ -925,6 +925,153 @@ describe("reading an audit query off the URL", () => {
     });
   });
 
+  test.each([["from"], ["to"]] as const)(
+    "refuses ?%s= that names a time of day and no zone",
+    async (parameter: "from" | "to") => {
+      /*
+       * The one shape two replicas answer the same query differently on.
+       *
+       * `new Date("2026-08-31T12:00:00")` is read in the server process's own local zone, so this
+       * bound meant 03:00Z on a replica running in Tokyo and 19:00Z on one running in Los Angeles —
+       * the same URL, answered as much as a day apart, with a 200 on each and neither of them wrong
+       * from inside the read. `parseActivityInput` in `channels/routes.ts` had refused this shape on a
+       * reported `at` for exactly this reason since before this bound existed; the rule now has one
+       * home in `time.ts` and two readers rather than one reader and a defect.
+       *
+       * The refusal says which part is missing and how to supply it, rather than calling the value
+       * invalid: this is what `<input type="datetime-local">` submits, so it is very nearly right and
+       * the fix is one character.
+       */
+      const app = appWith(async () => ({ events: [] }));
+      const response = await app.request(
+        `http://openbot.local/api/admin/audit-events?${parameter}=2026-08-31T12:00:00`,
+      );
+
+      expect(response.status).toBe(400);
+      expect(response.headers.get("content-type")).toContain(
+        "application/json",
+      );
+      await expect(response.json()).resolves.toEqual({
+        error: `${parameter} must name a time zone when it names a time of day, and "2026-08-31T12:00:00" names none. Add "Z" for UTC, or an offset such as "+02:00".`,
+      });
+    },
+  );
+
+  test("reads a bare date the same in every zone, and refuses the date and time that would not", async () => {
+    /*
+     * BOTH HALVES OF THE ASYMMETRY THE RULE RESTS ON, proven here rather than cited.
+     *
+     * ECMA-262 gives the two forms two different defaults: a date-only value is UTC, and a date and
+     * time with no offset is local. So `?from=2026-08-31` is portable and stays accepted — a bare date
+     * is an honest answer to "when" and `AuditEventQuery.from` says so — while
+     * `?from=2026-08-31T12:00:00` is the shape that moves with `TZ`. Refusing both would have been the
+     * shorter fix and a regression on the screen where somebody types a date by hand.
+     *
+     * The zone is switched under the running process on purpose. An assertion about what `new Date`
+     * does with the accepted shape is worth nothing asked in one zone only, and the refused shape's
+     * whole defect is invisible in one zone: this is the test that would have caught it.
+     */
+    const originalZone = process.env.TZ;
+    try {
+      const accepted: string[] = [];
+      const refused: string[] = [];
+      const refusals: unknown[] = [];
+      for (const zone of ["Asia/Tokyo", "America/Los_Angeles"]) {
+        process.env.TZ = zone;
+        const queries: { from?: string }[] = [];
+        const app = appWith(async (query) => {
+          queries.push(query as { from?: string });
+          return { events: [] };
+        });
+
+        const bareDate = await app.request(
+          "http://openbot.local/api/admin/audit-events?from=2026-08-31",
+        );
+        expect(bareDate.status).toBe(200);
+        // Parsed the way the read parses it, from the value the read was handed.
+        accepted.push(new Date(queries[0]?.from as string).toISOString());
+        refused.push(new Date("2026-08-31T12:00:00").toISOString());
+
+        const zoneLess = await app.request(
+          "http://openbot.local/api/admin/audit-events?from=2026-08-31T12:00:00",
+        );
+        expect(zoneLess.status).toBe(400);
+        refusals.push(await zoneLess.json());
+      }
+
+      // The accepted shape is one instant in both zones, which is why it is accepted.
+      expect(accepted).toEqual([
+        "2026-08-31T00:00:00.000Z",
+        "2026-08-31T00:00:00.000Z",
+      ]);
+      // The refused one is sixteen hours of daylight apart, from a single string.
+      expect(refused).toEqual([
+        "2026-08-31T03:00:00.000Z",
+        "2026-08-31T19:00:00.000Z",
+      ]);
+      // And it is refused identically in both, rather than answered differently in each.
+      expect(refusals[1]).toEqual(refusals[0]);
+    } finally {
+      if (originalZone === undefined) delete process.env.TZ;
+      else process.env.TZ = originalZone;
+    }
+  });
+
+  test.each([
+    ["2026-08-31", "a bare date, which every zone reads as the same midnight"],
+    ["2026-08-31T12:00:00.123Z", "a full instant, as the screen prints one"],
+    ["2026-08-31T12:00+02:00", "an offset instead of `Z`, and no seconds"],
+    ["2026-08-31t12:00:00z", "the lower-case designators ISO-8601 also allows"],
+  ])("accepts ?from=%p: %s", async (value: string) => {
+    /*
+     * The other half of the shape rule, asserted because the cheap way to close a parser that admits a
+     * zone-less date and time is to admit nothing but `Z`-suffixed instants — which refuses the bare
+     * date this surface's own bound docblock promises, on the screen where somebody types one, and
+     * refuses the offset form of the same instant for no reason at all.
+     */
+    const queries: unknown[] = [];
+    const app = appWith(async (query) => {
+      queries.push(query);
+      return { events: [] };
+    });
+
+    const response = await app.request(
+      `http://openbot.local/api/admin/audit-events?from=${encodeURIComponent(value)}`,
+    );
+
+    expect(response.status).toBe(200);
+    expect(queries).toEqual([{ limit: 50, from: value }]);
+  });
+
+  test.each([
+    ["12/25/2026", "a date `new Date` guesses at, in the process's own zone"],
+    ["2026-08-31 12:00:00", "a space where ISO-8601 has a `T`, and no zone"],
+    ["Sat, 31 Aug 2026 12:00:00 GMT", "an HTTP date, which this is not"],
+    ["2026-08-31T12:00:00+0200", "an offset with no colon in it"],
+  ])("refuses ?from=%p: %s", async (value: string) => {
+    /*
+     * A date only because `new Date` says so.
+     *
+     * Every one of these parses, so none reaches the "is not one" refusal above, and the first two are
+     * read in the local zone — the zone-less defect arriving through a format nothing here ever
+     * documented accepting. The last two name their zone and are refused anyway, because a parser
+     * looser than its own error message is how the zone-less shape got in: `parseActivityInput` was
+     * this loose, said "ISO-8601" in its refusal, and accepted "12/25/2026".
+     *
+     * So the refusal names the two shapes that are accepted rather than saying "not a date", which is
+     * not true of any of these and tells a client nothing it can act on.
+     */
+    const app = appWith(async () => ({ events: [] }));
+    const response = await app.request(
+      `http://openbot.local/api/admin/audit-events?from=${encodeURIComponent(value)}`,
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      error: `from must be an ISO-8601 date, or a date and time with a time zone, and "${value}" is neither.`,
+    });
+  });
+
   test("reads an empty ?from= as absent, the way every other parameter reads", async () => {
     /*
      * A parameter that says nothing is not a parameter — `parsePageLimit`'s words for the rule the

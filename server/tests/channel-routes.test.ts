@@ -314,9 +314,11 @@ describe("activity input parser", () => {
 
   test("refuses a year `timestamptz` has no room for", () => {
     /*
-     * `0000-01-01T00:00:00Z` is the whole of what got this far: it matches the shape above, `Date`
-     * holds it and round-trips it perfectly, and `timestamptz` has no year between 1 BC and AD 1. The
-     * extended `±YYYYYY` forms that break the other way are already refused by the shape.
+     * `0000-01-01T00:00:00Z` is one of three things that get this far: it matches the shape above,
+     * `Date` holds it and round-trips it perfectly, and `timestamptz` has no year between 1 BC and AD
+     * 1. The extended `±YYYYYY` forms that break the other way reach it too now, and the test below
+     * covers them — the shared shape in `time.ts` asks nothing about years, because this check is the
+     * one that can name the range.
      *
      * Neither existing bound caught it when this was written. The clamp held the ceiling only and
      * this is in the past, and the store's moves-forwards-only guard does not save it either —
@@ -325,9 +327,9 @@ describe("activity input parser", () => {
      * range` came out of the middle of the store's transaction, where the parameter no longer has a
      * name, as a 500 for a request that is simply malformed.
      *
-     * THE FLOOR NOW COVERS THE CRASH, and this stays a refusal anyway. The shape above admits exactly
-     * four digits of year, so with both ends clamped nothing out of the column's range can reach it.
-     * But a clamp is what a wrong clock deserves, and year 0 is not a clock running slow — it is a
+     * THE FLOOR NOW COVERS THE CRASH, and this stays a refusal anyway. With both ends clamped, a stamp
+     * that reaches the column is within the allowance of this server's clock whatever year it named on
+     * the way in. But a clamp is what a wrong clock deserves, and year 0 is not a clock running slow — it is a
      * stamp that names no time at all, and 400 is the only way the client is ever told so. The check
      * runs on what was reported, before the clamp, which is what keeps that answer reachable.
      */
@@ -337,6 +339,35 @@ describe("activity input parser", () => {
         agentId: null,
         at: "0000-01-01T00:00:00Z",
       }),
+    ).toEqual({
+      ok: false,
+      error: "Timestamp must name a year between 0001 and 9999.",
+    });
+  });
+
+  test.each([
+    [
+      "+010000-01-02T00:00:00Z",
+      "a five-digit year, which `toISOString` renders back as a zone",
+    ],
+    ["-271821-04-20T00:00:00Z", "the earliest instant a `Date` holds"],
+  ])("refuses a reported %p: %s", (value: string) => {
+    /*
+     * The extended `±YYYYYY` forms, refused for the year they name rather than for their shape.
+     *
+     * The shape refused them before, as a side effect of admitting exactly four digits of year, and the
+     * client was told its timestamp was not an ISO-8601 date and time with a time zone — which is false
+     * of both of these. Each names a zone, each is an instant `Date` holds and round-trips, and what is
+     * actually wrong with them is that `timestamptz` has no room for the year: `+010000-01-02T00:00:00Z`
+     * comes back out of `toISOString` as an extended year Postgres reads as a zone displacement.
+     *
+     * The shape now lives in `time.ts` and asks nothing about years, deliberately, because this refusal
+     * can name the range and a shape check cannot. `audit.ts` makes the same distinction on its query
+     * bounds, and that is the point of the two readers sharing one shape: the shape says what form the
+     * value takes, and each reader says what it can hold.
+     */
+    expect(
+      parseActivityInput({ text: "One more thing", agentId: null, at: value }),
     ).toEqual({
       ok: false,
       error: "Timestamp must name a year between 0001 and 9999.",

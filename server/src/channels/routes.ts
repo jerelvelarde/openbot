@@ -51,6 +51,7 @@ import {
   parseRosterStatus,
   type RosterStatus,
 } from "../roster/query";
+import { timestampShape } from "../time";
 import {
   CHANNEL_ACTIVITY_TOPIC,
   type ChannelEventHub,
@@ -1404,18 +1405,6 @@ export function limitBody(subject: string, maxSize: number): MiddlewareHandler {
 export const MAX_ACTIVITY_CLOCK_SKEW_MS = 5 * 60 * 1000;
 
 /**
- * The one shape of `at` this parser accepts: a calendar date and time with an explicit zone.
- *
- * A zone is required because `new Date("2026-08-31T12:00")` is read in the server process's own local
- * zone, so two clients sending the identical string landed at two different instants depending on
- * where the process happened to run — and that instant is then compared against what is stored. The
- * bare `new Date` this replaces also accepted "12/25/2026" while the refusal below said ISO-8601, so
- * the parser was looser than its own error message.
- */
-const ISO_8601_WITH_ZONE =
-  /^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}(:\d{2}(\.\d+)?)?([Zz]|[+-]\d{2}:\d{2})$/;
-
-/**
  * Parse a reported message.
  *
  * `at` comes from the client that saw the message, because only it knows when the message arrived,
@@ -1463,7 +1452,23 @@ export function parseActivityInput(input: unknown): ActivityInputParseResult {
   if (typeof object.at !== "string") {
     return { ok: false, error: "Timestamp is required." };
   }
-  if (!ISO_8601_WITH_ZONE.test(object.at)) {
+  /*
+   * ONE SHAPE, and it is the shared one: an ISO-8601 date and time carrying an explicit zone.
+   *
+   * A zone is required because `new Date("2026-08-31T12:00")` is read in the server process's own local
+   * zone, so two clients sending the identical string landed at two different instants depending on
+   * where the process happened to run — and that instant is then compared against what is stored.
+   * `time.ts` holds that argument now, because `auditQueryFromUrl` in `audit.ts` needs it too and had
+   * the defect for as long as this parser had the fix.
+   *
+   * NOTHING LOOSER, because a reported `at` is a machine's record of when a message arrived, not
+   * something typed: a bare `2026-08-31` names no time of day, and `12/25/2026` is a date only because
+   * `new Date` guesses at it — it was accepted while the refusal here said ISO-8601, so the parser was
+   * looser than its own error message. The audit bound reads the same classification and does accept a
+   * bare date, because there a person does the typing; the shapes are shared and the acceptance is
+   * each reader's own.
+   */
+  if (timestampShape(object.at) !== "date-time-with-zone") {
     return {
       ok: false,
       error: "Timestamp must be an ISO-8601 date and time with a time zone.",
@@ -1482,10 +1487,13 @@ export function parseActivityInput(input: unknown): ActivityInputParseResult {
   /*
    * A date this column has no room for, refused here rather than by letting Postgres try.
    *
-   * `0000-01-01T00:00:00Z` is the whole of what reaches this line: it matches the shape above, `Date`
+   * `0000-01-01T00:00:00Z` was the whole of what reached this line: it matches the shape above, `Date`
    * holds it and round-trips it perfectly, and `timestamptz` has no year between 1 BC and AD 1, so it
-   * answers `date/time field value out of range`. The extended `±YYYYYY` forms that break the other
-   * way are already refused by `ISO_8601_WITH_ZONE`.
+   * answers `date/time field value out of range`. The extended `±YYYYYY` forms that break the other way
+   * now reach it too, and deliberately: the shared shape asks nothing about the year, because this
+   * check is the one that can name the range in its refusal, and `+010000-01-02T00:00:00Z` is an
+   * instant with a zone on it whose only fault is a year — being told it is not an ISO-8601 date and
+   * time is false.
    *
    * The clamp did not catch it when this check was written — year 0 is in the past, and only the
    * ceiling was clamped — and neither does the store's moves-forwards-only guard, which is the trap:
@@ -1494,8 +1502,9 @@ export function parseActivityInput(input: unknown): ActivityInputParseResult {
    * middle of the store's transaction, where the parameter no longer has a name, as a 500 for what is
    * a malformed request.
    *
-   * The floor below now covers the crash — the shape above admits exactly four digits of year, so
-   * with both ends clamped nothing out of range can reach the column. This stays a refusal anyway,
+   * The floor below now covers the crash — with both ends clamped, a stamp that reaches the column is
+   * within the allowance of this server's clock whatever year it named on the way in. This stays a
+   * refusal anyway,
    * and stays ABOVE the clamp so it is reachable at all: a clamp is what a wrong clock deserves, and
    * year 0 is not a clock running slow. It is a stamp that names no time, and 400 is the only way the
    * client is ever told so.
