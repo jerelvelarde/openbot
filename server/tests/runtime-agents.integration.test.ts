@@ -4,6 +4,7 @@ import { eq } from "drizzle-orm";
 import { createAgentProfileStore } from "../src/agents/profile-store";
 import type { AgentActor } from "../src/agents/profile-types";
 import { createRuntimeAgentLoader } from "../src/agents/runtime-agents";
+import { createBotChatStore } from "../src/bot-chats/store";
 import { createChannelStore } from "../src/channels/routes";
 import { createThreadIdentity } from "../src/channels/thread-identity";
 import { standingRoleMessage } from "../src/copilot";
@@ -12,6 +13,7 @@ import { TEST_POOL } from "./support/database";
 import {
   agentProfiles,
   agents,
+  botChats,
   channels,
   intelligenceChannelMappings,
   users,
@@ -28,6 +30,11 @@ const channelStore = createChannelStore(
   profileStore,
   createThreadIdentity("test-deployment"),
 );
+const botChatStore = createBotChatStore(
+  database,
+  profileStore,
+  createThreadIdentity("test-deployment"),
+);
 const managedAgentToken = "managed-agent-token";
 const loadAgents = createRuntimeAgentLoader(database, undefined, {
   endpoint: managedEndpoint,
@@ -38,6 +45,7 @@ const testPrefix = `runtime-agents-${randomUUID()}`;
 const createdUserIds: string[] = [];
 const createdAgentIds: string[] = [];
 const createdChannelIds: string[] = [];
+const createdBotChatIds: string[] = [];
 
 afterEach(async () => {
   for (const channelId of createdChannelIds.splice(0)) {
@@ -45,6 +53,12 @@ afterEach(async () => {
       .delete(intelligenceChannelMappings)
       .where(eq(intelligenceChannelMappings.channelId, channelId));
     await database.delete(channels).where(eq(channels.id, channelId));
+  }
+  // Before the agents, which is what these rows name. `bot_chats.agent_id` cascades, so the delete
+  // below would take them anyway; it is written out so a conversation this file created is never
+  // left behind by a change to how agents are cleaned up.
+  for (const botChatId of createdBotChatIds.splice(0)) {
+    await database.delete(botChats).where(eq(botChats.id, botChatId));
   }
   for (const agentId of createdAgentIds.splice(0)) {
     await database
@@ -168,6 +182,70 @@ describe("runtime agent loading", () => {
     });
     // Somebody with no channel of their own gets no tombstone: history is what authorizes it.
     expect(idsOf(await loadAgents(otherUser))).not.toContain(profile.id);
+  });
+
+  /**
+   * THE OTHER KIND OF HISTORY, which used to authorize nothing.
+   *
+   * The tombstone arm joined `channel_agents` to `channel_memberships` and knew nothing about
+   * `bot_chats`, so a retired Bot somebody had only ever direct-messaged was registered nowhere.
+   * `useAgent` throws in the browser for an id the runtime does not hold — and the packaged
+   * `CopilotChat` resolves the same id the same way — so that screen fell to the error boundary,
+   * taking down the "this Bot has been retired, the conversation stays readable" banner written for
+   * exactly this case.
+   */
+  test("keeps a deleted coworker as a tombstone for somebody who only direct-messaged it", async () => {
+    const owner = await createUser();
+    const otherUser = await createUser();
+    const profile = await createCoworker(owner);
+    const chat = await botChatStore.create(owner, profile.id);
+    createdBotChatIds.push(chat.id);
+
+    await profileStore.softDelete(owner, profile.id);
+
+    expect(await loadAgents(owner)).toContainEqual({
+      id: profile.id,
+      name: "Expense Manager",
+      type: "unavailable",
+      reason:
+        "Expense Manager has been deleted and can no longer run. Its conversations remain readable.",
+    });
+    // No channel anywhere in this test, and somebody else's conversation is not this person's
+    // history: the bot chat arm is scoped to the owner exactly as the channel arm is to a member.
+    expect(idsOf(await loadAgents(otherUser))).not.toContain(profile.id);
+  });
+
+  /**
+   * Archived is hidden from the roster, not from a direct read — the conversation's URL still opens
+   * it. So it still needs the tombstone, and a filter on `archived_at` in the arm above would crash
+   * precisely the screen archiving promises stays readable.
+   */
+  test("keeps the tombstone for an archived direct conversation", async () => {
+    const owner = await createUser();
+    const profile = await createCoworker(owner);
+    const chat = await botChatStore.create(owner, profile.id);
+    createdBotChatIds.push(chat.id);
+    await botChatStore.setArchived(owner, chat.id, true);
+
+    await profileStore.softDelete(owner, profile.id);
+
+    expect(idsOf(await loadAgents(owner))).toContain(profile.id);
+  });
+
+  /**
+   * A deleted conversation is the opposite case, and it is why the arm filters `deleted_at`: `get`
+   * refuses the row, so there is no screen left to register an agent for.
+   */
+  test("drops the tombstone once the only direct conversation has been deleted", async () => {
+    const owner = await createUser();
+    const profile = await createCoworker(owner);
+    const chat = await botChatStore.create(owner, profile.id);
+    createdBotChatIds.push(chat.id);
+    await botChatStore.softDelete(owner, chat.id);
+
+    await profileStore.softDelete(owner, profile.id);
+
+    expect(idsOf(await loadAgents(owner))).not.toContain(profile.id);
   });
 
   test("applies an edited role to the next load without a restart", async () => {
