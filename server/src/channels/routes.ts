@@ -7,6 +7,7 @@ import {
   isNotNull,
   isNull,
   lt,
+  lte,
   or,
   sql,
 } from "drizzle-orm";
@@ -171,11 +172,14 @@ export type ChannelStore = {
     archived: boolean,
   ): Promise<boolean>;
   /**
-   * Record the last thing said, and bring the channel back if a PERSON said it and it was archived.
+   * Record the last thing said, and bring the channel back if a PERSON said it, after it was
+   * archived, and it was archived.
    *
-   * A Bot's reply moves the preview and the recency and leaves an archived channel archived; the
-   * implementation says why at length. Throws ChannelNotFoundError for a non-member, an unknown
-   * channel, or a deleted one.
+   * A Bot's reply moves the preview and the recency and leaves an archived channel archived, and so
+   * does a person's own report of a message they sent before the archive: the clear is measured
+   * against `archived_at` on a statement of its own, because whether a channel is hidden is a
+   * different question from what its last message was. The implementation says why at length. Throws
+   * ChannelNotFoundError for a non-member, an unknown channel, or a deleted one.
    *
    * Reports whether it restored an archive, for the same reason `setArchived` reports whether it
    * changed anything: the route audits the act, and an unarchiving that happens here is as real as
@@ -984,7 +988,19 @@ export function createChannelStore(
           const [membership] = await transaction
             .select({
               channelId: channelMemberships.channelId,
-              archivedAt: channels.archivedAt,
+              /*
+               * The row's own preview, read for the announcement rather than for a decision.
+               *
+               * Two writes below can leave the row holding something other than what this report
+               * carries — a report that is stale for the recency but still lifts the archive, and a
+               * message that renders as nothing — and the browser spreads whatever the event carries
+               * onto the row it is showing. So the event is built from what the row holds after this
+               * transaction, and for the fields this call did not move that is exactly this read.
+               * Safe because the lock below is held: nothing else can change them underneath it.
+               */
+              lastMessage: channels.lastMessage,
+              lastMessageAt: channels.lastMessageAt,
+              lastMessageAgentId: channels.lastMessageAgentId,
             })
             .from(channelMemberships)
             // Joined rather than checked on the membership alone, so a deleted channel is refused
@@ -1005,16 +1021,22 @@ export function createChannelStore(
               ),
             )
             /*
-             * Locked, because `archivedAt` read here decides what the event says.
+             * Locked, because everything below is a decision about the row as this call found it.
              *
-             * The write below clears `archived_at` under its own guard, which is correct on its own.
-             * What cannot be decided from a separate earlier snapshot is whether to SAY the
-             * conversation came back: an archive committing between the two left this read saying
-             * "not archived", the write clearing the flag anyway, and the event omitting
-             * `archived: false`. `app/src/lib/channels/use-channel-events.ts` refetches only when
-             * that field is present, so the conversation was restored in the database and stayed
-             * hidden on every viewer. A person saying something in an archived conversation is how it
-             * comes back, which makes the restore direction the one that must not be lossy.
+             * WHAT THE LOCK USED TO CARRY. `archivedAt` read here was what said whether to announce
+             * `archived: false`: an archive committing between this read and the write left the read
+             * saying "not archived", the write cleared the flag anyway, and the event omitted the
+             * field — and `app/src/lib/channels/use-channel-events.ts` refetches only when it is
+             * present, so the conversation was restored in the database and stayed hidden on every
+             * viewer. A person saying something in an archived conversation is how it comes back,
+             * which makes the restore direction the one that must not be lossy.
+             *
+             * That fact now comes from the clear's own `returning` rather than from this read, so
+             * this snapshot could no longer get it wrong. The lock stays because two other things
+             * still rest on it: the refusal below is decided here and neither write carries a
+             * `deleted_at` term, so without it a delete committing in the gap gets its channel
+             * written to and announced; and the fields this call does not move are announced from
+             * this read, which is only the row's true state while nothing else may write it.
              *
              * `of channels` for the reason `setArchived` gives: the membership row is not what
              * changes here, and locking it would collide with the methods that do write it.
@@ -1037,9 +1059,51 @@ export function createChannelStore(
             if (!linked) throw new AgentNotFoundError(activity.agentId);
           }
 
-          // A person's message and the agent's reply are reported separately, so they can arrive out
-          // of order. Only ever move forwards.
           const lastMessage = previewOf(activity.text);
+          const saidByAPerson = activity.agentId === null;
+          /*
+           * The preview and the recency, on a guard that only ever moves forwards.
+           *
+           * A person's message and the agent's reply are reported separately, so they can arrive out
+           * of order and a late one must not drag the row's preview backwards.
+           *
+           * `<=` AND NOT `<`. An equal stamp from a later report is not a regression, and the clamp in
+           * `parseActivityInput` is what makes equality ordinary rather than a coincidence: every
+           * report from a client further out than `MAX_ACTIVITY_CLOCK_SKEW_MS` is rewritten to the same
+           * bound, so two reports made inside one millisecond of this server's clock arrive carrying
+           * one instant and the second was dropped as stale. Re-applying an equal stamp costs nothing
+           * — the values are the ones already there, unless the report is genuinely a different
+           * message, which is the case this is for.
+           *
+           * `lastMessage` is left out of the `SET` when the message renders as nothing, and
+           * `lastMessageAgentId` goes with it. `previewOf` answers null for a message of only format
+           * characters, and writing that null blanked the row's preview — a caller can send one,
+           * because the parser rejects on `text.trim()` and a zero-width space survives it. The title
+           * write in `bot-chats/store.ts` refuses the same write with the same argument. The author
+           * moves with the text because the two are halves of one fact, what the row shows and who
+           * said it, and moving the author alone leaves a person's words rendering under a Bot's name.
+           * `lastMessageAt` still moves: the message is real, and recency is what the sort is for.
+           */
+          const applied = await transaction
+            .update(channels)
+            .set({
+              ...(lastMessage === null
+                ? {}
+                : { lastMessage, lastMessageAgentId: activity.agentId }),
+              lastMessageAt: activity.at,
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(channels.id, channelId),
+                or(
+                  isNull(channels.lastMessageAt),
+                  lte(channels.lastMessageAt, activity.at),
+                ),
+              ),
+            )
+            .returning({ id: channels.id });
+
           /*
            * A PERSON speaking is what brings an archived channel back. A Bot answering is not.
            *
@@ -1051,54 +1115,91 @@ export function createChannelStore(
            * it came back on its own, which is the whole of why the archive stopped feeling reliable.
            *
            * A reply that lands after an archive therefore leaves the row archived and still moves the
-           * preview and the recency below — the conversation is hidden, not frozen, so the row a
+           * preview and the recency above — the conversation is hidden, not frozen, so the row a
            * person finds under Archived is the up-to-date one and sorts where its last message says.
            * And nothing is stranded: the person can still bring it back by speaking in it, which is
            * the same gesture the rule was always about, or by pressing Restore.
            *
-           * `bot-chats/store.ts` guards its own clear the same way, from the same reasoning: the two
+           * ON ITS OWN STATEMENT, and measured against `archived_at` rather than against
+           * `last_message_at`. It rode the write above, which made the recency guard decide the
+           * archive too, and that is the wrong question asked twice:
+           *
+           *   - A person's message OLDER than the stored last message failed to lift the archive. The
+           *     row stayed hidden, `restored` was false so there was no audit row and no
+           *     `archived: false` on the wire, and the POST still answered 204. A tab whose clock is a
+           *     couple of seconds behind whoever last wrote `last_message_at` — the Bot's reply,
+           *     usually — could not speak the conversation back into view at all, and nothing said why.
+           *   - A person's message that PREDATED the archive did lift it, and laid down a
+           *     `channel.unarchived` row for a message sent before the archive existed. Excluding the
+           *     Bot's reply fixed the half that was noticed; the person's own late report walks the
+           *     identical path.
+           *
+           * Whether a conversation is hidden and what its last message was are different questions
+           * about it, so they get a statement each. `archived_at IS NOT NULL` says out loud that only
+           * an archived row is being cleared rather than resting on `<` against NULL being unknown, and
+           * `archived_at < at` is the whole of the rule: a message said after the archive lifts it, one
+           * said before it does not. The two stamps come from different clocks, which is what the
+           * parser's clamp is for — it bounds the disagreement to the allowance either side. A message
+           * stamped exactly `archived_at`, or one from a clock so wrong that the clamp puts it behind
+           * an archive made in the last five minutes, leaves the row hidden and Restore is still there.
+           *
+           * `restored` therefore comes from this statement's `returning` and not from the read above:
+           * it is the fact of what this write did. The event carries it so the browser moves the row
+           * between lists, and the route writes `channel.unarchived` from the answer this method
+           * returns, so the two cannot disagree about what happened. It is also idempotent for free —
+           * a repeated report finds `archived_at` already null and reports nothing — where a `restored`
+           * taken from a snapshot could announce `archived: false` for a row still archived and put a
+           * trail row on an unarchiving that never happened: confidently wrong, which `audit.ts`
+           * argues is worse than silent.
+           *
+           * `bot-chats/store.ts` guards its own clear identically, from the same reasoning: the two
            * kinds of conversation are read by one roster and a rule that held for only one of them
            * would be this feature implemented twice with two answers.
            */
-          const saidByAPerson = activity.agentId === null;
-          const applied = await transaction
-            .update(channels)
-            .set({
-              lastMessage,
-              lastMessageAt: activity.at,
-              lastMessageAgentId: activity.agentId,
-              /*
-               * On this write rather than a separate one, so the clear lands under the same
-               * moves-forwards-only guard below: a report the store ignores as stale must not
-               * unarchive the conversation either. An ignored report is not news.
-               */
-              ...(saidByAPerson ? { archivedAt: null } : {}),
-              updatedAt: new Date(),
-            })
-            .where(
-              and(
-                eq(channels.id, channelId),
-                or(
-                  isNull(channels.lastMessageAt),
-                  lt(channels.lastMessageAt, activity.at),
-                ),
-              ),
-            )
-            .returning({ id: channels.id });
-          // Nothing changed, so there is nothing to announce and nothing to record: a stale report is
-          // not news, and it did not restore anything either.
-          if (applied.length === 0) return { restored: false };
+          const cleared = saidByAPerson
+            ? await transaction
+                .update(channels)
+                .set({ archivedAt: null, updatedAt: new Date() })
+                .where(
+                  and(
+                    eq(channels.id, channelId),
+                    isNotNull(channels.archivedAt),
+                    lt(channels.archivedAt, activity.at),
+                  ),
+                )
+                .returning({ id: channels.id })
+            : [];
+          const restored = cleared.length > 0;
 
-          // One fact, used twice: whether this report is what cleared the archive. The event carries
-          // it so the browser moves the row between lists, and the route writes `channel.unarchived`
-          // from the answer this method returns, so the two cannot disagree about what happened.
-          //
-          // Both terms, because both are conditions of the clear above: the channel has to have been
-          // archived, and a Bot's reply does not clear it. A `restored` that ignored the second would
-          // announce `archived: false` for a row still archived and lay down a `channel.unarchived`
-          // row for an unarchiving that did not happen — the trail confidently wrong, which is the
-          // failure `audit.ts` argues is worse than a silent one.
-          const restored = saidByAPerson && membership.archivedAt !== null;
+          // Nothing was written, so there is nothing to announce and nothing to record: a stale
+          // report is not news, and it did not restore anything either. Both terms, because either
+          // write can land without the other — that is the point of their being two.
+          if (applied.length === 0 && !restored) return { restored: false };
+
+          /*
+           * What the row holds now, which is not always what this report carried.
+           *
+           * The browser spreads these three onto the row it is rendering, so an event that carried
+           * this call's values where the write did not take them would stamp a preview the row does
+           * not have. Two cases: a report stale for the recency that still lifted the archive, and a
+           * message that renders as nothing. In both, the fields that did not move are announced from
+           * the locked read, which under the lock above is the row's current state.
+           */
+          const announced =
+            applied.length === 0
+              ? {
+                  lastMessage: membership.lastMessage,
+                  lastMessageAt: membership.lastMessageAt,
+                  lastMessageAgentId: membership.lastMessageAgentId,
+                }
+              : {
+                  lastMessage: lastMessage ?? membership.lastMessage,
+                  lastMessageAt: activity.at,
+                  lastMessageAgentId:
+                    lastMessage === null
+                      ? membership.lastMessageAgentId
+                      : activity.agentId,
+                };
 
           const members = await transaction
             .select({ userId: channelMemberships.userId })
@@ -1113,9 +1214,9 @@ export function createChannelStore(
             id: channelId,
             channelId,
             memberIds: members.map((member) => member.userId),
-            lastMessage,
-            lastMessageAt: activity.at.toISOString(),
-            lastMessageAgentId: activity.agentId,
+            lastMessage: announced.lastMessage,
+            lastMessageAt: announced.lastMessageAt?.toISOString() ?? null,
+            lastMessageAgentId: announced.lastMessageAgentId,
             // Only when this report is what restored it. On every other activity event the field is
             // absent, so a client patching a row does not have to distinguish "still not archived"
             // from "just came back".
@@ -1215,18 +1316,25 @@ const MAX_ACTIVITY_TEXT_UNITS = 16_000;
 export const MAX_ACTIVITY_BODY_BYTES = 256 * 1024;
 
 /**
- * How far ahead of this server's clock a reported `at` may be.
+ * How far from this server's clock, in either direction, a reported `at` may be.
  *
  * Not zero: the stamp comes from the machine that saw the message, and two clocks a few seconds
- * apart is ordinary rather than an error. Not unbounded, which is what it was — and unbounded above
- * is the dangerous direction, because both stores write this value to `last_message_at` under a
+ * apart is ordinary rather than an error. Not unbounded, which is what it was — and ABOVE was named
+ * as the dangerous direction, because both stores write this value to `last_message_at` under a
  * guard that only ever moves forwards. One report carrying a year-3000 stamp therefore pinned the row
  * to the top of every member's roster permanently, made every later genuine report a no-op, and —
- * because clearing `archived_at` rides that same guarded write — left an archived conversation that
+ * because clearing `archived_at` rode that same guarded write — left an archived conversation that
  * saying something in could no longer bring back. There is no API that undoes any of it.
  *
+ * BELOW IS DANGEROUS TOO, which is the half this docblock's first line used to leave out. Recency is
+ * `coalesce(last_message_at, created_at)`, so the first report on a conversation replaces
+ * `created_at` as its sort key and a year-1970 stamp sinks the row below one nobody has ever said
+ * anything in — also with no API that undoes it. And a client running behind whoever last wrote
+ * `last_message_at` has every report of its own read as stale, so it cannot move the preview at all.
+ * The allowance is symmetric because the harm is.
+ *
  * Five minutes is generous for a clock and short enough that a client which lies by the whole
- * allowance has pinned the row for five minutes rather than for good.
+ * allowance has pinned or sunk the row for five minutes rather than for good.
  */
 export const MAX_ACTIVITY_CLOCK_SKEW_MS = 5 * 60 * 1000;
 
@@ -1248,12 +1356,12 @@ const ISO_8601_WITH_ZONE =
  * `at` comes from the client that saw the message, because only it knows when the message arrived,
  * and it is trusted no further than that. Two bounds hold it: the store compares it against what is
  * stored and only ever moves forwards, and this parser refuses a stamp with no zone and clamps one
- * more than `MAX_ACTIVITY_CLOCK_SKEW_MS` ahead of this server's clock. Between them a wrong clock can
- * lose a report; it cannot leave the row pinned to the top of every roster with every later report a
- * no-op and its archive no longer clearable by speaking in it.
+ * more than `MAX_ACTIVITY_CLOCK_SKEW_MS` from this server's clock in EITHER direction. Between them a
+ * wrong clock can lose a report; it cannot leave the row pinned to the top of every roster with every
+ * later report a no-op, and it cannot sink the row below every conversation nobody has spoken in.
  *
- * A year the column cannot hold is refused outright, because neither bound covers it: see the
- * `withinTimestamptzRange` check below.
+ * A year the column cannot hold is refused outright rather than clamped, because a stamp naming year
+ * 0 is not a clock running slow: see the `withinTimestamptzRange` check below.
  */
 export function parseActivityInput(input: unknown): ActivityInputParseResult {
   if (!isChannelInputObject(input)) {
@@ -1314,11 +1422,18 @@ export function parseActivityInput(input: unknown): ActivityInputParseResult {
    * answers `date/time field value out of range`. The extended `±YYYYYY` forms that break the other
    * way are already refused by `ISO_8601_WITH_ZONE`.
    *
-   * The clamp below does not catch it — year 0 is in the past, and only the ceiling is clamped — and
-   * neither does the store's moves-forwards-only guard, which is the trap: `activity.at` is bound in
-   * that guard's `WHERE` as well as in the `SET`, so Postgres parses it to decide whether to write
-   * rather than because it is writing. The failure therefore came out of the middle of the store's
-   * transaction, where the parameter no longer has a name, as a 500 for what is a malformed request.
+   * The clamp did not catch it when this check was written — year 0 is in the past, and only the
+   * ceiling was clamped — and neither does the store's moves-forwards-only guard, which is the trap:
+   * `activity.at` is bound in that guard's `WHERE` as well as in the `SET`, so Postgres parses it to
+   * decide whether to write rather than because it is writing. The failure therefore came out of the
+   * middle of the store's transaction, where the parameter no longer has a name, as a 500 for what is
+   * a malformed request.
+   *
+   * The floor below now covers the crash — the shape above admits exactly four digits of year, so
+   * with both ends clamped nothing out of range can reach the column. This stays a refusal anyway,
+   * and stays ABOVE the clamp so it is reachable at all: a clamp is what a wrong clock deserves, and
+   * year 0 is not a clock running slow. It is a stamp that names no time, and 400 is the only way the
+   * client is ever told so.
    *
    * `withinTimestamptzRange` rather than a fourth copy of `year < 1`: it lives in `roster/order.ts`
    * with the range and the reasoning, and `audit.ts` borrows it for the same class of bug on its own
@@ -1332,19 +1447,41 @@ export function parseActivityInput(input: unknown): ActivityInputParseResult {
   }
 
   /*
-   * Clamped, not refused.
+   * Clamped, not refused, at both ends.
    *
    * A report is a message somebody actually sent. The store's guard is built so that a wrong clock
    * loses a report; refusing here would make a wrong clock lose every report that client ever makes,
    * with nothing the person could do about it. Clamped, the stamp is never more than the allowance
-   * ahead of this server, successive reports from that client still advance as long as this server's
-   * clock has ticked between them, and the bound is what makes this function's docblock true.
+   * from this server in either direction, successive reports from that client still advance as long as
+   * this server's clock has ticked between them, and the bound is what makes this function's docblock
+   * true.
    *
-   * Only the ceiling. A stamp in the past needs no defending: the store's guard already ignores one
-   * older than what is stored, and an old stamp cannot pin a row or hide a later message.
+   * IT USED TO HOLD THE CEILING ONLY, on the argument that a stamp in the past needs no defending
+   * because "the store's guard already ignores one older than what is stored, and an old stamp cannot
+   * pin a row or hide a later message". Both halves of that are true and neither is the whole harm.
+   * Recency is `coalesce(last_message_at, created_at)`, so the FIRST report on a conversation replaces
+   * `created_at` as its sort key: `at: "1970-01-02T00:00:00Z"` passes the shape check, names a year the
+   * column holds, is in the past so was never clamped, and matches the store's `last_message_at IS
+   * NULL` guard — so it was written, and the conversation then sorted below one nobody had ever said
+   * anything in, with no API that resets it. And "ignores one older than what is stored" is itself the
+   * second harm: a browser running behind whoever last wrote `last_message_at` had every report of its
+   * own dropped, so it could not move the preview, and before the archive clear was given a guard of
+   * its own it could not speak a hidden conversation back into view either.
+   *
+   * WHAT THE FLOOR COSTS. A report genuinely delayed by more than the allowance — a tab that was
+   * offline and is catching up — is stamped at the floor rather than when the message was said, so it
+   * sorts a little high and can take a preview from a message that really was later. That is the same
+   * trade the ceiling already makes, and it is the cheaper failure: a late report shown slightly out
+   * of order is worth less than a conversation nothing can bring back.
    */
-  const ceiling = Date.now() + MAX_ACTIVITY_CLOCK_SKEW_MS;
-  const at = reported.getTime() > ceiling ? new Date(ceiling) : reported;
+  const now = Date.now();
+  // One reading of the clock for both ends, so the window is the same window at both edges rather
+  // than two reads with a tick in between.
+  const clamped = Math.min(
+    Math.max(reported.getTime(), now - MAX_ACTIVITY_CLOCK_SKEW_MS),
+    now + MAX_ACTIVITY_CLOCK_SKEW_MS,
+  );
+  const at = clamped === reported.getTime() ? reported : new Date(clamped);
 
   return {
     ok: true,

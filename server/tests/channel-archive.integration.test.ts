@@ -337,8 +337,12 @@ describe("activity in an archived channel", () => {
     });
     await store.setArchived(owner, channel.id, true);
 
-    // Older than what is stored, so the store ignores it as stale. An ignored report is not news,
-    // and must not quietly unarchive the conversation either.
+    /*
+     * Older than what is stored, so the store ignores it as stale for the preview — and older than
+     * `archived_at` too, which is what the archive clear is guarded on and the reason it stays
+     * archived. The two used to be one guard, and this scenario is where they agree; the two tests
+     * below are where they do not, in both directions.
+     */
     await store.recordActivity(owner, channel.id, {
       text: "Older",
       agentId: null,
@@ -355,6 +359,143 @@ describe("activity in an archived channel", () => {
 
     expect(row?.archivedAt).not.toBeNull();
     expect(row?.lastMessage).toBe("Recent");
+  });
+
+  test("brings it back on a message newer than the archive but behind the stored last message", async () => {
+    /*
+     * The archive silently failing to lift, which is the direction that strands somebody.
+     *
+     * The clear used to ride the moves-forwards-only guard, so a person's message was measured
+     * against `last_message_at` and never against `archived_at` at all. Here the Bot's reply is
+     * reported first and carries the later stamp — a clock a couple of seconds slow on the tab the
+     * person is typing in is all it takes — so their message reads as stale, the row stays archived,
+     * `restored` is false so there is no audit row and no `archived: false` on the wire, and the POST
+     * still answers 204. The conversation cannot be spoken back into view, and nothing anywhere says
+     * why.
+     */
+    const owner = await createUser();
+    const agentId = await createAgent(owner);
+    const channel = await createChannel(owner, [agentId]);
+
+    await store.setArchived(owner, channel.id, true);
+    // Taken after the archive committed, so both stamps below are newer than `archived_at` whatever
+    // this machine's clock did in between.
+    const afterArchive = new Date();
+
+    await store.recordActivity(owner, channel.id, {
+      text: "Thirty days, unopened.",
+      agentId,
+      at: new Date(afterArchive.getTime() + 2000),
+    });
+    const outcome = await store.recordActivity(owner, channel.id, {
+      text: "One more thing",
+      agentId: null,
+      at: new Date(afterArchive.getTime() + 1000),
+    });
+
+    // Said after the archive by a person, so it came back — and said so, which is what the route
+    // writes `channel.unarchived` from and what moves the row between lists in every tab.
+    expect(outcome).toEqual({ restored: true });
+
+    const [row] = await database
+      .select({
+        archivedAt: channels.archivedAt,
+        lastMessage: channels.lastMessage,
+      })
+      .from(channels)
+      .where(eq(channels.id, channel.id));
+
+    expect(row?.archivedAt).toBeNull();
+    // And the preview did not go backwards. The report is still stale for the recency write, which is
+    // the whole reason these are two statements: whether a conversation is hidden and what its last
+    // message was are different questions about it.
+    expect(row?.lastMessage).toBe("Thirty days, unopened.");
+  });
+
+  test("leaves it archived for a person's own message that predates the archive", async () => {
+    /*
+     * The same root cause, the opposite symptom: the archive lifting on its own.
+     *
+     * Wave 3 excluded the Bot's reply from clearing `archived_at`, and the person's own late report
+     * walks the identical path. Sent at T1, archived at T2, reported at T3: newer than
+     * `last_message_at`, so the old single guard let it through, and it cleared an archive that did
+     * not exist when the message was said — with a `channel.unarchived` row on the trail for it, which
+     * `audit.ts` argues is worse than no row at all.
+     */
+    const owner = await createUser();
+    const agentId = await createAgent(owner);
+    const channel = await createChannel(owner, [agentId]);
+
+    const asked = new Date(Date.now() - 60_000);
+    await store.recordActivity(owner, channel.id, {
+      text: "What is our refund policy?",
+      agentId: null,
+      at: asked,
+    });
+    await store.setArchived(owner, channel.id, true);
+
+    const outcome = await store.recordActivity(owner, channel.id, {
+      text: "And one more thing",
+      agentId: null,
+      at: new Date(asked.getTime() + 1000),
+    });
+
+    expect(outcome).toEqual({ restored: false });
+
+    const [row] = await database
+      .select({
+        archivedAt: channels.archivedAt,
+        lastMessage: channels.lastMessage,
+      })
+      .from(channels)
+      .where(eq(channels.id, channel.id));
+
+    expect(row?.archivedAt).not.toBeNull();
+    // Hidden, not frozen: the message still moves the preview and the recency, so the row a person
+    // finds under Archived is the up-to-date one. Only the clear is refused.
+    expect(row?.lastMessage).toBe("And one more thing");
+  });
+
+  test("takes a report whose stamp equals the one already stored", async () => {
+    /*
+     * An equal stamp from a later report is not a regression, and the guard read it as one.
+     *
+     * `>` on `last_message_at` dropped the second of two reports carrying one instant, and the skew
+     * clamp is what manufactures that: every report from a client more than
+     * `MAX_ACTIVITY_CLOCK_SKEW_MS` out is rewritten to the same bound, so two reports made inside one
+     * millisecond of this server's clock arrive identical. Dropped, the second report lost its
+     * preview AND — before the clear was given its own statement — its unarchiving with it.
+     */
+    const owner = await createUser();
+    const agentId = await createAgent(owner);
+    const channel = await createChannel(owner, [agentId]);
+
+    await store.setArchived(owner, channel.id, true);
+    const at = new Date(Date.now() + 1000);
+
+    await store.recordActivity(owner, channel.id, {
+      text: "Thirty days, unopened.",
+      agentId,
+      at,
+    });
+    const outcome = await store.recordActivity(owner, channel.id, {
+      text: "One more thing",
+      agentId: null,
+      at,
+    });
+
+    expect(outcome).toEqual({ restored: true });
+
+    const [row] = await database
+      .select({
+        archivedAt: channels.archivedAt,
+        lastMessage: channels.lastMessage,
+      })
+      .from(channels)
+      .where(eq(channels.id, channel.id));
+
+    expect(row?.archivedAt).toBeNull();
+    expect(row?.lastMessage).toBe("One more thing");
   });
 });
 

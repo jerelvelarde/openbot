@@ -13,7 +13,17 @@
  * Every method is scoped to `actor.id`. A row belonging to somebody else is reported exactly as a row
  * that does not exist, so ownership is not something an outsider can probe for.
  */
-import { and, desc, eq, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
+import {
+  and,
+  desc,
+  eq,
+  isNotNull,
+  isNull,
+  lt,
+  lte,
+  or,
+  sql,
+} from "drizzle-orm";
 import {
   AgentNotFoundError,
   type AgentProfileStore,
@@ -67,13 +77,17 @@ export type BotChatStore = {
   /**
    * Record the last thing said, and report whether doing so brought an archived conversation back.
    *
-   * `last_message` moves forwards only, so a report that arrives late is dropped. The title does not:
-   * it is written from the person's first message whenever that message arrives, because which
-   * message names a conversation has nothing to do with which one arrived last.
+   * `last_message` moves forwards only, so a report that arrives late is dropped. Two things do not
+   * ride that guard, and each has a statement of its own: the title, which is written from the
+   * person's first message whenever that message arrives, because which message names a conversation
+   * has nothing to do with which one arrived last; and the archive clear, which is measured against
+   * `archived_at`, because whether a conversation is hidden is a different question from what its
+   * last message was.
    *
-   * Only a PERSON's message clears the archive. A Bot's reply moves the preview and the recency and
-   * leaves an archived conversation archived, so the reply to a question asked before the archive
-   * cannot undo it; the implementation argues this at length.
+   * Only a PERSON's message clears the archive, and only one said after the archive. A Bot's reply
+   * moves the preview and the recency and leaves an archived conversation archived, so the reply to a
+   * question asked before the archive cannot undo it — and neither can the person's own report of a
+   * message they sent before it. The implementation argues both at length.
    *
    * `restored` is for the route above, which writes the trail: a person speaking in an archived
    * conversation clears the archive, and that is a restore nobody performed as such.
@@ -448,7 +462,19 @@ export function createBotChatStore(
           const [row] = await transaction
             .select({
               agentId: botChats.agentId,
-              archivedAt: botChats.archivedAt,
+              /*
+               * The row's own preview, read for the announcement rather than for a decision.
+               *
+               * Two writes below can leave the row holding something other than what this report
+               * carries — a report that is stale for the recency but still lifts the archive, and a
+               * message that renders as nothing — and the browser spreads whatever the event carries
+               * onto the row it is showing. So the event is built from what the row holds after this
+               * transaction, and for the fields this call did not move that is exactly this read.
+               * Safe because the lock below is held: nothing else can change them underneath it.
+               */
+              lastMessage: botChats.lastMessage,
+              lastMessageAt: botChats.lastMessageAt,
+              lastMessageAgentId: botChats.lastMessageAgentId,
             })
             .from(botChats)
             .where(
@@ -463,17 +489,23 @@ export function createBotChatStore(
               ),
             )
             /*
-             * Locked, because `archived_at` read here is the state of the row BEFORE this write and
-             * it decides what the announcement below says.
+             * Locked, because everything below is a decision about the row as this call found it.
              *
-             * Unlocked, an archive committing between this statement and the update reads here as
-             * "was not archived"; the update clears `archived_at` regardless, and the event goes out
-             * without `archived: false`. The conversation is then restored in the database and still
-             * hidden in every tab until something unrelated makes them refetch — and a person saying
-             * something in an archived conversation is exactly how it is meant to come back, which
-             * `app/src/lib/channels/use-channel-events.ts` argues at length is the direction that must
-             * not be lossy. The lock is what makes the pre-image this method announces from the same
-             * one it writes over.
+             * WHAT THE LOCK USED TO CARRY. `archived_at` read here was what decided whether the
+             * announcement said `archived: false`. Unlocked, an archive committing between this
+             * statement and the update read here as "was not archived"; the update cleared
+             * `archived_at` regardless, and the event went out without the field. The conversation was
+             * then restored in the database and still hidden in every tab until something unrelated
+             * made them refetch — and a person saying something in an archived conversation is exactly
+             * how it is meant to come back, which `app/src/lib/channels/use-channel-events.ts` argues
+             * at length is the direction that must not be lossy.
+             *
+             * That fact now comes from the clear's own `returning` rather than from this read, so this
+             * snapshot could no longer get it wrong. The lock stays because two other things still
+             * rest on it: the refusals below are decided here and neither write carries a `deleted_at`
+             * term, so without it a delete committing in the gap gets its chat written to and
+             * announced; and the fields this call does not move are announced from this read, which is
+             * the row's true state only while nothing else may write it.
              *
              * `FOR UPDATE` and not `FOR SHARE`: an archive must block on it rather than commit
              * underneath it. Note this is a `bot_chats` row and has nothing to do with the share lock
@@ -524,6 +556,50 @@ export function createBotChatStore(
           }
 
           const lastMessage = previewOf(activity.text);
+          const saidByAPerson = activity.agentId === null;
+          /*
+           * The preview and the recency, on a guard that only ever moves forwards.
+           *
+           * A person's message and the Bot's reply are reported separately, so they can arrive out of
+           * order and a late one must not drag the row's preview backwards.
+           *
+           * `<=` AND NOT `<`. An equal stamp from a later report is not a regression, and the clamp in
+           * `parseActivityInput` is what makes equality ordinary rather than a coincidence: every
+           * report from a client further out than `MAX_ACTIVITY_CLOCK_SKEW_MS` is rewritten to the same
+           * bound, so two reports made inside one millisecond of the server's clock arrive carrying one
+           * instant and the second was dropped as stale. Re-applying an equal stamp costs nothing — the
+           * values are the ones already there, unless the report is genuinely a different message,
+           * which is the case this is for.
+           *
+           * `lastMessage` is left out of the `SET` when the message renders as nothing, and
+           * `lastMessageAgentId` goes with it. `previewOf` answers null for a message of only format
+           * characters, and writing that null blanked the row's preview — the same write the title
+           * above refuses, for the same reason, two statements away. A caller can send one: the parser
+           * rejects on `text.trim()` and a zero-width space survives it. The author moves with the text
+           * because the two are halves of one fact, what the row shows and who said it, and moving the
+           * author alone leaves a person's words rendering under the Bot's name. `lastMessageAt` still
+           * moves: the message is real, and recency is what the sort is for.
+           */
+          const applied = await transaction
+            .update(botChats)
+            .set({
+              ...(lastMessage === null
+                ? {}
+                : { lastMessage, lastMessageAgentId: activity.agentId }),
+              lastMessageAt: activity.at,
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(botChats.id, id),
+                or(
+                  isNull(botChats.lastMessageAt),
+                  lte(botChats.lastMessageAt, activity.at),
+                ),
+              ),
+            )
+            .returning({ id: botChats.id });
+
           /*
            * A PERSON speaking is how an archived conversation comes back. The Bot answering is not.
            *
@@ -535,68 +611,99 @@ export function createBotChatStore(
            * the archive stopped feeling like it held.
            *
            * A reply that arrives after an archive therefore leaves the row archived and still moves
-           * the preview, `last_message_at` and `last_message_agent_id` below: hidden, not frozen, so
+           * the preview, `last_message_at` and `last_message_agent_id` above: hidden, not frozen, so
            * the row found under Archived is the current one and sorts where its last message says. The
            * person can still bring it back by speaking in it, or with Restore.
+           *
+           * ON ITS OWN STATEMENT, and measured against `archived_at` rather than against
+           * `last_message_at`. It rode the write above, which made the recency guard decide the archive
+           * too, and that is the wrong question asked twice:
+           *
+           *   - A person's message OLDER than the stored last message failed to lift the archive. The
+           *     row stayed hidden, `restored` was false so there was no trail row and no
+           *     `archived: false` on the wire, and the POST still answered 204. A tab whose clock is a
+           *     couple of seconds behind whatever last wrote `last_message_at` — the Bot's reply,
+           *     usually — could not speak the conversation back into view at all, and nothing said why.
+           *   - A person's message that PREDATED the archive did lift it, and put a
+           *     `bot_chat.unarchived` row on the trail for a message sent before the archive existed.
+           *     Excluding the Bot's reply fixed the half that was noticed; the person's own late report
+           *     walks the identical path.
+           *
+           * Whether a conversation is hidden and what its last message was are different questions
+           * about it, so they get a statement each. `archived_at IS NOT NULL` says out loud that only
+           * an archived row is being cleared rather than resting on `<` against NULL being unknown, and
+           * `archived_at < at` is the whole of the rule: a message said after the archive lifts it, one
+           * said before it does not. The two stamps come from different clocks, which is what the
+           * parser's clamp is for — it bounds the disagreement to the allowance either side. A message
+           * stamped exactly `archived_at`, or one from a clock so wrong that the clamp puts it behind an
+           * archive made in the last five minutes, leaves the row hidden and Restore is still there.
+           *
+           * `restored` therefore comes from this statement's `returning` and not from the read above:
+           * it is the fact of what this write did. The event carries it so the browser moves the row
+           * between lists, and the route writes `bot_chat.unarchived` from what this method returns, so
+           * the two cannot disagree about what happened. It is idempotent for free — a repeated report
+           * finds `archived_at` already null and reports nothing — where a `restored` taken from a
+           * snapshot could announce `archived: false` for a row that is still archived and put a trail
+           * row on an unarchiving that never happened: confidently wrong, which `audit.ts` argues is
+           * worse than a silent one.
            *
            * `channels/routes.ts`'s `recordActivity` guards its own clear identically. This file's
            * header is why: one roster reads both kinds, and a rule that held for only one of them is
            * the archive implemented twice with two answers.
            */
-          const saidByAPerson = activity.agentId === null;
-          const applied = await transaction
-            .update(botChats)
-            .set({
-              lastMessage,
-              lastMessageAt: activity.at,
-              lastMessageAgentId: activity.agentId,
-              /*
-               * Cleared on this write rather than a separate one, so it rides the guard below: a
-               * report the store ignores as stale must not un-archive anything either. Cleared rather
-               * than cleared-only-when-set, because the guard is what decides whether this write
-               * happens at all and a second clear of an already-null column changes nothing.
-               */
-              ...(saidByAPerson ? { archivedAt: null } : {}),
-              updatedAt: new Date(),
-            })
-            .where(
-              and(
-                eq(botChats.id, id),
-                // A person's message and the Bot's reply are reported separately, so they can arrive
-                // out of order. Only ever move forwards. This is also what keeps a stale report from
-                // clearing `archived_at`: a late arrival cannot un-archive what it predates.
-                or(
-                  isNull(botChats.lastMessageAt),
-                  lt(botChats.lastMessageAt, activity.at),
-                ),
-              ),
-            )
-            .returning({ id: botChats.id });
-          /*
-           * The report was stale, so there is nothing to announce: a stale report is not news, and
-           * nothing was restored either — the guard is also what stops a late arrival un-archiving
-           * what it predates.
-           *
-           * A title may still have been written just above. Deliberately not announced: this event
-           * carries no title, and the browser spreads whatever arrives onto the row it holds, so an
-           * event sent for a title alone would stamp this call's null `lastMessage` over the preview
-           * the roster is rendering (`applyRosterEvent` in use-channel-events.ts, which guards the
-           * pin path against exactly that). The name is picked up by the next refetch, and by the next
-           * report that is not stale.
-           */
-          if (applied.length === 0) return { restored: false };
+          const cleared = saidByAPerson
+            ? await transaction
+                .update(botChats)
+                .set({ archivedAt: null, updatedAt: new Date() })
+                .where(
+                  and(
+                    eq(botChats.id, id),
+                    isNotNull(botChats.archivedAt),
+                    lt(botChats.archivedAt, activity.at),
+                  ),
+                )
+                .returning({ id: botChats.id })
+            : [];
+          const restored = cleared.length > 0;
 
           /*
-           * One fact, used twice: the event carries it so the browser moves the row between lists, and
-           * the route writes `bot_chat.unarchived` from what this method returns, so the two cannot
-           * disagree about what happened.
+           * Neither write landed, so there is nothing to announce: a stale report is not news, and it
+           * restored nothing either. Both terms, because either write can land without the other —
+           * that is the point of their being two.
            *
-           * Both terms, because both are conditions of the clear above. A `restored` that dropped the
-           * second would announce `archived: false` for a row that is still archived and put a
-           * `bot_chat.unarchived` row on the trail for an unarchiving that never happened — a trail
-           * that is confidently wrong, which `audit.ts` argues is worse than a silent one.
+           * A title may still have been written above. Deliberately not announced: this event carries
+           * no title, and the browser spreads whatever arrives onto the row it holds, so an event sent
+           * for a title alone would stamp this call's `lastMessage` over the preview the roster is
+           * rendering (`applyRosterEvent` in use-channel-events.ts, which guards the pin path against
+           * exactly that). The name is picked up by the next refetch, and by the next report that is
+           * not stale.
            */
-          const restored = saidByAPerson && row.archivedAt !== null;
+          if (applied.length === 0 && !restored) return { restored: false };
+
+          /*
+           * What the row holds now, which is not always what this report carried.
+           *
+           * The browser spreads these three onto the row it is rendering, so an event that carried
+           * this call's values where the write did not take them would stamp a preview the row does not
+           * have. Two cases: a report stale for the recency that still lifted the archive, and a
+           * message that renders as nothing. In both, the fields that did not move are announced from
+           * the locked read, which under that lock is the row's current state.
+           */
+          const announced =
+            applied.length === 0
+              ? {
+                  lastMessage: row.lastMessage,
+                  lastMessageAt: row.lastMessageAt,
+                  lastMessageAgentId: row.lastMessageAgentId,
+                }
+              : {
+                  lastMessage: lastMessage ?? row.lastMessage,
+                  lastMessageAt: activity.at,
+                  lastMessageAgentId:
+                    lastMessage === null
+                      ? row.lastMessageAgentId
+                      : activity.agentId,
+                };
 
           /*
            * Announced through the channel side's `announce`, on this transaction, so it is delivered
@@ -619,9 +726,9 @@ export function createBotChatStore(
             kind: "bot_chat",
             id,
             memberIds: [actor.id],
-            lastMessage,
-            lastMessageAt: activity.at.toISOString(),
-            lastMessageAgentId: activity.agentId,
+            lastMessage: announced.lastMessage,
+            lastMessageAt: announced.lastMessageAt?.toISOString() ?? null,
+            lastMessageAgentId: announced.lastMessageAgentId,
             // Only when this write actually restored something, so an ordinary message does not
             // carry an archive state the receiver then has to decide to ignore.
             ...(restored ? { archived: false } : {}),

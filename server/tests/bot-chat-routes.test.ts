@@ -6,6 +6,10 @@ import type { AuditEventInput, AuditStore } from "../src/audit";
 import type { AppVariables, AuthenticatedActor } from "../src/auth/guards";
 import { createBotChatRoutes, parseAdoptInput } from "../src/bot-chats/routes";
 import {
+  type ChannelActivity,
+  MAX_ACTIVITY_CLOCK_SKEW_MS,
+} from "../src/channels/routes";
+import {
   type BotChat,
   BotChatNotFoundError,
   type BotChatStore,
@@ -493,7 +497,10 @@ describe("PUT /:id/pin and /:id/read", () => {
 describe("POST /:id/activity", () => {
   test("reports what was said", async () => {
     const store = fakeStore();
-    const at = "2026-08-31T09:00:00.000Z";
+    // From this clock, because this asserts the value the store was handed and `parseActivityInput`
+    // holds a report to `MAX_ACTIVITY_CLOCK_SKEW_MS` either side of this server. A fixed stamp here
+    // proved whatever the calendar happened to say on the day it was written.
+    const at = new Date().toISOString();
     const response = await post(appFor(store), "/botchat_1/activity", {
       text: "Hello",
       agentId: null,
@@ -509,6 +516,36 @@ describe("POST /:id/activity", () => {
         { text: "Hello", agentId: null, at: new Date(at) },
       ],
     ]);
+  });
+
+  test("holds a report from a slow clock to the allowance before the store sees it", async () => {
+    /*
+     * The clamp is route-reachable here too, and this route is why it has to be proved twice: it
+     * imports `parseActivityInput` from `channels/routes.ts` rather than restating it, so a bound
+     * added there is a bound here — and that is a claim about an import, which is exactly the kind of
+     * thing that stops being true without anybody noticing.
+     *
+     * A stamp in 1970 passes the shape check and names a year the column holds, so before the floor
+     * existed this exact request reached the store verbatim. The store writes it to
+     * `last_message_at`, which is `coalesce(last_message_at, created_at)` — the roster's sort key — so
+     * any signed-in caller could sink their own conversation below one nobody had ever said anything
+     * in.
+     */
+    const store = fakeStore();
+    const before = Date.now();
+
+    const response = await post(appFor(store), "/botchat_1/activity", {
+      text: "Hello",
+      agentId: null,
+      at: "1970-01-02T00:00:00.000Z",
+    });
+
+    expect(response.status).toBe(204);
+    const [call] = store.calls;
+    const reported = call?.[3] as ChannelActivity | undefined;
+    expect(reported?.at.getTime()).toBeGreaterThanOrEqual(
+      before - MAX_ACTIVITY_CLOCK_SKEW_MS,
+    );
   });
 
   test("refuses an activity body too large to parse", async () => {

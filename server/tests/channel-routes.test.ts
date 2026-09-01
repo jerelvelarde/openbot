@@ -22,6 +22,7 @@ import { DEV_ACTOR } from "../src/auth/dev-actor";
 import type { AppVariables, AuthenticatedActor } from "../src/auth/guards";
 import {
   type AgentChannel,
+  type ChannelActivity,
   ChannelNotFoundError,
   ChannelPackageOwnedError,
   type ChannelStore,
@@ -208,11 +209,24 @@ describe("activity input parser", () => {
   });
 
   test("takes a report a person made, with no agent on it", () => {
+    // Stamped from this clock rather than with the fixed `at` every shape test above uses, because
+    // this is the one assertion here about the VALUE that comes back: the clamp holds a report to
+    // the allowance either side of this server, and a stamp from January is outside it.
+    const reported = new Date().toISOString();
+
     expect(
-      parseActivityInput({ text: "One more thing", agentId: null, at }),
+      parseActivityInput({
+        text: "One more thing",
+        agentId: null,
+        at: reported,
+      }),
     ).toEqual({
       ok: true,
-      value: { text: "One more thing", agentId: null, at: new Date(at) },
+      value: {
+        text: "One more thing",
+        agentId: null,
+        at: new Date(reported),
+      },
     });
   });
 
@@ -304,12 +318,18 @@ describe("activity input parser", () => {
      * holds it and round-trips it perfectly, and `timestamptz` has no year between 1 BC and AD 1. The
      * extended `±YYYYYY` forms that break the other way are already refused by the shape.
      *
-     * Neither existing bound catches it. The clamp only holds the ceiling and this is in the past, and
-     * the store's moves-forwards-only guard does not save it either — `activity.at` is bound in that
-     * guard's `WHERE` as well as in the `SET`, so Postgres parses it to decide whether to write rather
-     * than because it is writing. So `date/time field value out of range` came out of the middle of
-     * the store's transaction, where the parameter no longer has a name, as a 500 for a request that
-     * is simply malformed.
+     * Neither existing bound caught it when this was written. The clamp held the ceiling only and
+     * this is in the past, and the store's moves-forwards-only guard does not save it either —
+     * `activity.at` is bound in that guard's `WHERE` as well as in the `SET`, so Postgres parses it
+     * to decide whether to write rather than because it is writing. So `date/time field value out of
+     * range` came out of the middle of the store's transaction, where the parameter no longer has a
+     * name, as a 500 for a request that is simply malformed.
+     *
+     * THE FLOOR NOW COVERS THE CRASH, and this stays a refusal anyway. The shape above admits exactly
+     * four digits of year, so with both ends clamped nothing out of the column's range can reach it.
+     * But a clamp is what a wrong clock deserves, and year 0 is not a clock running slow — it is a
+     * stamp that names no time at all, and 400 is the only way the client is ever told so. The check
+     * runs on what was reported, before the clamp, which is what keeps that answer reachable.
      */
     expect(
       parseActivityInput({
@@ -325,6 +345,7 @@ describe("activity input parser", () => {
 
   test.each([
     ["a minute behind this server", -60_000],
+    ["half the allowance behind it", -MAX_ACTIVITY_CLOCK_SKEW_MS / 2],
     ["half the allowance ahead of it", MAX_ACTIVITY_CLOCK_SKEW_MS / 2],
   ])("keeps a timestamp %s exactly as reported", (_label, offset) => {
     const reported = new Date(Date.now() + offset).toISOString();
@@ -364,6 +385,41 @@ describe("activity input parser", () => {
     );
     expect(parsed.value.at.getTime()).toBeLessThanOrEqual(
       after + MAX_ACTIVITY_CLOCK_SKEW_MS,
+    );
+  });
+
+  test("clamps a timestamp further behind than the allowance", () => {
+    /*
+     * The end that was left open, on the argument that "an old stamp cannot pin a row or hide a later
+     * message". True, and not the whole harm.
+     *
+     * Recency is `coalesce(last_message_at, created_at)`, so the FIRST report on a conversation
+     * replaces `created_at` as its sort key. This stamp has the right shape, names a year the column
+     * holds, is in the past so was never clamped, and matches the store's `last_message_at IS NULL`
+     * guard — so it was written, and the conversation then sorted BELOW one nobody had ever said
+     * anything in, with nothing in the API to reset it. Any signed-in caller could do it to their own
+     * conversations.
+     *
+     * The same missing floor is why a browser running behind whoever last wrote `last_message_at`
+     * had every report of its own ignored as stale, and — before the archive clear was given a guard
+     * of its own — could not speak an archived conversation back into view.
+     */
+    const before = Date.now();
+    const parsed = parseActivityInput({
+      text: "One more thing",
+      agentId: null,
+      at: "1970-01-02T00:00:00.000Z",
+    });
+    const after = Date.now();
+
+    if (!parsed.ok) throw new Error(parsed.error);
+    // Clamped rather than refused, for the same reason the ceiling is: a slow-clocked client would
+    // otherwise lose every report it ever makes rather than have one held to the allowance.
+    expect(parsed.value.at.getTime()).toBeGreaterThanOrEqual(
+      before - MAX_ACTIVITY_CLOCK_SKEW_MS,
+    );
+    expect(parsed.value.at.getTime()).toBeLessThanOrEqual(
+      after - MAX_ACTIVITY_CLOCK_SKEW_MS,
     );
   });
 });
@@ -666,7 +722,10 @@ describe("channel routes", () => {
   test("reports activity through the authenticated actor and answers 204", async () => {
     const store = fakeStore();
     const app = appFor(store);
-    const at = "2026-01-01T00:00:00.000Z";
+    // From this clock, because the assertion below is about the value the store was handed and the
+    // parser holds a report to the allowance either side of this server. A fixed stamp here proved
+    // whatever the calendar happened to say on the day it was read.
+    const at = new Date().toISOString();
 
     const response = await app.request(
       "http://openbot.test/channel-1/activity",
@@ -695,6 +754,40 @@ describe("channel routes", () => {
         { text: "One more thing", agentId: null, at: new Date(at) },
       ],
     ]);
+  });
+
+  test("holds a report from a slow clock to the allowance before the store sees it", async () => {
+    /*
+     * The clamp is route-reachable, in the direction that had no bound at all.
+     *
+     * A stamp in 1970 passes the shape check and names a year the column holds, so before the floor
+     * existed this exact request reached the store verbatim — and the store writes it to
+     * `last_message_at`, which is `coalesce(last_message_at, created_at)`, the roster's sort key. Any
+     * signed-in caller could sink their own conversation below one nobody had ever said anything in.
+     * The parser test above proves the clamp; this proves nothing on the way in undoes it.
+     */
+    const store = fakeStore();
+    const before = Date.now();
+
+    const response = await appFor(store).request(
+      "http://openbot.test/channel-1/activity",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          text: "One more thing",
+          agentId: null,
+          at: "1970-01-02T00:00:00.000Z",
+        }),
+      },
+    );
+
+    expect(response.status).toBe(204);
+    const [call] = store.calls;
+    const reported = call?.[3] as ChannelActivity | undefined;
+    expect(reported?.at.getTime()).toBeGreaterThanOrEqual(
+      before - MAX_ACTIVITY_CLOCK_SKEW_MS,
+    );
   });
 
   test("refuses an activity body too large to parse", async () => {
@@ -1490,6 +1583,55 @@ describe("channel store integration", () => {
       expect(await channelTableSnapshot()).toEqual(before);
     },
   );
+
+  test("keeps the preview a row has when the next message renders as nothing", async () => {
+    /*
+     * `previewOf` answers null for a message of nothing but invisible characters, and that null was
+     * written straight onto the row — while the bot-chat twin's title write two lines away refuses
+     * the same write, with an argument for why. So any caller could blank their own roster preview:
+     * the parser rejects on `text.trim()`, and `"\u200b".trim()` is one character long, so a message
+     * of zero-width spaces is accepted as text and rendered as nothing.
+     *
+     * `last_message_agent_id` is held back with it, because the two are halves of one fact — what the
+     * row shows and who said it — and moving the author alone leaves the row rendering a person's
+     * words under a Bot's name. `last_message_at` does move: the message is real, and recency is what
+     * the sort is for.
+     */
+    const actor = await createPersistentUser();
+    const agentId = await createPersistentAgent({
+      name: "Invisible-message agent",
+      owner: actor,
+    });
+    const created = await persistentStore.create(actor, [agentId]);
+    createdChannelIds.push(created.id);
+
+    const said = new Date();
+    await persistentStore.recordActivity(actor, created.id, {
+      text: "What is our refund policy?",
+      agentId: null,
+      at: said,
+    });
+    const invisible = new Date(said.getTime() + 1000);
+    await persistentStore.recordActivity(actor, created.id, {
+      // Written as escapes, because a message whose whole content is invisible is not something a
+      // reader of this file could otherwise see is here.
+      text: "\u200b \u200b",
+      agentId,
+      at: invisible,
+    });
+
+    const [row] = await database
+      .select({
+        lastMessage: channels.lastMessage,
+        lastMessageAt: channels.lastMessageAt,
+        lastMessageAgentId: channels.lastMessageAgentId,
+      })
+      .from(channels)
+      .where(eq(channels.id, created.id));
+    expect(row?.lastMessage).toBe("What is our refund policy?");
+    expect(row?.lastMessageAgentId).toBeNull();
+    expect(row?.lastMessageAt).toEqual(invisible);
+  });
 });
 
 describe("channel pinning", () => {

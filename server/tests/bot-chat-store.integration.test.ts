@@ -651,6 +651,53 @@ describe("recording activity", () => {
     );
   });
 
+  test("keeps the preview a row has when the next message renders as nothing", async () => {
+    /*
+     * The same message the title write above refuses, on the preview path, which took it.
+     *
+     * `previewOf` answers null for a message of nothing but invisible characters and that null was
+     * written straight onto the row — two lines from a title write that refuses it with an argument
+     * for why. So any caller could blank their own roster preview: the parser rejects on
+     * `text.trim()`, and `"\u200b".trim()` is one character long, so a message of zero-width spaces
+     * is accepted as text and renders as nothing.
+     *
+     * `last_message_agent_id` is held back with it, because the two are halves of one fact — what the
+     * row shows and who said it — and moving the author alone leaves the row rendering a person's
+     * words under a Bot's name. `last_message_at` does move: the message is real, and recency is what
+     * the sort is for.
+     */
+    const userId = await seedUser();
+    const agentId = await seedProfile();
+    const chat = await store.create(actorFor(userId), agentId);
+    createdBotChatIds.push(chat.id);
+
+    const said = new Date();
+    await store.recordActivity(actorFor(userId), chat.id, {
+      text: "What is our refund policy?",
+      agentId: null,
+      at: said,
+    });
+    const invisible = new Date(said.getTime() + 1000);
+    await store.recordActivity(actorFor(userId), chat.id, {
+      // Written as escapes, for the reason the title test above gives.
+      text: "\u200b \u200b",
+      agentId,
+      at: invisible,
+    });
+
+    const [row] = await database
+      .select({
+        lastMessage: botChats.lastMessage,
+        lastMessageAt: botChats.lastMessageAt,
+        lastMessageAgentId: botChats.lastMessageAgentId,
+      })
+      .from(botChats)
+      .where(eq(botChats.id, chat.id));
+    expect(row?.lastMessage).toBe("What is our refund policy?");
+    expect(row?.lastMessageAgentId).toBeNull();
+    expect(row?.lastMessageAt).toEqual(invisible);
+  });
+
   test("says it restored a conversation archived while it was deciding", async () => {
     const userId = await seedUser();
     const agentId = await seedProfile();
@@ -767,12 +814,140 @@ describe("recording activity", () => {
     });
 
     /*
-     * The moves-forwards-only guard is what carries this. Saying something in an archived
-     * conversation restores it, so a report that arrives late — a reply the client only got round to
-     * announcing after the person put the conversation away — would otherwise pull it back onto the
-     * roster, and the archive would have been undone by nothing anybody did.
+     * The clear's own guard is what carries this: the report predates `archived_at`. Saying something
+     * in an archived conversation restores it, so a report that arrives late — a message the client
+     * only got round to announcing after the person put the conversation away — would otherwise pull
+     * it back onto the roster, and the archive would have been undone by nothing anybody did.
+     *
+     * The report here is also stale for the preview, which is why this test passed while the two
+     * questions shared one guard. The three tests below are the cases where they disagree.
      */
     expect((await store.get(actorFor(userId), chat.id))?.archived).toBe(true);
+  });
+
+  test("restores a chat on a message newer than the archive but behind the stored last message", async () => {
+    /*
+     * The archive silently failing to lift, which is the direction that strands somebody.
+     *
+     * The clear used to ride the moves-forwards-only guard, so a person's message was measured
+     * against `last_message_at` and never against `archived_at` at all. Here the Bot's reply is
+     * reported first and carries the later stamp — a clock a couple of seconds slow on the tab the
+     * person is typing in is all it takes — so their message reads as stale, the row stays archived,
+     * `restored` is false so no `bot_chat.unarchived` row is written and no `archived: false` goes on
+     * the wire, and the POST still answers 204.
+     */
+    const userId = await seedUser();
+    const agentId = await seedProfile();
+    const chat = await store.create(actorFor(userId), agentId);
+    createdBotChatIds.push(chat.id);
+
+    await store.setArchived(actorFor(userId), chat.id, true);
+    // Taken after the archive committed, so both stamps below are newer than `archived_at` whatever
+    // this machine's clock did in between.
+    const afterArchive = new Date();
+
+    await store.recordActivity(actorFor(userId), chat.id, {
+      text: "Thirty days, unopened.",
+      agentId,
+      at: new Date(afterArchive.getTime() + 2000),
+    });
+    const outcome = await store.recordActivity(actorFor(userId), chat.id, {
+      text: "One more thing",
+      agentId: null,
+      at: new Date(afterArchive.getTime() + 1000),
+    });
+
+    expect(outcome).toEqual({ restored: true });
+    expect((await store.get(actorFor(userId), chat.id))?.archived).toBe(false);
+
+    const [row] = await database
+      .select({ lastMessage: botChats.lastMessage })
+      .from(botChats)
+      .where(eq(botChats.id, chat.id));
+    // And the preview did not go backwards. The report is still stale for the recency write, which is
+    // the whole reason these are two statements: whether a conversation is hidden and what its last
+    // message was are different questions about it.
+    expect(row?.lastMessage).toBe("Thirty days, unopened.");
+  });
+
+  test("leaves the archive in place for a person's own message that predates it", async () => {
+    /*
+     * The same root cause, the opposite symptom: the archive lifting on its own.
+     *
+     * The Bot's reply was excluded from clearing `archived_at`, and the person's own late report walks
+     * the identical path. Sent at T1, archived at T2, reported at T3: newer than `last_message_at`, so
+     * the old single guard let it through, and it cleared an archive that did not exist when the
+     * message was said — with a `bot_chat.unarchived` row on the trail for it, which `audit.ts` argues
+     * is worse than no row at all.
+     */
+    const userId = await seedUser();
+    const agentId = await seedProfile();
+    const chat = await store.create(actorFor(userId), agentId);
+    createdBotChatIds.push(chat.id);
+
+    const asked = new Date(Date.now() - 60_000);
+    await store.recordActivity(actorFor(userId), chat.id, {
+      text: "What is our refund policy?",
+      agentId: null,
+      at: asked,
+    });
+    await store.setArchived(actorFor(userId), chat.id, true);
+
+    const outcome = await store.recordActivity(actorFor(userId), chat.id, {
+      text: "And one more thing",
+      agentId: null,
+      at: new Date(asked.getTime() + 1000),
+    });
+
+    expect(outcome).toEqual({ restored: false });
+    expect((await store.get(actorFor(userId), chat.id))?.archived).toBe(true);
+
+    const [row] = await database
+      .select({ lastMessage: botChats.lastMessage })
+      .from(botChats)
+      .where(eq(botChats.id, chat.id));
+    // Hidden, not frozen: the message still moves the preview and the recency. Only the clear is
+    // refused.
+    expect(row?.lastMessage).toBe("And one more thing");
+  });
+
+  test("takes a report whose stamp equals the one already stored", async () => {
+    /*
+     * An equal stamp from a later report is not a regression, and the guard read it as one.
+     *
+     * `>` on `last_message_at` dropped the second of two reports carrying one instant, and the skew
+     * clamp in `parseActivityInput` is what manufactures that: every report from a client more than
+     * the allowance out is rewritten to the same bound, so two reports made inside one millisecond of
+     * the server's clock arrive identical. Dropped, the second report lost its preview AND — before
+     * the clear was given its own statement — its unarchiving with it.
+     */
+    const userId = await seedUser();
+    const agentId = await seedProfile();
+    const chat = await store.create(actorFor(userId), agentId);
+    createdBotChatIds.push(chat.id);
+
+    await store.setArchived(actorFor(userId), chat.id, true);
+    const at = new Date(Date.now() + 1000);
+
+    await store.recordActivity(actorFor(userId), chat.id, {
+      text: "Thirty days, unopened.",
+      agentId,
+      at,
+    });
+    const outcome = await store.recordActivity(actorFor(userId), chat.id, {
+      text: "One more thing",
+      agentId: null,
+      at,
+    });
+
+    expect(outcome).toEqual({ restored: true });
+    expect((await store.get(actorFor(userId), chat.id))?.archived).toBe(false);
+
+    const [row] = await database
+      .select({ lastMessage: botChats.lastMessage })
+      .from(botChats)
+      .where(eq(botChats.id, chat.id));
+    expect(row?.lastMessage).toBe("One more thing");
   });
 
   test("refuses an agent id that is not this chat's Bot", async () => {
