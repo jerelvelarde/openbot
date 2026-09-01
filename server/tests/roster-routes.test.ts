@@ -5,12 +5,7 @@ import { createApp } from "../src/app";
 import type { AppVariables, AuthenticatedActor } from "../src/auth/guards";
 import { loadConfig } from "../src/config";
 import { createRosterRoutes } from "../src/roster/routes";
-import type {
-  RosterItem,
-  RosterPage,
-  RosterQuery,
-  RosterStore,
-} from "../src/roster/query";
+import type { RosterItem, RosterPage, RosterStore } from "../src/roster/query";
 import { testEnvironment } from "./support/environment";
 
 /**
@@ -18,7 +13,7 @@ import { testEnvironment } from "./support/environment";
  * of the two, and it carries an email the narrower type has no field for. Annotated `AgentActor` it
  * did not compile — `context.set("actor", …)` wants the wider type — and nothing said so, because
  * `server/tsconfig.json` excludes `tests`. `RosterStore.list` takes the narrower type and receives
- * this unchanged, which is what the assertions on `store.queries` below are about.
+ * this unchanged, which is what the assertions on `store.calls` below are about.
  *
  * The third of three fixtures in this change with the same defect; `channel-archive.test.ts` and
  * `bot-chat-routes.test.ts` are the two that were already annotated this way.
@@ -56,28 +51,87 @@ function item(overrides: Partial<RosterItem> = {}): RosterItem {
   };
 }
 
+type StoreCall = [method: keyof RosterStore, ...arguments_: unknown[]];
+
 /**
- * Records the query it was given rather than answering from a database, so the assertions below are
- * about what the route asked for, not about anything a real `RosterStore` would compute.
+ * Records the actor and the query it was given rather than answering from a database, so the
+ * assertions below are about what the route asked for and who it asked as, not about anything a real
+ * `RosterStore` would compute.
+ *
+ * `calls`, WITH THE ACTOR IN EVERY ONE, is `channel-routes.test.ts`'s and `bot-chat-routes.test.ts`'s
+ * shape rather than a third spelling of it. This file used to record the query alone —
+ * `async list(_actor, …)` — and discard the actor, which is the one thing `GET /api/roster` has to get
+ * right: it is the sidebar's only read and its entire authorization is that the store is handed
+ * whoever the middleware authenticated. Nothing here observed that, so deleting `requireUser` from
+ * the route left all nineteen tests green, and so did handing the store somebody else's actor, while
+ * the same deletion fails two tests on channels and five on bot chats.
  */
-function fakeStore(page: RosterPage): RosterStore & { queries: RosterQuery[] } {
-  const queries: RosterQuery[] = [];
+function fakeStore(page: RosterPage): RosterStore & { calls: StoreCall[] } {
+  const calls: StoreCall[] = [];
   return {
-    async list(_actor, query = {}) {
-      queries.push(query);
+    async list(receivedActor, query = {}) {
+      calls.push(["list", receivedActor, query]);
       return page;
     },
-    queries,
+    calls,
   };
 }
 
-function appFor(store: RosterStore) {
+/**
+ * The middleware is a parameter, the way it is in `channel-routes.test.ts`, so a test can authenticate
+ * somebody other than this file's one actor. Without that, "the store is read as the authenticated
+ * actor" and "the store is read as the actor this file happens to declare" are the same assertion.
+ */
+function appFor(
+  store: RosterStore,
+  middleware: MiddlewareHandler<{ Variables: AppVariables }> = requireUser,
+) {
   const app = new Hono<{ Variables: AppVariables }>();
-  app.route("/", createRosterRoutes(store, requireUser));
+  app.route("/", createRosterRoutes(store, middleware));
   return app;
 }
 
 describe("GET /", () => {
+  /*
+   * WHO THE ROSTER IS READ AS, which on this endpoint is the whole of the authorization.
+   *
+   * `RosterStore.list` is scoped to the actor it is handed and there is no other check anywhere on
+   * this route: no membership term, no ownership term, nothing to refuse. So the one thing that can go
+   * wrong here is the actor not arriving, and until this file recorded the actor nothing could tell.
+   * Asserted on every call below as well, the way both sibling fixtures do it, rather than only here —
+   * a route that forwarded the actor for a plain read and dropped it for a filtered one would pass a
+   * single test at the top of the file.
+   */
+  test("reads the roster as the authenticated actor", async () => {
+    const store = fakeStore({ items: [], nextCursor: null });
+    await appFor(store).request("/");
+
+    expect(store.calls).toEqual([["list", actor, { status: "active" }]]);
+  });
+
+  test("reads it as whoever the middleware authenticated, not as a fixed actor", async () => {
+    /*
+     * The half the test above cannot make: it compares against the only actor this file declares, so
+     * a route that ignored `context.var.actor` and read as some constant of its own would satisfy it
+     * as long as the constant matched. A second actor is what separates "forwards the actor" from
+     * "happens to agree with this fixture".
+     */
+    const somebodyElse: AuthenticatedActor = {
+      id: "user-2",
+      email: "other@openbot.test",
+      role: "admin",
+    };
+    const store = fakeStore({ items: [item()], nextCursor: null });
+
+    const response = await appFor(store, async (context, next) => {
+      context.set("actor", somebodyElse);
+      await next();
+    }).request("/");
+
+    expect(response.status).toBe(200);
+    expect(store.calls).toEqual([["list", somebodyElse, { status: "active" }]]);
+  });
+
   test("serialises every timestamp as ISO-8601", async () => {
     const store = fakeStore({ items: [item()], nextCursor: null });
     const response = await appFor(store).request("/");
@@ -109,22 +163,22 @@ describe("GET /", () => {
     const store = fakeStore({ items: [], nextCursor: null });
     await appFor(store).request("/?status=archived");
 
-    expect(store.queries).toEqual([{ status: "archived" }]);
+    expect(store.calls).toEqual([["list", actor, { status: "archived" }]]);
   });
 
   test("reads an unrecognised status as active", async () => {
     const store = fakeStore({ items: [], nextCursor: null });
     await appFor(store).request("/?status=nonsense");
 
-    expect(store.queries).toEqual([{ status: "active" }]);
+    expect(store.calls).toEqual([["list", actor, { status: "active" }]]);
   });
 
   test("passes a cursor and a limit through", async () => {
     const store = fakeStore({ items: [], nextCursor: null });
     await appFor(store).request("/?cursor=abc&limit=10");
 
-    expect(store.queries).toEqual([
-      { status: "active", cursor: "abc", limit: 10 },
+    expect(store.calls).toEqual([
+      ["list", actor, { status: "active", cursor: "abc", limit: 10 }],
     ]);
   });
 
@@ -134,14 +188,18 @@ describe("GET /", () => {
     const store = fakeStore({ items: [], nextCursor: null });
     await appFor(store).request("/?limit=1000");
 
-    expect(store.queries).toEqual([{ status: "active", limit: 1000 }]);
+    expect(store.calls).toEqual([
+      ["list", actor, { status: "active", limit: 1000 }],
+    ]);
   });
 
   test("reads a leading zero as a digit, not as a refusal", async () => {
     const store = fakeStore({ items: [], nextCursor: null });
     await appFor(store).request("/?limit=007");
 
-    expect(store.queries).toEqual([{ status: "active", limit: 7 }]);
+    expect(store.calls).toEqual([
+      ["list", actor, { status: "active", limit: 7 }],
+    ]);
   });
 
   test("reads an empty ?limit= as absent", async () => {
@@ -150,7 +208,7 @@ describe("GET /", () => {
     const store = fakeStore({ items: [], nextCursor: null });
     await appFor(store).request("/?limit=");
 
-    expect(store.queries).toEqual([{ status: "active" }]);
+    expect(store.calls).toEqual([["list", actor, { status: "active" }]]);
   });
 
   /*
@@ -183,7 +241,7 @@ describe("GET /", () => {
     });
     // And no page was read. A refusal that still served rows would be the same misreading with a
     // status code on top of it.
-    expect(store.queries).toEqual([]);
+    expect(store.calls).toEqual([]);
   });
 
   test("carries the next cursor", async () => {
