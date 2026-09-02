@@ -418,7 +418,7 @@ export function createAgentProfileStore(
            * it alone" rather than "remove it".
            */
           const [row] = await transaction
-            .select({ configuration: agents.configuration })
+            .select({ configuration: agents.configuration, type: agents.type })
             .from(agents)
             .where(eq(agents.id, id))
             .limit(1);
@@ -426,8 +426,29 @@ export function createAgentProfileStore(
             string,
             unknown
           >;
+          /**
+           * A coworker that runs here runs on its role description, so editing one has to move both.
+           *
+           * `create` writes the role description into `configuration.systemPrompt` for a coworker
+           * with no address, and that prompt is the ONLY instruction such a coworker ever gets:
+           * `registeredAgentFromRow` gives a `built_in` agent its `systemPrompt` and no standing
+           * role message, so `agentProfiles.roleDescription` never reaches it. Left out of this
+           * merge, an edit wrote the new text to the profile every screen reads and left the Bot
+           * running on the original — permanently, with nothing anywhere to say so. That is the
+           * worst shape a failed edit can take, and it is the same one the endpoint comment above
+           * describes.
+           *
+           * Only for `built_in`, and that matters. A remote Bot has no `systemPrompt` and must not
+           * acquire one — its instruction travels as the standing role message instead — and the
+           * tenant package's Bots, whose `system_prompt` is deliberately not their
+           * `role_description`, cannot reach this code at all: `requireManageable` above throws
+           * `ProtectedAgentError` for anything the package owns.
+           */
           const configuration = {
             ...previous,
+            ...(row?.type === "built_in"
+              ? { systemPrompt: input.roleDescription }
+              : {}),
             ...(input.endpoint ? { endpoint: input.endpoint } : {}),
             ...(input.auth && vault
               ? {

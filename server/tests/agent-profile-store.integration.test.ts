@@ -268,6 +268,83 @@ describe("agent profile store integration", () => {
     expect(created.endpoint).toBeNull();
   });
 
+  /**
+   * The other half of the same column, and the half that was missing.
+   *
+   * `registeredAgentFromRow` gives a `built_in` agent its `configuration.systemPrompt` and NO
+   * standing role message, so that column is the whole of what such a coworker is ever told —
+   * `agentProfiles.roleDescription` never reaches it. `update` wrote only the profile, so editing a
+   * coworker that runs here changed what every screen shows and nothing the Bot follows, for good,
+   * with nothing anywhere to say so.
+   */
+  test("an edit moves the instruction a coworker that runs here actually follows", async () => {
+    const owner = await createUser();
+    const withoutManaged = createAgentProfileStore(database, undefined);
+    const created = await withoutManaged.create(owner, {
+      name: "Runs Here",
+      title: "Accounts Receivable",
+      roleDescription: "The first instruction.",
+      visibility: "private",
+      systemPrompt: "The first instruction.",
+    });
+    createdAgentIds.push(created.id);
+
+    await withoutManaged.update(owner, created.id, {
+      name: "Runs Here",
+      title: "Accounts Receivable",
+      roleDescription: "The second instruction, which must be the live one.",
+      visibility: "private",
+    });
+
+    const [row] = await database
+      .select({ type: agents.type, configuration: agents.configuration })
+      .from(agents)
+      .where(eq(agents.id, created.id))
+      .limit(1);
+    expect(row?.type).toBe("built_in");
+    expect(
+      (row?.configuration as { systemPrompt?: string } | null)?.systemPrompt,
+    ).toBe("The second instruction, which must be the live one.");
+    // And the profile every screen reads agrees, rather than only one of the two moving.
+    expect((await profileById(owner, created.id)).roleDescription).toBe(
+      "The second instruction, which must be the live one.",
+    );
+  });
+
+  /**
+   * A coworker at its own address must not acquire a prompt it never had.
+   *
+   * Its instruction travels as the standing role message built from the profile, so a `systemPrompt`
+   * in its configuration would be a second source for the same thing — and the one the runtime
+   * prefers if that row's type ever changed.
+   */
+  test("an edit never gives a coworker at its own address a system prompt", async () => {
+    const owner = await createUser();
+    const source = await createProfileFixture({
+      owner,
+      visibility: "private",
+      configuration: { endpoint: "https://remote.example.test/ag-ui" },
+    });
+
+    await store.update(owner, source.agentId, {
+      name: "Still Remote",
+      title: "Elsewhere",
+      roleDescription: "Edited, and it still runs at its own address.",
+      visibility: "private",
+      endpoint: "https://remote.example.test/ag-ui",
+    });
+
+    const [row] = await database
+      .select({ type: agents.type, configuration: agents.configuration })
+      .from(agents)
+      .where(eq(agents.id, source.agentId))
+      .limit(1);
+    expect(row?.type).toBe("remote_ag_ui");
+    expect(
+      (row?.configuration as { systemPrompt?: string } | null)?.systemPrompt,
+    ).toBeUndefined();
+  });
+
   test("lets an owner and admin get and list a private profile but hides it from another user", async () => {
     const owner = await createUser();
     const other = await createUser();
