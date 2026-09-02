@@ -10,13 +10,19 @@ agents:
     system_prompt: You are a helpful general assistant. Give clear, concise, and accurate answers.
     # Authoring lives on the everyday Bot, and on this one only.
     #
-    # Holding `skill-creator` is what makes the app offer this Bot the four authoring tools, so this
-    # line is the difference between a deployment where people can write skills in a conversation and
-    # one where they fill in the form on /skills. It is on the general assistant because that is the
-    # Bot somebody already has open when they notice they keep asking for the same thing; putting it
-    # on Knowledge as well would spend four of its tool slots on a job nobody would ask it to do.
+    # Each of these slugs is a gate rather than a preference: the app offers a Bot the tools behind
+    # one only while it holds that skill. So these two lines are the difference between a deployment
+    # where people write skills and make coworkers in a conversation and one where they fill in the
+    # forms on /skills and /agents — and dropping either breaks its half with nothing on any screen
+    # to say why.
+    #
+    # Both are on the general assistant because that is the Bot somebody already has open when they
+    # notice they keep asking for the same thing, and the one with no specialism to dilute. Knowledge
+    # narrows to document tools per run, so spending its slots on jobs nobody would ask it to do is
+    # how the narrowing stops working for both.
     skills:
       - skill-creator
+      - bot-creator
   - id: knowledge
     name: Knowledge
     title: Company Knowledge
