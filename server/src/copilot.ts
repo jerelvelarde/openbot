@@ -683,12 +683,22 @@ function remoteAgentWithStandingRole(
     return {
       ...input,
       messages: [
-        agent.standingMessage,
+        /*
+         * Guarded like the holdings message beside it, rather than assumed.
+         *
+         * Every remote Bot this deployment builds comes through `registeredAgentFromRow`, which
+         * always writes one, so in production this is never absent. A caller assembling a registered
+         * agent by hand is not, though, and an absent standing role used to arrive here as a literal
+         * `undefined` in `messages` — which does not fail here at all. It fails several layers down
+         * inside the AG-UI client, mapping the outgoing body, as a `subagentRunId` read on undefined:
+         * a stack that names neither this file nor the missing role.
+         */
+        ...(agent.standingMessage ? [agent.standingMessage] : []),
         ...(holdingsMessage ? [holdingsMessage] : []),
         ...sanitizeSeededHistory(
           input.messages.filter(
             (message) =>
-              message.id !== agent.standingMessage.id &&
+              message.id !== agent.standingMessage?.id &&
               message.id !== holdingsMessage?.id,
           ),
           answeredByResume,

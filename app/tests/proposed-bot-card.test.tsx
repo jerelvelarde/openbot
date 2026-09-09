@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import {
   createMemoryHistory,
@@ -34,21 +34,34 @@ import {
  * class attribute, which is ugly and is the only way to catch the thing that would actually go
  * wrong.
  *
- * THE HARNESS IS THIS REPOSITORY'S, and matching it is load-bearing rather than tidiness. Every DOM
- * test here registers Happy DOM in `beforeAll` and unregisters it in `afterAll`, and bun walks every
- * file into one process — so a file that instead registered once at module scope and queried the
- * global `screen` has its document torn out from under it by whichever neighbour finishes first.
- * That failure is invisible in isolation: the file passes alone and every case in it fails in a full
- * run, which is exactly what this one did. Queries come off `render()`'s own return for the same
- * reason.
+ * THE HARNESS IS THIS REPOSITORY'S, and matching it is load-bearing rather than tidiness. bun walks
+ * every file into one process and the app tests here share ONE Happy DOM, installed at module scope
+ * by whichever file loads first and never unregistered — see the registration below. Queries still
+ * come off `render()`'s own return rather than the global `screen`, which is the half of the older
+ * convention worth keeping: it is what makes a case independent of what a neighbour left in the
+ * document, and `afterEach(cleanup)` is what keeps that true within this file.
  *
  * NO MODULE MOCKS, and nothing stubbed at `fetch`: creating is a prop, so the card is exercised with
  * a plain function and the transport never enters this file.
  */
 
-beforeAll(() => GlobalRegistrator.register());
+/*
+ * ONE DOM FOR THE WHOLE APP SUITE, REGISTERED HERE AND NEVER TORN DOWN.
+ *
+ * bun walks every test file into one process, and the app tests in this repository share a single
+ * Happy DOM installed at module scope by whichever file loads first. A file that registers in
+ * `beforeAll` and unregisters in `afterAll` instead pulls that document out from under every
+ * neighbour still to run: they were bound to it at import time, and they fail with "the window
+ * object is not available for the provided node" — a message that names neither this file nor the
+ * teardown. Invisible in isolation, too, since alone this file is the only one there is.
+ *
+ * The address is load-bearing separately: Happy DOM defaults to `about:blank`, whose origin is the
+ * STRING "null", and Better Auth throws `Invalid base URL: null` while it is being imported.
+ */
+if (!GlobalRegistrator.isRegistered) {
+  GlobalRegistrator.register({ url: "http://localhost:3010" });
+}
 afterEach(cleanup);
-afterAll(() => GlobalRegistrator.unregister());
 
 /** The instruction under test, long enough that a clamp would visibly cost somebody the end of it. */
 const INSTRUCTIONS =

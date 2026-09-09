@@ -32,8 +32,24 @@ class SocketDouble {
 
 let originalWebSocket: typeof WebSocket;
 
+/*
+ * ONE DOM FOR THE WHOLE APP SUITE, REGISTERED HERE AND NEVER TORN DOWN.
+ *
+ * bun walks every test file into one process, and the app tests in this repository share a single
+ * Happy DOM installed at module scope by whichever file loads first. A file that registers in
+ * `beforeAll` and unregisters in `afterAll` instead pulls that document out from under every
+ * neighbour still to run: they were bound to it at import time, and they fail with "the window
+ * object is not available for the provided node" — a message that names neither this file nor the
+ * teardown. Invisible in isolation, too, since alone this file is the only one there is.
+ *
+ * The address is load-bearing separately: Happy DOM defaults to `about:blank`, whose origin is the
+ * STRING "null", and Better Auth throws `Invalid base URL: null` while it is being imported.
+ */
+if (!GlobalRegistrator.isRegistered) {
+  GlobalRegistrator.register({ url: "http://localhost:3010" });
+}
+
 beforeAll(() => {
-  GlobalRegistrator.register();
   originalWebSocket = globalThis.WebSocket;
   globalThis.WebSocket = SocketDouble as unknown as typeof WebSocket;
 });
@@ -45,7 +61,6 @@ afterEach(() => {
 
 afterAll(() => {
   globalThis.WebSocket = originalWebSocket;
-  GlobalRegistrator.unregister();
 });
 
 async function liveSocket(): Promise<SocketDouble> {

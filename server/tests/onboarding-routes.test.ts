@@ -26,11 +26,13 @@ function appWith(store?: OnboardingStore) {
     } as never,
     { rolesForUser: async () => ["user"] },
     /*
-     * Positions 4-23 are the other stores; `store` is 24, onboardingStore, the signature's last.
-     * Every parameter from 4 on is optional, so a wrong count is a silent type-check pass — see
-     * people-routes.test.ts, which learned this the hard way.
+     * Positions 4-26 are the other stores; `store` is 27, onboardingStore. Every parameter from 4 on
+     * is optional, so a wrong count is a silent type-check pass — see people-routes.test.ts, which
+     * learned this the hard way. This fork carries three parameters upstream does not, so the pad is
+     * three longer than the same helper upstream: a count copied from there lands the store on
+     * `slackStatus` and every route below answers 503.
      */
-    ...(Array.from({ length: 20 }) as never[]),
+    ...(Array.from({ length: 23 }) as never[]),
     store as never,
   );
 }

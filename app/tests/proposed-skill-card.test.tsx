@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import { cleanup, render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -21,9 +21,23 @@ import { skillCardAnswer } from "@/lib/skills/proposal";
  * file deciding whether a later one has a DOM.
  */
 
-beforeAll(() => GlobalRegistrator.register());
+/*
+ * ONE DOM FOR THE WHOLE APP SUITE, REGISTERED HERE AND NEVER TORN DOWN.
+ *
+ * bun walks every test file into one process, and the app tests in this repository share a single
+ * Happy DOM installed at module scope by whichever file loads first. A file that registers in
+ * `beforeAll` and unregisters in `afterAll` instead pulls that document out from under every
+ * neighbour still to run: they were bound to it at import time, and they fail with "the window
+ * object is not available for the provided node" — a message that names neither this file nor the
+ * teardown. Invisible in isolation, too, since alone this file is the only one there is.
+ *
+ * The address is load-bearing separately: Happy DOM defaults to `about:blank`, whose origin is the
+ * STRING "null", and Better Auth throws `Invalid base URL: null` while it is being imported.
+ */
+if (!GlobalRegistrator.isRegistered) {
+  GlobalRegistrator.register({ url: "http://localhost:3010" });
+}
 afterEach(cleanup);
-afterAll(() => GlobalRegistrator.unregister());
 
 /** A draft that passes the fields, so each test varies only the thing it is about. */
 const DRAFT = {

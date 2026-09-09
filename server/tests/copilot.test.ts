@@ -1050,23 +1050,22 @@ describe("a person's standing instructions", () => {
 
   test("is resolved for whoever the request turned out to be", async () => {
     const asked: string[] = [];
+    /*
+     * Through the resolver, because that is the one place this deployment builds a coworker. The
+     * request path and a routine's headless turn both go through it, so a seam wired into only one
+     * of them would be exactly the drift the resolver exists to prevent.
+     */
     const factory = createRequestAgents(
       async () => ({ id: "user-7", role: "user" as const }),
-      async () => [assistant],
-      model,
-      async () => "openai-secret",
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      (actorId) => async () => {
-        asked.push(actorId);
-        return "Write in British English.";
-      },
+      createActorAgentResolver({
+        loadAgents: async () => [assistant],
+        model,
+        resolveModelApiKey: async () => "openai-secret",
+        loadInstructionsForActor: (actorId) => async () => {
+          asked.push(actorId);
+          return "Write in British English.";
+        },
+      }),
     );
 
     await factory({

@@ -42,13 +42,16 @@ function appWith(
     } as never,
     { rolesForUser: async () => ["user"] },
     /*
-     * Positions 4-12 are the other stores, 13 is auditStore, 14-24 are more stores, and `store` is
-     * 25, userInstructions, the signature's last. Every parameter from 4 on is optional, so a wrong
-     * count is a silent type-check pass: see people-routes.test.ts, which learned this the hard way.
+     * Positions 4-12 are the other stores, 13 is auditStore, 14-27 are more stores, and `store` is
+     * 28, userInstructions. Every parameter from 4 on is optional, so a wrong count is a silent
+     * type-check pass: see people-routes.test.ts, which learned this the hard way. This fork carries
+     * three parameters upstream does not, so the second pad is three longer than the same helper
+     * upstream: a count copied from there lands the store on `routineRunner` and every route below
+     * answers 503.
      */
     ...(Array.from({ length: 9 }) as never[]),
     options.auditStore as never,
-    ...(Array.from({ length: 11 }) as never[]),
+    ...(Array.from({ length: 14 }) as never[]),
     store as never,
   );
 }
