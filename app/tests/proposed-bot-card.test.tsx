@@ -8,7 +8,15 @@ import {
   Outlet,
   RouterProvider,
 } from "@tanstack/react-router";
+import { cleanup, render, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
+import { ProposedBotCard } from "@/components/agents/proposed-bot";
+import {
+  botCardAnswer,
+  createdBotIdIn,
+  wasCreated,
+} from "@/lib/agents/proposal";
 
 /**
  * The card a Bot's proposed coworker stops on, and every answer it can give.
@@ -26,31 +34,33 @@ import type { ReactNode } from "react";
  * class attribute, which is ugly and is the only way to catch the thing that would actually go
  * wrong.
  *
+ * THE HARNESS IS THIS REPOSITORY'S, and matching it is load-bearing rather than tidiness. bun walks
+ * every file into one process and the app tests here share ONE Happy DOM, installed at module scope
+ * by whichever file loads first and never unregistered — see the registration below. Queries still
+ * come off `render()`'s own return rather than the global `screen`, which is the half of the older
+ * convention worth keeping: it is what makes a case independent of what a neighbour left in the
+ * document, and `afterEach(cleanup)` is what keeps that true within this file.
+ *
  * NO MODULE MOCKS, and nothing stubbed at `fetch`: creating is a prop, so the card is exercised with
  * a plain function and the transport never enters this file.
  */
+
 /*
- * Registered with an address, and only if nothing else has registered already. `register` throws on
- * a second call and bun walks every test file into one process, so whichever DOM file the walk
- * reaches first installs the window. The address matters too: Happy DOM defaults to `about:blank`,
- * whose origin is the STRING "null", which Better Auth rejects while it is still being imported.
+ * ONE DOM FOR THE WHOLE APP SUITE, REGISTERED HERE AND NEVER TORN DOWN.
+ *
+ * bun walks every test file into one process, and the app tests in this repository share a single
+ * Happy DOM installed at module scope by whichever file loads first. A file that registers in
+ * `beforeAll` and unregisters in `afterAll` instead pulls that document out from under every
+ * neighbour still to run: they were bound to it at import time, and they fail with "the window
+ * object is not available for the provided node" — a message that names neither this file nor the
+ * teardown. Invisible in isolation, too, since alone this file is the only one there is.
+ *
+ * The address is load-bearing separately: Happy DOM defaults to `about:blank`, whose origin is the
+ * STRING "null", and Better Auth throws `Invalid base URL: null` while it is being imported.
  */
 if (!GlobalRegistrator.isRegistered) {
   GlobalRegistrator.register({ url: "http://localhost:3010" });
 }
-/*
- * A DOM before Testing Library. `screen` binds its queries to `document.body` at import time, so a
- * static import would be hoisted above the registration and bind to nothing.
- */
-const { cleanup, render, screen, waitFor } = await import(
-  "@testing-library/react"
-);
-const userEvent = (await import("@testing-library/user-event")).default;
-const { ProposedBotCard } = await import("@/components/agents/proposed-bot");
-const { botCardAnswer, createdBotIdIn, wasCreated } = await import(
-  "@/lib/agents/proposal"
-);
-
 afterEach(cleanup);
 
 /** The instruction under test, long enough that a clamp would visibly cost somebody the end of it. */
@@ -92,7 +102,7 @@ function routed(node: ReactNode) {
     history: createMemoryHistory({ initialEntries: ["/"] }),
   });
   // The app's router is registered globally for typing; this one only has to resolve /agents.
-  return <RouterProvider router={router as never} />;
+  return render(<RouterProvider router={router as never} />);
 }
 
 test("a proposal still streaming shows nothing to press", async () => {
@@ -101,42 +111,38 @@ test("a proposal still streaming shows nothing to press", async () => {
    * coworker out of half an instruction — and unlike a skill, a coworker cannot be quietly replaced
    * by proposing it again.
    */
-  render(
-    routed(
-      <ProposedBotCard args={{ name: "Renewal" }} create={async () => MADE} />,
-    ),
+  const view = routed(
+    <ProposedBotCard args={{ name: "Renewal" }} create={async () => MADE} />,
   );
 
   // Awaited rather than read synchronously: the router mounts its route on a later tick, so nothing
   // at all is in the document on the first one.
-  expect(await screen.findByText("Writing the coworker…")).toBeTruthy();
-  expect(screen.queryByRole("button")).toBeNull();
+  expect(await view.findByText("Writing the coworker…")).toBeTruthy();
+  expect(view.queryByRole("button")).toBeNull();
 });
 
 test("the whole instruction is on screen, unclipped, before anything is created", async () => {
   let created = 0;
-  render(
-    routed(
-      <ProposedBotCard
-        args={DRAFT}
-        create={async () => {
-          created += 1;
-          return MADE;
-        }}
-        respond={async () => {}}
-      />,
-    ),
+  const view = routed(
+    <ProposedBotCard
+      args={DRAFT}
+      create={async () => {
+        created += 1;
+        return MADE;
+      }}
+      respond={async () => {}}
+    />,
   );
 
-  const instruction = await screen.findByText(INSTRUCTIONS);
+  const instruction = await view.findByText(INSTRUCTIONS);
   // The regression this guards: a clamp or a truncate on the one field somebody is agreeing to.
   expect(instruction.className).not.toContain("line-clamp");
   expect(instruction.className).not.toContain("truncate");
   expect(instruction.className).toContain("overflow-y-auto");
 
-  expect(screen.getByText("Renewal Desk")).toBeTruthy();
-  expect(screen.getByText("Accounts Receivable")).toBeTruthy();
-  expect(screen.getByText("/find-a-document, /check-a-claim")).toBeTruthy();
+  expect(view.getByText("Renewal Desk")).toBeTruthy();
+  expect(view.getByText("Accounts Receivable")).toBeTruthy();
+  expect(view.getByText("/find-a-document, /check-a-claim")).toBeTruthy();
   // Rendering the card writes nothing. The press is the write.
   expect(created).toBe(0);
 });
@@ -144,22 +150,20 @@ test("the whole instruction is on screen, unclipped, before anything is created"
 test("pressing creates once and answers with what was made", async () => {
   const answers: string[] = [];
   let created = 0;
-  render(
-    routed(
-      <ProposedBotCard
-        args={DRAFT}
-        create={async () => {
-          created += 1;
-          return MADE;
-        }}
-        respond={async (result) => {
-          answers.push(String(result));
-        }}
-      />,
-    ),
+  const view = routed(
+    <ProposedBotCard
+      args={DRAFT}
+      create={async () => {
+        created += 1;
+        return MADE;
+      }}
+      respond={async (result) => {
+        answers.push(String(result));
+      }}
+    />,
   );
 
-  await userEvent.click(await screen.findByText("Create it"));
+  await userEvent.click(await view.findByText("Create it"));
 
   await waitFor(() => expect(answers.length).toBe(1));
   expect(created).toBe(1);
@@ -185,19 +189,17 @@ test("a skill that did not land is named rather than rounded up", async () => {
     granted: ["find-a-document"],
     failed: ["check-a-claim"],
   };
-  render(
-    routed(
-      <ProposedBotCard
-        args={DRAFT}
-        create={async () => partial}
-        respond={async (result) => {
-          answers.push(String(result));
-        }}
-      />,
-    ),
+  const view = routed(
+    <ProposedBotCard
+      args={DRAFT}
+      create={async () => partial}
+      respond={async (result) => {
+        answers.push(String(result));
+      }}
+    />,
   );
 
-  await userEvent.click(await screen.findByText("Create it"));
+  await userEvent.click(await view.findByText("Create it"));
 
   await waitFor(() => expect(answers.length).toBe(1));
   expect(answers[0]).toContain("/check-a-claim could not be put on it");
@@ -212,25 +214,23 @@ test("a skill that did not land is named rather than rounded up", async () => {
  */
 test("a refusal keeps the run open with the buttons still live", async () => {
   const answers: string[] = [];
-  render(
-    routed(
-      <ProposedBotCard
-        args={DRAFT}
-        create={async () => {
-          throw new Error("A coworker called Renewal Desk already exists.");
-        }}
-        respond={async (result) => {
-          answers.push(String(result));
-        }}
-      />,
-    ),
+  const view = routed(
+    <ProposedBotCard
+      args={DRAFT}
+      create={async () => {
+        throw new Error("A coworker called Renewal Desk already exists.");
+      }}
+      respond={async (result) => {
+        answers.push(String(result));
+      }}
+    />,
   );
 
-  await userEvent.click(await screen.findByText("Create it"));
+  await userEvent.click(await view.findByText("Create it"));
 
-  await screen.findByText("A coworker called Renewal Desk already exists.");
+  await view.findByText("A coworker called Renewal Desk already exists.");
   expect(answers).toEqual([]);
-  expect((screen.getByText("Create it") as HTMLButtonElement).disabled).toBe(
+  expect((view.getByText("Create it") as HTMLButtonElement).disabled).toBe(
     false,
   );
 });
@@ -238,22 +238,20 @@ test("a refusal keeps the run open with the buttons still live", async () => {
 test("declining answers without creating anything", async () => {
   const answers: string[] = [];
   let created = 0;
-  render(
-    routed(
-      <ProposedBotCard
-        args={DRAFT}
-        create={async () => {
-          created += 1;
-          return MADE;
-        }}
-        respond={async (result) => {
-          answers.push(String(result));
-        }}
-      />,
-    ),
+  const view = routed(
+    <ProposedBotCard
+      args={DRAFT}
+      create={async () => {
+        created += 1;
+        return MADE;
+      }}
+      respond={async (result) => {
+        answers.push(String(result));
+      }}
+    />,
   );
 
-  await userEvent.click(await screen.findByText("Don't create"));
+  await userEvent.click(await view.findByText("Don't create"));
 
   await waitFor(() => expect(answers.length).toBe(1));
   expect(answers[0]).toBe(botCardAnswer.declined());
@@ -270,26 +268,24 @@ test("declining answers without creating anything", async () => {
 test("an unwritable proposal is answered without asking anybody", async () => {
   const answers: string[] = [];
   let created = 0;
-  render(
-    routed(
-      <ProposedBotCard
-        args={{ name: "", title: "Accounts Receivable", roleDescription: "" }}
-        create={async () => {
-          created += 1;
-          return MADE;
-        }}
-        respond={async (result) => {
-          answers.push(String(result));
-        }}
-      />,
-    ),
+  const view = routed(
+    <ProposedBotCard
+      args={{ name: "", title: "Accounts Receivable", roleDescription: "" }}
+      create={async () => {
+        created += 1;
+        return MADE;
+      }}
+      respond={async (result) => {
+        answers.push(String(result));
+      }}
+    />,
   );
 
   await waitFor(() => expect(answers.length).toBe(1));
   expect(answers[0]).toContain("Not created, and the person was not asked");
   expect(answers[0]).toContain("name:");
   expect(created).toBe(0);
-  expect(screen.queryByText("Create it")).toBeNull();
+  expect(view.queryByText("Create it")).toBeNull();
 });
 
 /**
@@ -301,17 +297,15 @@ test("an unwritable proposal is answered without asking anybody", async () => {
  * anybody who refreshed the page — which is not a failure anything would report.
  */
 test("a completed card links to the coworker, rebuilt from the answer alone", async () => {
-  render(
-    routed(
-      <ProposedBotCard
-        args={DRAFT}
-        create={async () => MADE}
-        result={botCardAnswer.created(MADE)}
-      />,
-    ),
+  const view = routed(
+    <ProposedBotCard
+      args={DRAFT}
+      create={async () => MADE}
+      result={botCardAnswer.created(MADE)}
+    />,
   );
 
-  const link = await screen.findByText("Open Renewal Desk");
+  const link = await view.findByText("Open Renewal Desk");
   expect(link.closest("a")?.getAttribute("href")).toContain("agent=agent_1");
 });
 

@@ -8,7 +8,9 @@ import { createAgentRoutes } from "./agents/routes";
 import {
   type AuditReader,
   type AuditStore,
+  AuditQueryError,
   auditQueryFromUrl,
+  DEPLOYMENT_INITIATOR,
   recordAuditEvent,
 } from "./audit";
 import { createDevRequireUser } from "./auth/dev-actor";
@@ -36,6 +38,7 @@ import { createComputerRoutes } from "./computer/routes";
 import { configuredAuthProviders, type DeploymentConfig } from "./config";
 import type { CredentialAdminService, CredentialInput } from "./credentials";
 import { createIntelligenceClient } from "./intelligence-client";
+import type { OnboardingStore } from "./people/onboarding";
 import type { PeopleStore } from "./people/store";
 import { createPluginRoutes } from "./plugins/routes";
 import type { PluginStore } from "./plugins/store";
@@ -56,6 +59,11 @@ import {
 } from "./templates/routes";
 import type { TemplateReadExecutor, TemplateStore } from "./templates/store";
 import type { PackageStatusReader } from "./tenant-package";
+import {
+  INSTRUCTIONS_LIMIT,
+  InstructionsTooLongError,
+  type UserInstructionsStore,
+} from "./user-instructions";
 
 /**
  * One row for something an administrator did to somebody's access.
@@ -219,6 +227,28 @@ export function createApp(
    */
   routineStore?: RoutineStore,
   /**
+   * Where each person is in first-run onboarding.
+   *
+   * Appended last, like everything above it: these are positional, so inserting one anywhere else
+   * silently shifts every existing call site's arguments by one.
+   *
+   * Absent leaves /api/me reporting no onboarding to track, which is the correct degraded
+   * behaviour: a deployment that cannot read the status must not lock everybody behind a gate
+   * nothing can finish.
+   */
+  onboardingStore?: OnboardingStore,
+  /**
+   * One person's standing instructions, which every built-in coworker they run is told.
+   *
+   * Appended last, like everything above it: these are positional, so inserting one anywhere else
+   * silently shifts every existing call site's arguments by one.
+   *
+   * Absent leaves the routes answering 503 rather than "you have written none". The difference
+   * matters on exactly this screen: a person who cannot be told what they saved would otherwise be
+   * shown an empty box, and the obvious thing to do with an empty box is fill it in again.
+   */
+  userInstructions?: UserInstructionsStore,
+  /**
    * Bot templates: the drafts this deployment authored, and the one act that installs somebody's.
    *
    * Only the three things this module cannot build for itself. The trail, the grant stores and
@@ -353,9 +383,135 @@ export function createApp(
       ? createRequireUser(auth, roleRepository)
       : authenticationUnavailable;
 
-  app.get("/api/me", requireUser, (context) =>
-    context.json({ user: context.var.actor }),
+  app.get("/api/me", requireUser, async (context) =>
+    context.json({
+      user: {
+        ...context.var.actor,
+        /*
+         * Read here rather than in the guard, so only this route pays the extra query. Null means
+         * this deployment does not track onboarding, which the app reads as nothing to finish;
+         * a not-yet-completed status is what sends it to /onboarding.
+         */
+        onboarding: onboardingStore
+          ? await onboardingStore.status(context.var.actor.id)
+          : null,
+      },
+    }),
   );
+  app.post("/api/me/onboarding", requireUser, async (context) => {
+    if (!onboardingStore) {
+      return context.json({ error: "Onboarding is not available." }, 503);
+    }
+
+    const body = (await context.req.json().catch(() => undefined)) as
+      | { step?: unknown; completed?: unknown }
+      | undefined;
+
+    if (body?.completed === true) {
+      await onboardingStore.complete(context.var.actor.id);
+    } else if (
+      typeof body?.step === "number" &&
+      Number.isInteger(body.step) &&
+      body.step >= 0 &&
+      // The column's range — the only bound the server knows, since the wizard's length is the
+      // app's fact rather than the deployment's.
+      body.step <= 2_147_483_647
+    ) {
+      await onboardingStore.setStep(context.var.actor.id, body.step);
+    } else {
+      return context.json(
+        { error: "Send the step to move to, or completed: true." },
+        400,
+      );
+    }
+
+    return context.json({
+      onboarding: await onboardingStore.status(context.var.actor.id),
+    });
+  });
+  /*
+   * A person's own standing instructions, read and written by the person they belong to.
+   *
+   * `requireUser` and never `requireAdmin`, and scoped to `context.var.actor.id` rather than to
+   * anything in the path or the body. There is deliberately no route here for reading somebody
+   * else's or writing on their behalf: these instructions go into a prompt that then speaks as that
+   * person's coworker, so a way to set them for another account would be a way to put words in
+   * somebody's mouth in every channel they work in. An administrator has no business here either,
+   * for the same reason.
+   */
+  app.get("/api/settings/instructions", requireUser, async (context) => {
+    if (!userInstructions) {
+      return context.json(
+        { error: "Standing instructions are not available." },
+        503,
+      );
+    }
+
+    return context.json({
+      // "" is what having written none looks like to a text box, and the store's null is what it
+      // looks like to a database. The translation happens once, here.
+      instructions: (await userInstructions.read(context.var.actor.id)) ?? "",
+    });
+  });
+  app.put("/api/settings/instructions", requireUser, async (context) => {
+    if (!userInstructions) {
+      return context.json(
+        { error: "Standing instructions are not available." },
+        503,
+      );
+    }
+
+    const body = (await context.req.json().catch(() => undefined)) as
+      | { instructions?: unknown }
+      | undefined;
+
+    if (typeof body?.instructions !== "string") {
+      return context.json({ error: "Send the instructions to save." }, 400);
+    }
+
+    /*
+     * The cap is the store's rule, so the store is what enforces it and this catches the refusal
+     * rather than checking the length again. A second copy of `> 4000` here is a second place for
+     * the number to be changed in only one of them.
+     */
+    let saved: string;
+    try {
+      saved = await userInstructions.write(
+        context.var.actor.id,
+        body.instructions,
+      );
+    } catch (error) {
+      if (error instanceof InstructionsTooLongError) {
+        return context.json({ error: error.message }, 400);
+      }
+      throw error;
+    }
+
+    /*
+     * The trail records that they changed and how long they now are, NEVER what they say.
+     *
+     * The audit table is append-only and read by administrators, and this is a person's own note
+     * about how they want to be spoken to. Recording the text would put it somewhere they cannot
+     * edit it and somebody else can read it, which is not what a preferences screen promises. The
+     * length is enough to answer the question a trail is for: when did this change, and to what
+     * extent.
+     */
+    if (auditStore) {
+      await recordAuditEvent(auditStore, {
+        eventType: "configuration.changed",
+        targetType: "user_instructions",
+        targetId: context.var.actor.id,
+        actorUserId: context.var.actor.id,
+        payload: {
+          change: saved === "" ? "instructions_cleared" : "instructions_saved",
+          characters: saved.length,
+          limit: INSTRUCTIONS_LIMIT,
+        },
+      });
+    }
+
+    return context.json({ instructions: saved });
+  });
   app.get("/api/admin/status", requireUser, (context) => {
     const denied = requireAdmin(context);
     return denied ?? context.json({ status: "ok" });
@@ -369,9 +525,16 @@ export function createApp(
       return context.json({ error: "Audit logging is not configured." }, 503);
     }
 
-    return context.json(
-      await auditReader.list(auditQueryFromUrl(new URL(context.req.url))),
-    );
+    try {
+      return context.json(
+        await auditReader.list(auditQueryFromUrl(new URL(context.req.url))),
+      );
+    } catch (error) {
+      if (error instanceof AuditQueryError) {
+        return context.json({ error: error.message }, 400);
+      }
+      throw error;
+    }
   });
   /*
    * Who is here, and what they may do.
@@ -741,6 +904,7 @@ export function createApp(
             await recordAuditEvent(auditStore, {
               eventType: "routines.dispatch_refused",
               targetType: "worker",
+              initiator: DEPLOYMENT_INITIATOR,
               payload: {
                 reason: !expected
                   ? "unconfigured"
@@ -854,8 +1018,16 @@ export function createApp(
                 config.handoff.maxDepth > 0 && config.handoff.maxPerRun > 0,
               reachableFrom: (agentId) =>
                 pluginStore.botsReachableFrom(agentId),
+              // The same answer the write path checks, read up front so the screen can say it once.
+              runsHere: (agentId) => pluginStore.agentRunsHere(agentId),
             }
           : undefined,
+        // Whether "built-in" is a kind of coworker this deployment can actually make: the create
+        // path falls back to the managed Bot's endpoint, so without one it can only refuse.
+        config.managedAgent !== undefined,
+        // The managed Bot's address, so a coworker created without an endpoint — which creation
+        // stores as running at this address — can be told apart from one a person hosts.
+        config.managedAgent?.endpoint.toString(),
         /*
          * Packing a coworker into a template draft, mounted on the Bot rather than under
          * /api/templates because that is what it is done to.
@@ -1091,6 +1263,7 @@ export function createApp(
           await recordAuditEvent(auditStore, {
             eventType: "mcp.callback_refused",
             targetType: "mcp_tool",
+            initiator: DEPLOYMENT_INITIATOR,
             targetId:
               typeof body?.name === "string"
                 ? body.name.slice(0, 120)

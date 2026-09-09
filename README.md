@@ -11,6 +11,8 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 ![Alpha](https://img.shields.io/badge/status-alpha-orange.svg)
 
+[![Trendshift: #3 Repository Of The Day](https://trendshift.io/api/badge/trendshift/repositories/175080/daily)](https://trendshift.io/repositories/175080)
+
 </div>
 
 https://github.com/user-attachments/assets/535ef7ee-1631-4a69-b839-564c56cf90b4
@@ -24,6 +26,8 @@ answers with components rather than only prose, and the whole thing runs on
 your own machine.
 
 </div>
+
+> **A template, not a product.** OpenBot is meant to be cloned and made your own. There is no hosted version to sign up for, and nothing here is published as a package to depend on: every workspace in this repository is private. You take the repository, replace the example tenant package under `examples/` with your own coworkers, channels and skills, and run it. Everything below describes a starting point, not a finished thing somebody operates for you.
 
 > **Alpha, and under active development.** OpenBot is early. Expect rough edges and bugs, and expect things to move. Issues and pull requests are welcome.
 
@@ -57,6 +61,11 @@ A Bot is any endpoint speaking [AG-UI](https://github.com/ag-ui-protocol/ag-ui),
 
 ## Quick start
 
+> **Setting up with an AI assistant?** Paste [`prompt.txt`](prompt.txt) into it first. It carries the
+> same steps as below plus the things that are easy to get wrong: which of the ten blank keys in
+> `.env.example` are actually yours to fill (three), which the start script generates for you, and
+> what each start-up refusal means. Every claim in it is checked against this repository.
+
 1. Create `.env`:
 
    ```sh
@@ -68,12 +77,12 @@ A Bot is any endpoint speaking [AG-UI](https://github.com/ag-ui-protocol/ag-ui),
    ```sh
    npx --yes copilotkit@latest login
    npx --yes copilotkit@latest project select
-   npx --yes copilotkit@latest license --write
    ```
 
    Put the `cpk-...` runtime key from `project select` in `.env` as
-   `INTELLIGENCE_API_KEY`. `license --write` writes
-   `COPILOTKIT_LICENSE_TOKEN` into the existing `.env`.
+   `INTELLIGENCE_API_KEY`. That is the only Intelligence credential you need:
+   managed Intelligence derives entitlement from the project key, so there is
+   no separate licence token to fetch.
 
 3. Fill the remaining required values:
 
@@ -96,6 +105,8 @@ A Bot is any endpoint speaking [AG-UI](https://github.com/ag-ui-protocol/ag-ui),
 
 `scripts/start.sh` starts Docker services, applies migrations, starts the API server on port 3001, starts the app on port 3010, and checks that the services answer their own health routes before printing next steps.
 
+`scripts/stop.sh` takes the same things down, including each Bot's computer, which compose does not own. Nothing is deleted: the database, the Bots' files and their browser profiles are volumes.
+
 ## Deploy it
 
 One image carries the app, the API, the browser the Bots drive, and optionally PostgreSQL. Same
@@ -104,7 +115,7 @@ One image carries the app, the API, the browser the Bots drive, and optionally P
 ```sh
 docker build -t openbot .
 docker run -p 3001:3001 --env-file .env \
-  -e EMBEDDED_POSTGRES=on -v openbot-data:/var/lib/postgresql/data openbot
+  -e EMBEDDED_POSTGRES=on -v openbot-data:/var/lib/postgresql openbot
 ```
 
 Leave `EMBEDDED_POSTGRES` off and set `DATABASE_URL` to point at a database you already run.
@@ -199,7 +210,10 @@ See [docs/configuration.md](docs/configuration.md) and [docs/coworkers.md](docs/
 - `INTELLIGENCE_API_URL`
 - `INTELLIGENCE_GATEWAY_WS_URL`
 - `INTELLIGENCE_API_KEY`
-- `COPILOTKIT_LICENSE_TOKEN`
+
+`COPILOTKIT_LICENSE_TOKEN` is optional. A self-hosted Intelligence with its own
+licence can still set it and it is forwarded to the runtime; managed Intelligence
+does not issue one and startup no longer asks for it.
 
 Settings worth knowing:
 
@@ -326,7 +340,7 @@ bun run --filter server db:generate
 bun run --filter server db:migrate
 ```
 
-Use `bash scripts/start.sh` for the whole stack. Use `bun run dev` only when you want the app and server without the Docker Bots and computers.
+Use `bash scripts/start.sh` for the whole stack and `bash scripts/stop.sh` to take it down. Use `bun run dev` only when you want the app and server without the Docker Bots and computers.
 
 ## Documentation
 

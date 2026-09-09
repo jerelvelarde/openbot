@@ -356,7 +356,7 @@ info = json.loads(sys.argv[1])
 status, agents = info.get("licenseStatus"), list(info.get("agents", {}))
 if status != "valid":
     print(f"\033[31m  licence is '{status}', not 'valid'.\033[0m")
-    print("\033[31m  Run: npx copilotkit@latest login && npx copilotkit@latest license --write\033[0m")
+    print("\033[31m  Check INTELLIGENCE_API_KEY: npx copilotkit@latest login && npx copilotkit@latest project select\033[0m")
     print("\033[31m  See README.md for Intelligence setup.\033[0m")
     raise SystemExit(1)
 if not agents:
@@ -394,10 +394,9 @@ Try:
 
 Logs: $LOGS
   Routine sweep worker: $LOGS/worker.log
-Stop the routine worker: pkill -f 'bun worker/src/index.ts'
-Stop Docker services: docker compose down
-  A Bot's computer is made by the supervisor rather than by compose, so it keeps running:
-  docker rm -f \$(docker ps -q --filter label=openbot.supervisor=true)
-  Its files and its browser profile are volumes and survive either way.
-Stop host app/server: kill the processes using ports $APP_PORT and $SERVER_PORT
+
+Stop all of it: bash scripts/stop.sh
+  The app, the worker, the API server, the Docker services, and each Bot's computer, which compose
+  does not own because the supervisor makes it. Pass --keep-computers to leave the browsers signed
+  in. Nothing is deleted either way: the database, the files and the browser profiles are volumes.
 EOF

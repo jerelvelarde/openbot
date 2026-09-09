@@ -198,6 +198,12 @@ function appFor(
       false,
       auditStore,
       new Set(),
+      // handoff
+      undefined,
+      // builtInAvailable and managedEndpoint, which this suite does not exercise. Named rather than
+      // left off: `templateExport` is positional and sits after them, so a missing placeholder here
+      // hands the export to `builtInAvailable` and every route below answers 503.
+      undefined,
       undefined,
       createTemplateExport({
         executor: database,

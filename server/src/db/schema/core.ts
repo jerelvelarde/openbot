@@ -4,6 +4,7 @@ import {
   boolean,
   check,
   index,
+  integer,
   pgEnum,
   pgTable,
   primaryKey,
@@ -65,6 +66,16 @@ export const users = pgTable("users", {
    * list for everybody.
    */
   groups: text("groups").array().notNull().default([]),
+  /**
+   * Where this person is in first-run onboarding.
+   *
+   * The step is where the wizard resumes if they leave halfway; the null completion timestamp is
+   * what gates the app into /onboarding. Set once — finishing again keeps the first timestamp.
+   */
+  onboardingStep: integer("onboarding_step").notNull().default(0),
+  onboardingCompletedAt: timestamp("onboarding_completed_at", {
+    withTimezone: true,
+  }),
   createdAt: createdAt(),
   updatedAt: updatedAt(),
 });
@@ -149,6 +160,33 @@ export const userRoles = pgTable(
   },
   (table) => [primaryKey({ columns: [table.userId, table.role] })],
 );
+
+/**
+ * One person's standing instructions, applied to every built-in coworker they run.
+ *
+ * The person-shaped half of a durable instruction. The other two carriers are both about the work
+ * rather than about the person: a coworker's role belongs to the coworker and is the same for
+ * everybody who talks to it, and a skill is invoked for one task. Neither can say "always write to
+ * me in British English" or "we are a two-person company, never call us a team", which is a fact
+ * about the person and true in every channel.
+ *
+ * The user id IS the primary key rather than a column beside a surrogate one. There is exactly one
+ * of these per person, and a table that allowed two would make "what are this person's standing
+ * instructions" depend on which row a query happened to order first.
+ *
+ * Empty is absence, not a row: the store deletes on an empty save rather than storing "". A row
+ * holding an empty string would be a person with standing instructions that say nothing, which the
+ * prompt seam then has to recognise and skip anyway — so there is one representation of "none", and
+ * it is having no row.
+ */
+export const userInstructions = pgTable("user_instructions", {
+  userId: text("user_id")
+    .primaryKey()
+    .references(() => users.id, { onDelete: "cascade" }),
+  instructions: text("instructions").notNull(),
+  createdAt: createdAt(),
+  updatedAt: updatedAt(),
+});
 
 /**
  * An enterprise identity provider this deployment has been told about.
@@ -344,6 +382,10 @@ export const channels = pgTable(
       onDelete: "set null",
     }),
     override: jsonb("override"),
+    /** A few words about the conversation. Channel grain like `last_message`; null is ordinary. */
+    summary: text("summary"),
+    /** When the summary above was written, so a later change can decide whether to redo it. */
+    summaryAt: timestamp("summary_at", { withTimezone: true }),
     /**
      * The last thing said in this channel, denormalised so a roster is one indexed read.
      *
@@ -387,6 +429,18 @@ export const channels = pgTable(
     index("channels_recent_activity_idx").on(
       sql`COALESCE(${table.lastMessageAt}, ${table.createdAt}) DESC`,
     ),
+    /**
+     * The channels still waiting for a summary.
+     *
+     * Partial, on the condition rather than the column, because the sweep that offers this work asks
+     * for exactly the rows this index holds and nothing else. Every channel that has been summarised
+     * leaves the index, so it shrinks as the deployment settles rather than growing with it: a
+     * question asked every couple of seconds on every replica should not be a scan of every
+     * conversation anybody has ever had.
+     */
+    index("channels_awaiting_summary_idx")
+      .on(table.id)
+      .where(sql`${table.summary} is null and ${table.deletedAt} is null`),
   ],
 );
 
@@ -461,6 +515,10 @@ export const auditEvents = pgTable(
      * user who had done anything could never be deleted.
      */
     actorUserId: text("actor_user_id"),
+    /** Defaulted rather than nullable, because every row written before this was a person's. */
+    initiatorKind: text("initiator_kind").notNull().default("person"),
+    /** Which routine, or which Bot handed the work on. Null when a person started it. */
+    initiatorId: text("initiator_id"),
     eventType: text("event_type").notNull(),
     targetType: text("target_type").notNull(),
     targetId: text("target_id"),
@@ -495,6 +553,11 @@ export const auditEvents = pgTable(
     index("audit_events_target_time_idx").on(
       table.targetType,
       table.targetId,
+      table.createdAt.desc(),
+      table.id.desc(),
+    ),
+    index("audit_events_initiator_time_idx").on(
+      table.initiatorKind,
       table.createdAt.desc(),
       table.id.desc(),
     ),

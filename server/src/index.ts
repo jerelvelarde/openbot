@@ -4,12 +4,13 @@ import {
   IntelligenceAgentRunner,
 } from "@copilotkit/runtime/v2";
 import { serve } from "bun";
+import { eq } from "drizzle-orm";
 import { COMPUTER_GUIDANCE } from "../../shared/bot-prompt";
 import { createActorAgentResolver } from "./agents/agent-resolver";
 import { mintRunAssertion, readRunAssertion } from "./agents/callback-token";
 import { createAgentFetch } from "./agents/endpoint";
 import { askTheirOwnPerson, escalationTool } from "./agents/escalation";
-import { createHandoffDesk } from "./agents/handoff";
+import { createHandoffDesk, HANDOFF_KIND } from "./agents/handoff";
 import { createHandoffDelivery } from "./agents/handoff-delivery";
 import { createHandoffRunner } from "./agents/handoff-runner";
 import { handoffTool } from "./agents/handoff-tool";
@@ -17,7 +18,14 @@ import { createAgentProfileStore } from "./agents/profile-store";
 import type { AgentActor } from "./agents/profile-types";
 import { createRuntimeAgentLoader } from "./agents/runtime-agents";
 import { createApp } from "./app";
-import { createAuditReader, createAuditStore, recordAuditEvent } from "./audit";
+import {
+  type AuditInitiator,
+  createAuditReader,
+  createAuditStore,
+  DEPLOYMENT_INITIATOR,
+  PERSON_INITIATOR,
+  recordAuditEvent,
+} from "./audit";
 import { startRetentionSweeps } from "./audit-retention";
 import { createAuth } from "./auth";
 import {
@@ -35,7 +43,13 @@ import {
 import { createChannelStore } from "./channels/routes";
 import { websocket as channelSocket } from "./channels/socket";
 import { createStallGuard } from "./channels/stall-guard";
+import {
+  forgetSettledSummaries,
+  offerChannelsAwaitingSummary,
+  summariseClaimedChannels,
+} from "./channels/summary";
 import { createThreadIdentity } from "./channels/thread-identity";
+import { createChannelTitler } from "./channels/titler";
 import { createSandboxedStore } from "./components/sandboxed";
 import { createComponentStore } from "./components/store";
 import { createComputerGateway } from "./computer/gateway";
@@ -65,6 +79,8 @@ import { createDatabase } from "./db/client";
 import { createExternalLinkStore } from "./external/link-store";
 import { createExternalLinkRoutes } from "./external/routes";
 import { createExternalThreadStore } from "./external/thread-store";
+import { intelligenceChannelMappings } from "./db/schema";
+import { createOnboardingStore } from "./people/onboarding";
 import { createPeopleStore } from "./people/store";
 import { useRoutineTools } from "./plugins/builtin-routines";
 import { redirectUriFor } from "./plugins/oauth";
@@ -91,8 +107,14 @@ import {
   loadTenantPackage,
   synchronizeTenantPackage,
 } from "./tenant-package";
+import { createUserInstructionsStore } from "./user-instructions";
 import { repeatAfterEach } from "./work/loop";
-import { createWorkQueue } from "./work/queue";
+import {
+  createWorkQueue,
+  startWorkOfferedListener,
+  type WorkOfferedListener,
+} from "./work/queue";
+import { workOwner } from "../../shared/work-owner";
 
 /**
  * Who is asking, for a CopilotKit request.
@@ -153,7 +175,9 @@ const identifyActor: IdentifyActor = async (request) => {
 };
 
 const config = loadConfig();
-const port = Number.parseInt(process.env.PORT ?? "3001", 10);
+// Read with the rest of the configuration, where an empty variable is an absent one. See
+// `serverPort` in config.ts for what `process.env.PORT ?? …` did with `PORT=` instead.
+const port = config.port;
 const database = createDatabase(config.databaseUrl);
 await initializeDevActorUser(database, config.singleUser);
 // The vault, built before the agent store because a customer's agent may sit behind a key and that
@@ -384,6 +408,7 @@ const handoffDesk = createHandoffDesk({
 void recordAuditEvent(bootAuditStore, {
   eventType: "computer.policy_loaded",
   targetType: "policy",
+  initiator: DEPLOYMENT_INITIATOR,
   payload: {
     ...policyStore.get(),
     source:
@@ -410,6 +435,7 @@ const isolation = describeComputerIsolation(computerProvider);
 void recordAuditEvent(bootAuditStore, {
   eventType: "computer.isolation_loaded",
   targetType: "computer",
+  initiator: DEPLOYMENT_INITIATOR,
   payload: {
     isolation: isolation.isolation,
     note: isolation.note,
@@ -498,22 +524,42 @@ const chooseSkills = createModelCompleter({
     }),
 });
 
+/** The deployment's model key, resolved per call so a credential rotated a moment ago is used next. */
+const resolveRuntimeModelApiKey = () =>
+  resolveModelApiKey({
+    encryptionKey: config.keyEncryptionKey,
+    reader: credentialStore,
+    provider: tenantPackage.model.provider,
+    keyId: tenantPackage.model.credentialSecretRef,
+    environment: process.env,
+  });
+
+/** One person's standing instructions, for both the /api/settings routes and every run they start. */
+const userInstructionsStore = createUserInstructionsStore(database);
+
+/*
+ * What this person has told every built-in coworker they run.
+ *
+ * Per actor and read per build, for the reason every other per-person fact here is: somebody who
+ * edits their instructions and sends a message expects the message to land on the new ones, and a
+ * value captured at boot would serve the whole deployment whatever the first person to sign in had
+ * written.
+ */
+const loadInstructionsForActor = (actorId: string) => () =>
+  userInstructionsStore.read(actorId);
+
 const actorAgentResolver = createActorAgentResolver({
   loadAgents: loadAgentsForActor,
   model: tenantPackage.model,
-  resolveModelApiKey: () =>
-    resolveModelApiKey({
-      encryptionKey: config.keyEncryptionKey,
-      reader: credentialStore,
-      provider: tenantPackage.model.provider,
-      keyId: tenantPackage.model.credentialSecretRef,
-      environment: process.env,
-    }),
+  resolveModelApiKey: resolveRuntimeModelApiKey,
   stallGuard,
   // Tools run here, not in the browser. Each one still executes through the plugin store, so the
   // grant, the policy and the audit row are exactly where they were.
-  loadToolsForActor: (actorId) => (botId) =>
-    grantedTools({ store: pluginStore, botId, actorId }),
+  loadToolsForActor:
+    (actorId, initiator = PERSON_INITIATOR) =>
+    (botId) =>
+      grantedTools({ store: pluginStore, botId, actorId, initiator }),
+  loadInstructionsForActor,
   /*
    * What the deployment tells a remote Bot about the run it is starting.
    *
@@ -522,11 +568,13 @@ const actorAgentResolver = createActorAgentResolver({
    * from: its own token proves which agent is calling, this proves who it is calling for, and
    * neither is read out of the request body any more.
    */
-  signRunForActor: (actorId) => (botId, runId, threadId) =>
-    mintRunAssertion(
-      { botId, actorId, runId, threadId },
-      config.keyEncryptionKey,
-    ),
+  signRunForActor:
+    (actorId, initiator = PERSON_INITIATOR) =>
+    (botId, runId, threadId) =>
+      mintRunAssertion(
+        { botId, actorId, runId, threadId, initiator },
+        config.keyEncryptionKey,
+      ),
   /*
    * Only when a computer exists. The tools themselves are registered by the surface, so a Bot is
    * offered them without this and the guidance is what tells it how they go together: snapshot
@@ -630,6 +678,9 @@ const actorAgentResolver = createActorAgentResolver({
       runId: input.runId,
       threadId: input.threadId,
       depth: from?.depth ?? 0,
+      // Read from the assertion for the reason `depth` is: the run is rebuilt from parts here, and
+      // a field left out of this object is a field the desk and the escalation never see.
+      initiator: from?.initiator ?? PERSON_INITIATOR,
     };
     /*
      * The caps are checked BEFORE the grants query, not inside the tool that would discard it.
@@ -722,9 +773,17 @@ const actorFor = async (ownerUserId: string): Promise<AgentActor> => {
 const buildAgentFor = async ({
   ownerUserId,
   agentId,
+  initiator,
 }: {
   ownerUserId: string;
   agentId: string;
+  /*
+   * What started this turn, carried through the resolver so the tools it calls and the assertion it
+   * signs are recorded against the routine rather than against the person whose authority it runs
+   * with. Both facts belong on the row: a routine firing at three in the morning is not somebody
+   * sitting at a keyboard, and a trail that cannot tell them apart cannot answer either question.
+   */
+  initiator: AuditInitiator;
 }) => {
   const actor = await actorFor(ownerUserId);
   /*
@@ -735,7 +794,11 @@ const buildAgentFor = async ({
    * owner's to see, which is the case the sentence below is for. A model key that cannot be read or a
    * database that blinked is raised instead, and must not be reported as a deleted coworker.
    */
-  const agent = await actorAgentResolver.findAgentForActor(actor, agentId);
+  const agent = await actorAgentResolver.findAgentForActor(
+    actor,
+    agentId,
+    initiator,
+  );
   if (!agent) {
     /*
      * Named, and raised rather than swallowed. The routine's Bot was deleted, or made private by
@@ -840,6 +903,11 @@ const copilotRuntime = mountCopilotRuntime(
   identifyActor,
   "/api/copilotkit",
   [openbotSlackChannel],
+  // A run started or ended on a thread; light the channel it belongs to. Fire-and-forget, keyed by
+  // thread, and a scratch thread maps to no channel and signals nowhere.
+  (input) => {
+    void channelStore.signalBusy(input.threadId, input.busy).catch(() => {});
+  },
 );
 const requireExternalUser = config.singleUser
   ? createDevRequireUser()
@@ -877,28 +945,18 @@ const externalLinkRoutes = createExternalLinkRoutes({
  * seconds for hops that can never be offered: roughly forty thousand claim transactions per replica
  * per day, for a feature it had turned off.
  */
-if (config.handoff.maxDepth > 0 && config.handoff.maxPerRun > 0) {
-  /**
-   * The person a delivery acts as, with a failure a person can be told about.
-   *
-   * `actorFor` throws when a role cannot be established — a revoked role, or a database that
-   * blinked. Thrown from inside a delivery that message becomes the reason on a failed hop, and the
-   * reason is paraphrased to somebody by the Bot that asked: "A routine requires an authorized
-   * owner." is not a sentence to put in front of a person who asked about a refund policy.
-   */
-  const theirActor = async (userId: string) => {
-    const actor = await actorFor(userId).catch(() => null);
-    if (!actor) {
-      throw new Error(
-        "who this is for could not be confirmed, so the answer had nowhere to go",
-      );
-    }
-    return actor;
-  };
+/**
+ * The queue's own wake-up, when handing work between Bots is switched on at all.
+ *
+ * Held at module scope so the shutdown below can give its connection back. Undefined on a
+ * deployment with the capability off, which is a deployment that never started one.
+ */
+let workOfferedListener: WorkOfferedListener | undefined;
 
+if (config.handoff.maxDepth > 0 && config.handoff.maxPerRun > 0) {
   const runner = createHandoffRunner({
     queue: createWorkQueue(database),
-    owner: `handoff/${process.env.HOSTNAME ?? randomUUID().slice(0, 8)}`,
+    owner: workOwner("handoff"),
     auditStore: bootAuditStore,
     /*
      * The signed statement of the run the addressed Bot is about to start, carrying how deep the
@@ -921,44 +979,54 @@ if (config.handoff.maxDepth > 0 && config.handoff.maxPerRun > 0) {
        * delivery that then rebuilt them as an ordinary user could not find the Bot the desk had just
        * agreed to, and the person was told it never answered.
        */
-      agentFor: async ({ actorId, botId }) => {
+      agentFor: async ({ actorId, botId, fromBotId }) => {
         const actor = await actorFor(actorId).catch(() => null);
         if (!actor) {
           throw new Error(
             "who this is for could not be confirmed, so the Bot was not run",
           );
         }
-        return copilotRuntime.agentFor({ actor, botId });
+        return copilotRuntime.agentFor({
+          actor,
+          botId,
+          initiator: { kind: "handoff", id: fromBotId },
+        });
       },
       history: copilotRuntime.history,
       lock: copilotRuntime.threadLock,
       /*
-       * A conversation of the addressed Bot's own, with the same person.
+       * A scratch thread of the addressed Bot's own, one per hop.
        *
        * An Intelligence thread has exactly one agent, so a second Bot cannot answer inside the first
-       * Bot's conversation however it asks. Rather than pretend otherwise, the answer lands where
-       * that Bot can speak and the conversation that asked says where it went.
+       * Bot's conversation however it asks. Its turn runs here instead, unmapped to any channel, and
+       * what it said comes back to the conversation that asked through the relay — in the asking
+       * Bot's voice, which is the only voice that thread admits. Minted with the deployment's own
+       * identity, like every thread this deployment starts.
        */
-      answerIn: async (input) => {
-        // The conversation this person already has with that Bot, made only if they have not had
-        // one. See ChannelStore.direct: a hop is retried, and creating here left an empty channel
-        // behind for every attempt.
-        // The person's own role, for the same reason the desk resolves it: an administrator sees Bots
-        // a user does not, and a conversation with one of those is still theirs.
-        const channel = await channelStore.direct(
-          await theirActor(input.actorId),
-          input.botId,
-        );
-        return { threadId: channel.threadId, channelId: channel.id };
+      mintThreadId: () => threadIdentity.mint(),
+      /*
+       * The roster, told that a relayed answer landed. The delivery knows only the thread it ran
+       * in; this resolves which channel shows that thread — a scratch thread maps to nothing and
+       * announces nowhere, which is the point of a scratch thread.
+       */
+      announce: async (input) => {
+        const [mapped] = await database
+          .select({ channelId: intelligenceChannelMappings.channelId })
+          .from(intelligenceChannelMappings)
+          .where(eq(intelligenceChannelMappings.threadId, input.threadId))
+          .limit(1);
+        if (!mapped) return;
+        const actor = await actorFor(input.actorId).catch(() => null);
+        if (!actor) return;
+        await channelStore.recordActivity(actor, mapped.channelId, {
+          text: input.text,
+          agentId: input.agentId,
+          at: new Date(),
+        });
       },
-      // The roster is written by whoever finished a run, and for a hop that is this server rather
-      // than a browser. See ChannelStore.recordActivity.
-      announce: async (input) =>
-        channelStore.recordActivity(
-          await theirActor(input.actorId),
-          input.channelId,
-          { text: input.text, agentId: input.agentId, at: new Date() },
-        ),
+      // The asking conversation shown as working while a hop runs in it. Keyed by thread, resolved
+      // to its channel by the store; a scratch thread maps to none and signals nowhere.
+      setBusy: (input) => channelStore.signalBusy(input.threadId, input.busy),
       newRunId: () => randomUUID(),
       // The same address and the same token the runtime uses. Assembling either from configuration
       // produced a runner every join was refused for, because the thread's active run is a lock the
@@ -985,12 +1053,44 @@ if (config.handoff.maxDepth > 0 && config.handoff.maxPerRun > 0) {
   };
 
   /*
-   * ONE SWEEP AT A TIME ON THIS REPLICA. See repeatAfterEach: an interval would start another sweep
-   * every two seconds while a five-minute delivery runs, each claiming a different batch, and this
-   * replica's concurrent agent runs would grow with the backlog rather than stopping at the limit
-   * it was asked for.
+   * ONE SWEEP AT A TIME ON THIS REPLICA, from both callers below. A sweep poked while one is
+   * running is remembered rather than started, and runs once the current one ends — a wake-up
+   * that arrived mid-sweep may be for a hop the running sweep's claim already missed.
    */
-  repeatAfterEach(sweep, 2_000);
+  let sweeping = false;
+  let sweepAgain = false;
+  const kick = async () => {
+    if (sweeping) {
+      sweepAgain = true;
+      return;
+    }
+    sweeping = true;
+    try {
+      do {
+        sweepAgain = false;
+        await sweep();
+      } while (sweepAgain);
+    } finally {
+      sweeping = false;
+    }
+  };
+
+  /*
+   * Woken by the queue itself, from any replica: a person is waiting through every hop, and the
+   * poll below would spend up to two seconds per leg doing nothing. The poll stays as the
+   * backstop — a notification is a latency optimisation, and one lost in transit costs one
+   * interval, never the work. See repeatAfterEach for why an interval must not be used: an
+   * interval would start another sweep every two seconds while a five-minute delivery runs, each
+   * claiming a different batch, and this replica's concurrent agent runs would grow with the
+   * backlog rather than stopping at the limit it was asked for.
+   */
+  workOfferedListener = await startWorkOfferedListener(
+    config.databaseUrl,
+    (kind) => {
+      if (kind === HANDOFF_KIND) void kick();
+    },
+  );
+  repeatAfterEach(kick, 2_000);
 }
 
 /*
@@ -1007,7 +1107,7 @@ if (config.handoff.maxDepth > 0 && config.handoff.maxPerRun > 0) {
  */
 const reaper = createHandoffRunner({
   queue: createWorkQueue(database),
-  owner: `reaper/${process.env.HOSTNAME ?? randomUUID().slice(0, 8)}`,
+  owner: workOwner("reaper"),
   sign: () => "",
   auditStore: bootAuditStore,
   // Never called: `reap` deletes rows by age and claims nothing.
@@ -1099,6 +1199,40 @@ const templates = {
  * permitted it.
  */
 await templates.catalogue.load();
+/*
+ * Naming conversations, in the API process rather than `worker/`, which the single-image container
+ * does not run. Its own loop, so a slow model never delays a hop.
+ */
+const channelSummaries = {
+  database,
+  queue: createWorkQueue(database),
+  transcript: routineIntelligence,
+  title: createChannelTitler({
+    model: tenantPackage.model.defaultModel,
+    resolveApiKey: resolveRuntimeModelApiKey,
+  }),
+  owner: workOwner("summariser"),
+};
+repeatAfterEach(async () => {
+  try {
+    await offerChannelsAwaitingSummary(channelSummaries);
+    const report = await summariseClaimedChannels(channelSummaries);
+    if (report.written.length > 0) {
+      console.info(
+        JSON.stringify({ type: "channel-summaries", written: report.written }),
+      );
+    }
+    // Same pass: one statement, deletes by age, and two replicas running it changes nothing.
+    await forgetSettledSummaries(channelSummaries);
+  } catch (error) {
+    // Never fatal, and never loud enough to drown the log: a deployment with no model configured
+    // reaches this on every pass, and it has not gone wrong, it simply has no titles.
+    console.warn(
+      "[channels] conversations could not be named:",
+      error instanceof Error ? error.message : error,
+    );
+  }
+}, 10_000);
 
 const app = createApp(
   config,
@@ -1151,6 +1285,11 @@ const app = createApp(
   routineRunner,
   // A person's own standing instructions: the list, and a switch to stop one.
   routineStore,
+  // Where each person is in first-run onboarding, read by /api/me and written by the wizard.
+  createOnboardingStore(database),
+  // The same store every run reads through `loadInstructionsForActor`, so the screen a person edits
+  // and the prompt their coworker is built from can never be two different pieces of text.
+  userInstructionsStore,
   // Packing a coworker into a file, and installing somebody else's. Last, because these arguments
   // are positional and inserting one anywhere else shifts every call site above it.
   templates,
@@ -1323,6 +1462,20 @@ if (config.singleUser) {
       `${DEV_ACTOR.email} (administrator). Configure GOOGLE_OAUTH_*, ` +
       "MICROSOFT_OAUTH_* or OKTA_OAUTH_* before anybody else can reach this.",
   );
+}
+
+// Each listener holds a connection of its own for the life of the process. Released on the way out,
+// so a watch-mode restart does not leave two behind on every reload.
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.on(signal, () => {
+    void Promise.allSettled([
+      channelActivityListener.stop(),
+      policyListener.stop(),
+      // Started only where handing work between Bots is switched on, so it is often not there.
+      workOfferedListener?.stop() ?? Promise.resolve(),
+      Promise.resolve(retentionSweeps.stop()),
+    ]).finally(() => process.exit(0));
+  });
 }
 
 console.info(`OpenBot server listening on http://localhost:${port}`);

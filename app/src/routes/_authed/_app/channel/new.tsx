@@ -38,7 +38,7 @@ export const Route = createFileRoute("/_authed/_app/channel/new")({
 function RouteComponent() {
   const { agent } = Route.useSearch();
   const navigate = Route.useNavigate();
-  const { start, pending } = useStartChannel();
+  const { startChosen, pending } = useStartChannel();
   const { data: profiles } = useQuery(agentListQueryOptions());
 
   const [error, setError] = useState<string | null>(null);
@@ -87,6 +87,10 @@ function RouteComponent() {
           value={chosen ?? null}
         >
           <ComboboxInput
+            // The popup opening is not enough on its own: typing filters through this input, so
+            // the caret starts here whenever the recipient question is still open. Same condition
+            // as `defaultOpen` — a recipient from the URL means the composer takes focus instead.
+            autoFocus={!agent}
             placeholder="Choose a coworker…"
             // InputGroup owns focus rings via `has-[…:focus-visible]`; disable that wrapper ring here.
             className="border-none w-full bg-transparent! text-sm has-[[data-slot=input-group-control]:focus-visible]:ring-0"
@@ -131,7 +135,9 @@ function RouteComponent() {
           setSent(seedMessage(draft.text, newId()));
 
           try {
-            await start(recipient.id, draft.text);
+            // Recorded, then started: a coworker picked here is as much a choice as an `@` on the
+            // home screen, and the trail has to say so for both.
+            await startChosen(recipient.id, draft.text);
           } catch (caught) {
             // Preserve the unsent draft when channel creation fails.
             setSent(null);

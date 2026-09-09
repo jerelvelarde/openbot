@@ -126,6 +126,8 @@ async function auditRowsFor(targetId: string) {
     .select({
       eventType: auditEvents.eventType,
       payload: auditEvents.payload,
+      initiatorKind: auditEvents.initiatorKind,
+      initiatorId: auditEvents.initiatorId,
     })
     .from(auditEvents)
     .where(
@@ -267,6 +269,49 @@ describe("a grant is the permission", () => {
     );
   });
 
+  test("a refusal names the routine that asked, not only the person it ran as", async () => {
+    await expect(
+      store.callTool({
+        ref,
+        args: {},
+        botId: strangerId,
+        actorId: "someone@openbot.local",
+        initiator: { kind: "routine", id: "routine_standup" },
+      }),
+    ).rejects.toBeInstanceOf(PluginRefusedError);
+
+    const rows = await auditRowsFor(ref);
+    const rejected = rows.filter(
+      (row) =>
+        row.eventType === "mcp.call_rejected" &&
+        (row.payload as { bot?: string }).bot === strangerId &&
+        row.initiatorKind === "routine",
+    );
+    expect(rejected.length).toBeGreaterThan(0);
+    expect(rejected[0].initiatorId).toBe("routine_standup");
+  });
+
+  test("a call nobody said anything about is still filed as a person's", async () => {
+    await expect(
+      store.callTool({
+        ref,
+        args: {},
+        botId: strangerId,
+        actorId: "someone@openbot.local",
+      }),
+    ).rejects.toBeInstanceOf(PluginRefusedError);
+
+    const rows = await auditRowsFor(ref);
+    expect(
+      rows.some(
+        (row) =>
+          row.eventType === "mcp.call_rejected" &&
+          row.initiatorKind === "person" &&
+          row.initiatorId === null,
+      ),
+    ).toBe(true);
+  });
+
   test("granting lets the same Bot past the grant check", async () => {
     await store.grant("mcp", ref, holderId, "admin@openbot.local");
     const decision = await store.decide("mcp", ref, holderId);
@@ -310,6 +355,37 @@ describe("a grant is the permission", () => {
 });
 
 describe("the policy is asked as well as the grant", () => {
+  test("credential material is refused and never copied into the audit trail", async () => {
+    await store.grant("mcp", ref, holderId, "admin@openbot.local");
+    const secret = `sk-${"z".repeat(32)}`;
+
+    await expect(
+      store.callTool({
+        ref,
+        args: { query: "quarterly report", nested: { apiKey: secret } },
+        botId: holderId,
+        actorId: "someone@openbot.local",
+      }),
+    ).rejects.toThrow("credential material");
+
+    const rows = await auditRowsFor(ref);
+    const rejected = rows.find(
+      (row) =>
+        row.eventType === "mcp.call_rejected" &&
+        (row.payload as { refusal?: string }).refusal ===
+          "sensitive_tool_arguments",
+    );
+    expect(rejected).toBeDefined();
+    expect(rejected?.payload).toMatchObject({
+      bot: holderId,
+      contentInspection: {
+        reason: "sensitive_content",
+        findings: [{ category: "credential_field", path: "$.nested.apiKey" }],
+      },
+    });
+    expect(JSON.stringify(rejected)).not.toContain(secret);
+  });
+
   test("a granted tool is still refused by a deny rule, and the rule is named", async () => {
     await store.grant("mcp", ref, holderId, "admin@openbot.local");
     policy = {
@@ -382,6 +458,54 @@ describe("the policy is asked as well as the grant", () => {
     expect(thrown).toBeInstanceOf(PluginRefusedError);
     expect((thrown as PluginRefusedError).rule).toBeNull();
     expect((thrown as PluginRefusedError).message).toContain("connected");
+  });
+
+  test("a dry-run refusal is recorded, even though the call is let through", async () => {
+    await store.grant("mcp", ref, holderId, "admin@openbot.local");
+    /*
+     * The mode an operator switches on to size a rule before enforcing it, and the only mode in
+     * which the policy refuses and the call still goes out. Its whole value is the row: without one
+     * the report reads "this rule would refuse nothing" about traffic it would refuse.
+     */
+    const rule = `mcp.tool == "${toolName}"`;
+    policy = { mode: "dry-run", deny: [rule], allow: ["true"] };
+
+    try {
+      await store
+        .callTool({
+          ref,
+          args: {},
+          botId: holderId,
+          actorId: "someone@openbot.local",
+        })
+        // Forwarded past the policy, so what happens next is the vendor's business and not this
+        // test's: nobody has connected an account, so it fails there. Swallowed deliberately.
+        .catch(() => undefined);
+    } finally {
+      policy = { mode: "enforce", deny: [], allow: ["true"] };
+    }
+
+    const rows = await auditRowsFor(ref);
+    const recorded = rows.filter(
+      (row) =>
+        row.eventType === "mcp.call_rejected" &&
+        (row.payload as { decision?: { rule?: string } }).decision?.rule ===
+          rule,
+    );
+    expect(recorded.length).toBeGreaterThan(0);
+    /*
+     * What tells this row apart from a call this deployment actually stopped. `allowed` is the
+     * policy's answer and `carriedOut` is what the mode did with it, so a reader counting what a
+     * rule would have refused finds this one, and a reader counting what was refused does not.
+     */
+    const decision = (
+      recorded[0].payload as {
+        decision?: { allowed?: boolean; mode?: string; carriedOut?: boolean };
+      }
+    ).decision;
+    expect(decision?.allowed).toBe(false);
+    expect(decision?.mode).toBe("dry-run");
+    expect(decision?.carriedOut).toBe(true);
   });
 });
 
@@ -1968,6 +2092,67 @@ describe("a dynamic client the vendor has evicted", () => {
       registeredBy(registeredBefore, "someone@openbot.test", FRESH.clientId) +
         1,
     );
+  });
+
+  /**
+   * The registration nothing stands in for.
+   *
+   * Every other test here injects `registerClient`, which is right for asserting what the store does
+   * with an answer but means the real function is never the one answering. What it returns when the
+   * vendor cannot be reached at all is exactly what the store's `null` branches were written for, so
+   * once that path exists it is worth one test that lets the real code produce the value rather than
+   * a stub asserting the value the real code is assumed to produce.
+   */
+  const storeWithRealRegistration = createPluginStore({
+    database,
+    auditStore: createAuditStore(database),
+    credentials: vault,
+    encryptionKey: DYNAMIC_KEY,
+    policy: () => policy,
+    callVendor: async () => ({
+      text: "[vendor not reached in tests]",
+      isError: false,
+    }),
+    exchangeRefreshToken: seams.exchangeRefreshToken,
+    redirectUri: REDIRECT_URI,
+  });
+
+  test("an unreachable registration endpoint leaves no client and no trail", async () => {
+    await clearClient();
+    const registeredBefore = await registeredRows();
+    const said: string[] = [];
+    const realError = console.error;
+    const realFetch = globalThis.fetch;
+    console.error = (...args: unknown[]) => {
+      said.push(args.map(String).join(" "));
+    };
+    globalThis.fetch = (async () => {
+      throw new TypeError("Unable to connect.");
+    }) as unknown as typeof fetch;
+
+    try {
+      expect(
+        await storeWithRealRegistration.ensureOAuthClient(
+          dynamicServerId,
+          "someone@openbot.test",
+        ),
+      ).toBeNull();
+    } finally {
+      globalThis.fetch = realFetch;
+      console.error = realError;
+    }
+
+    // Nothing kept, and nothing claimed. A trail row here would say this deployment registered
+    // itself with a vendor that never answered.
+    expect(
+      await storeWithRealRegistration.oauthClientFor(dynamicServerId),
+    ).toBe(null);
+    expect((await registeredRows()).length).toBe(registeredBefore.length);
+    expect(
+      said.find((line) =>
+        line.includes("oauth-registration-endpoint-unreachable"),
+      ),
+    ).toBeDefined();
   });
 
   test("an entry an administrator registers by hand is left alone", async () => {

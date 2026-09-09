@@ -23,9 +23,11 @@ bash scripts/start.sh
 | `INTELLIGENCE_API_URL`        | CopilotKit Intelligence API URL.                                                                      |
 | `INTELLIGENCE_GATEWAY_WS_URL` | CopilotKit Intelligence realtime gateway URL.                                                         |
 | `INTELLIGENCE_API_KEY`        | Runtime key for the Intelligence project.                                                             |
-| `COPILOTKIT_LICENSE_TOKEN`    | License token for the Intelligence project.                                                           |
 
-All four Intelligence values are required together. Missing any of them stops server startup.
+The three above are required together. Missing any of them stops server startup.
+
+`COPILOTKIT_LICENSE_TOKEN` is optional: managed Intelligence issues no licence token, and a
+self-hosted Intelligence that has one sets this and has it forwarded to the runtime.
 
 ## Managed Slack
 
@@ -319,6 +321,7 @@ then is a row nothing will read.
 | `COMPUTER_TOKEN`                     | Secret every computer request must present. The computer refuses to start without it.     |
 | `COMPUTER_MAX_BROWSERS`              | How many Bots may hold a running browser at once. `8` by default; the least recently used is closed past it. |
 | `COMPUTER_BROWSER_IDLE_MS`           | How long an untouched browser is kept. 30 minutes by default; `0` keeps them resident.    |
+| `COMPUTER_BROWSER_MODE`              | `headless` by default; set to `headed` to run full Chromium on a private virtual display for human takeover. |
 | `COMPUTER_SUPERVISOR_URL`            | Supervisor URL for per-Bot computers. If absent, Bots share `AGENT_COMPUTER_URL`.         |
 | `SUPERVISOR_TOKEN`                   | Bearer token required by the supervisor.                                                  |
 | `AGENT_COMPUTER_ALLOW_PRIVATE_HOSTS` | Local-only private-host browsing when `true`. A deployment running with `NODE_ENV=production` refuses to start while it is set. Cloud metadata addresses are refused either way. |
@@ -326,6 +329,17 @@ then is a row nothing will read.
 | `AGENT_COMPUTER_POLICY`              | JSON action policy: `{"mode":"enforce","deny":[...],"allow":[...]}`.                      |
 | `COMPUTER_RUNTIME`                   | Set to `runsc` to run supervised computers under gVisor.                                  |
 | `COMPUTER_SANDBOX`                   | Set to `on` to enable Chromium's own sandbox where the host permits user namespaces. Which way it went is printed at start-up. |
+
+Changing `COMPUTER_BROWSER_MODE` affects new supervised computers. A computer that already exists is
+left running until its image changes or its container is recreated. To apply a mode-only change to
+all computers while preserving their browser profiles and workspaces, apply the new supervisor
+environment and remove only the owned containers (do not remove their volumes):
+
+```sh
+docker ps -aq --filter "label=openbot.namespace=openbot" | xargs -r docker rm -f
+```
+
+The supervisor recreates each computer with the same named volumes on its next request.
 
 `agent-computer` also reads:
 
@@ -369,6 +383,14 @@ The supervisor also reads:
 - `COMPUTER_MEMORY_BYTES`
 - `DOCKER_SOCKET`
 
+`ENGINE_SOCKET` is separate from those, because it is read by Compose rather than by the supervisor:
+it is the host path mounted into the supervisor as `/var/run/docker.sock`. Unset, it is
+`/var/run/docker.sock`, which is right for Docker and for Podman on macOS, where `podman machine`
+symlinks that path to the rootless socket. Rootless Podman on Linux needs
+`ENGINE_SOCKET=$XDG_RUNTIME_DIR/podman/podman.sock`: there the default path is either missing or a
+symlink to the rootful socket, which is not the one running, and the supervisor reports that it
+cannot reach Docker.
+
 `COMPUTER_NAMESPACE` defaults to `openbot` and names the deployment a computer belongs to. It is part
 of every container and volume name the supervisor derives, and the supervisor acts only on computers
 carrying it, so two deployments on one Docker host never adopt each other's.
@@ -391,6 +413,32 @@ When optional SPIRE services are used:
 - the supervisor reads `SPIRE_SOCKET`, `SPIRE_AGENT_ID`, `SPIRE_TRUST_DOMAIN`, and `SPIRE_AGENT_SOCKET_VOLUME`;
 - computers read `SPIFFE_ENDPOINT_SOCKET`;
 - Compose also uses `SPIRE_JOIN_TOKEN` and `COMPOSE_PROJECT_NAME`.
+
+## Images
+
+Every service `docker-compose.yml` can build is published by a release, so a machine can run the
+stack without a toolchain and without waiting for Chromium to build.
+
+| Service           | Setting             | Published image                            |
+| ----------------- | ------------------- | ------------------------------------------ |
+| `agent-computer`  | `COMPUTER_IMAGE`    | `ghcr.io/copilotkit/openbot-agent-computer` |
+| `supervisor`      | `SUPERVISOR_IMAGE`  | `ghcr.io/copilotkit/openbot-supervisor`     |
+| `agent-bot`       | `BOT_IMAGE`         | `ghcr.io/copilotkit/openbot-agent-bot`      |
+| `agent-langgraph` | `LANGGRAPH_IMAGE`   | `ghcr.io/copilotkit/openbot-agent-langgraph`|
+| `migrate`         | `SERVER_IMAGE`      | `ghcr.io/copilotkit/openbot-server`         |
+
+Unset, each names a local tag and Compose builds it, which is what a checkout of this repository
+does. Set to a published reference, pinned by digest, together with `IMAGE_PULL_POLICY=missing`,
+Compose pulls instead. Both architectures are in every image, so the same reference works on an
+arm64 laptop and an amd64 server.
+
+`IMAGE_PULL_POLICY` is needed because a service carrying a `build` section builds by default
+however its image is named. It is also not a promise that nothing is built: a pull that fails falls
+back to building, which suits a developer and does not suit a machine with no toolchain, where the
+useful answer is that the image could not be fetched. Somewhere that must never build, override the
+`build` sections away instead.
+
+`docs/releasing.md` shows reading the digests straight out of a release's `container-images.json`.
 
 ## Ports
 

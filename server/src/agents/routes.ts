@@ -125,6 +125,68 @@ function isAgentInputObject(input: unknown): input is AgentInputObject {
 }
 
 /**
+ * Parse and validate the headers a person attaches to a connection test.
+ *
+ * Unvalidated, the route cast any object straight into the probe `fetch`, so an array value, a
+ * nested object, or a `__proto__` key travelled into the network call and threw a TypeError 500 —
+ * or probed header handling the deployment never meant to exercise. Names follow the same rule as
+ * the stored agent auth header; values must be strings; the whole map is capped so a pasted dump
+ * cannot balloon the probe.
+ */
+export function parseConnectionHeaders(
+  input: unknown,
+):
+  | { ok: true; value: Record<string, string> | undefined }
+  | { ok: false; error: string } {
+  if (input === undefined) return { ok: true, value: undefined };
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    return { ok: false, error: "Headers must be an object of name to value." };
+  }
+  /*
+   * A JSON body carrying `__proto__` does not arrive as an own property: `JSON.parse` sets the
+   * object's prototype instead, so `Object.entries` never sees it and a name block-list below
+   * would pass it straight through into the probe fetch. Refuse any headers object whose prototype
+   * is not a plain one before reading entries.
+   */
+  if (Object.getPrototypeOf(input) !== Object.prototype) {
+    return { ok: false, error: "Headers must be an object of name to value." };
+  }
+  const entries = Object.entries(input);
+  if (entries.length > 32) {
+    return { ok: false, error: "Headers must have at most 32 entries." };
+  }
+  const headers: Record<string, string> = {};
+  for (const [name, value] of entries) {
+    if (
+      name === "__proto__" ||
+      name === "constructor" ||
+      name === "prototype" ||
+      !/^[A-Za-z0-9-]+$/.test(name) ||
+      name.length > 64
+    ) {
+      return {
+        ok: false,
+        error: `That is not a valid header name: ${name.slice(0, 64)}.`,
+      };
+    }
+    if (typeof value !== "string") {
+      return {
+        ok: false,
+        error: `Header "${name}" must be a string value.`,
+      };
+    }
+    if (value.length > 4096) {
+      return {
+        ok: false,
+        error: `Header "${name}" must be at most 4096 characters.`,
+      };
+    }
+    headers[name] = value;
+  }
+  return { ok: true, value: entries.length === 0 ? undefined : headers };
+}
+
+/**
  * The local development actor, which is not a row in `users`.
  *
  * The audit table has a foreign key to that table, so writing this id would fail the constraint and
@@ -162,7 +224,31 @@ export function createAgentRoutes(
     enabled: boolean;
     /** The Bots this one may address today, read per call so a revoked grant stops showing. */
     reachableFrom: (agentId: string) => Promise<readonly string[]>;
+    /**
+     * Whether this Bot can be a grantee at all — the handing-on tool executes inside this
+     * deployment's own run loop, so only a Bot that runs in it can be offered one. Exposed so the
+     * screen can say that once, instead of letting every switch fail with the same refusal.
+     * Optional so a caller without a plugin store answers "no" rather than crashing the read.
+     */
+    runsHere?: (agentId: string) => Promise<boolean | undefined>;
   },
+  /**
+   * Whether a coworker can run on this deployment's own Bot, i.e. be created with no endpoint.
+   *
+   * The store already refuses such a create on a deployment with no managed Bot; this exists so a
+   * screen can say so before somebody fills in three steps of a form that was always going to fail.
+   */
+  builtInAvailable = false,
+  /**
+   * The managed Bot's own address, so a coworker created without an endpoint can be told apart.
+   *
+   * Creation bakes this address into the coworker's stored configuration, and afterwards nothing in
+   * the row says whether a person supplied it. The difference matters to exactly one screen: a
+   * coworker running here calls tools back with the deployment's own credential and needs no setup,
+   * while one a person hosts needs a callback token put into their process. Without this flag the
+   * dialog nagged built-in coworkers about a credential they never needed.
+   */
+  managedEndpoint?: string,
   /**
    * Packing this coworker into a template draft.
    *
@@ -177,6 +263,13 @@ export function createAgentRoutes(
    */
   templateExport?: TemplateExport,
 ) {
+  /** The dto with the one fact only this closure knows: whether the coworker runs on our own Bot. */
+  const dto = (actor: AgentActor, agent: AgentProfile) => ({
+    ...agentDto(actor, agent),
+    // A string comparison on purpose: two absent values must not read as "runs on our Bot".
+    builtIn:
+      typeof agent.endpoint === "string" && agent.endpoint === managedEndpoint,
+  });
   const routes = new Hono<{ Variables: AppVariables }>();
 
   /**
@@ -199,6 +292,21 @@ export function createAgentRoutes(
     const reason = typeof body?.reason === "string" ? body.reason.trim() : "";
     if (!reason) {
       return context.json({ error: "A reason is required." }, 400);
+    }
+
+    /*
+     * The same question every other route here asks first: is this a Bot the caller may reach?
+     *
+     * The row says "reportedBy: the Bot itself", and the Bot reports through the person's session,
+     * so the trail's only way of knowing the report came from a Bot is that the person could have
+     * been talking to that Bot. Without this check, any signed-in person could write a decline
+     * against any id at all, a coworker they cannot see included, and an administrator reading the
+     * trail would take it for something the Bot said. Not found rather than forbidden, as the store
+     * answers everywhere else, so the check does not confirm which ids exist.
+     */
+    const agent = await store.get(context.var.actor, agentId);
+    if (!agent) {
+      return context.json({ error: "Agent not found." }, 404);
     }
 
     if (auditStore) {
@@ -232,12 +340,22 @@ export function createAgentRoutes(
       const hidden = context.req.query("hidden") === "true";
       const agents = await store.list(context.var.actor, hidden);
       return context.json({
-        agents: agents.map((agent) => agentDto(context.var.actor, agent)),
+        agents: agents.map((agent) => dto(context.var.actor, agent)),
       });
     } catch (error) {
       return mapStoreError(context, error);
     }
   });
+
+  /**
+   * What kinds of coworker this deployment can create, for the screen that asks.
+   *
+   * Static per process: whether a managed Bot exists is deployment configuration, not data. Above
+   * the parameterised route on purpose, so "capabilities" can never be read as an agent id.
+   */
+  routes.get("/capabilities", requireUser, (context) =>
+    context.json({ capabilities: { builtInAvailable } }),
+  );
 
   routes.get("/:agentId", requireUser, async (context) => {
     try {
@@ -248,7 +366,7 @@ export function createAgentRoutes(
       if (!agent) {
         return context.json({ error: "Agent not found." }, 404);
       }
-      return context.json({ agent: agentDto(context.var.actor, agent) });
+      return context.json({ agent: dto(context.var.actor, agent) });
     } catch (error) {
       return mapStoreError(context, error);
     }
@@ -267,10 +385,11 @@ export function createAgentRoutes(
       endpoint?: unknown;
       headers?: unknown;
     } | null;
-    const headers =
-      body?.headers && typeof body.headers === "object"
-        ? (body.headers as Record<string, string>)
-        : undefined;
+    const parsed = parseConnectionHeaders(body?.headers);
+    if (!parsed.ok) {
+      return context.json({ error: parsed.error }, 400);
+    }
+    const headers = parsed.value;
     const result = await testAgentConnection(body?.endpoint, {
       headers,
       allowPrivateHosts,
@@ -331,19 +450,14 @@ export function createAgentRoutes(
 
     try {
       /*
-       * NO ADDRESS AND NO BOT IN THE BOX MEANS IT RUNS HERE, which is what the form already promises.
+       * A coworker with no address runs here, on the text this form already requires.
        *
-       * The endpoint field is labelled "Agent endpoint (optional)" and was not optional on the
-       * recommended one-container image: with nothing to bind to, `create` refused with "This
-       * deployment has no managed Bot", so a person could not make a coworker at all on the image the
-       * README tells them to deploy. Importing a template hit the same wall until it started binding
-       * in-process, and this is that same rule applied to the screen next to it rather than a second
-       * behaviour.
-       *
-       * The role description is what the coworker runs on, which is the field this form already
-       * requires and the same text a template carries for the same purpose. Passing it only when no
-       * endpoint was given keeps every other path exactly as it was: give an address and it is a
-       * remote Bot, as before.
+       * "Agent endpoint (optional)" was not optional on the recommended one-container image: with
+       * nothing to bind to, `create` refused with "This deployment has no managed Bot", so a person
+       * could not make a coworker at all on the image the README tells them to deploy. The role
+       * description is what such a coworker runs on — the same field a `built_in` Bot in the tenant
+       * package carries, for the same purpose — and passing it only when no endpoint was given keeps
+       * every other path exactly as it was: give an address and it is a remote Bot, as before.
        */
       const agent = await store.create(context.var.actor, {
         ...parsed.value,
@@ -354,13 +468,19 @@ export function createAgentRoutes(
       /*
        * The endpoint, because that is where conversation content will be sent, and whether a key was
        * attached, because "this Bot authenticates" is a fact and the key itself never is.
+       *
+       * And who may reach it. `visibility` is not a display preference: `accessFilter` admits a
+       * `public` coworker to every signed-in person, and `canRunAgent` is `canAccessAgent`, so public
+       * means everybody in the deployment may act as this Bot and spend the grants it holds. A row
+       * that cannot say which it was cannot reconstruct who could use this coworker at the time.
        */
       await record(context, "bot.created", agent.id, {
         name: parsed.value.name,
+        visibility: parsed.value.visibility,
         ...(parsed.value.endpoint ? { endpoint: parsed.value.endpoint } : {}),
         hasKey: Boolean(parsed.value.auth),
       });
-      return context.json({ agent: agentDto(context.var.actor, agent) }, 201);
+      return context.json({ agent: dto(context.var.actor, agent) }, 201);
     } catch (error) {
       return mapStoreError(context, error);
     }
@@ -381,14 +501,26 @@ export function createAgentRoutes(
         context.req.param("agentId"),
         parsed.value,
       );
-      // What changed, not the new values. Repointing the endpoint is the dangerous edit and is worth
-      // naming; a replaced key is worth knowing about and is never worth recording.
+      /*
+       * What changed, not the new values. Repointing the endpoint is the dangerous edit and is worth
+       * naming; a replaced key is worth knowing about and is never worth recording.
+       *
+       * `visibility` is carried the way `name` is — on every row, whether or not this edit moved it —
+       * because it is the second dangerous edit and the route has no before to compare against.
+       * Public admits every signed-in person to this coworker, and `canRunAgent` is `canAccessAgent`,
+       * so it hands them the right to act as it and spend what it was granted. Without the value on
+       * each row, an edit that opened a coworker to the whole deployment is byte-identical to one
+       * that corrected its title, and the trail cannot say when it was opened or by whom. Recorded on
+       * every row rather than only on the row that changed it, so reading the trail forward tells you
+       * what was reachable at any point, which is what an incident asks.
+       */
       await record(context, "bot.updated", agent.id, {
         name: parsed.value.name,
+        visibility: parsed.value.visibility,
         ...(parsed.value.endpoint ? { endpoint: parsed.value.endpoint } : {}),
         ...(parsed.value.auth ? { keyReplaced: true } : {}),
       });
-      return context.json({ agent: agentDto(context.var.actor, agent) });
+      return context.json({ agent: dto(context.var.actor, agent) });
     } catch (error) {
       return mapStoreError(context, error);
     }
@@ -405,7 +537,7 @@ export function createAgentRoutes(
       await record(context, "bot.duplicated", agent.id, {
         copiedFrom: context.req.param("agentId"),
       });
-      return context.json({ agent: agentDto(context.var.actor, agent) }, 201);
+      return context.json({ agent: dto(context.var.actor, agent) }, 201);
     } catch (error) {
       return mapStoreError(context, error);
     }
@@ -584,6 +716,11 @@ export function createAgentRoutes(
           // Granting is an administrator's, the same as it is on every other grant.
           canGrant: context.var.actor.role === "admin",
           reachable: handoff ? await handoff.reachableFrom(agentId) : [],
+          // Whether this Bot can hold such a grant at all; the write path refuses one that cannot,
+          // and the screen should say so before a person flips switches that can only bounce.
+          grantable: handoff?.runsHere
+            ? ((await handoff.runsHere(agentId)) ?? false)
+            : false,
         },
       });
     } catch (error) {
