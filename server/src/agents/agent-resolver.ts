@@ -1,8 +1,10 @@
 import type { AbstractAgent } from "@ag-ui/client";
 import type { AgentFetch, StallGuard } from "../channels/stall-guard";
+import type { AuditInitiator } from "../audit";
 import {
   type HandoffForRun,
   type LoadAgentsForActor,
+  type LoadInstructions,
   type LoadToolsForBot,
   type RuntimeModel,
   resolveRuntimeAgents,
@@ -26,6 +28,8 @@ export type ActorAgentResolver = {
   findAgentForActor(
     actor: AgentActor,
     agentId: string,
+    /** What started this run, so a routine's tool calls are not recorded against a person. */
+    initiator?: AuditInitiator,
   ): Promise<AbstractAgent | null>;
   resolveAgentForActor(
     actor: AgentActor,
@@ -38,8 +42,11 @@ export type ActorAgentResolverDependencies = {
   model: RuntimeModel;
   resolveModelApiKey: () => Promise<string | null>;
   stallGuard?: StallGuard;
-  loadToolsForActor?: (actorId: string) => LoadToolsForBot;
-  signRunForActor?: (actorId: string) => SignRun;
+  loadToolsForActor?: (
+    actorId: string,
+    initiator?: AuditInitiator,
+  ) => LoadToolsForBot;
+  signRunForActor?: (actorId: string, initiator?: AuditInitiator) => SignRun;
   computerGuidance?: string;
   loadVendors?: () => Promise<readonly string[]>;
   selectionForActor?: (actorId: string) => ToolSelection;
@@ -52,6 +59,15 @@ export type ActorAgentResolverDependencies = {
    * roster that person can see, so a Bot must never be able to address one they cannot.
    */
   handoffForActor?: (actorId: string) => HandoffForRun;
+  /**
+   * What this person has told every built-in coworker they run.
+   *
+   * Per actor and read per build, for the reason every other per-person fact here is: somebody who
+   * edits their instructions and sends a message expects the message to land on the new ones, and a
+   * value captured at boot would serve the whole deployment whatever the first person to sign in had
+   * written.
+   */
+  loadInstructionsForActor?: (actorId: string) => LoadInstructions;
 };
 
 /**
@@ -78,29 +94,41 @@ export function createActorAgentResolver(
      * what gets built.
      */
     onlyBotId?: string,
+    initiator?: AuditInitiator,
   ) =>
     resolveRuntimeAgents(
       () => Promise.resolve(registered),
       deps.model,
       deps.resolveModelApiKey,
       deps.stallGuard,
-      deps.loadToolsForActor?.(actor.id),
-      deps.signRunForActor?.(actor.id),
+      deps.loadToolsForActor?.(actor.id, initiator),
+      deps.signRunForActor?.(actor.id, initiator),
       deps.computerGuidance,
       deps.loadVendors,
       deps.selectionForActor?.(actor.id),
       deps.agentFetch,
       deps.handoffForActor?.(actor.id),
       onlyBotId,
+      deps.loadInstructionsForActor?.(actor.id),
+      initiator,
     );
 
   const resolveAgentsForActor = async (actor: AgentActor) =>
     resolveRegisteredAgents(actor, await deps.loadAgents(actor));
 
-  const findAgentForActor = async (actor: AgentActor, agentId: string) => {
+  const findAgentForActor = async (
+    actor: AgentActor,
+    agentId: string,
+    initiator?: AuditInitiator,
+  ) => {
     const registered = await deps.loadAgents(actor);
     if (!registered.some((agent) => agent.id === agentId)) return null;
-    const agents = await resolveRegisteredAgents(actor, registered, agentId);
+    const agents = await resolveRegisteredAgents(
+      actor,
+      registered,
+      agentId,
+      initiator,
+    );
     return Object.hasOwn(agents, agentId) ? (agents[agentId] ?? null) : null;
   };
 

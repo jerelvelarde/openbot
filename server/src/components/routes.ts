@@ -95,15 +95,29 @@ export function createComponentRoutes(
       >;
       if (
         typeof name !== "string" ||
-        !name ||
+        !name.trim() ||
         typeof title !== "string" ||
+        !title.trim() ||
         typeof kind !== "string" ||
+        !kind.trim() ||
         typeof description !== "string" ||
-        !description
+        !description.trim()
       ) {
         return [];
       }
-      return [{ name, title, kind, description }];
+      // Trimmed, because that is the string the guard above just approved. A component's `name` is
+      // its identity -- `syncCatalogue` compares it against what is already published, `decide` and
+      // `listForAgent` look it up by it, and a grant names it -- so publishing " weatherPanel "
+      // adds a second component beside `weatherPanel` that nobody has granted and no Bot can be
+      // held back from by the name people use.
+      return [
+        {
+          name: name.trim(),
+          title: title.trim(),
+          kind: kind.trim(),
+          description: description.trim(),
+        },
+      ];
     });
 
     const { added } = await store.syncCatalogue(valid);

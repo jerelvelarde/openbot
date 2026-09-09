@@ -445,6 +445,30 @@ describe("the computer gateway", () => {
     expect(rows[0]?.payload.element).toBeUndefined();
   });
 
+  test("a permitted action stopped mid-flight is recorded as a stop, not a failure", async () => {
+    // A person pressing Stop is not the computer failing. The row still says so in its message, but
+    // its TYPE is `computer.action_stopped`, so a count of `action_failed` rows — the natural way to
+    // measure outages — does not read every Stop as one.
+    const { gateway, rows } = await gatewayWith(PERMISSIVE);
+    const stop = new AbortController();
+    stop.abort();
+
+    await expect(
+      gateway.runCommand(
+        "bot-1",
+        ACTOR,
+        { command: "cat secrets.txt" },
+        stop.signal,
+      ),
+    ).rejects.toThrow(/stopped/);
+
+    // The decision that permitted it, then the outcome — a stop, not a failure.
+    expect(rows).toHaveLength(2);
+    expect(rows[0]?.eventType).toBe("computer.action_allowed");
+    expect(rows[1]?.eventType).toBe("computer.action_stopped");
+    expect(rows[1]?.payload.failure).toContain("stopped");
+  });
+
   test("a command the policy refuses is recorded and never reaches the computer", async () => {
     const { gateway, calls, rows } = await gatewayWith({
       ...PERMISSIVE,
@@ -695,6 +719,67 @@ describe("the computer gateway", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]?.eventType).toBe("computer.reset");
     expect(rows[0]?.targetId).toBe("bot-2");
+  });
+
+  /*
+   * "The most destructive button we have. Every login the Bot had is gone and no undo exists, so the
+   * row is written whatever happens next."
+   *
+   * The profile is destroyed by `provider.reset` before either of the two Postgres deletes runs, so
+   * a delete that fails cannot put it back -- it can only take the row with it, which is the one
+   * thing that note rules out.
+   */
+  test("resetComputer records the reset even when clearing the stored page fails", async () => {
+    const { provider, fetchImpl } = fakeComputer({
+      resetResult: { cleared: true },
+    });
+    const { store, rows } = fakeAudit();
+    const snapshots: SnapshotStore = {
+      ...createInMemorySnapshotStore(),
+      clear: async () => {
+        throw new Error("connection reset by peer");
+      },
+    };
+    const gateway = createComputerGateway({
+      provider,
+      fetchImpl,
+      auditStore: store,
+      policy: () => PERMISSIVE,
+      snapshots,
+    });
+
+    await expect(gateway.resetComputer("bot-1", ACTOR)).rejects.toThrow(
+      "connection reset by peer",
+    );
+
+    expect(rows.map((row) => row.eventType)).toContain("computer.reset");
+    expect(rows[0]?.targetId).toBe("bot-1");
+  });
+
+  test("resetComputer records the reset even when clearing the screenshots fails", async () => {
+    const { provider, fetchImpl } = fakeComputer({
+      resetResult: { cleared: true },
+    });
+    const { store, rows } = fakeAudit();
+    const gateway = createComputerGateway({
+      provider,
+      fetchImpl,
+      auditStore: store,
+      policy: () => PERMISSIVE,
+      pageFrames: {
+        clear: async () => {
+          throw new Error("statement timeout");
+        },
+      } as unknown as NonNullable<
+        Parameters<typeof createComputerGateway>[0]["pageFrames"]
+      >,
+    });
+
+    await expect(gateway.resetComputer("bot-1", ACTOR)).rejects.toThrow(
+      "statement timeout",
+    );
+
+    expect(rows.map((row) => row.eventType)).toContain("computer.reset");
   });
 
   test("computers maps provider status 'running' and 'stopped' directly and preserves egress distinctions", async () => {

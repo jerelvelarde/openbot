@@ -1,6 +1,7 @@
 import { and, asc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import {
   type AuditEventInput,
+  type AuditInitiator,
   type AuditStore,
   recordAuditEvent,
   redactAuditPayload,
@@ -41,6 +42,7 @@ import {
   resolveServerUrl,
   serverCredentialKind,
 } from "./catalogue";
+import { inspectToolArguments } from "./content-governance";
 import { McpServerError } from "./mcp";
 import { registerDynamicClient } from "./oauth";
 import { transportFor } from "./transport";
@@ -411,6 +413,15 @@ export async function exchangeRefreshTokenOverHttp(input: {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: params,
+    /*
+     * A redirect is a refusal, not a detour to be followed.
+     *
+     * `tokenUrl` is pinned in the catalogue because this request carries the deployment's client
+     * secret and somebody's refresh token, and following a 302 would hand both to whatever address
+     * the answer named. Manual leaves the 3xx as the response, which is not `ok`, so it falls into
+     * the refusal below. The same guard the authorization-code redemption in `oauth.ts` uses.
+     */
+    redirect: "manual",
     signal: AbortSignal.timeout(TOKEN_TIMEOUT_MS),
   });
 
@@ -1990,17 +2001,37 @@ export function createPluginStore(options: PluginStoreOptions) {
           token,
         });
 
-        await database.delete(mcpTools).where(eq(mcpTools.serverId, serverId));
-        if (tools.length > 0) {
-          await database.insert(mcpTools).values(
-            tools.map((tool) => ({
-              serverId,
-              name: tool.name,
-              description: tool.description,
-              inputSchema: tool.inputSchema,
-            })),
-          );
-        }
+        /*
+         * ONE STEP, because the catch below promises that it is one.
+         *
+         * "The tools already held are left alone" is only true while nothing has been written yet.
+         * As two auto-committed statements the delete landed on its own whenever the insert did not:
+         * a pod killed mid-refresh, a dropped connection, a statement timeout — or, with no crash at
+         * all, a server that answers `tools/list` with the same `name` twice, which `mcp_tools`'
+         * `(server_id, name)` primary key refuses as one multi-row insert. `mcp_tools` is shared, so
+         * that is every replica at once, and nothing repopulates it: `refreshTools` is only ever
+         * called by `addServer`, `addCustomServer` and an administrator pressing Refresh. The
+         * connector kept every grant an administrator had made and offered none of them, and
+         * `grantedToolGuidance` then told the Bot outright that it holds none of that vendor's tools.
+         *
+         * Rolled back together, the vendor's bad answer is recorded in `lastError` and the Bots go
+         * on using what they were granted, which is what the comment said all along.
+         */
+        await database.transaction(async (transaction) => {
+          await transaction
+            .delete(mcpTools)
+            .where(eq(mcpTools.serverId, serverId));
+          if (tools.length > 0) {
+            await transaction.insert(mcpTools).values(
+              tools.map((tool) => ({
+                serverId,
+                name: tool.name,
+                description: tool.description,
+                inputSchema: tool.inputSchema,
+              })),
+            );
+          }
+        });
 
         await database
           .update(mcpServers)
@@ -2897,6 +2928,7 @@ export function createPluginStore(options: PluginStoreOptions) {
       args: Record<string, unknown>;
       botId: string;
       actorId: string;
+      initiator?: AuditInitiator;
     }): Promise<{ text: string; isError: boolean }> {
       const [serverId, ...rest] = input.ref.split("/");
       const toolName = rest.join("/");
@@ -2910,6 +2942,7 @@ export function createPluginStore(options: PluginStoreOptions) {
           eventType: "mcp.call_rejected",
           targetType: "mcp_tool",
           targetId: input.ref,
+          ...(input.initiator ? { initiator: input.initiator } : {}),
           payload: {
             actor: input.actorId,
             bot: input.botId,
@@ -3005,19 +3038,66 @@ export function createPluginStore(options: PluginStoreOptions) {
       };
 
       /*
-       * A refusal is written here, because there is no attempt to wait for.
+       * A refusal is written on the POLICY's answer, not on whether the call was then let through.
        *
        * This deployment declining is the whole event, and it is recorded before the throw so that a
        * refusal cannot be lost by the caller's error handling.
+       *
+       * In `dry-run` the policy still refuses and the mode forwards anyway, which is the whole point
+       * of the mode: `evaluateActionPolicy` returns `allowed: false` with `forward: true` so a rule
+       * can be tried against live traffic before it starts refusing anybody. Writing this row on
+       * `forward` therefore recorded nothing at all on this surface for exactly the traffic an
+       * operator switched dry-run on to measure — the browser gateway keys its row on
+       * `decision.allowed` and does record it — so `Blocked` on the audit page, and every
+       * `eventType=mcp.call_rejected` query behind it, answered "this rule would refuse none of your
+       * tool calls" about calls it would refuse. The rule then looked inert, and enforcing it
+       * started refusing Bots with no warning in the trail.
+       *
+       * `decision.carriedOut` is what tells the two rows apart: false is a call this deployment
+       * stopped, true is one dry-run recorded and let past. The outcome row below is unchanged, so a
+       * forwarded call still says separately whether the vendor answered.
        */
-      if (!verdict.forward) {
+      if (!verdict.allowed) {
         await recordAuditEvent(auditStore, {
           eventType: "mcp.call_rejected",
           targetType: "mcp_tool",
           targetId: input.ref,
+          ...(input.initiator ? { initiator: input.initiator } : {}),
           payload: decided,
         });
+      }
+      if (!verdict.forward) {
         throw new PluginRefusedError(verdict.reason, verdict.matched);
+      }
+
+      /**
+       * Structural policy answers whether this Bot may call this tool. Content inspection answers
+       * whether the arguments would carry a credential out of the deployment. It runs after policy
+       * and before credentials are read or a vendor is contacted, and its result contains paths and
+       * categories only: never the values it refused.
+       */
+      const contentDecision = inspectToolArguments(args);
+      if (!contentDecision.safe) {
+        await recordAuditEvent(auditStore, {
+          eventType: "mcp.call_rejected",
+          targetType: "mcp_tool",
+          targetId: input.ref,
+          ...(input.initiator ? { initiator: input.initiator } : {}),
+          payload: {
+            ...decided,
+            refusal: "sensitive_tool_arguments",
+            contentInspection: {
+              reason: contentDecision.reason,
+              findings: contentDecision.findings,
+            },
+          },
+        });
+        throw new PluginRefusedError(
+          contentDecision.reason === "sensitive_content"
+            ? "The tool call was refused because its arguments contain credential material."
+            : "The tool call was refused because its arguments could not be inspected safely.",
+          null,
+        );
       }
 
       /*
@@ -3051,6 +3131,7 @@ export function createPluginStore(options: PluginStoreOptions) {
           eventType: result.isError ? "mcp.call_failed" : "mcp.call_succeeded",
           targetType: "mcp_tool",
           targetId: input.ref,
+          ...(input.initiator ? { initiator: input.initiator } : {}),
           /*
            * The vendor's own words, when it is reporting a failure.
            *
@@ -3086,6 +3167,7 @@ export function createPluginStore(options: PluginStoreOptions) {
           eventType: "mcp.call_failed",
           targetType: "mcp_tool",
           targetId: input.ref,
+          ...(input.initiator ? { initiator: input.initiator } : {}),
           payload: {
             ...decided,
             failure: (error instanceof Error

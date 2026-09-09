@@ -232,7 +232,7 @@ export function createPluginRoutes(
       url?: string;
       credentialId?: string;
     } | null;
-    if (!body?.id || !body.title || !body.url) {
+    if (!body?.id?.trim() || !body?.title?.trim() || !body?.url?.trim()) {
       return context.json(
         { error: "A name, a title and a URL are required." },
         400,
@@ -241,9 +241,9 @@ export function createPluginRoutes(
 
     try {
       const server = await store.addCustomServer({
-        id: body.id,
-        title: body.title,
-        url: body.url,
+        id: body.id.trim(),
+        title: body.title.trim(),
+        url: body.url.trim(),
         credentialId: body.credentialId,
         by: actorEmail(context),
       });
@@ -415,7 +415,7 @@ export function createPluginRoutes(
       if (entry.auth.clientRegistration === "dynamic") {
         return context.json(
           {
-            error: `${entry.title} refused this deployment's registration. Try again, and check the vendor's status if it persists.`,
+            error: `${entry.title} would not register this deployment, or could not be reached. Try again, and check the vendor's status if it persists.`,
           },
           502,
         );
@@ -514,12 +514,36 @@ export function createPluginRoutes(
     });
     if (!grant) return context.redirect(failed);
 
-    await store.recordConnection({
-      serverId: state.serverId,
-      userId: state.userId,
-      refreshToken: grant.refreshToken,
-      scope: grant.scope,
-    });
+    /*
+     * The last thing that can fail, answered the same way as everything before it.
+     *
+     * A vault that will not take the grant is this deployment's problem, not the person's, and they
+     * have already done their part at the vendor. Unhandled, this threw past the handler and gave
+     * them the bare 500 that every other failure on this route was written to avoid, on the one
+     * path where they had most reason to think it had worked.
+     *
+     * Told, because unlike the refusals above this one is nobody's fault but ours, and the person's
+     * sentence deliberately says nothing about which failure it was. The refresh token is not
+     * logged: it is the one thing here worth stealing, and the row it belonged to was never written.
+     */
+    try {
+      await store.recordConnection({
+        serverId: state.serverId,
+        userId: state.userId,
+        refreshToken: grant.refreshToken,
+        scope: grant.scope,
+      });
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          type: "oauth-connection-not-recorded",
+          serverId: state.serverId,
+          note: "A person consented and the grant could not be stored. They were sent back to Settings with a failure and will have to connect again.",
+          error: String(error),
+        }),
+      );
+      return context.redirect(failed);
+    }
 
     return context.redirect(
       connectedAccountsUrlFor(
@@ -550,7 +574,7 @@ export function createPluginRoutes(
       global?: boolean;
       tools?: unknown;
     } | null;
-    if (!body?.slug || !body.title || !body.instructions) {
+    if (!body?.slug || !body?.title?.trim() || !body?.instructions?.trim()) {
       return context.json(
         { error: "A slug, a title and instructions are required." },
         400,
@@ -593,9 +617,9 @@ export function createPluginRoutes(
     try {
       await store.installSkill({
         slug: body.slug,
-        title: body.title,
+        title: body.title.trim(),
         summary: body.summary ?? "",
-        instructions: body.instructions,
+        instructions: body.instructions.trim(),
         ownerUserId: body.global ? null : actor.id,
         ...(tools === undefined ? {} : { tools }),
         by: actorEmail(context),

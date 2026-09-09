@@ -4,6 +4,7 @@ import { createApp } from "../src/app";
 import {
   type AuditEventType,
   auditEventTypes,
+  createAuditStore,
   recordAuditEvent,
   redactAuditPayload,
 } from "../src/audit";
@@ -160,6 +161,30 @@ describe("audit payload redaction", () => {
         payload: { apiKey: "[REDACTED]", provider: "openai" },
       },
     ]);
+  });
+
+  test("a direct store insert is redacted too", async () => {
+    // Redaction used to live only in recordAuditEvent, so a direct insert()
+    // stored secrets in cleartext. The store is the last line of defence.
+    let stored: unknown;
+    const store = createAuditStore({
+      insert: () => ({
+        values: async (event: unknown) => {
+          stored = event;
+        },
+      }),
+    } as never);
+
+    await store.insert({
+      eventType: "credential.created",
+      targetType: "credential",
+      targetId: "credential-1",
+      payload: { apiKey: "plaintext-key", provider: "openai" },
+    } as never);
+
+    expect(stored).toMatchObject({
+      payload: { apiKey: "[REDACTED]", provider: "openai" },
+    });
   });
 });
 

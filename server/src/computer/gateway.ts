@@ -19,6 +19,7 @@
  */
 import { type AuditStore, recordAuditEvent } from "../audit";
 import {
+  ComputerStoppedError,
   ComputerUnavailableError,
   createComputerTransport,
   StaleSnapshotError,
@@ -614,6 +615,10 @@ export function createComputerGateway(
         pageUrl,
         decision,
         failure: error instanceof Error ? error.message : "The action failed.",
+        // A person pressing Stop mid-action is not the computer failing. The message still says so;
+        // this keeps the row's type a stop, so a count of failed actions does not read every Stop as
+        // an outage.
+        ...(error instanceof ComputerStoppedError ? { stopped: true } : {}),
       });
       throw error;
     }
@@ -761,6 +766,22 @@ export function createComputerGateway(
      */
     async resetComputer(botId: string, actor: ActionActor) {
       const result = await provider.reset(botId);
+      /*
+       * The row goes in HERE, before the two deletes below, because this line is the point of no
+       * return: the profile is already gone and nothing after it can put the logins back.
+       *
+       * Both clears are Postgres deletes, and a connection reset, a failover or a statement timeout
+       * in either used to throw before the row was written -- leaving a computer wiped with nothing
+       * on the trail to say who wiped it, which is the one outcome the note above rules out. The
+       * failure still propagates, so the caller is told the clears did not finish.
+       */
+      await writeControlEvent(auditStore, "computer.reset", {
+        botId,
+        actor,
+        reason: result.cleared
+          ? "the computer and its saved state were deleted"
+          : "no saved state was present to delete",
+      });
       // The refs the last snapshot handed out describe a page that no longer exists, and a fresh
       // computer counts generations from one again, so the row has to go with the profile.
       await snapshots.clear(botId);
@@ -773,13 +794,6 @@ export function createComputerGateway(
        * anything a person would recognise as private.
        */
       await pageFrames?.clear(botId);
-      await writeControlEvent(auditStore, "computer.reset", {
-        botId,
-        actor,
-        reason: result.cleared
-          ? "the computer and its saved state were deleted"
-          : "no saved state was present to delete",
-      });
       return result;
     },
 
@@ -1118,16 +1132,22 @@ async function write(
     command?: string;
     /** Set only when a permitted action was attempted and did not succeed. */
     failure?: string;
+    /** Set when that non-success was a person pressing Stop, so the row is typed a stop, not a failure. */
+    stopped?: boolean;
   },
 ) {
   await recordAuditEvent(auditStore, {
     // A failure is its own kind of event, not a variant of "allowed": the whole point of the extra row
     // is that a reader can tell an action that happened from one that was permitted and then did not.
-    eventType: entry.failure
-      ? "computer.action_failed"
-      : entry.decision.allowed
-        ? "computer.action_allowed"
-        : "computer.action_refused",
+    // A stop is a third kind again: the action did not happen, but nothing broke, so it is neither a
+    // failure to be counted as an outage nor an action that was carried out.
+    eventType: entry.stopped
+      ? "computer.action_stopped"
+      : entry.failure
+        ? "computer.action_failed"
+        : entry.decision.allowed
+          ? "computer.action_allowed"
+          : "computer.action_refused",
     targetType: "computer",
     targetId: entry.botId,
     // Only ever a real users row. The audit table has a foreign key to it, so writing the local

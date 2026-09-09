@@ -33,6 +33,37 @@ const docker = new Docker(
 const COMPUTER_PORT = "4100/tcp";
 
 /**
+ * Readiness, stated at create time rather than read off the image.
+ *
+ * `agent-computer/Dockerfile` declares the same HEALTHCHECK, and under Docker that was enough: the
+ * image carried it, the daemon ran it, and {@link waitUntilAnswering} could ask. Podman does not
+ * report it. Its images are OCI-manifest, the OCI image config has no healthcheck field, and the
+ * instruction is dropped, both when Podman builds the image and when it pulls one that has it. The
+ * published `agent-computer` config does carry it; `podman inspect` of that same image reports
+ * none.
+ *
+ * Silently, and into the one branch that cannot tell the difference: with no health to read,
+ * `waitUntilAnswering` accepts `Running`, and a container that is running is not a Chromium that
+ * is answering. Every cold start of a computer then raced the first request, which arrived at a
+ * port nothing was listening on yet and was reported as a computer that is not running.
+ *
+ * Passed here, the engine is told what to run instead of asked what it inherited, which is also
+ * true on Docker and one less thing that depends on how an image was built. Podman honours an
+ * explicit healthcheck: it is how every service in `docker-compose.yml` reports healthy there.
+ */
+const COMPUTER_HEALTHCHECK = {
+  Test: [
+    "CMD-SHELL",
+    `bun -e "const r = await fetch('http://localhost:${COMPUTER_PORT.split("/")[0]}/health'); process.exit(r.ok ? 0 : 1)"`,
+  ],
+  // Nanoseconds, which is what the API takes. The same numbers the Dockerfile states.
+  Interval: 2_000_000_000,
+  Timeout: 3_000_000_000,
+  StartPeriod: 2_000_000_000,
+  Retries: 30,
+};
+
+/**
  * How many times `ensure` will build a computer before giving up.
  *
  * One retry, because the only thing being retried is losing a race to another request for the same
@@ -120,6 +151,20 @@ function portOf(ports?: Docker.Port[] | undefined): number | undefined {
 }
 
 /**
+ * A published port from `inspect`, which Docker reports as a string.
+ *
+ * The daemon hands back `""` before a port is assigned and anything at all when it
+ * misbehaves, so a bare `parseInt` turns `"abc"` into a `NaN` port and `"0"` into a
+ * port nothing can dial. Only digits in range are a port; anything else is no port.
+ */
+export function parseHostPort(value: unknown): number | undefined {
+  if (typeof value !== "string" || !/^\d+$/.test(value)) return undefined;
+  const port = Number.parseInt(value, 10);
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65535) return undefined;
+  return port;
+}
+
+/**
  * Whether a labelled thing belongs to this deployment.
  *
  * Containers created before the namespace label existed carry the default namespace, so an existing
@@ -178,9 +223,10 @@ async function inspectOwned(names: ComputerNames): Promise<{
     if (!ours(info.Config?.Labels)) return null;
     const published =
       info.NetworkSettings?.Ports?.[COMPUTER_PORT]?.[0]?.HostPort;
+    const port = parseHostPort(published);
     return {
       status: info.State?.Status ?? "unknown",
-      ...(published ? { port: Number.parseInt(published, 10) } : {}),
+      ...(port !== undefined ? { port } : {}),
       // The resolved image, not the tag it was started from. A tag moves when the image is
       // rebuilt; this is what the container is actually running.
       ...(info.Image ? { image: info.Image } : {}),
@@ -262,8 +308,9 @@ async function waitUntilAnswering(
     try {
       const info = await docker.getContainer(container).inspect();
       const health = info.State?.Health?.Status;
-      // An image without a HEALTHCHECK reports nothing. Waiting forever for an answer that will
-      // never come would be worse than going ahead, so running is accepted as the best available.
+      // Nothing to read. Every computer this supervisor creates is given a healthcheck, so this is
+      // an engine that does not report one rather than an image that does not carry one, and
+      // waiting forever for an answer that will never come would be worse than going ahead.
       if (!health) {
         if (info.State?.Running) return;
       } else if (health === "healthy") {
@@ -432,6 +479,7 @@ export async function ensure(
           Labels: labelsFor(names),
           Env: options.environment,
           ExposedPorts: { [COMPUTER_PORT]: {} },
+          Healthcheck: COMPUTER_HEALTHCHECK,
           HostConfig: hostConfig(names, options),
         });
       } catch (error) {

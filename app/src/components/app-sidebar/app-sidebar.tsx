@@ -1,7 +1,6 @@
 import {
   IconBolt,
   IconBox,
-  IconClock,
   IconLogout,
   IconPlus,
   IconSearch,
@@ -108,6 +107,36 @@ function UserAvatar() {
 const MAX_ANIMATED_ROWS = 60;
 
 /**
+ * The roster, narrowed to what the person typed.
+ *
+ * Matches the channel's name, its summary, and the last message, because those are the things the
+ * row can actually show — searching against something invisible returns results a person cannot
+ * account for. The last message is included because it is still what the second line draws until the
+ * conversation has been named. Message history beyond that line is not here to search: it lives in
+ * the thread store, and reaching for it is a server endpoint rather than a filter.
+ *
+ * An empty query returns the input array unchanged rather than a copy, so typing and clearing does
+ * not hand `AnimatePresence` a new array identity and restage the whole list.
+ */
+export function matchingChannels(
+  channels: ChannelSummary[] | undefined,
+  query: string,
+): ChannelSummary[] {
+  if (!channels) {
+    return [];
+  }
+  const needle = query.trim().toLowerCase();
+  if (!needle) {
+    return channels;
+  }
+  return channels.filter((channel) =>
+    [channel.name, channel.summary, channel.lastMessage].some((field) =>
+      field?.toLowerCase().includes(needle),
+    ),
+  );
+}
+
+/**
  * Pinned channels first, everything else after, newest activity first within each group.
  *
  * The mirror of a server rule, not the rule itself: the roster query orders pinned-first and its
@@ -190,6 +219,7 @@ function ChannelRow({
         channelId={channel.id}
         participantIds={channel.agentIds}
         name={channel.name}
+        summary={channel.summary ?? undefined}
         lastMessage={channel.lastMessage ?? undefined}
         lastMessageAt={
           channel.lastMessageAt
@@ -198,6 +228,7 @@ function ChannelRow({
         }
         pinned={channel.pinned}
         unread={unread}
+        busy={channel.busy ?? false}
       />
     </motion.div>
   );
@@ -433,26 +464,9 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
               <span className="text-sm trackint-tight">Agents</span>
             </SidebarMenuButton>
           </SidebarMenuItem>
-          <SidebarMenuItem>
-            {/* Beside Skills and Agents rather than inside Admin: a routine is something anybody has. */}
-            <SidebarMenuButton
-              className="hover:bg-foreground/5 h-10"
-              render={(props) => (
-                <Link
-                  {...props}
-                  to="/routines"
-                  activeProps={{
-                    className: "bg-foreground/5",
-                  }}
-                />
-              )}
-            >
-              <div className="size-[28px] flex items-center justify-center">
-                <IconClock />
-              </div>
-              <span className="text-sm trackint-tight">Routines</span>
-            </SidebarMenuButton>
-          </SidebarMenuItem>
+          {/* Routines live on each coworker's own dialog now, not as a nav destination: the
+              question "what does this Bot do on a schedule" is asked while looking at the Bot.
+              The /routines route still answers a direct link. */}
           <SidebarMenuItem>
             <DropdownMenu>
               <DropdownMenuTrigger

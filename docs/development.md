@@ -14,12 +14,10 @@ Provision CopilotKit Intelligence after `.env` exists:
 ```sh
 npx --yes copilotkit@latest login
 npx --yes copilotkit@latest project select
-npx --yes copilotkit@latest license --write
 ```
 
 Put the `cpk-...` runtime key from `project select` in `.env` as
-`INTELLIGENCE_API_KEY`. `license --write` writes `COPILOTKIT_LICENSE_TOKEN`.
-Then add `OPENAI_API_KEY`.
+`INTELLIGENCE_API_KEY`. There is no licence step. Then add `OPENAI_API_KEY`.
 
 Start the stack:
 
@@ -30,6 +28,8 @@ bash scripts/start.sh
 ## Running services
 
 Use `bash scripts/start.sh` for the full local stack. It starts Docker services, applies migrations, starts the API server and app, and verifies health routes.
+
+Use `bash scripts/stop.sh` to take it down: the app, the routine worker, the API server, the Docker services, and each Bot's computer, which the supervisor makes rather than compose and which therefore outlives `docker compose down`. Pass `--keep-computers` to leave those browsers signed in. Nothing is deleted either way.
 
 Use `bun run dev` only when you want the app and API server without starting the Docker Bots and computers.
 

@@ -9,6 +9,22 @@ export class ComputerUnavailableError extends Error {
   }
 }
 
+/**
+ * A person pressed Stop and the action was aborted mid-flight.
+ *
+ * A subclass of `ComputerUnavailableError` on purpose: everything downstream that catches an
+ * unavailable computer to tell the model still catches this unchanged. What it adds is a type the
+ * gateway can see, so the audit row it writes is `computer.action_stopped` rather than
+ * `computer.action_failed` -- a stop is not an outage, and a count of failures that includes every
+ * Stop reports one where there was none.
+ */
+export class ComputerStoppedError extends ComputerUnavailableError {
+  constructor(reason: string) {
+    super(reason);
+    this.name = "ComputerStoppedError";
+  }
+}
+
 /** The requested element is not on the current page. */
 export class ElementNotFoundError extends Error {
   constructor(reason: string) {
@@ -125,7 +141,7 @@ export function createComputerTransport(
     timeoutMsOverride?: number,
   ): Promise<T> {
     if (caller?.aborted) {
-      throw new ComputerUnavailableError("The action was stopped.");
+      throw new ComputerStoppedError("The action was stopped.");
     }
 
     /*
@@ -155,6 +171,18 @@ export function createComputerTransport(
           : AbortSignal.timeout(timeoutMs),
       });
     } catch (error) {
+      /*
+       * The caller's own abort is answered first, and says what the check above the fetch says.
+       *
+       * The signal is handed to fetch precisely so a Stop can land mid-flight, and a fetch aborted
+       * that way rejects with an AbortError, which is neither a TimeoutError nor a computer that is
+       * not running. Both of the other answers are statements about the infrastructure, and this
+       * message is not only read by the model: the gateway writes it into the action's audit row,
+       * and the type below is what keeps that row a stop rather than an outage.
+       */
+      if (caller?.aborted) {
+        throw new ComputerStoppedError("The action was stopped.");
+      }
       throw new ComputerUnavailableError(
         error instanceof Error && error.name === "TimeoutError"
           ? "The assistant's computer did not respond in time."
