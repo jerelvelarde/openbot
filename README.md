@@ -30,7 +30,7 @@ Choose your models. Bring your agents. Own your infrastructure.
 
 </div>
 
-https://github.com/user-attachments/assets/c60f07da-8b6d-46eb-a573-17fc1e65a644
+https://github.com/user-attachments/assets/64fb43db-fe0e-4fda-a3a1-4721e19c7a43
 
 <p align="center"><sub>Watch a Bot use its browser and tools, answer with interactive results, and wait for your approval before it sends. Take over when it needs you, and connect the agents you already run.</sub></p>
 
